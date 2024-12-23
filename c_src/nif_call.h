@@ -9,7 +9,7 @@
 #define NIF_CALL_CAT(A, B) A##B
 #define NIF_CALL_SYMBOL(A, B) NIF_CALL_CAT(A, B)
 
-#define CallbackNifRes NIF_CALL_SYMBOL(NIF_CALL_NAMESPACE, CallbackNifRes)
+#define NifCallCallbackNifRes NIF_CALL_SYMBOL(NIF_CALL_NAMESPACE, NifCallCallbackNifRes)
 #define nif_call_onload NIF_CALL_SYMBOL(NIF_CALL_NAMESPACE, nif_call_onload)
 #define prepare_nif_call NIF_CALL_SYMBOL(NIF_CALL_NAMESPACE, prepare_nif_call)
 #define make_nif_call NIF_CALL_SYMBOL(NIF_CALL_NAMESPACE, make_nif_call)
@@ -22,19 +22,27 @@
 
 #ifndef NIF_CALL_IMPLEMENTATION
 
-struct CallbackNifRes;
+struct NifCallCallbackNifRes;
 static int nif_call_onload(ErlNifEnv *env);
-static CallbackNifRes * prepare_nif_call(ErlNifEnv* env);
-static ERL_NIF_TERM make_nif_call(ErlNifEnv* caller_env, ErlNifPid evaluator, ERL_NIF_TERM fun, ERL_NIF_TERM args);
+static NifCallCallbackNifRes * prepare_nif_call(ErlNifEnv* env);
+static ERL_NIF_TERM make_nif_call(ErlNifEnv* caller_env, ERL_NIF_TERM tag, ERL_NIF_TERM args);
 static ERL_NIF_TERM nif_call_evaluated(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]);
 static void destruct_nif_call_res(ErlNifEnv *, void *obj);
 
 #else
 
-struct CallbackNifRes {
+struct NifCallCallbackNifRes {
   static ErlNifResourceType *type;
+  static ERL_NIF_TERM kAtomOK;
+  static ERL_NIF_TERM kAtomError;
   static ERL_NIF_TERM kAtomNil;
   static ERL_NIF_TERM kAtomENOMEM;
+  static ERL_NIF_TERM kAtomExecute;
+  static ERL_NIF_TERM kAtomCallerEnv;
+  static ERL_NIF_TERM kAtomNotTag;
+  static ERL_NIF_TERM kAtomInvalidRunner;
+  static ERL_NIF_TERM kAtomInvalidRunnerReply;
+  static ERL_NIF_TERM kAtomRunnerIsDown;
 
   ErlNifEnv * msg_env;
   ErlNifMutex *mtx = NULL;
@@ -44,14 +52,73 @@ struct CallbackNifRes {
   bool return_value_set;
 };
 
-ErlNifResourceType * CallbackNifRes::type = NULL;
-ERL_NIF_TERM CallbackNifRes::kAtomNil;
-ERL_NIF_TERM CallbackNifRes::kAtomENOMEM;
+struct NifCallResult {
+  bool err;
+  
+  // `kind` can be one of these atoms:
+  // - `ok`
+  // - `error`
+  // - `exit`
+  // - `throw`
+  ERL_NIF_TERM kind;
+  ERL_NIF_TERM value;
 
-CallbackNifRes * prepare_nif_call(ErlNifEnv* env) {
-  CallbackNifRes *res = (CallbackNifRes *)enif_alloc_resource(CallbackNifRes::type, sizeof(CallbackNifRes));
+  bool is_ok() {
+    return !err;
+  }
+
+  ERL_NIF_TERM get_kind() {
+    return kind;
+  }
+
+  ERL_NIF_TERM get_value() {
+    return value;
+  }
+
+  ERL_NIF_TERM get_err() {
+    return value;
+  }
+
+  static NifCallResult ok(ERL_NIF_TERM value) {
+    NifCallResult res;
+    res.err = false;
+    res.value = value;
+    return res;
+  }
+
+  static NifCallResult error(ERL_NIF_TERM value) {
+    NifCallResult res;
+    res.err = true;
+    res.kind = NifCallCallbackNifRes::kAtomError;
+    res.value = value;
+    return res;
+  }
+
+  static NifCallResult error(ERL_NIF_TERM kind, ERL_NIF_TERM value) {
+    NifCallResult res;
+    res.err = true;
+    res.kind = kind;
+    res.value = value;
+    return res;
+  }
+};
+
+ErlNifResourceType * NifCallCallbackNifRes::type = NULL;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomOK;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomError;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomNil;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomENOMEM;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomExecute;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomCallerEnv;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomNotTag;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomInvalidRunner;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomInvalidRunnerReply;
+ERL_NIF_TERM NifCallCallbackNifRes::kAtomRunnerIsDown;
+
+NifCallCallbackNifRes * prepare_nif_call(ErlNifEnv* env) {
+  NifCallCallbackNifRes *res = (NifCallCallbackNifRes *)enif_alloc_resource(NifCallCallbackNifRes::type, sizeof(NifCallCallbackNifRes));
   if (!res) return NULL;
-  memset(res, 0, sizeof(CallbackNifRes));
+  memset(res, 0, sizeof(NifCallCallbackNifRes));
 
   res->msg_env = enif_alloc_env();
   if (!res->msg_env) {
@@ -75,47 +142,75 @@ CallbackNifRes * prepare_nif_call(ErlNifEnv* env) {
   }
 
   res->return_value_set = false;
-  res->return_value = CallbackNifRes::kAtomNil;
+  res->return_value = NifCallCallbackNifRes::kAtomNil;
 
   return res;
 }
 
-static ERL_NIF_TERM make_nif_call(ErlNifEnv* caller_env, ErlNifPid evaluator, ERL_NIF_TERM fun, ERL_NIF_TERM args) {
-  CallbackNifRes *callback_res = prepare_nif_call(caller_env);
-  if (!callback_res) return CallbackNifRes::kAtomENOMEM;
+static NifCallResult make_nif_call(ErlNifEnv* caller_env, ERL_NIF_TERM tag, ERL_NIF_TERM args) {
+  NifCallCallbackNifRes *callback_res = prepare_nif_call(caller_env);
+  if (!callback_res) {
+    return NifCallResult::error(NifCallCallbackNifRes::kAtomENOMEM);
+  }
+
+  int arity = 0;
+  const ERL_NIF_TERM * tag_container = NULL;
+  if (!enif_get_tuple(caller_env, tag, &arity, &tag_container) || arity != 2 || !enif_is_pid(caller_env, tag_container[0])) {
+    return NifCallResult::error(NifCallCallbackNifRes::kAtomNotTag);
+  }
+
+  ErlNifPid evaluator;
+  if (!enif_get_local_pid(caller_env, tag_container[0], &evaluator)) {
+    return NifCallResult::error(NifCallCallbackNifRes::kAtomInvalidRunner);
+  }
 
   ERL_NIF_TERM callback_term = enif_make_resource(caller_env, (void *)callback_res);
-  enif_send(caller_env, &evaluator, callback_res->msg_env, enif_make_copy(callback_res->msg_env, enif_make_tuple3(caller_env,
-    fun,
-    args,
-    callback_term
+  enif_send(caller_env, &evaluator, callback_res->msg_env, enif_make_copy(callback_res->msg_env, enif_make_tuple4(caller_env,
+    NifCallCallbackNifRes::kAtomExecute,
+    callback_term,
+    tag_container[1],
+    args
   )));
 
   enif_mutex_lock(callback_res->mtx);
   while (!callback_res->return_value_set) {
     enif_cond_wait(callback_res->cond, callback_res->mtx);
+    if (enif_is_process_alive(caller_env, &evaluator) == 0) {
+      enif_mutex_unlock(callback_res->mtx);
+      return NifCallResult::error(NifCallCallbackNifRes::kAtomRunnerIsDown);
+    }
   }
   enif_mutex_unlock(callback_res->mtx);
 
   ERL_NIF_TERM return_value = enif_make_copy(caller_env, callback_res->return_value);
   enif_release_resource(callback_res);
+
+  arity = 0;
+  const ERL_NIF_TERM * val_container = NULL;
+  if (!enif_get_tuple(caller_env, return_value, &arity, &val_container) || arity != 2) {
+    return NifCallResult::error(NifCallCallbackNifRes::kAtomInvalidRunnerReply);
+  }
+
+  if (enif_compare(val_container[0], NifCallCallbackNifRes::kAtomOK) == 0) {
+    return NifCallResult::ok(val_container[1]);
+  }
   
-  return return_value;
+  return NifCallResult::error(val_container[0], val_container[1]);
 }
 
 static ERL_NIF_TERM nif_call_evaluated(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
-  CallbackNifRes *res = NULL;
-  if (!enif_get_resource(env, argv[0], CallbackNifRes::type, (void **)&res)) return enif_make_badarg(env);
+  NifCallCallbackNifRes *res = NULL;
+  if (!enif_get_resource(env, argv[0], NifCallCallbackNifRes::type, (void **)&res)) return enif_make_badarg(env);
 
   res->return_value = enif_make_copy(res->msg_env, argv[1]);
   res->return_value_set = true;
   enif_cond_signal(res->cond);
 
-  return enif_make_atom(env, "ok");
+  return NifCallCallbackNifRes::kAtomOK;
 }
 
 static void destruct_nif_call_res(ErlNifEnv *, void *obj) {
-  CallbackNifRes *res = (CallbackNifRes *)obj;
+  NifCallCallbackNifRes *res = (NifCallCallbackNifRes *)obj;
   if (res->cond) {
     enif_cond_destroy(res->cond);
     res->cond = NULL;
@@ -135,12 +230,25 @@ static int nif_call_onload(ErlNifEnv *env) {
   if (loaded) return 0;
 
   ErlNifResourceType *rt;
-  rt = enif_open_resource_type(env, "Elixir.NifCall.NIF", "CallbackNifRes", destruct_nif_call_res, ERL_NIF_RT_CREATE, NULL);
+  rt = enif_open_resource_type(env, "Elixir.NifCall.NIF", "NifCallCallbackNifRes", destruct_nif_call_res, ERL_NIF_RT_CREATE, NULL);
   if (!rt) return -1;
-  CallbackNifRes::type = rt;
+  NifCallCallbackNifRes::type = rt;
 
-  CallbackNifRes::kAtomNil = enif_make_atom(env, "nil");
-  CallbackNifRes::kAtomENOMEM = enif_make_atom(env, "enomem");
+  NifCallCallbackNifRes::kAtomOK = enif_make_atom(env, "ok");
+  NifCallCallbackNifRes::kAtomError = enif_make_atom(env, "error");
+  NifCallCallbackNifRes::kAtomNil = enif_make_atom(env, "nil");
+  NifCallCallbackNifRes::kAtomENOMEM = enif_make_atom(env, "enomem");
+  NifCallCallbackNifRes::kAtomExecute = enif_make_atom(env, "execute");
+
+  // https://www.erlang.org/doc/apps/erts/erl_nif.html#enif_self
+  // https://www.erlang.org/doc/apps/erts/erl_nif#proc_bound_env
+  NifCallCallbackNifRes::kAtomCallerEnv = enif_make_atom(env, "not_in_process_bound_env");
+  
+  NifCallCallbackNifRes::kAtomNotTag = enif_make_atom(env, "not_tag");
+  NifCallCallbackNifRes::kAtomInvalidRunner = enif_make_atom(env, "invalid_runner");
+  NifCallCallbackNifRes::kAtomInvalidRunnerReply = enif_make_atom(env, "invalid_runner_reply");
+  NifCallCallbackNifRes::kAtomRunnerIsDown = enif_make_atom(env, "runner_is_down");
+  
   loaded = 1;
   return 0;
 }

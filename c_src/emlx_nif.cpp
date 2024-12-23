@@ -526,29 +526,48 @@ void move_between_envs(ERL_NIF_TERM from_term, ERL_NIF_TERM *to_term,
   enif_binary_to_term(to_env, serialized.data, serialized.size, to_term, 0);
 }
 
+class EMLXCompileError : public std::runtime_error {
+public:
+  EMLXCompileError(ERL_NIF_TERM term)
+      : std::runtime_error("EMLXCompileError"), error_term(term) {}
+
+  ERL_NIF_TERM get_error_term() const { return error_term; }
+
+private:
+  ERL_NIF_TERM error_term;
+};
+
 NIF(compile) {
-  ERL_NIF_TERM callback_fun_outer = argv[0];
-  LIST_PARAM(1, std::vector<mlx::core::array>, arrays);
-  ErlNifPid evaluator_pid;
-  if (!enif_get_local_pid(env, argv[2], &evaluator_pid)) {
-    return nx::nif::error(env, "Could not get evaluator pid");
-  }
+  LIST_PARAM(0, std::vector<mlx::core::array>, arrays);
+  ERL_NIF_TERM tag = argv[1];
 
   ErlNifEnv *closure_env = enif_alloc_env();
 
-  auto fun = [env = closure_env, evaluator_pid, callback_fun_outer](
+  auto fun = [env = closure_env, outer_env = env, tag_outer = tag](
                  const std::vector<mlx::core::array> &compile_args) {
-    ERL_NIF_TERM callback_fun = enif_make_copy(env, callback_fun_outer);
+    ERL_NIF_TERM tag = enif_make_copy(env, tag_outer);
     ERL_NIF_TERM tensor_list = nx::nif::make_list(env, compile_args);
     ERL_NIF_TERM arg_list = enif_make_list1(env, tensor_list);
 
-    ERL_NIF_TERM output_list =
-        make_nif_call(env, evaluator_pid, callback_fun, arg_list);
+    NifCallResult result = make_nif_call(env, tag, arg_list);
+    enif_clear_env(env);
+
+    if (result.is_ok()) {
+      ERL_NIF_TERM error_term =
+          enif_make_tuple2(env, enif_make_atom(env, "error"), result.get_err());
+      throw EMLXCompileError(enif_make_copy(outer_env, error_term));
+    }
+
+    ERL_NIF_TERM output_list = result.get_value();
 
     // Convert output_list back to vector of MLX arrays
     std::vector<mlx::core::array> output_tensors;
     if (!nx::nif::get_list(env, output_list, output_tensors)) {
-      throw std::runtime_error("Failed to convert callback result to tensors");
+      ERL_NIF_TERM error_string = enif_make_string(
+          env, "Failed to convert callback result to tensors", ERL_NIF_LATIN1);
+      ERL_NIF_TERM error_term =
+          enif_make_tuple2(env, enif_make_atom(env, "error"), error_string);
+      throw EMLXCompileError(enif_make_copy(outer_env, error_term));
     }
 
     enif_free_env(env);
@@ -556,7 +575,13 @@ NIF(compile) {
     return output_tensors;
   };
 
-  emlx::function compiled_function_ptr = mlx::core::compile(fun);
+  emlx::function compiled_function_ptr;
+
+  try {
+    compiled_function_ptr = mlx::core::compile(fun);
+  } catch (const EMLXCompileError &e) {
+    return e.get_error_term();
+  }
 
   return nx::nif::ok(env, create_function_resource(env, compiled_function_ptr));
 }
@@ -1127,7 +1152,7 @@ static ErlNifFunc nif_funcs[] = {
     {"clip", 4, clip},
     {"tri_inv", 3, tri_inv},
     {"set_compile", 1, set_compile},
-    {"compile", 3, compile, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"compile", 2, compile, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"call_compiled", 2, call_compiled, ERL_NIF_DIRTY_JOB_CPU_BOUND}};
 
 // Update the NIF initialization

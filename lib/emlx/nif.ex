@@ -19,7 +19,7 @@ defmodule EMLX.NIF do
     :erlang.load_nif(path, 0)
   end
 
-  def compile(_fun, _args, _evaluator_pid) do
+  def compile(_args, _tag) do
     :erlang.nif_error(:nif_not_loaded)
   end
 

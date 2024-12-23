@@ -362,12 +362,6 @@ defmodule EMLX do
             {:cont, acc}
         end)
 
-      evaluator_pid = Process.whereis(EMLX.NIF.CallEvaluator)
-
-      if not Process.alive?(evaluator_pid) do
-        raise "EMLX.NIF.CallEvaluator not alive"
-      end
-
       cache_key = {__MODULE__, :compiled_fun, key}
 
       compiled_fun =
@@ -377,19 +371,21 @@ defmodule EMLX do
 
             EMLX.NIF.set_compile(true)
 
-            fun =
-              EMLX.NIF.compile(
-                fn args ->
-                  args = Enum.map(args, fn ref -> fn -> EMLX.Backend.to_nx({device, ref}) end end)
+            evaluator_pid = Process.whereis(EMLX.Runner)
 
-                  eval_fun.([args])
-                  |> Nx.Defn.Composite.flatten_list()
-                  |> Enum.map(fn %Nx.Tensor{data: %{ref: {_device, ref}}} -> ref end)
-                end,
-                nif_args,
-                evaluator_pid
-              )
-              |> unwrap!()
+            if not Process.alive?(evaluator_pid) do
+              raise "EMLX.Runner not alive"
+            end
+
+            callback = fn args ->
+              args = Enum.map(args, fn ref -> fn -> EMLX.Backend.to_nx({device, ref}) end end)
+
+              eval_fun.([args])
+              |> Nx.Defn.Composite.flatten_list()
+              |> Enum.map(fn %Nx.Tensor{data: %{ref: {_device, ref}}} -> ref end)
+            end
+
+            fun = NifCall.run(EMLX.Runner, callback, &nif_compile(nif_args, &1))
 
             EMLX.NIF.set_compile(false)
 
@@ -415,6 +411,12 @@ defmodule EMLX do
 
       [result]
     end
+  end
+
+  defp nif_compile(nif_args, tag) do
+    nif_args
+    |> EMLX.NIF.compile(tag)
+    |> unwrap!()
   end
 
   @impl Nx.Defn.Compiler
