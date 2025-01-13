@@ -273,7 +273,7 @@ NIF(to_blob) {
   // Set up contiguous iterator
   std::vector<int> slice_sizes(reshaped.shape().begin(),
                                reshaped.shape().end());
-  ContiguousIterator<size_t> iterator(slice_sizes, reshaped.strides(),
+  ContiguousIterator iterator(slice_sizes, reshaped.strides(),
                                       reshaped.ndim());
 
   // Copy data element by element using iterator
@@ -907,7 +907,7 @@ NIF(strides) {
 NIF(as_strided) {
   TENSOR_PARAM(0, t);
   TUPLE_PARAM(1, std::vector<int>, shape);
-  LIST_PARAM(2, std::vector<size_t>, strides);
+  LIST_PARAM(2, std::vector<int64_t>, strides);
   PARAM(3, int, offset);
   DEVICE_PARAM(4, device);
 
