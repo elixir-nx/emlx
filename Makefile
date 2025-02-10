@@ -86,12 +86,8 @@ $(MLX_SO): $(MLX_SRC_DIR)
 $(EMLX_SO): $(PRIV_DIR) $(MLX_SO) $(OBJECTS)
 	@ echo "Copying MLX library to $(EMLX_LIB_DIR)"
 	@ mkdir -p $(EMLX_LIB_DIR)
-	@ if [ "${MIX_BUILD_EMBEDDED}" = "true" ]; then \
-		cp -a $(MLX_LIB_DIR)/* $(EMLX_LIB_DIR) ; \
-	else \
-		rm -rf $(EMLX_LIB_DIR) ; \
-		ln -sf $(MLX_LIB_DIR) $(EMLX_LIB_DIR) ; \
-	fi
+	@ echo "EMLX_CACHE_DIR: $(EMLX_CACHE_DIR)"
+	@ cp -a $(MLX_LIB_DIR)/* $(EMLX_LIB_DIR)
 	$(CXX) $(OBJECTS) -o $(EMLX_SO) $(LDFLAGS)
 
 clean:

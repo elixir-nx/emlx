@@ -3,7 +3,7 @@ defmodule EMLX.MixProject do
 
   @app :emlx
   @version "0.1.1-dev"
-  @mlx_version "0.22.0"
+  @mlx_version "0.22.1"
 
   def project do
     libmlx_config = libmlx_config()
@@ -33,8 +33,7 @@ defmodule EMLX.MixProject do
           ),
         "MLX_VARIANT" => libmlx_config.variant,
         "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
-        "EMLX_VERSION" => @version,
-        "MIX_BUILD_EMBEDDED" => "#{Mix.Project.config()[:build_embedded]}"
+        "EMLX_VERSION" => @version
       },
 
       # Compilers
