@@ -552,7 +552,7 @@ NIF(compile) {
     NifCallResult result = make_nif_call(env, tag, arg_list);
     enif_clear_env(env);
 
-    if (result.is_ok()) {
+    if (!result.is_ok()) {
       ERL_NIF_TERM error_term =
           enif_make_tuple2(env, enif_make_atom(env, "error"), result.get_err());
       throw EMLXCompileError(enif_make_copy(outer_env, error_term));
