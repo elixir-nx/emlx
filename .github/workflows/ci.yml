@@ -61,7 +61,7 @@ jobs:
       - name: Compile and check warnings
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
-          if [ ${{ matrix.job.build }} = "true" ]; then
+          if [ "${{ matrix.job.build }}" = "true" ]; then
             export LIBMLX_BUILD=true
           fi
           mix compile --warnings-as-errors
@@ -70,7 +70,7 @@ jobs:
         if: ${{ matrix.job.lint }}
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
-          if [ ${{ matrix.job.build }} = "true" ]; then
+          if [ "${{ matrix.job.build }}" = "true" ]; then
             export LIBMLX_BUILD=true
           fi
           mix format --check-formatted
@@ -83,7 +83,7 @@ jobs:
       - name: Run tests
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
-          if [ ${{ matrix.job.build }} = "true" ]; then
+          if [ "${{ matrix.job.build }}" = "true" ]; then
             export LIBMLX_BUILD=true
           fi
           mix test --warnings-as-errors

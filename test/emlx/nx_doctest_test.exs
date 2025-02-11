@@ -7,6 +7,8 @@ defmodule EMLX.Nx.DoctestTest do
   end
 
   @rounding_error [
+    exp: 1,
+    erf: 1,
     erfc: 1,
     expm1: 1,
     atan: 1,

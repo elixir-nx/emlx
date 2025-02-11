@@ -214,7 +214,8 @@ ERL_NIF_TERM make(ErlNifEnv *env, const char *string) {
   return enif_make_string(env, string, ERL_NIF_LATIN1);
 }
 
-ERL_NIF_TERM make_list(ErlNifEnv *env, std::vector<size_t> result) {
+template <typename T>
+ERL_NIF_TERM make_list(ErlNifEnv *env, std::vector<T> result) {
   size_t n = result.size();
 
   std::vector<ERL_NIF_TERM> nif_terms;
@@ -372,6 +373,23 @@ int get_list(ErlNifEnv *env, ERL_NIF_TERM list, std::vector<size_t> &var) {
 
   while (enif_get_list_cell(env, list, &head, &tail)) {
     size_t elem;
+    if (!get(env, head, &elem))
+      return 0;
+    var.push_back(elem);
+    list = tail;
+  }
+  return 1;
+}
+
+int get_list(ErlNifEnv *env, ERL_NIF_TERM list, std::vector<int64_t> &var) {
+  unsigned int length;
+  if (!enif_get_list_length(env, list, &length))
+    return 0;
+  var.reserve(length);
+  ERL_NIF_TERM head, tail;
+
+  while (enif_get_list_cell(env, list, &head, &tail)) {
+    int64_t elem;
     if (!get(env, head, &elem))
       return 0;
     var.push_back(elem);

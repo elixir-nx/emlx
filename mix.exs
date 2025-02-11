@@ -2,8 +2,8 @@ defmodule EMLX.MixProject do
   use Mix.Project
 
   @app :emlx
-  @version "0.1.0"
-  @mlx_version "0.21.1"
+  @version "0.1.1-dev"
+  @mlx_version "0.22.1"
 
   def project do
     libmlx_config = libmlx_config()
@@ -34,7 +34,6 @@ defmodule EMLX.MixProject do
         "MLX_VARIANT" => libmlx_config.variant,
         "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
         "EMLX_VERSION" => @version,
-        "MIX_BUILD_EMBEDDED" => "#{Mix.Project.config()[:build_embedded]}",
         "LIBMLX_ENABLE_DEBUG" => to_string(libmlx_config.features.debug?)
       },
 
@@ -169,7 +168,7 @@ defmodule EMLX.MixProject do
       # Download libmlx
 
       if {:unix, :darwin} != :os.type() do
-        Mix.raise("No MLX support on non Apple Silicon machines")
+        Mix.raise("EMLX only supports macOS for now")
       end
 
       download!(url, libmlx_archive)
