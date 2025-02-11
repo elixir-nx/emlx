@@ -288,8 +288,43 @@ defmodule EMLX.Backend do
 
     tensor
     |> from_nx()
+    |> slice_negative_padding(input_config)
     |> EMLX.pad(axes, low_pad_size, high_pad_size, pad_value)
     |> to_nx(out)
+  end
+
+  defp slice_negative_padding(t_mx, input_config) do
+    if Enum.any?(input_config, fn {pre, post, _} -> pre < 0 or post < 0 end) do
+      shape = EMLX.shape(t_mx)
+
+      {starts, stops} =
+        input_config
+        |> Enum.with_index(fn {pre, post, _inner}, axis ->
+          start =
+            if pre < 0 do
+              -pre
+            else
+              0
+            end
+
+          axis_size = elem(shape, axis)
+
+          stop =
+            if post < 0 do
+              axis_size + post
+            else
+              axis_size
+            end
+
+          {start, stop}
+        end)
+        |> Enum.unzip()
+
+      strides = List.duplicate(1, tuple_size(shape))
+      EMLX.slice(t_mx, starts, stops, strides)
+    else
+      t_mx
+    end
   end
 
   @impl true

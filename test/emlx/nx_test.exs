@@ -9,7 +9,8 @@ defmodule EMLX.NxTest do
   @types [{:s, 8}, {:u, 8}, {:s, 16}, {:s, 32}, {:s, 64}, {:bf, 16}, {:f, 32}]
   @bf16_and_ints [{:s, 8}, {:u, 8}, {:s, 16}, {:s, 32}, {:s, 64}, {:bf, 16}]
   @ints [{:s, 8}, {:u, 8}, {:s, 16}, {:s, 32}, {:s, 64}]
-  @ops [:add, :subtract, :divide, :remainder, :multiply, :pow, :atan2, :min, :max]
+  @ops [:add, :subtract, :divide, :remainder, :multiply, :atan2, :min, :max]
+  @float_only_ops [:pow]
   @ops_unimplemented_for_bfloat [:remainder, :atan2, :pow]
   @ops_with_bfloat_specific_result [:divide]
   @bitwise_ops [:bitwise_and, :bitwise_or, :bitwise_xor, :left_shift, :right_shift]
@@ -57,6 +58,19 @@ defmodule EMLX.NxTest do
         not (op in (@ops_unimplemented_for_bfloat ++ @ops_with_bfloat_specific_result) and
                Nx.Type.merge(type_a, type_b) == {:bf, 16}) do
       test "#{op}(#{Nx.Type.to_string(type_a)}, #{Nx.Type.to_string(type_b)})" do
+        op = unquote(op)
+        type_a = unquote(type_a)
+        type_b = unquote(type_b)
+
+        test_binary_op(op, type_a, type_b)
+      end
+    end
+
+    for op <- @float_only_ops,
+        type_a <- @types,
+        type_b <- @types,
+        Nx.Type.merge(type_a, type_b) == {:f, 32} do
+      test "#{op}(#{Nx.Type.to_string(type_a)}, #{Nx.Type.to_string(type_b)}) float-only op" do
         op = unquote(op)
         type_a = unquote(type_a)
         type_b = unquote(type_b)
@@ -854,6 +868,13 @@ defmodule EMLX.NxTest do
           ]
         ])
       )
+    end
+
+    test "negative paddings" do
+      t = Nx.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
+
+      assert_equal(Nx.pad(t, 0, [{-1, -1, 0}, {0, 0, 0}]), Nx.tensor([[5, 6, 7, 8]]))
+      assert_equal(Nx.pad(t, 0, [{0, 0, 0}, {-1, -1, 0}]), Nx.tensor([[2, 3], [6, 7], [10, 11]]))
     end
   end
 
