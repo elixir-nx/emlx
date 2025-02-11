@@ -86,7 +86,6 @@ $(MLX_SO): $(MLX_SRC_DIR)
 $(EMLX_SO): $(PRIV_DIR) $(MLX_SO) $(OBJECTS)
 	@ echo "Copying MLX library to $(EMLX_LIB_DIR)"
 	@ mkdir -p $(EMLX_LIB_DIR)
-	@ echo "EMLX_CACHE_DIR: $(EMLX_CACHE_DIR)"
 	@ cp -a $(MLX_LIB_DIR)/* $(EMLX_LIB_DIR)
 	$(CXX) $(OBJECTS) -o $(EMLX_SO) $(LDFLAGS)
 
