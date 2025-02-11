@@ -57,7 +57,7 @@ defmodule EMLX.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       {:nx, "~> 0.9.2"},
-      {:nif_call, "~> 0.1.2"}
+      {:nif_call, "~> 0.1.3"}
     ]
   end
 
