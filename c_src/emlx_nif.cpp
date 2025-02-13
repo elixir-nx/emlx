@@ -6,6 +6,7 @@
 #include <map>
 #include <numeric>
 #include <string>
+#include <cstring>
 
 using namespace mlx::core;
 
