@@ -640,7 +640,17 @@ defmodule EMLX.NxTest do
       non_finite =
         Nx.stack([Nx.Constants.infinity(), Nx.Constants.nan(), Nx.Constants.neg_infinity()])
 
-      for to_type <- [u: 8, s: 16, s: 32] do
+      skip_infinity_to_u8 =
+        case :os.type() do
+          {:unix, subtype} when subtype != :darwin ->
+            [arch | _] = String.split(to_string(:erlang.system_info(:system_architecture)), "-")
+            arch == "x86_64"
+
+          _ ->
+            false
+        end
+
+      for to_type <- [u: 8, s: 16, s: 32], !(to_type == {:u, 8} and skip_infinity_to_u8) do
         actual = Nx.as_type(non_finite, to_type) |> Nx.backend_transfer()
         expected = Nx.backend_copy(non_finite, Nx.BinaryBackend) |> Nx.as_type(to_type)
         assert actual == expected

@@ -2,8 +2,10 @@ defmodule EMLX.MixProject do
   use Mix.Project
 
   @app :emlx
-  @version "0.1.1-dev"
+  @version "0.1.2"
   @mlx_version "0.22.1"
+
+  require Logger
 
   def project do
     libmlx_config = libmlx_config()
@@ -77,7 +79,115 @@ defmodule EMLX.MixProject do
     end
   end
 
-  defp libmlx_config() do
+  defp current_target_from_env do
+    arch = System.get_env("TARGET_ARCH")
+    os = System.get_env("TARGET_OS")
+    abi = System.get_env("TARGET_ABI")
+
+    if !Enum.all?([arch, os, abi], &Kernel.is_nil/1) do
+      "#{arch}-#{os}-#{abi}"
+    end
+  end
+
+  defp current_target! do
+    case current_target() do
+      {:ok, target} ->
+        target
+
+      {:error, reason} ->
+        Mix.raise(reason)
+    end
+  end
+
+  defp current_target do
+    current_target_from_env = current_target_from_env()
+
+    if current_target_from_env do
+      # overwrite current target triplet from environment variables
+      {:ok, current_target_from_env}
+    else
+      current_target(:os.type())
+    end
+  end
+
+  defp current_target({:win32, _}) do
+    processor_architecture =
+      String.downcase(String.trim(System.get_env("PROCESSOR_ARCHITECTURE")))
+
+    # https://docs.microsoft.com/en-gb/windows/win32/winprog64/wow64-implementation-details?redirectedfrom=MSDN
+    partial_triplet =
+      case processor_architecture do
+        "amd64" ->
+          "x86_64-windows-"
+
+        "ia64" ->
+          "ia64-windows-"
+
+        "arm64" ->
+          "aarch64-windows-"
+
+        "x86" ->
+          "x86-windows-"
+      end
+
+    {compiler, _} = :erlang.system_info(:c_compiler_used)
+
+    case compiler do
+      :msc ->
+        {:ok, partial_triplet <> "msvc"}
+
+      :gnuc ->
+        {:ok, partial_triplet <> "gnu"}
+
+      other ->
+        {:ok, partial_triplet <> Atom.to_string(other)}
+    end
+  end
+
+  defp current_target({:unix, _}) do
+    # get current target triplet from `:erlang.system_info/1`
+    system_architecture = to_string(:erlang.system_info(:system_architecture))
+    current = String.split(system_architecture, "-", trim: true)
+
+    case length(current) do
+      4 ->
+        {:ok, "#{Enum.at(current, 0)}-#{Enum.at(current, 2)}-#{Enum.at(current, 3)}"}
+
+      3 ->
+        case :os.type() do
+          {:unix, :darwin} ->
+            current =
+              if "aarch64" == Enum.at(current, 0) do
+                ["arm64" | tl(current)]
+              else
+                current
+              end
+
+            # could be something like aarch64-apple-darwin21.0.0
+            # but we don't really need the last 21.0.0 part
+            if String.match?(Enum.at(current, 2), ~r/^darwin.*/) do
+              {:ok, "#{Enum.at(current, 0)}-#{Enum.at(current, 1)}-darwin"}
+            else
+              {:ok, system_architecture}
+            end
+
+          _ ->
+            {:ok, system_architecture}
+        end
+
+      _ ->
+        {:error, "Cannot determine current target"}
+    end
+  end
+
+  @supported_targets [
+    "x86_64-apple-darwin",
+    "arm64-apple-darwin",
+    "x86_64-linux-gnu",
+    "aarch64-linux-gnu",
+    "riscv64-linux-gnu"
+  ]
+  defp libmlx_config do
     version = System.get_env("LIBMLX_VERSION", @mlx_version)
 
     features = %{
@@ -88,6 +198,8 @@ defmodule EMLX.MixProject do
 
     variant = to_variant(features)
 
+    current_target = current_target!()
+
     cache_dir =
       if dir = System.get_env("LIBMLX_CACHE") do
         Path.expand(dir)
@@ -95,9 +207,33 @@ defmodule EMLX.MixProject do
         :filename.basedir(:user_cache, "libmlx")
       end
 
+    libmlx_archive =
+      Path.join(
+        cache_dir,
+        "libmlx-#{version}-#{current_target}#{variant}.tar.gz"
+      )
+
+    libmlx_archive = System.get_env("MLX_ARCHIVE_PATH", libmlx_archive)
+
+    features =
+      if not Enum.member?(@supported_targets, current_target) and
+           is_nil(System.get_env("MLX_ARCHIVE_PATH")) do
+        Logger.warning("""
+        Current target #{current_target} is not officially supported by EMLX, will fallback to building from source.
+
+        A prebuilt libmlx archive for this target can be specified by setting the environment variable MLX_ARCHIVE_PATH to the path of the archive.
+        """)
+
+        %{features | build?: true}
+      else
+        features
+      end
+
     %{
+      target: current_target,
+      libmlx_archive: libmlx_archive,
       version: version,
-      dir: Path.join(cache_dir, "libmlx-#{version}#{variant}"),
+      dir: Path.join(cache_dir, "libmlx-#{version}-#{current_target}#{variant}"),
       features: features,
       variant: variant,
       cache_dir: cache_dir
@@ -144,13 +280,10 @@ defmodule EMLX.MixProject do
   defp download_and_unarchive(cache_dir, libmlx_config) do
     File.mkdir_p!(cache_dir)
 
-    libmlx_archive =
-      Path.join(cache_dir, "libmlx-#{libmlx_config.version}#{libmlx_config.variant}.tar.gz")
-
-    libmlx_archive = System.get_env("MLX_ARCHIVE_PATH", libmlx_archive)
+    libmlx_archive = libmlx_config.libmlx_archive
 
     url =
-      "https://github.com/cocoa-xu/mlx-build/releases/download/v#{libmlx_config.version}/mlx-arm64-apple-darwin#{libmlx_config.variant}.tar.gz"
+      "https://github.com/cocoa-xu/mlx-build/releases/download/v#{libmlx_config.version}/mlx-#{libmlx_config.target}#{libmlx_config.variant}.tar.gz"
 
     sha256_url = "#{url}.sha256"
 
@@ -167,10 +300,18 @@ defmodule EMLX.MixProject do
     unless File.exists?(libmlx_archive) do
       # Download libmlx
 
-      if {:unix, :darwin} != :os.type() do
-        Mix.raise("EMLX only supports macOS for now")
+      case :os.type() do
+        {:unix, :darwin} ->
+          :ok
+
+        {:unix, _} ->
+          Logger.warning("MLX only has CPU backend available for current target")
+
+        _ ->
+          Mix.raise("EMLX only supports macOS and x86_64, aarch64 and riscv64 Linux for now")
       end
 
+      Mix.shell().info("Downloading libmlx from #{url}")
       download!(url, libmlx_archive)
       :ok = maybe_verify_integrity!(verify_integrity, libmlx_archive)
     end

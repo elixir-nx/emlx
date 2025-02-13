@@ -2,7 +2,11 @@
 
 EMLX is the Nx Backend for the [MLX](https://github.com/ml-explore/mlx) library.
 
-Because of MLX's nature, EMLX is only supported on macOS.
+Because of MLX's nature, EMLX with GPU backend is only supported on macOS. 
+
+MLX with CPU backend is available on most mainstream platforms, however, the CPU backend may not be as optimized as the GPU backend, 
+especially for non-macOS OSes, as they're not prioritized for development. Right now, EMLX supports x86_64 and arm64 architectures
+on both macOS and Linux.
 
 The M-Series Macs have an unified memory architecture, which allows for more passing data between the CPU and GPU to be effectively a no-op.
 

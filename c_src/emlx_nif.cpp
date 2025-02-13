@@ -7,6 +7,7 @@
 #include <map>
 #include <numeric>
 #include <string>
+#include <cstring>
 
 #define NIF_CALL_IMPLEMENTATION
 #include "nif_call.h"
