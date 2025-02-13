@@ -7,6 +7,59 @@ on:
   pull_request:
 
 jobs:
+  linux:
+    name: ${{ matrix.job.arch }}-linux-gnu (${{ matrix.job.elixir }}, ${{ matrix.job.otp }})
+    runs-on: ${{ matrix.job.runs-os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          - { arch: "x86_64", runs-os: ubuntu-latest, otp: "25.3.2.15", elixir: "1.15.4" }
+          - { arch: "aarch64", runs-os: ubuntu-24.04-arm, otp: "25.3.2.15", elixir: "1.15.4" }
+    env:
+      MIX_ENV: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Elixir and Erlang
+        id: setup
+        run: |
+          curl -fsSO https://elixir-lang.org/install.sh
+          sh install.sh elixir@${{ matrix.job.elixir }} otp@${{ matrix.job.otp }}
+
+          OTP_VERSION="${{ matrix.job.otp }}"
+          OTP_MAJOR="${OTP_VERSION%%.*}"
+          export OTP_PATH=$HOME/.elixir-install/installs/otp/${OTP_VERSION}/bin
+          export ELIXIR_PATH=$HOME/.elixir-install/installs/elixir/${{ matrix.job.elixir }}-otp-${OTP_MAJOR}/bin
+
+          echo "path=${OTP_PATH}:${ELIXIR_PATH}" >> $GITHUB_OUTPUT
+          echo "${OTP_PATH}" >> $GITHUB_PATH
+          echo "${ELIXIR_PATH}" >> $GITHUB_PATH
+
+      - name: Compile and check warnings
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+
+          mix local.hex --force
+          mix local.rebar --force
+
+          mix deps.get
+          mix compile --warnings-as-errors
+
+      - name: Run epmd for distributed tests
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          epmd -daemon
+
+      - name: Run tests
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          if [ "${{ matrix.job.build }}" = "true" ]; then
+            export LIBMLX_BUILD=true
+          fi
+          mix test --warnings-as-errors
+
   macos:
     name: macOS (${{ matrix.job.elixir }}, ${{ matrix.job.otp }})
     runs-on: macos-14
