@@ -2,7 +2,7 @@ defmodule EMLX.MixProject do
   use Mix.Project
 
   @app :emlx
-  @version "0.1.1-dev"
+  @version "0.1.2"
   @mlx_version "0.22.1"
 
   require Logger
