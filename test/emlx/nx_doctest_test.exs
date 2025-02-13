@@ -15,7 +15,7 @@ defmodule EMLX.Nx.DoctestTest do
                                      # x86_64 and aarch64
                                      atanh: 1,
                                      # aarch64
-                                     ifft: 1
+                                     ifft: 2
                                    ]
 
                                  _ ->
