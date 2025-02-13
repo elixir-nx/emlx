@@ -197,17 +197,6 @@ defmodule EMLX.MixProject do
 
     current_target = current_target!()
 
-    features =
-      if not Enum.member?(@supported_targets, current_target) do
-        Logger.warning(
-          "Current target #{current_target} is not officially supported by EMLX, will always fallback to building from source"
-        )
-
-        %{features | build?: true}
-      else
-        features
-      end
-
     cache_dir =
       if dir = System.get_env("LIBMLX_CACHE") do
         Path.expand(dir)
@@ -215,8 +204,31 @@ defmodule EMLX.MixProject do
         :filename.basedir(:user_cache, "libmlx")
       end
 
+    libmlx_archive =
+      Path.join(
+        cache_dir,
+        "libmlx-#{version}-#{current_target}#{variant}.tar.gz"
+      )
+
+    libmlx_archive = System.get_env("MLX_ARCHIVE_PATH", libmlx_archive)
+
+    features =
+      if not Enum.member?(@supported_targets, current_target) and
+           is_nil(System.get_env("MLX_ARCHIVE_PATH")) do
+        Logger.warning("""
+        Current target #{current_target} is not officially supported by EMLX, will fallback to building from source.
+
+        A prebuilt libmlx archive for this target can be specified by setting the environment variable MLX_ARCHIVE_PATH to the path of the archive.
+        """)
+
+        %{features | build?: true}
+      else
+        features
+      end
+
     %{
       target: current_target,
+      libmlx_archive: libmlx_archive,
       version: version,
       dir: Path.join(cache_dir, "libmlx-#{version}-#{current_target}#{variant}"),
       features: features,
@@ -265,13 +277,7 @@ defmodule EMLX.MixProject do
   defp download_and_unarchive(cache_dir, libmlx_config) do
     File.mkdir_p!(cache_dir)
 
-    libmlx_archive =
-      Path.join(
-        cache_dir,
-        "libmlx-#{libmlx_config.version}-#{libmlx_config.target}#{libmlx_config.variant}.tar.gz"
-      )
-
-    libmlx_archive = System.get_env("MLX_ARCHIVE_PATH", libmlx_archive)
+    libmlx_archive = libmlx_config.libmlx_archive
 
     url =
       "https://github.com/cocoa-xu/mlx-build/releases/download/v#{libmlx_config.version}/mlx-#{libmlx_config.target}#{libmlx_config.variant}.tar.gz"
