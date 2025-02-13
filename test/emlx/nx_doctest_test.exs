@@ -6,6 +6,22 @@ defmodule EMLX.Nx.DoctestTest do
     :ok
   end
 
+  @os_specific_rounding_error case(:os.type()) do
+    {:unix, :darwin} ->
+      []
+
+    {:unix, _} ->
+      [
+        # x86_64 and aarch64
+        atanh: 1,
+        # aarch64
+        ifft: 1
+      ]
+
+    _ ->
+      []
+  end
+
   @rounding_error [
     exp: 1,
     erf: 1,
@@ -56,5 +72,6 @@ defmodule EMLX.Nx.DoctestTest do
     sort: 2
   ]
 
-  doctest Nx, except: @rounding_error ++ @not_supported ++ @to_be_fixed
+  doctest Nx,
+    except: @rounding_error ++ @os_specific_rounding_error ++ @not_supported ++ @to_be_fixed
 end

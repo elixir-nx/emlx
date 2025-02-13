@@ -197,6 +197,17 @@ defmodule EMLX.MixProject do
 
     current_target = current_target!()
 
+    features =
+      if not Enum.member?(@supported_targets, current_target) do
+        Logger.warning(
+          "Current target #{current_target} is not officially supported by EMLX, will always fallback to building from source"
+        )
+
+        %{features | build?: true}
+      else
+        features
+      end
+
     cache_dir =
       if dir = System.get_env("LIBMLX_CACHE") do
         Path.expand(dir)
@@ -291,6 +302,7 @@ defmodule EMLX.MixProject do
           Mix.raise("EMLX only supports macOS and x86_64, aarch64 and riscv64 Linux for now")
       end
 
+      Mix.shell().info("Downloading libmlx from #{url}")
       download!(url, libmlx_archive)
       :ok = maybe_verify_integrity!(verify_integrity, libmlx_archive)
     end
