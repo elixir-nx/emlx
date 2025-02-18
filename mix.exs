@@ -3,7 +3,7 @@ defmodule EMLX.MixProject do
 
   @app :emlx
   @version "0.1.2"
-  @mlx_version "0.22.1"
+  @mlx_version "0.23.0"
 
   require Logger
 
