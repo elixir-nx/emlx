@@ -76,6 +76,8 @@ jobs:
           - { otp: "25.3.2.15", elixir: "1.15.4" }
           - { otp: "25.3.2.15", elixir: "1.16.2", lint: true }
           - { otp: "25.3.2.15", elixir: "1.16.2", build: true }
+          - { otp: "25.3.2.15", elixir: "1.16.2", gpu: true }
+          - { otp: "25.3.2.15", elixir: "1.16.2", gpu: true, build: true }
     env:
       MIX_ENV: test
     steps:
@@ -142,7 +144,14 @@ jobs:
       - name: Run tests
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          export EMLX_TEST_DEFAULT_GPU="${{ matrix.job.gpu }}"
+
           if [ "${{ matrix.job.build }}" = "true" ]; then
             export LIBMLX_BUILD=true
           fi
-          mix test --warnings-as-errors
+
+          if [ "${{ matrix.job.gpu }}" = "true" ]; then
+            find test -name "*_test.exs" -exec bash -c 'NAME={}; echo -e "\n\n----$NAME----\n"; mix test $NAME' \;
+          else
+            mix test --warnings-as-errors
+          fi
