@@ -318,25 +318,32 @@ defmodule EMLX do
 
   @impl Nx.Defn.Compiler
   def __jit__(key, vars, fun, args_list, opts) do
-    # TODO: instead of checking the backend here,
-    # we should automatically convert from binary backend to EMLX backend
-    # given a device optionsg
-    case Nx.default_backend() do
-      EMLX.Backend ->
-        :ok
-
-      {EMLX.Backend, _} ->
-        :ok
-
-      other ->
-        raise ArgumentError, "EMLX can only be used with the EMLX backend, got: #{inspect(other)}"
-    end
-
     __compile__(key, vars, fun, opts).(args_list)
   end
 
   @impl Nx.Defn.Compiler
   def __compile__(key, vars, fun, opts) do
+    backend = Nx.default_backend()
+
+    target_backend =
+      case backend do
+        EMLX.Backend ->
+          backend
+
+        {EMLX.Backend, _} ->
+          backend
+
+        Nx.BinaryBackend ->
+          EMLX.Backend
+
+        {Nx.BinaryBackend, _} ->
+          EMLX.Backend
+
+        other ->
+          raise ArgumentError,
+                "EMLX can only be used with the EMLX.Backend or Nx.BinaryBackend, got: #{inspect(other)}"
+      end
+
     expr = fun.(vars)
 
     fn [args] ->
@@ -344,6 +351,12 @@ defmodule EMLX do
         Enum.map(args, fn arg ->
           case arg.() do
             %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} ->
+              {device, ref}
+
+            %Nx.Tensor{data: %Nx.BinaryBackend{}} = t ->
+              %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} =
+                Nx.backend_copy(t, target_backend)
+
               {device, ref}
 
             other ->
