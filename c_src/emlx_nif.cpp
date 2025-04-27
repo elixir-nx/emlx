@@ -275,22 +275,14 @@ NIF(to_blob) {
   int limit = 0;
   bool has_received_limit = (argc == 2);
 
+  // Evaluate to ensure data is available
+  t->eval();
+
   if (has_received_limit) {
     PARAM(1, int, param_limit);
     limit = param_limit;
     byte_size = limit * t->itemsize();
   }
-
-  // Flatten and slice if needed
-  mlx::core::array flattened = mlx::core::flatten(*t);
-  mlx::core::array reshaped =
-      (has_received_limit && byte_size < t->nbytes())
-          ? mlx::core::slice(flattened, std::vector<int>{0},
-                             std::vector<int>{limit})
-          : flattened;
-
-  // Evaluate to ensure data is available
-  mlx::core::eval(reshaped);
 
   // Create result binary
   void *result_data = (void *)enif_make_new_binary(env, byte_size, &result);
@@ -300,14 +292,12 @@ NIF(to_blob) {
   // https://github.com/ml-explore/mlx/discussions/1608#discussioncomment-11332071
   //
   // Set up contiguous iterator
-  std::vector<int> slice_sizes(reshaped.shape().begin(),
-                               reshaped.shape().end());
-  ContiguousIterator iterator(slice_sizes, reshaped.strides(),
-                                      reshaped.ndim());
+  std::vector<int> slice_sizes(t->shape().begin(), t->shape().end());
+  ContiguousIterator iterator(slice_sizes, t->strides(), t->ndim());
 
   // Copy data element by element using iterator
-  size_t element_size = reshaped.itemsize();
-  const char *src_data = static_cast<const char *>(reshaped.data<void>());
+  size_t element_size = t->itemsize();
+  const char *src_data = static_cast<const char *>(t->data<void>());
   char *dst_data = static_cast<char *>(result_data);
 
   size_t num_elements = byte_size / element_size;
