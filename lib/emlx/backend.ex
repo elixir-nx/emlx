@@ -4,7 +4,11 @@ defmodule EMLX.Backend do
   alias Nx.Tensor, as: T
   alias EMLX.Backend, as: Backend
 
+  require Logger
+
   defstruct [:ref, :shape, :type, :data]
+
+  @warn_unsupported_option Application.compile_env(:emlx, :warn_unsupported_option, true)
 
   @impl true
   def init(opts) do
@@ -534,6 +538,12 @@ defmodule EMLX.Backend do
     def unquote(op)(out, tensor, opts) do
       axis = opts[:axis]
       keep_axis = opts[:keep_axis] == true
+
+      if @warn_unsupported_option && opts[:tie_break] == :high do
+        Logger.warning(
+          "Nx.Backend.#{unquote(op)}/3 with tie_break: :high is not supported in EMLX"
+        )
+      end
 
       t_mx = from_nx(tensor)
 
