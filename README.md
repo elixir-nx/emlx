@@ -2,9 +2,9 @@
 
 EMLX is the Nx Backend for the [MLX](https://github.com/ml-explore/mlx) library.
 
-Because of MLX's nature, EMLX with GPU backend is only supported on macOS. 
+Because of MLX's nature, EMLX with GPU backend is only supported on macOS.
 
-MLX with CPU backend is available on most mainstream platforms, however, the CPU backend may not be as optimized as the GPU backend, 
+MLX with CPU backend is available on most mainstream platforms, however, the CPU backend may not be as optimized as the GPU backend,
 especially for non-macOS OSes, as they're not prioritized for development. Right now, EMLX supports x86_64 and arm64 architectures
 on both macOS and Linux.
 
@@ -47,6 +47,23 @@ Defaulting to Nx.Defn.Evaluator is the safest option for now.
 
 ```elixir
 Nx.Defn.default_options(compiler: EMLX)
+```
+
+### Configuration
+
+EMLX supports several configuration options that can be set in your application's config:
+
+#### `:warn_unsupported_option`
+
+Controls whether warnings are logged when unsupported options are used with certain operations.
+
+- **Type**: `boolean`
+- **Default**: `true`
+- **Description**: When enabled, EMLX will log warnings for operations that receive options not supported by the MLX backend. For example, `Nx.argmax/2` and `Nx.argmin/2` with `tie_break: :high` will log a warning since MLX doesn't support this tie-breaking behavior.
+
+```elixir
+# In config/config.exs
+config :emlx, :warn_unsupported_option, false
 ```
 
 ### MLX binaries

@@ -8,8 +8,6 @@ defmodule EMLX.Backend do
 
   defstruct [:ref, :shape, :type, :data]
 
-  @warn_unsupported_option Application.compile_env(:emlx, :warn_unsupported_option, true)
-
   @impl true
   def init(opts) do
     Keyword.validate!(opts, device: :cpu)
@@ -539,7 +537,7 @@ defmodule EMLX.Backend do
       axis = opts[:axis]
       keep_axis = opts[:keep_axis] == true
 
-      if @warn_unsupported_option && opts[:tie_break] == :high do
+      if Application.get_env(:emlx, :warn_unsupported_option, true) and opts[:tie_break] == :high do
         Logger.warning(
           "Nx.Backend.#{unquote(op)}/3 with tie_break: :high is not supported in EMLX"
         )
