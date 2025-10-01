@@ -54,7 +54,7 @@ defmodule EMLX.Nx.DoctestTest do
     window_product: 3,
     window_mean: 3,
     # missing support for inner padding
-    pad: 3,
+    # pad: 3,
     # MLX sorts NaNs lowest, Nx sorts them highest
     argmin: 2,
     argmax: 2,
