@@ -1290,42 +1290,46 @@ defmodule EMLX.Backend do
   for op <- [:sum, :product, :max, :min] do
     @impl true
     def unquote(:"window_#{op}")(out, tensor, window_shape, opts) do
-      # TODO: window dilations can be implemented after we support internal padding
-      # in Nx.pad (we should have pad_internal as a shared defp)
-      tensor_rank = tuple_size(tensor.shape)
-
-      axes =
-        0..(tuple_size(window_shape) - 1)
-        |> Enum.to_list()
-        |> Enum.map(fn axis ->
-          tensor_rank + axis
-        end)
-
-      {low_pad, high_pad} = Enum.unzip(opts[:padding])
-      {device, _} = t_mx = from_nx(tensor)
-
-      {_device, pad_mx} =
-        case unquote(op) do
-          :sum ->
-            EMLX.scalar_tensor(0, to_mlx_type(out.type), device)
-
-          :product ->
-            EMLX.scalar_tensor(1, to_mlx_type(out.type), device)
-
-          :max ->
-            Nx.Constants.min(tensor.type, backend: {EMLX.Backend, device: device}) |> from_nx()
-
-          :min ->
-            Nx.Constants.max(tensor.type, backend: {EMLX.Backend, device: device}) |> from_nx()
-        end
-
-      padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_mx)
-
-      padded_mx
-      |> sliding_window_view(EMLX.shape(padded_mx), window_shape, opts[:strides])
-      |> EMLX.unquote(op)(axes, false)
-      |> to_nx(out)
+      window_op(unquote(op), out, tensor, window_shape, opts)
     end
+  end
+
+  defp window_op(op, out, tensor, window_shape, opts) do
+    # TODO: window dilations can be implemented after we support internal padding
+    # in Nx.pad (we should have pad_internal as a shared defp)
+    tensor_rank = tuple_size(tensor.shape)
+
+    axes =
+      0..(tuple_size(window_shape) - 1)
+      |> Enum.to_list()
+      |> Enum.map(fn axis ->
+        tensor_rank + axis
+      end)
+
+    {low_pad, high_pad} = Enum.unzip(opts[:padding])
+    {device, _} = t_mx = from_nx(tensor)
+
+    {_device, pad_mx} =
+      case op do
+        :sum ->
+          EMLX.scalar_tensor(0, to_mlx_type(out.type), device)
+
+        :product ->
+          EMLX.scalar_tensor(1, to_mlx_type(out.type), device)
+
+        :max ->
+          Nx.Constants.min(tensor.type, backend: {EMLX.Backend, device: device}) |> from_nx()
+
+        :min ->
+          Nx.Constants.max(tensor.type, backend: {EMLX.Backend, device: device}) |> from_nx()
+      end
+
+    padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_mx)
+
+    padded_mx
+    |> sliding_window_view(EMLX.shape(padded_mx), window_shape, opts[:strides])
+    |> then(&apply(EMLX, op, [&1, axes, false]))
+    |> to_nx(out)
   end
 
   defp sliding_window_view(t, tensor_shape, window_shape, opt_strides) do
