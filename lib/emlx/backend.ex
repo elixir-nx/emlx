@@ -286,7 +286,7 @@ defmodule EMLX.Backend do
 
     tensor
     |> from_nx()
-    |> interior_padding(pad_value_mx, interior_padding)
+    |> interior_padding_mlx(pad_value_mx, interior_padding)
     |> slice_negative_padding(input_config)
     |> EMLX.pad(axes, low_pad_size, high_pad_size, pad_value_mx)
     |> to_nx(out)
