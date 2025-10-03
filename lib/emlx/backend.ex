@@ -292,7 +292,7 @@ defmodule EMLX.Backend do
     |> to_nx(out)
   end
 
-  defp interior_padding(tensor, value, padding_config) do
+  defp interior_padding_mlx(tensor, value, padding_config) do
     new_shape = Tuple.insert_at(EMLX.shape(tensor), tuple_size(EMLX.shape(tensor)), 1)
     tensor = EMLX.reshape(tensor, new_shape)
 
