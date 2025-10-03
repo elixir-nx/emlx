@@ -280,10 +280,7 @@ defmodule EMLX.Backend do
           {[i | axes], [max(low, 0) | lows], [max(high, 0) | highs]}
       end)
 
-    pad_value_mx =
-      pad_value
-      |> from_nx()
-      |> elem(1)
+    {_device, pad_value_mx} = from_nx(pad_value)
 
     interior_padding = Enum.map(input_config, fn {_low, _high, interior} -> interior end)
 
