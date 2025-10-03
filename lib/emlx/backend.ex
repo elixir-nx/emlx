@@ -276,23 +276,73 @@ defmodule EMLX.Backend do
       input_config
       |> Enum.with_index()
       |> Enum.reduce({[], [], []}, fn
-        {{low, high, 0}, i}, {axes, lows, highs} ->
+        {{low, high, _}, i}, {axes, lows, highs} ->
           {[i | axes], [max(low, 0) | lows], [max(high, 0) | highs]}
-
-        _, _ ->
-          raise "Interior padding not supported in EMLX yet"
       end)
 
-    pad_value =
+    pad_value_mx =
       pad_value
       |> from_nx()
       |> elem(1)
 
+    interior_padding = Enum.map(input_config, fn {_low, _high, interior} -> interior end)
+
     tensor
     |> from_nx()
+    |> interior_padding(pad_value_mx, interior_padding)
     |> slice_negative_padding(input_config)
-    |> EMLX.pad(axes, low_pad_size, high_pad_size, pad_value)
+    |> EMLX.pad(axes, low_pad_size, high_pad_size, pad_value_mx)
     |> to_nx(out)
+  end
+
+  defp interior_padding(tensor, value, padding_config) do
+    new_shape = Tuple.insert_at(EMLX.shape(tensor), tuple_size(EMLX.shape(tensor)), 1)
+    tensor = EMLX.reshape(tensor, new_shape)
+
+    {final_tensor, _} =
+      Enum.reduce(padding_config, {tensor, 0}, fn interior, {acc, axis_index} ->
+        new_tensor = apply_interior_padding(acc, value, axis_index, interior, EMLX.shape(acc))
+        {new_tensor, axis_index + 1}
+      end)
+
+    final_tensor
+    |> EMLX.squeeze([-1])
+  end
+
+  defp apply_interior_padding(tensor, _value, _axis_index, 0, _shape) do
+    tensor
+  end
+
+  defp apply_interior_padding(tensor, value, axis_index, interior_padding, shape) do
+    rank = tuple_size(shape)
+    next_axis = axis_index + 1
+    axis_size = elem(shape, axis_index)
+    next_axis_size = elem(shape, next_axis)
+
+    lows = [0]
+    highs = [next_axis_size * interior_padding]
+    axes = [next_axis]
+
+    padded_tensor = EMLX.pad(tensor, axes, lows, highs, value)
+
+    new_axis_size = axis_size + axis_size * interior_padding
+
+    new_shape =
+      shape
+      |> put_elem(axis_index, new_axis_size)
+      |> put_elem(axis_index + 1, next_axis_size)
+
+    lengths =
+      new_shape
+      |> Tuple.to_list()
+      |> List.replace_at(axis_index, new_axis_size - interior_padding)
+
+    starts = List.duplicate(0, rank)
+    strides = List.duplicate(1, rank)
+
+    padded_tensor
+    |> EMLX.reshape(new_shape)
+    |> mlx_slice(new_shape, starts, lengths, strides)
   end
 
   defp slice_negative_padding(t_mx, input_config) do
