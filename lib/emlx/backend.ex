@@ -330,7 +330,7 @@ defmodule EMLX.Backend do
       |> put_elem(axis_index + 1, next_axis_size)
 
     lengths =
-      new_shape(
+      new_shape
       |> put_elem(axis_index, new_axis_size - interior_padding)
       |> Tuple.to_list()
 
