@@ -1355,17 +1355,19 @@ defmodule EMLX.Backend do
     {device, _} = t_mx = from_nx(tensor)
 
     window_dilations = opts[:window_dilations] || List.duplicate(1, tuple_size(window_shape))
-    interior_padding_config = Enum.map(window_dilations, &{0, 0, &1 - 1})
+    interior_padding_config = Enum.map(window_dilations, &(&1 - 1))
+
+    {_device, zero_mx} = EMLX.scalar_tensor(0, :bool, device)
 
     window =
       1
       |> EMLX.scalar_tensor(:bool, device)
       |> EMLX.broadcast_to(window_shape)
-      |> interior_padding_mlx(0, interior_padding_config)
+      |> interior_padding_mlx(zero_mx, interior_padding_config)
 
     window_shape = EMLX.shape(window)
 
-    {_device, pad_mx} =
+    {device, pad_mx} =
       case op do
         :sum ->
           EMLX.scalar_tensor(0, to_mlx_type(out.type), device)
@@ -1384,8 +1386,7 @@ defmodule EMLX.Backend do
 
     padded_mx
     |> sliding_window_view(EMLX.shape(padded_mx), window_shape, opts[:strides])
-    |> EMLX.broadcast_to(window_shape)
-    |> EMLX.where(window, &1)
+    |> then(&EMLX.where(window, &1, {device, pad_mx}))
     |> then(&apply(EMLX, op, [&1, axes, false]))
     |> to_nx(out)
   end

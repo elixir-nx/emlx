@@ -47,13 +47,6 @@ defmodule EMLX.Nx.DoctestTest do
 
   @to_be_fixed [
     :moduledoc,
-    # window_* do not support window_dilations yet
-    window_sum: 3,
-    window_max: 3,
-    window_min: 3,
-    window_product: 3,
-    window_mean: 3,
-    # missing support for inner padding
     # MLX sorts NaNs lowest, Nx sorts them highest
     argmin: 2,
     argmax: 2,
