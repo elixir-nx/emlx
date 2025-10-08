@@ -1342,8 +1342,6 @@ defmodule EMLX.Backend do
   end
 
   defp window_op(op, out, tensor, window_shape, opts) do
-    # TODO: window dilations can be implemented after we support internal padding
-    # in Nx.pad (we should have pad_internal as a shared defp)
     tensor_rank = tuple_size(tensor.shape)
 
     axes =
@@ -1355,6 +1353,17 @@ defmodule EMLX.Backend do
 
     {low_pad, high_pad} = Enum.unzip(opts[:padding])
     {device, _} = t_mx = from_nx(tensor)
+
+    window_dilations = opts[:window_dilations] || List.duplicate(1, tuple_size(window_shape))
+    interior_padding_config = Enum.map(window_dilations, &{0, 0, &1 - 1})
+
+    window =
+      1
+      |> EMLX.scalar_tensor(:bool, device)
+      |> EMLX.broadcast_to(window_shape)
+      |> interior_padding_mlx(0, interior_padding_config)
+
+    window_shape = EMLX.shape(window)
 
     {_device, pad_mx} =
       case op do
@@ -1375,6 +1384,8 @@ defmodule EMLX.Backend do
 
     padded_mx
     |> sliding_window_view(EMLX.shape(padded_mx), window_shape, opts[:strides])
+    |> EMLX.broadcast_to(window_shape)
+    |> EMLX.where(window, &1)
     |> then(&apply(EMLX, op, [&1, axes, false]))
     |> to_nx(out)
   end
