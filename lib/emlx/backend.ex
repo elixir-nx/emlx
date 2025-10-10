@@ -599,26 +599,29 @@ defmodule EMLX.Backend do
 
       {device, _} =
         result =
-          if axis do
-            EMLX.unquote(op)(t_mx, axis, keep_axis)
-          else
-            EMLX.unquote(op)(t_mx, keep_axis)
-          end
+        if axis do
+          EMLX.unquote(op)(t_mx, axis, keep_axis)
+        else
+          EMLX.unquote(op)(t_mx, keep_axis)
+        end
 
       # in case we had tie_break: :high, we need to subtract the result from the size of the sorted
       # set because in reversing the axis above, we will get the complement of the result
-      result = case {axis, opts[:tie_break]} do
-        {nil, :high} ->
-          size = EMLX.scalar_tensor(Nx.size(tensor) - 1, to_mlx_type(out.type), device)
-          EMLX.subtract(size, result)
+      result =
+        case {axis, opts[:tie_break]} do
+          {nil, :high} ->
+            size = EMLX.scalar_tensor(Nx.size(tensor) - 1, to_mlx_type(out.type), device)
+            EMLX.subtract(size, result)
 
-        {_, :high} ->
-          size = EMLX.scalar_tensor(Nx.axis_size(tensor, axis) - 1, to_mlx_type(out.type), device)
-          EMLX.subtract(size, result)
+          {_, :high} ->
+            size =
+              EMLX.scalar_tensor(Nx.axis_size(tensor, axis) - 1, to_mlx_type(out.type), device)
 
-        {_, _} ->
-          result
-      end
+            EMLX.subtract(size, result)
+
+          {_, _} ->
+            result
+        end
 
       result
       |> EMLX.astype(to_mlx_type(out.type))

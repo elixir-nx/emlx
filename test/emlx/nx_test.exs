@@ -1408,10 +1408,13 @@ defmodule EMLX.NxTest do
 
       assert_equal(
         Nx.argmax(t, tie_break: :high, axis: :y, type: :u32),
-        Nx.tensor([
-          [0, 0, 1],
-          [0, 1, 1]
-        ], type: :u32)
+        Nx.tensor(
+          [
+            [0, 0, 1],
+            [0, 1, 1]
+          ],
+          type: :u32
+        )
       )
     end
 
@@ -1523,10 +1526,13 @@ defmodule EMLX.NxTest do
 
       assert_equal(
         Nx.argmin(t, tie_break: :high, axis: :y, type: :u32),
-        Nx.tensor([
-          [1, 1, 1],
-          [1, 0, 1]
-        ], type: :u32)
+        Nx.tensor(
+          [
+            [1, 1, 1],
+            [1, 0, 1]
+          ],
+          type: :u32
+        )
       )
     end
 
