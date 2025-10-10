@@ -1340,4 +1340,234 @@ defmodule EMLX.NxTest do
       assert Nx.tensor(1, type: :u64) |> Nx.to_binary() == <<1::native-64>>
     end
   end
+
+  describe "argmax" do
+    test "scalar" do
+      assert_equal(Nx.argmax(4), Nx.tensor(0))
+    end
+
+    test "full tensor" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]])
+      assert_equal(Nx.argmax(t), Nx.tensor(10))
+    end
+
+    test "with floats" do
+      assert_equal(Nx.argmax(Nx.tensor([2.0, 4.0])), Nx.tensor(1))
+    end
+
+    test "aggregating over axis 0" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]])
+
+      assert_equal(
+        Nx.argmax(t, axis: 0),
+        Nx.tensor([
+          [1, 0, 0],
+          [1, 1, 0]
+        ])
+      )
+    end
+
+    test "aggregating over named axis :y" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmax(t, axis: :y),
+        Nx.tensor([
+          [0, 0, 0],
+          [0, 1, 0]
+        ])
+      )
+    end
+
+    test "aggregating over named axis :z" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmax(t, axis: :z),
+        Nx.tensor([
+          [0, 2],
+          [0, 1]
+        ])
+      )
+    end
+
+    test "tie_break: :low" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmax(t, tie_break: :low, axis: :y),
+        Nx.tensor([
+          [0, 0, 0],
+          [0, 1, 0]
+        ])
+      )
+    end
+
+    test "tie_break: :high with custom type" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmax(t, tie_break: :high, axis: :y, type: :u32),
+        Nx.tensor([
+          [0, 0, 1],
+          [0, 1, 1]
+        ], type: :u32)
+      )
+    end
+
+    test "keep_axis: true" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmax(t, axis: :y, keep_axis: true),
+        Nx.tensor([
+          [
+            [0, 0, 0]
+          ],
+          [
+            [0, 1, 0]
+          ]
+        ])
+      )
+    end
+
+    test "vectorized tensor" do
+      v = Nx.tensor([[1, 2, 3], [6, 5, 4]]) |> Nx.vectorize(:x)
+
+      assert_equal(Nx.argmax(v) |> Nx.devectorize(), Nx.tensor([2, 0]))
+    end
+
+    test "vectorized tensor with axis" do
+      v = Nx.tensor([[1, 2, 3], [6, 5, 4]]) |> Nx.vectorize(:x)
+
+      assert_equal(Nx.argmax(v, axis: 0) |> Nx.devectorize(), Nx.tensor([2, 0]))
+    end
+
+    test "vectorized tensor with keep_axis" do
+      v = Nx.tensor([[1, 2, 3], [6, 5, 4]]) |> Nx.vectorize(:x)
+
+      assert_equal(
+        Nx.argmax(v, keep_axis: true) |> Nx.devectorize(),
+        Nx.tensor([
+          [2],
+          [0]
+        ])
+      )
+    end
+  end
+
+  describe "argmin" do
+    test "scalar" do
+      assert_equal(Nx.argmin(4), Nx.tensor(0))
+    end
+
+    test "full tensor" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]])
+      assert_equal(Nx.argmin(t), Nx.tensor(4))
+    end
+
+    test "with floats" do
+      assert_equal(Nx.argmin(Nx.tensor([2.0, 4.0])), Nx.tensor(0))
+    end
+
+    test "aggregating over axis 0" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]])
+
+      assert_equal(
+        Nx.argmin(t, axis: 0),
+        Nx.tensor([
+          [0, 0, 0],
+          [0, 0, 0]
+        ])
+      )
+    end
+
+    test "aggregating over axis 1" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmin(t, axis: 1),
+        Nx.tensor([
+          [1, 1, 0],
+          [1, 0, 0]
+        ])
+      )
+    end
+
+    test "aggregating over named axis :z" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmin(t, axis: :z),
+        Nx.tensor([
+          [1, 1],
+          [1, 2]
+        ])
+      )
+    end
+
+    test "tie_break: :low" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmin(t, tie_break: :low, axis: :y),
+        Nx.tensor([
+          [1, 1, 0],
+          [1, 0, 0]
+        ])
+      )
+    end
+
+    test "tie_break: :high with custom type" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmin(t, tie_break: :high, axis: :y, type: :u32),
+        Nx.tensor([
+          [1, 1, 1],
+          [1, 0, 1]
+        ], type: :u32)
+      )
+    end
+
+    test "keep_axis: true" do
+      t = Nx.tensor([[[4, 2, 3], [1, -5, 3]], [[6, 2, 3], [4, 8, 3]]], names: [:x, :y, :z])
+
+      assert_equal(
+        Nx.argmin(t, axis: :y, keep_axis: true),
+        Nx.tensor([
+          [
+            [1, 1, 0]
+          ],
+          [
+            [1, 0, 0]
+          ]
+        ])
+      )
+    end
+
+    test "vectorized tensor" do
+      v = Nx.tensor([[1, 2, 3], [6, 5, 4]]) |> Nx.vectorize(:x)
+
+      assert_equal(Nx.argmin(v) |> Nx.devectorize(), Nx.tensor([0, 2]))
+    end
+
+    test "vectorized tensor with axis" do
+      v = Nx.tensor([[1, 2, 3], [6, 5, 4]]) |> Nx.vectorize(:x)
+
+      assert_equal(Nx.argmin(v, axis: 0) |> Nx.devectorize(), Nx.tensor([0, 2]))
+    end
+
+    test "vectorized tensor with keep_axis" do
+      v = Nx.tensor([[1, 2, 3], [6, 5, 4]]) |> Nx.vectorize(:x)
+
+      assert_equal(
+        Nx.argmin(v, keep_axis: true) |> Nx.devectorize(),
+        Nx.tensor([
+          [0],
+          [2]
+        ])
+      )
+    end
+  end
 end
