@@ -1055,8 +1055,6 @@ defmodule EMLX.NxTest do
       )
     end
 
-    # does not support window_dilations yet
-    @tag :skip
     test "works with non-default options" do
       t = Nx.tensor([[[4, 2, 1, 3], [4, 2, 1, 7]], [[1, 2, 5, 7], [1, 8, 9, 2]]])
       opts = [strides: [2, 1, 1], padding: :valid, window_dilations: [1, 2, 2]]
@@ -1117,8 +1115,6 @@ defmodule EMLX.NxTest do
       )
     end
 
-    # window_dilations are not supported yet
-    @tag :skip
     test "works with non-default options" do
       t = Nx.tensor([[[4, 2, 1, 3], [4, 2, 1, 7]], [[1, 2, 5, 7], [1, 8, 9, 2]]])
       opts = [strides: [2, 1, 1], padding: :valid, window_dilations: [1, 2, 2]]
@@ -1244,8 +1240,6 @@ defmodule EMLX.NxTest do
       )
     end
 
-    # window dilations are not supported yet
-    @tag :skip
     test "supports window dilations" do
       result = Nx.window_sum(Nx.iota({4, 4}), {2, 2}, window_dilations: [2, 1])
 
@@ -1298,8 +1292,6 @@ defmodule EMLX.NxTest do
       )
     end
 
-    # window dilations are not supported yet
-    @tag :skip
     test "supports window dilations" do
       result = Nx.window_product(Nx.iota({4, 4}), {2, 2}, window_dilations: [2, 1])
 
@@ -1338,6 +1330,47 @@ defmodule EMLX.NxTest do
       assert Nx.tensor(1, type: :u16) |> Nx.to_binary() == <<1::native-16>>
       assert Nx.tensor(1, type: :u32) |> Nx.to_binary() == <<1::native-32>>
       assert Nx.tensor(1, type: :u64) |> Nx.to_binary() == <<1::native-64>>
+    end
+  end
+
+  describe "window_scatter_max" do
+    test "window_scatter_max with strides [2, 3]" do
+      t = Nx.tensor([[7, 2, 5, 3, 10, 2], [3, 8, 9, 3, 4, 2], [1, 5, 7, 5, 6, 1], [0, 6, 2, 7, 2, 8]])
+      result = Nx.window_scatter_max(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, strides: [2, 3], padding: :valid)
+
+      assert_all_close(
+        result,
+        Nx.tensor([[0, 0, 0, 0, 6, 0], [0, 0, 2, 0, 0, 0], [0, 0, 3, 0, 0, 0], [0, 0, 0, 0, 0, 1]])
+      )
+    end
+
+    test "window_scatter_max with strides [2, 2]" do
+      t = Nx.tensor([[7, 2, 5, 3, 8], [3, 8, 9, 3, 4], [1, 5, 7, 5, 6], [0, 6, 2, 10, 2]])
+      result = Nx.window_scatter_max(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, strides: [2, 2], padding: :valid)
+      assert_all_close(
+        result,
+        Nx.tensor([[0, 0, 0, 0, 0], [0, 0, 8, 0, 0], [0, 0, 3, 0, 0], [0, 0, 0, 1, 0]])
+      )
+    end
+  end
+
+  describe "window_scatter_min" do
+    test "window_scatter_min with strides [2, 3]" do
+      t = Nx.tensor([[7, 2, 5, 3, 10, 2], [3, 8, 9, 3, 4, 2], [1, 5, 7, 5, 6, 1], [0, 6, 2, 7, 2, 8]])
+      result = Nx.window_scatter_min(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, strides: [2, 3], padding: :valid)
+      assert_all_close(
+        result,
+        Nx.tensor([[0, 2, 0, 0, 0, 0], [0, 0, 0, 0, 0, 6], [0, 0, 0, 0, 0, 1], [3, 0, 0, 0, 0, 0]])
+      )
+    end
+
+    test "window_scatter_min with strides [2, 2]" do
+      t = Nx.tensor([[7, 2, 5, 3, 8], [3, 8, 9, 3, 4], [1, 5, 7, 5, 6], [0, 6, 2, 10, 2]])
+      result = Nx.window_scatter_min(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, strides: [2, 2], padding: :valid)
+      assert_all_close(
+        result,
+        Nx.tensor([[0, 2, 0, 0, 0], [0, 0, 0, 6, 0], [0, 0, 0, 0, 0], [3, 0, 0, 0, 1]])
+      )
     end
   end
 end

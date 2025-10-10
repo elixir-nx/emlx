@@ -51,9 +51,7 @@ defmodule EMLX.Nx.DoctestTest do
     argmin: 2,
     argmax: 2,
     argsort: 2,
-    # Missing support for window dilations and for tie_break: :high
-    window_scatter_max: 5,
-    window_scatter_min: 5
+    # Missing support for tie_break: :high
   ]
 
   @not_supported [

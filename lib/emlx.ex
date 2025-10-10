@@ -177,7 +177,7 @@ defmodule EMLX do
   deftensor tensordot(tensorA, tensorB, axesA, axesB)
   deftensor einsum(tensorA, tensorB, spec_string)
   deftensor transpose(tensor, axes)
-  deftensor pad(tensor, axes, low_pad_size, high_pad_size, pad_value)
+  deftensor pad(tensor, axes, low_pad_size, high_pad_size, tensor_pad_value)
   deftensor sort(tensor, axis)
   deftensor argsort(tensor, axis)
   deftensor tri_inv(tensor, upper)

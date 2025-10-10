@@ -280,13 +280,14 @@ defmodule EMLX.Backend do
           {[i | axes], [max(low, 0) | lows], [max(high, 0) | highs]}
       end)
 
-    {_device, pad_value_mx} = from_nx(pad_value)
+    pad_value_mx = from_nx(pad_value)
+    {_device, pad_value_ref} = pad_value_mx
 
     interior_padding = Enum.map(input_config, fn {_low, _high, interior} -> interior end)
 
     tensor
     |> from_nx()
-    |> interior_padding_mlx(pad_value_mx, interior_padding)
+    |> interior_padding_mlx(pad_value_ref, interior_padding)
     |> slice_negative_padding(input_config)
     |> EMLX.pad(axes, low_pad_size, high_pad_size, pad_value_mx)
     |> to_nx(out)
@@ -320,7 +321,8 @@ defmodule EMLX.Backend do
     highs = [next_axis_size * interior_padding]
     axes = [next_axis]
 
-    padded_tensor = EMLX.pad(tensor, axes, lows, highs, value)
+    {device, _} = tensor
+    padded_tensor = EMLX.pad(tensor, axes, lows, highs, {device, value})
 
     new_axis_size = axis_size + axis_size * interior_padding
 
@@ -1367,7 +1369,7 @@ defmodule EMLX.Backend do
 
     window_shape = EMLX.shape(window)
 
-    {device, pad_mx} =
+    pad_value_mx =
       case op do
         :sum ->
           EMLX.scalar_tensor(0, to_mlx_type(out.type), device)
@@ -1382,7 +1384,8 @@ defmodule EMLX.Backend do
           Nx.Constants.max(tensor.type, backend: {EMLX.Backend, device: device}) |> from_nx()
       end
 
-    padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_mx)
+    {device, pad_mx} = pad_value_mx
+    padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_value_mx)
 
     padded_mx
     |> sliding_window_view(EMLX.shape(padded_mx), window_shape, opts[:strides])
@@ -1447,11 +1450,11 @@ defmodule EMLX.Backend do
     # TODO: support window dilations
     unfold_flat = fn tensor ->
       {device, _} = t_mx = from_nx(tensor)
-      {_, pad_mx} = EMLX.scalar_tensor(0, EMLX.scalar_type(t_mx), device)
+      pad_value_mx = EMLX.scalar_tensor(0, EMLX.scalar_type(t_mx), device)
 
       {low_pad, high_pad} = Enum.unzip(opts[:padding])
 
-      padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_mx)
+      padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_value_mx)
 
       unfolded_mx =
         sliding_window_view(
