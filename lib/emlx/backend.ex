@@ -246,7 +246,14 @@ defmodule EMLX.Backend do
 
   @impl true
   def reverse(out, tensor, axes) do
-    shape = Tuple.to_list(tensor.shape)
+    tensor
+    |> from_nx()
+    |> reverse_mlx(tensor.shape, axes)
+    |> to_nx(out)
+  end
+
+  defp reverse_mlx(tensor_mx, shape, axes) do
+    shape = Tuple.to_list(shape)
 
     {starts_stops, strides} =
       shape
@@ -264,10 +271,7 @@ defmodule EMLX.Backend do
 
     {starts, stops} = Enum.unzip(starts_stops)
 
-    tensor
-    |> from_nx()
-    |> EMLX.slice(starts, stops, strides)
-    |> to_nx(out)
+    EMLX.slice(tensor_mx, starts, stops, strides)
   end
 
   @impl true
@@ -584,19 +588,39 @@ defmodule EMLX.Backend do
       axis = opts[:axis]
       keep_axis = opts[:keep_axis] == true
 
-      if Application.get_env(:emlx, :warn_unsupported_option, true) and opts[:tie_break] == :high do
-        Logger.warning(
-          "Nx.Backend.#{unquote(op)}/3 with tie_break: :high is not supported in EMLX"
-        )
-      end
-
       t_mx = from_nx(tensor)
 
-      result =
+      t_mx =
+        if opts[:tie_break] == :high do
+          reverse_mlx(t_mx, tensor.shape, [axis] || Nx.axes(tensor))
+        else
+          t_mx
+        end
+
+      {device, _} =
+        result =
         if axis do
           EMLX.unquote(op)(t_mx, axis, keep_axis)
         else
           EMLX.unquote(op)(t_mx, keep_axis)
+        end
+
+      # in case we had tie_break: :high, we need to subtract the result from the size of the sorted
+      # set because in reversing the axis above, we will get the complement of the result
+      result =
+        case {axis, opts[:tie_break]} do
+          {nil, :high} ->
+            size = EMLX.scalar_tensor(Nx.size(tensor) - 1, to_mlx_type(out.type), device)
+            EMLX.subtract(size, result)
+
+          {_, :high} ->
+            size =
+              EMLX.scalar_tensor(Nx.axis_size(tensor, axis) - 1, to_mlx_type(out.type), device)
+
+            EMLX.subtract(size, result)
+
+          {_, _} ->
+            result
         end
 
       result

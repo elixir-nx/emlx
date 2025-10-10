@@ -48,10 +48,8 @@ defmodule EMLX.Nx.DoctestTest do
   @to_be_fixed [
     :moduledoc,
     # MLX sorts NaNs lowest, Nx sorts them highest
-    argmin: 2,
-    argmax: 2,
     argsort: 2,
-    # Missing support for window dilations and for tie_break: :high
+    # Missing support for window dilations
     window_scatter_max: 5,
     window_scatter_min: 5
   ]
@@ -61,7 +59,10 @@ defmodule EMLX.Nx.DoctestTest do
     window_reduce: 5,
     population_count: 1,
     count_leading_zeros: 1,
-    sort: 2
+    sort: 2,
+    # We do not support the same ordering for NaNs as Nx
+    argmin: 2,
+    argmax: 2
   ]
 
   doctest Nx,

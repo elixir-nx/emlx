@@ -49,23 +49,6 @@ Defaulting to Nx.Defn.Evaluator is the safest option for now.
 Nx.Defn.default_options(compiler: EMLX)
 ```
 
-### Configuration
-
-EMLX supports several configuration options that can be set in your application's config:
-
-#### `:warn_unsupported_option`
-
-Controls whether warnings are logged when unsupported options are used with certain operations.
-
-- **Type**: `boolean`
-- **Default**: `true`
-- **Description**: When enabled, EMLX will log warnings for operations that receive options not supported by the MLX backend. For example, `Nx.argmax/2` and `Nx.argmin/2` with `tie_break: :high` will log a warning since MLX doesn't support this tie-breaking behavior.
-
-```elixir
-# In config/config.exs
-config :emlx, :warn_unsupported_option, false
-```
-
 ### MLX binaries
 
 EMLX relies on the [MLX](https://github.com/ml-explore/mlx) library to function, and currently EMLX will download precompiled builds from [mlx-build](https://github.com/cocoa-xu/mlx-build).
