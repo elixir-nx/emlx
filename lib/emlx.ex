@@ -418,11 +418,11 @@ defmodule EMLX do
             cached_fun
         end
 
-        nif_result =
-          case device do
-            :cpu -> EMLX.NIF.call_compiled_cpu(compiled_fun, nif_args)
-            :gpu -> EMLX.NIF.call_compiled_gpu(compiled_fun, nif_args)
-          end
+      nif_result =
+        case device do
+          :cpu -> EMLX.NIF.call_compiled_cpu(compiled_fun, nif_args)
+          :gpu -> EMLX.NIF.call_compiled_gpu(compiled_fun, nif_args)
+        end
 
       results =
         nif_result
