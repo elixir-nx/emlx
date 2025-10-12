@@ -275,9 +275,6 @@ NIF(to_blob) {
   int limit = 0;
   bool has_received_limit = (argc == 2);
 
-  // Evaluate to ensure data is available
-  t->eval();
-
   if (has_received_limit) {
     PARAM(1, int, param_limit);
     limit = param_limit;
@@ -1051,7 +1048,7 @@ static ErlNifFunc nif_funcs[] = {
     {"slice", 5, slice},
     {"slice_update", 5, slice_update},
     {"squeeze", 3, squeeze},
-    {"item", 1, item},
+    {"item", 1, item, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"all", 4, all},
     {"any", 4, any},
     {"sum", 4, sum},
@@ -1067,8 +1064,8 @@ static ErlNifFunc nif_funcs[] = {
     {"shape", 1, shape},
     {"reshape", 3, reshape},
     {"astype", 3, astype},
-    {"to_blob", 1, to_blob},
-    {"to_blob", 2, to_blob},
+    {"to_blob", 1, to_blob, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"to_blob", 2, to_blob, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"from_blob", 4, from_blob},
     {"scalar_tensor", 3, scalar_tensor},
     {"ones", 3, ones},
@@ -1154,7 +1151,8 @@ static ErlNifFunc nif_funcs[] = {
     {"tri_inv", 3, tri_inv},
     {"set_compile", 1, set_compile},
     {"compile", 2, compile, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"call_compiled", 2, call_compiled, ERL_NIF_DIRTY_JOB_CPU_BOUND}};
+    {"call_compiled_cpu", 2, call_compiled, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"call_compiled_gpu", 2, call_compiled, ERL_NIF_DIRTY_JOB_IO_BOUND}};
 
 // Update the NIF initialization
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
