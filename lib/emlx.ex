@@ -255,10 +255,20 @@ defmodule EMLX do
   deftensor clip(tensor, tensor_min, tensor_max)
 
   ## Dirty non-tensor return values
-  defvalue to_blob(tensor)
-  defvalue to_blob(tensor, limit)
   defvalue scalar_type(tensor)
   defvalue shape(tensor)
+
+  def to_blob({device, ref} = tensor) when is_tensor(device, ref) do
+    # Two-step to_blob: eval on main scheduler, then copy on dirty scheduler
+    eval(tensor)
+    EMLX.NIF.to_blob(ref) |> unwrap!()
+  end
+
+  def to_blob({device, ref} = tensor, limit) when is_tensor(device, ref) do
+    # Two-step to_blob: eval on main scheduler, then copy on dirty scheduler
+    eval(tensor)
+    EMLX.NIF.to_blob(ref, limit) |> unwrap!()
+  end
 
   defp unwrap!(:ok), do: :ok
   defp unwrap!({:ok, result}), do: result
@@ -305,7 +315,6 @@ defmodule EMLX do
   defp merge_device(_, _), do: :cpu
 
   defvalue deallocate(tensor_ref)
-
   defvalue eval(tensor)
 
   deftensor slice(tensor, starts, stops, strides)
@@ -409,9 +418,14 @@ defmodule EMLX do
             cached_fun
         end
 
+        nif_result =
+          case device do
+            :cpu -> EMLX.NIF.call_compiled_cpu(compiled_fun, nif_args)
+            :gpu -> EMLX.NIF.call_compiled_gpu(compiled_fun, nif_args)
+          end
+
       results =
-        compiled_fun
-        |> EMLX.NIF.call_compiled(nif_args)
+        nif_result
         |> unwrap!()
         |> Enum.map(fn ref ->
           EMLX.Backend.to_nx({device, ref})
