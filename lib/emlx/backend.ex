@@ -590,6 +590,32 @@ defmodule EMLX.Backend do
 
       t_mx = from_nx(tensor)
 
+      # Check for NaNs in the original tensor (before any reversal)
+      is_nan_mx = EMLX.is_nan(t_mx)
+
+      nan_index_mx =
+        if axis do
+          EMLX.argmax(is_nan_mx, axis, keep_axis)
+        else
+          EMLX.argmax(is_nan_mx, keep_axis)
+        end
+
+      # Check if any NaN exists along the axis
+      has_nan_mx =
+        cond do
+          axis ->
+            EMLX.any(is_nan_mx, [axis], keep_axis)
+
+          tuple_size(tensor.shape) == 0 ->
+            # For scalar input, is_nan_mx is already a scalar boolean
+            is_nan_mx
+
+          true ->
+            # For full reduction over non-scalar tensors
+            EMLX.any(is_nan_mx, Nx.axes(tensor), keep_axis)
+        end
+
+      # Apply reversal for tie_break after NaN check
       t_mx =
         if opts[:tie_break] == :high do
           reverse_mlx(t_mx, tensor.shape, [axis] || Nx.axes(tensor))
@@ -622,6 +648,9 @@ defmodule EMLX.Backend do
           {_, _} ->
             result
         end
+
+      # Use NaN index if any NaN exists, otherwise use regular result
+      result = EMLX.where(has_nan_mx, nan_index_mx, result)
 
       result
       |> EMLX.astype(to_mlx_type(out.type))

@@ -53,9 +53,7 @@ defmodule EMLX.Nx.DoctestTest do
     reduce: 4,
     window_reduce: 5,
     population_count: 1,
-    count_leading_zeros: 1,
-    argmin: 2,
-    argmax: 2
+    count_leading_zeros: 1
   ]
 
   doctest Nx,
