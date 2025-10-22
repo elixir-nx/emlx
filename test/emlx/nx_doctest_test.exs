@@ -46,9 +46,7 @@ defmodule EMLX.Nx.DoctestTest do
   ]
 
   @to_be_fixed [
-    :moduledoc,
-    # MLX sorts NaNs lowest, Nx sorts them highest
-    argsort: 2
+    :moduledoc
   ]
 
   @not_supported [
