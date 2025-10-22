@@ -177,7 +177,7 @@ defmodule EMLX do
   deftensor tensordot(tensorA, tensorB, axesA, axesB)
   deftensor einsum(tensorA, tensorB, spec_string)
   deftensor transpose(tensor, axes)
-  deftensor pad(tensor, axes, low_pad_size, high_pad_size, pad_value)
+  deftensor pad(tensor, axes, low_pad_size, high_pad_size, tensor_pad_value)
   deftensor sort(tensor, axis)
   deftensor argsort(tensor, axis)
   deftensor tri_inv(tensor, upper)
@@ -448,9 +448,6 @@ defmodule EMLX do
 
   @impl Nx.Defn.Compiler
   defdelegate __partitions_options__(opts), to: Nx.Defn.Evaluator
-
-  @impl Nx.Defn.Compiler
-  defdelegate __stream__(key, input, acc, vars, fun, args, opts), to: Nx.Defn.Evaluator
 
   @impl Nx.Defn.Compiler
   def __to_backend__(opts) do

@@ -48,10 +48,7 @@ defmodule EMLX.Nx.DoctestTest do
   @to_be_fixed [
     :moduledoc,
     # MLX sorts NaNs lowest, Nx sorts them highest
-    argsort: 2,
-    # Missing support for window dilations
-    window_scatter_max: 5,
-    window_scatter_min: 5
+    argsort: 2
   ]
 
   @not_supported [
