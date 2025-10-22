@@ -54,8 +54,6 @@ defmodule EMLX.Nx.DoctestTest do
     window_reduce: 5,
     population_count: 1,
     count_leading_zeros: 1,
-    sort: 2,
-    # We do not support the same ordering for NaNs as Nx
     argmin: 2,
     argmax: 2
   ]

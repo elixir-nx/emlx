@@ -1196,15 +1196,39 @@ defmodule EMLX.Backend do
     axis = opts[:axis]
     asc? = opts[:direction] == :asc
 
-    t = tensor |> from_nx() |> EMLX.sort(axis)
+    t_mx = from_nx(tensor)
 
-    if asc? do
-      to_nx(t, out)
-    else
-      t
-      |> to_nx(out)
-      |> Nx.reverse(axes: [axis])
-    end
+    # Get the sorting indices
+    sort_mx =
+      if asc? do
+        EMLX.argsort(t_mx, axis)
+      else
+        t_mx
+        |> EMLX.negate()
+        |> EMLX.argsort(axis)
+      end
+
+    # Gather values at sorted positions to identify NaNs
+    sorted_values_mx = EMLX.take_along_axis(t_mx, sort_mx, axis)
+    is_nan_mx = EMLX.is_nan(sorted_values_mx)
+
+    # Partition indices to place NaNs correctly (NaNs are treated as highest):
+    # - For ascending: NaNs (highest) go to end: sort by is_nan (0 < 1)
+    # - For descending: NaNs (highest) go to beginning: sort by !is_nan (1 < 0)
+    partition_indices_mx =
+      if asc? do
+        EMLX.argsort(is_nan_mx, axis)
+      else
+        is_nan_mx
+        |> EMLX.logical_not()
+        |> EMLX.argsort(axis)
+      end
+
+    # Reorder the sorted values to move NaNs to the correct position
+    sorted_values_mx
+    |> EMLX.take_along_axis(partition_indices_mx, axis)
+    |> EMLX.astype(to_mlx_type(out.type))
+    |> to_nx(out)
   end
 
   @impl true
