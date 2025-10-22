@@ -1571,64 +1571,206 @@ defmodule EMLX.NxTest do
 
   describe "window_scatter_max" do
     test "window_scatter_max with strides [2, 3]" do
-      t = Nx.tensor([[7, 2, 5, 3, 10, 2], [3, 8, 9, 3, 4, 2], [1, 5, 7, 5, 6, 1], [0, 6, 2, 7, 2, 8]])
+      t =
+        Nx.tensor([
+          [7, 2, 5, 3, 10, 2],
+          [3, 8, 9, 3, 4, 2],
+          [1, 5, 7, 5, 6, 1],
+          [0, 6, 2, 7, 2, 8]
+        ])
+
       opts = [strides: [2, 3], padding: :valid]
       result = Nx.window_scatter_max(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, opts)
 
       assert_all_close(
         result,
-        Nx.tensor([[0, 0, 0, 0, 6, 0], [0, 0, 2, 0, 0, 0], [0, 0, 3, 0, 0, 0], [0, 0, 0, 0, 0, 1]])
+        Nx.tensor([
+          [0, 0, 0, 0, 6, 0],
+          [0, 0, 2, 0, 0, 0],
+          [0, 0, 3, 0, 0, 0],
+          [0, 0, 0, 0, 0, 1]
+        ])
       )
     end
 
     test "window_scatter_max with strides [2, 2]" do
-      t = Nx.tensor([[7, 2, 5, 3, 8], [3, 8, 9, 3, 4], [1, 5, 7, 5, 6], [0, 6, 2, 10, 2]])
+      t =
+        Nx.tensor([
+          [7, 2, 5, 3, 8],
+          [3, 8, 9, 3, 4],
+          [1, 5, 7, 5, 6],
+          [0, 6, 2, 10, 2]
+        ])
+
       opts = [strides: [2, 2], padding: :valid]
       result = Nx.window_scatter_max(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, opts)
+
       assert_all_close(
         result,
-        Nx.tensor([[0, 0, 0, 0, 0], [0, 0, 8, 0, 0], [0, 0, 3, 0, 0], [0, 0, 0, 1, 0]])
+        Nx.tensor([
+          [0, 0, 0, 0, 0],
+          [0, 0, 8, 0, 0],
+          [0, 0, 3, 0, 0],
+          [0, 0, 0, 1, 0]
+        ])
+      )
+    end
+
+    test "window_scatter_max with vectorized input" do
+      t =
+        Nx.tensor([
+          [
+            [7, 2, 5, 3],
+            [3, 8, 9, 3]
+          ],
+          [
+            [1, 5, 7, 5],
+            [0, 6, 2, 8]
+          ]
+        ])
+        |> Nx.vectorize(:x)
+
+      opts = [strides: [1, 2], padding: :valid]
+
+      source =
+        Nx.tensor([
+          [[2, 6]],
+          [[3, 1]]
+        ])
+        |> Nx.vectorize(:y)
+
+      result = Nx.window_scatter_max(t, source, 0, {2, 2}, opts)
+
+      Nx.Testing.assert_equal(
+        result,
+        Nx.tensor([
+          [
+            [
+              [0, 0, 0, 0],
+              [0, 2, 6, 0]
+            ],
+            [
+              [0, 0, 0, 0],
+              [0, 3, 1, 0]
+            ]
+          ],
+          [
+            [
+              [0, 0, 0, 0],
+              [0, 2, 0, 6]
+            ],
+            [
+              [0, 0, 0, 0],
+              [0, 3, 0, 1]
+            ]
+          ]
+        ])
+        |> Nx.vectorize([:x, :y])
       )
     end
   end
 
   describe "window_scatter_min" do
     test "window_scatter_min with strides [2, 3]" do
-      t = Nx.tensor([
-        [7, 2, 5, 3, 10, 2],
-        [3, 8, 9, 3, 4, 2],
-        [1, 5, 7, 5, 6, 1],
-        [0, 6, 2, 7, 2, 8]])
+      t =
+        Nx.tensor([
+          [7, 2, 5, 3, 10, 2],
+          [3, 8, 9, 3, 4, 2],
+          [1, 5, 7, 5, 6, 1],
+          [0, 6, 2, 7, 2, 8]
+        ])
+
       opts = [strides: [2, 3], padding: :valid]
       result = Nx.window_scatter_min(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, opts)
+
       assert_all_close(
         result,
         Nx.tensor([
           [0, 2, 0, 0, 0, 0],
           [0, 0, 0, 0, 0, 6],
           [0, 0, 0, 0, 0, 1],
-          [3, 0, 0, 0, 0, 0]])
+          [3, 0, 0, 0, 0, 0]
+        ])
       )
     end
 
     test "window_scatter_min with strides [2, 2]" do
-      t = Nx.tensor([[7, 2, 5, 3, 8], [3, 8, 9, 3, 4], [1, 5, 7, 5, 6], [0, 6, 2, 10, 2]])
+      t =
+        Nx.tensor([
+          [7, 2, 5, 3, 8],
+          [3, 8, 9, 3, 4],
+          [1, 5, 7, 5, 6],
+          [0, 6, 2, 10, 2]
+        ])
+
       opts = [strides: [2, 2], padding: :valid]
       result = Nx.window_scatter_min(t, Nx.tensor([[2, 6], [3, 1]]), 0, {2, 3}, opts)
+
       assert_all_close(
         result,
-        Nx.tensor([[0, 2, 0, 0, 0], [0, 0, 0, 6, 0], [0, 0, 0, 0, 0], [3, 0, 0, 0, 1]])
+        Nx.tensor([
+          [0, 2, 0, 0, 0],
+          [0, 0, 0, 6, 0],
+          [0, 0, 0, 0, 0],
+          [3, 0, 0, 0, 1]
+        ])
       )
     end
 
     test "window_scatter_min with vectorized input" do
-      t = Nx.tensor([[[7, 2, 5, 1], [3, 8, 9, 3]], [[1, 5, 7, 5], [0, 6, 2, 8]]])
+      t =
+        Nx.tensor([
+          [
+            [7, 2, 5, 3],
+            [3, 8, 9, 3]
+          ],
+          [
+            [1, 5, 7, 5],
+            [0, 6, 2, 8]
+          ]
+        ])
+        |> Nx.vectorize(:x)
+
       opts = [strides: [1, 2], padding: :valid]
-      source = Nx.tensor([[[2, 6]], [[3, 1]]]) |> Nx.vectorize(:y)
+
+      source =
+        Nx.tensor([
+          [
+            [2, 6]
+          ],
+          [
+            [3, 1]
+          ]
+        ])
+        |> Nx.vectorize(:y)
+
       result = Nx.window_scatter_min(t, source, 0, {2, 2}, opts)
+
       assert_all_close(
         result,
-        Nx.tensor([[0, 2, 0, 6], [0, 0, 0, 0]], [[0, 3, 0, 1], [0, 0, 0, 0]], [[0, 0, 0, 0], [2, 0, 6, 0]], [[0, 0, 0, 0], [3, 0, 1, 0]])
+        Nx.tensor([
+          [
+            [
+              [0, 2, 0, 0],
+              [0, 0, 0, 6]
+            ],
+            [
+              [0, 3, 0, 0],
+              [0, 0, 0, 1]
+            ]
+          ],
+          [
+            [
+              [0, 0, 0, 0],
+              [2, 0, 6, 0]
+            ],
+            [
+              [0, 0, 0, 0],
+              [3, 0, 1, 0]
+            ]
+          ]
+        ])
+        |> Nx.vectorize([:x, :y])
       )
     end
   end

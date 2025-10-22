@@ -450,9 +450,6 @@ defmodule EMLX do
   defdelegate __partitions_options__(opts), to: Nx.Defn.Evaluator
 
   @impl Nx.Defn.Compiler
-  defdelegate __stream__(key, input, acc, vars, fun, args, opts), to: Nx.Defn.Evaluator
-
-  @impl Nx.Defn.Compiler
   def __to_backend__(opts) do
     device = Keyword.get(opts, :device, :gpu)
     {EMLX.Backend, device: device}

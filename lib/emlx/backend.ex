@@ -1471,7 +1471,6 @@ defmodule EMLX.Backend do
   end
 
   defp window_scatter_function(function, out, tensor, source, init_value, window_dims_tuple, opts) do
-    # TODO: support window dilations
     unfold_flat = fn tensor ->
       {device, _} = t_mx = from_nx(tensor)
       pad_value_mx = EMLX.scalar_tensor(0, EMLX.scalar_type(t_mx), device)
