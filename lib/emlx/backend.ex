@@ -285,13 +285,12 @@ defmodule EMLX.Backend do
       end)
 
     pad_value_mx = from_nx(pad_value)
-    {_device, pad_value_ref} = pad_value_mx
 
     interior_padding = Enum.map(input_config, fn {_low, _high, interior} -> interior end)
 
     tensor
     |> from_nx()
-    |> interior_padding_mlx(pad_value_ref, interior_padding)
+    |> interior_padding_mlx(pad_value_mx, interior_padding)
     |> slice_negative_padding(input_config)
     |> EMLX.pad(axes, low_pad_size, high_pad_size, pad_value_mx)
     |> to_nx(out)
@@ -325,8 +324,7 @@ defmodule EMLX.Backend do
     highs = [next_axis_size * interior_padding]
     axes = [next_axis]
 
-    {device, _} = tensor
-    padded_tensor = EMLX.pad(tensor, axes, lows, highs, {device, value})
+    padded_tensor = EMLX.pad(tensor, axes, lows, highs, value)
 
     new_axis_size = axis_size + axis_size * interior_padding
 
@@ -1383,7 +1381,7 @@ defmodule EMLX.Backend do
     window_dilations = opts[:window_dilations] || List.duplicate(1, tuple_size(window_shape))
     interior_padding_config = Enum.map(window_dilations, &(&1 - 1))
 
-    {_device, zero_mx} = EMLX.scalar_tensor(0, :bool, device)
+    zero_mx = EMLX.scalar_tensor(0, :bool, device)
 
     window =
       1
@@ -1408,12 +1406,11 @@ defmodule EMLX.Backend do
           Nx.Constants.max(tensor.type, backend: {EMLX.Backend, device: device}) |> from_nx()
       end
 
-    {device, pad_mx} = pad_value_mx
     padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_value_mx)
 
     padded_mx
     |> sliding_window_view(EMLX.shape(padded_mx), window_shape, opts[:strides])
-    |> then(&EMLX.where(window, &1, {device, pad_mx}))
+    |> then(&EMLX.where(window, &1, pad_value_mx))
     |> then(&apply(EMLX, op, [&1, axes, false]))
     |> to_nx(out)
   end
