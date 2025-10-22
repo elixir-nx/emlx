@@ -27,7 +27,20 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
-  def call_compiled(_compiled_fun, _args) do
+  # Device-specific NIFs for dirty scheduler optimization
+  def call_compiled_cpu(_compiled_fun, _args) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def call_compiled_gpu(_compiled_fun, _args) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def to_blob(_tensor) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def to_blob(_tensor, _limit) do
     :erlang.nif_error(:nif_not_loaded)
   end
 end
