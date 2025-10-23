@@ -20,8 +20,8 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { arch: "x86_64", runs-os: ubuntu-latest, otp: "25.3.2.15", elixir: "1.15.4" }
-          - { arch: "aarch64", runs-os: ubuntu-24.04-arm, otp: "25.3.2.15", elixir: "1.15.4" }
+          - { arch: "x86_64", runs-os: ubuntu-latest, otp: "25.3.2.15", elixir: "1.17.0" }
+          - { arch: "aarch64", runs-os: ubuntu-24.04-arm, otp: "25.3.2.15", elixir: "1.17.0" }
     env:
       MIX_ENV: test
     steps:
@@ -73,11 +73,10 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { otp: "25.3.2.15", elixir: "1.15.4" }
-          - { otp: "25.3.2.15", elixir: "1.16.2", lint: true }
-          - { otp: "25.3.2.15", elixir: "1.16.2", build: true }
-          - { otp: "25.3.2.15", elixir: "1.16.2", gpu: true }
-          - { otp: "25.3.2.15", elixir: "1.16.2", gpu: true, build: true }
+          - { otp: "25.3.2.15", elixir: "1.17.0", lint: true }
+          - { otp: "25.3.2.15", elixir: "1.17.0", build: true }
+          - { otp: "25.3.2.15", elixir: "1.17.0", gpu: true }
+          - { otp: "25.3.2.15", elixir: "1.17.0", gpu: true, build: true }
     env:
       MIX_ENV: test
     steps:
@@ -98,7 +97,7 @@ jobs:
           echo "path=${OTP_PATH}:${ELIXIR_PATH}" >> $GITHUB_OUTPUT
           echo "${OTP_PATH}" >> $GITHUB_PATH
           echo "${ELIXIR_PATH}" >> $GITHUB_PATH
-          
+
       - name: Setup Mix
         run: |
           mix local.hex --force
