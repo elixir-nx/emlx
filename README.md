@@ -1,5 +1,7 @@
 # EMLX
 
+[![Package](https://img.shields.io/badge/-Package-important)](https://hex.pm/packages/emlx) [![Documentation](https://img.shields.io/badge/-Documentation-blueviolet)](https://hexdocs.pm/emlx)
+
 EMLX is the Nx Backend for the [MLX](https://github.com/ml-explore/mlx) library.
 
 Because of MLX's nature, EMLX with GPU backend is only supported on macOS.
