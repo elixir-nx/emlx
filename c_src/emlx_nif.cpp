@@ -914,7 +914,7 @@ NIF(item) {
 
   // Fix for MLX scalar layout bug: Use the correct type when calling item<T>()
   // to avoid reading wrong number of bytes from potentially invalid memory
-  // layouts. See: MLX_BUG_REPORT.md for details on the upstream issue.
+  // layouts.
   auto dtype = t->dtype();
 
   // Handle integer and boolean types with proper dtype matching
