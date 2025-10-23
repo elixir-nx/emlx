@@ -40,7 +40,7 @@ MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
 SOURCES = c_src/emlx_nif.cpp
-HEADERS = c_src/nif_call.h c_src/nx_nif_utils.hpp
+HEADERS = c_src/nx_nif_utils.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 
 # Main targets

@@ -2,7 +2,7 @@ defmodule EMLX.MixProject do
   use Mix.Project
 
   @app :emlx
-  @version "0.1.2"
+  @version "0.2.0"
   @mlx_version "0.25.1"
 
   require Logger
@@ -47,7 +47,6 @@ defmodule EMLX.MixProject do
 
   def application do
     [
-      mod: {EMLX.Application, []},
       extra_applications: [:logger, :inets, :ssl, :public_key, :crypto]
     ]
   end
@@ -58,8 +57,7 @@ defmodule EMLX.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:nx, "~> 0.10"},
-      {:nif_call, "~> 0.1.3"}
+      {:nx, "~> 0.10"}
     ]
   end
 

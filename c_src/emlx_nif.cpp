@@ -9,9 +9,6 @@
 #include <string>
 #include <cstring>
 
-#define NIF_CALL_IMPLEMENTATION
-#include "nif_call.h"
-
 using namespace mlx::core;
 
 std::map<const std::string, const mlx::core::Dtype> dtypes = {
@@ -495,98 +492,6 @@ NIF(eval) {
   return nx::nif::ok(env);
 }
 
-NIF(set_compile) {
-  PARAM(0, bool, compile);
-
-  if (compile) {
-    mlx::core::enable_compile();
-  } else {
-    mlx::core::disable_compile();
-  }
-
-  return nx::nif::ok(env);
-}
-
-void move_between_envs(ERL_NIF_TERM from_term, ERL_NIF_TERM *to_term,
-                       ErlNifEnv *from_env, ErlNifEnv *to_env) {
-  ErlNifBinary serialized;
-  enif_term_to_binary(from_env, from_term, &serialized);
-  enif_binary_to_term(to_env, serialized.data, serialized.size, to_term, 0);
-}
-
-class EMLXCompileError : public std::runtime_error {
-public:
-  EMLXCompileError(ERL_NIF_TERM term)
-      : std::runtime_error("EMLXCompileError"), error_term(term) {}
-
-  ERL_NIF_TERM get_error_term() const { return error_term; }
-
-private:
-  ERL_NIF_TERM error_term;
-};
-
-NIF(compile) {
-  LIST_PARAM(0, std::vector<mlx::core::array>, arrays);
-  ERL_NIF_TERM tag = argv[1];
-
-  ErlNifEnv *closure_env = enif_alloc_env();
-
-  auto fun = [env = closure_env, outer_env = env, tag_outer = tag](
-                 const std::vector<mlx::core::array> &compile_args) {
-    ERL_NIF_TERM tag = enif_make_copy(env, tag_outer);
-    ERL_NIF_TERM tensor_list = nx::nif::make_list(env, compile_args);
-    ERL_NIF_TERM arg_list = enif_make_list1(env, tensor_list);
-
-    NifCallResult result = make_nif_call(env, tag, arg_list);
-    enif_clear_env(env);
-
-    if (!result.is_ok()) {
-      ERL_NIF_TERM error_term =
-          enif_make_tuple2(env, enif_make_atom(env, "error"), result.get_err());
-      throw EMLXCompileError(enif_make_copy(outer_env, error_term));
-    }
-
-    ERL_NIF_TERM output_list = result.get_value();
-
-    // Convert output_list back to vector of MLX arrays
-    std::vector<mlx::core::array> output_tensors;
-    if (!nx::nif::get_list(env, output_list, output_tensors)) {
-      ERL_NIF_TERM error_string = enif_make_string(
-          env, "Failed to convert callback result to tensors", ERL_NIF_LATIN1);
-      ERL_NIF_TERM error_term =
-          enif_make_tuple2(env, enif_make_atom(env, "error"), error_string);
-      throw EMLXCompileError(enif_make_copy(outer_env, error_term));
-    }
-
-    enif_free_env(env);
-
-    return output_tensors;
-  };
-
-  emlx::function compiled_function_ptr;
-
-  try {
-    compiled_function_ptr = mlx::core::compile(fun);
-  } catch (const EMLXCompileError &e) {
-    return e.get_error_term();
-  }
-
-  return nx::nif::ok(env, create_function_resource(env, compiled_function_ptr));
-}
-
-NIF(call_compiled) {
-  emlx::function *compiled_function_ptr = nullptr;
-
-  if (!nx::nif::get(env, argv[0], compiled_function_ptr)) {
-    return nx::nif::error(env, "Unable to get compiled function pointer");
-  }
-  LIST_PARAM(1, std::vector<mlx::core::array>, args);
-
-  std::vector<mlx::core::array> result = (*compiled_function_ptr)(args);
-
-  return nx::nif::ok(env, nx::nif::make_list(env, result));
-}
-
 NIF(stack) {
   LIST_PARAM(0, std::vector<mlx::core::array>, arrays);
   PARAM(1, int, axis);
@@ -791,10 +696,6 @@ static int open_resources(ErlNifEnv *env) {
 
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   if (open_resources(env) != 0) {
-    return -1;
-  }
-
-  if (nif_call_onload(env) != 0) {
     return -1;
   }
 
@@ -1070,7 +971,6 @@ NIF(as_strided) {
 }
 
 static ErlNifFunc nif_funcs[] = {
-    NIF_CALL_NIF_FUNC(nif_call_evaluated),
     {"strides", 1, strides},
     {"as_strided", 5, as_strided},
     {"scalar_type", 1, scalar_type},
@@ -1187,11 +1087,8 @@ static ErlNifFunc nif_funcs[] = {
     {"max", 4, max},
     {"min", 4, min},
     {"clip", 4, clip},
-    {"tri_inv", 3, tri_inv},
-    {"set_compile", 1, set_compile},
-    {"compile", 2, compile, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"call_compiled_cpu", 2, call_compiled, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"call_compiled_gpu", 2, call_compiled, ERL_NIF_DIRTY_JOB_IO_BOUND}};
+    {"tri_inv", 3, tri_inv}
+};
 
 // Update the NIF initialization
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
