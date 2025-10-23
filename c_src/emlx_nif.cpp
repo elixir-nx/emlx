@@ -911,14 +911,53 @@ NIF(isclose) {
 NIF(item) {
   TENSOR_PARAM(0, t);
   mlx::core::eval(*t);
-  auto dtype_kind = mlx::core::kindof(t->dtype());
 
-  if (dtype_kind == mlx::core::Dtype::Kind::u ||
-      dtype_kind == mlx::core::Dtype::Kind::i ||
-      dtype_kind == mlx::core::Dtype::Kind::b) {
+  // Fix for MLX scalar layout bug: Use the correct type when calling item<T>()
+  // to avoid reading wrong number of bytes from potentially invalid memory
+  // layouts. See: MLX_BUG_REPORT.md for details on the upstream issue.
+  auto dtype = t->dtype();
+
+  // Handle integer and boolean types with proper dtype matching
+  if (dtype == mlx::core::bool_) {
+    bool value = t->item<bool>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::uint8) {
+    uint8_t value = t->item<uint8_t>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::uint16) {
+    uint16_t value = t->item<uint16_t>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::uint32) {
+    uint32_t value = t->item<uint32_t>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::uint64) {
+    uint64_t value = t->item<uint64_t>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::int8) {
+    int8_t value = t->item<int8_t>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::int16) {
+    int16_t value = t->item<int16_t>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::int32) {
+    int32_t value = t->item<int32_t>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<int64_t>(value)));
+  } else if (dtype == mlx::core::int64) {
     int64_t value = t->item<int64_t>();
     return nx::nif::ok(env, nx::nif::make(env, value));
+  } else if (dtype == mlx::core::float16 || dtype == mlx::core::bfloat16) {
+    // MLX handles float16/bfloat16 conversion internally
+    float value = t->item<float>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<double>(value)));
+  } else if (dtype == mlx::core::float32) {
+    float value = t->item<float>();
+    return nx::nif::ok(env, nx::nif::make(env, static_cast<double>(value)));
+  } else if (dtype == mlx::core::complex64) {
+    // Complex types need special handling - not supported via item()
+    return nx::nif::error(env,
+                          "Complex scalar extraction not supported via item()");
   } else {
+    // Fallback for any other types
     double value = t->item<double>();
     return nx::nif::ok(env, nx::nif::make(env, value));
   }
