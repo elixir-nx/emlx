@@ -4,6 +4,7 @@ defmodule EMLX.MixProject do
   @app :emlx
   @version "0.2.0"
   @mlx_version "0.25.1"
+  @source_url "https://github.com/elixir-nx/emlx"
 
   require Logger
 
@@ -13,11 +14,16 @@ defmodule EMLX.MixProject do
     [
       app: @app,
       version: @version,
-      elixir: "~> 1.15",
+      description: "MLX bindings and backend for Nx",
+      elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-
+      docs: docs(),
+      preferred_cli_env: [
+        docs: :docs,
+        "hex.publish": :docs
+      ],
       # elixir_make
       make_env: %{
         "MLX_DIR" => libmlx_config.dir,
@@ -41,7 +47,8 @@ defmodule EMLX.MixProject do
 
       # Compilers
       compilers: compilers(libmlx_config),
-      aliases: aliases()
+      aliases: aliases(),
+      package: package()
     ]
   end
 
@@ -57,7 +64,18 @@ defmodule EMLX.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:nx, "~> 0.10"}
+      {:nx, "~> 0.10"},
+      {:ex_doc, "~> 0.34", only: :docs}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "EMLX",
+      source_url_pattern: "#{@source_url}/blob/v#{@version}/%{path}#L%{line}",
+      extras: [
+        "README.md"
+      ]
     ]
   end
 
@@ -486,5 +504,13 @@ defmodule EMLX.MixProject do
           "Cannot read the file for checksum comparison: #{file_path}. Reason: #{inspect(reason)}"
         )
     end
+  end
+
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      links: %{"GitHub" => @source_url},
+      maintainers: ["Paulo Valente", "Cocoa Xu", "Samrat Man Singh"]
+    ]
   end
 end
