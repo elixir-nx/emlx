@@ -390,36 +390,45 @@ defmodule EMLX do
           :not_found ->
             eval_fun = Nx.Defn.Evaluator.__compile__(key, vars, fun, opts)
 
-            # The callback receives MLX array references wrapped in a tuple
-            # The NIF sends {[ref1, ref2, ...]} which gets List.wrapped to [{[ref1, ...]}]
-            # Then apply(callback, [{[ref1, ...]}]) calls callback.({[ref1, ...]})
-            callback = fn {refs} ->
-              # Convert refs back to tensors for evaluation
-              args_funs =
-                Enum.map(refs, fn ref ->
-                  fn -> EMLX.Backend.to_nx({device, ref}) end
-                end)
+            # Start a task that will handle the compilation
+            # This keeps eval_fun in the caller process instead of copying it to the runner
+            caller_pid = self()
 
-              # Evaluate in this process
-              result = eval_fun.([args_funs])
+            task =
+              Task.async(fn ->
+                # The callback receives MLX array references wrapped in a tuple
+                # It sends the refs back to the caller process for evaluation
+                callback = fn {refs} ->
+                  callback_ref = make_ref()
+                  runner_pid = self()
 
-              # Extract the refs from the result tensors
-              result
-              |> Nx.Defn.Composite.flatten_list()
-              |> Enum.map(fn %Nx.Tensor{data: %{ref: {_device, ref}}} -> ref end)
-            end
+                  # Send refs to the caller process for evaluation
+                  send(caller_pid, {:eval_defn, callback_ref, refs, device, runner_pid})
 
-            # Register callback and compile
-            tag = NifCall.Runner.register(EMLX.Runner, callback)
+                  # Wait for the result
+                  receive do
+                    {:eval_result, ^callback_ref, result_refs} -> result_refs
+                  after
+                    5_000 -> raise "Timeout waiting for eval_defn result"
+                  end
+                end
 
-            try do
-              fun = nif_compile(nif_args, tag)
-              :persistent_term.put(cache_key, fun)
-              fun
-            after
-              # Unregister the callback after compilation completes
-              NifCall.Runner.unregister(EMLX.Runner, tag)
-            end
+                # Register callback and compile
+                tag = EMLX.Runner.register(EMLX.Runner, callback)
+
+                try do
+                  fun = nif_compile(nif_args, tag)
+                  fun
+                after
+                  # Unregister the callback after compilation completes
+                  EMLX.Runner.unregister(EMLX.Runner, tag)
+                end
+              end)
+
+            # Wait for compilation and handle eval_defn requests
+            fun = await_with_eval_handler(task, eval_fun, device)
+            :persistent_term.put(cache_key, fun)
+            fun
 
           cached_fun ->
             cached_fun
@@ -445,6 +454,62 @@ defmodule EMLX do
         end)
 
       [result]
+    end
+  end
+
+  # Helper function to await a task while handling eval_defn messages
+  defp await_with_eval_handler(%Task{ref: task_ref} = task, eval_fun, device) do
+    monitor_ref = Process.monitor(task.pid)
+
+    result =
+      await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref)
+
+    Process.demonitor(monitor_ref, [:flush])
+    result
+  end
+
+  defp await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref) do
+    receive do
+      {:eval_defn, callback_ref, refs, ^device, reply_to} ->
+        # Convert refs back to tensors for evaluation on EMLX.Backend
+        arg_list =
+          Enum.map(refs, fn ref ->
+            fn -> EMLX.Backend.to_nx({device, ref}) end
+          end)
+
+        # Evaluate in this process (keeps eval_fun here)
+        # Nx.Defn.Evaluator.__compile__/4 returns a function expecting [params]
+        result = eval_fun.([arg_list])
+
+        # Extract the refs from the result tensors
+        result_refs =
+          result
+          |> Nx.Defn.Composite.flatten_list()
+          |> Enum.map(fn %Nx.Tensor{data: %{ref: {_device, ref}}} -> ref end)
+
+        # Send result back to the callback
+        send(reply_to, {:eval_result, callback_ref, result_refs})
+
+        # Continue handling messages
+        await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref)
+
+      {:DOWN, ^monitor_ref, :process, _pid, :normal} ->
+        # Task completed normally; keep waiting for its result message
+        await_with_eval_loop(task, eval_fun, device, task_ref, monitor_ref)
+
+      {:DOWN, ^monitor_ref, :process, _pid, reason} ->
+        raise "Task failed: #{inspect(reason)}"
+
+      {:EXIT, _pid, reason} ->
+        raise "Task exited: #{inspect(reason)}"
+
+      {^task_ref, result} ->
+        # This is the Task reply - successful completion
+        result
+    after
+      5_000 ->
+        Task.shutdown(task, :brutal_kill)
+        raise "Timeout waiting for compilation"
     end
   end
 

@@ -1156,7 +1156,7 @@ static ErlNifFunc nif_funcs[] = {
     {"min", 4, min},
     {"clip", 4, clip},
     {"tri_inv", 3, tri_inv},
-    {"compile", 2, compile},
+    {"compile", 2, compile, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"call_compiled_cpu", 2, call_compiled_cpu},
     {"call_compiled_gpu", 2, call_compiled_gpu},
     NIF_CALL_NIF_FUNC(nif_call_evaluated)};

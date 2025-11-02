@@ -6,7 +6,7 @@ defmodule EMLX.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      {NifCall.Runner,
+      {EMLX.Runner,
        runner_opts: [nif_module: EMLX.NIF, on_evaluated: :nif_call_evaluated], name: EMLX.Runner}
     ]
 
