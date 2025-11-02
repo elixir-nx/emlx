@@ -54,6 +54,11 @@ typedef std::function<std::vector<mlx::core::array>(
   ATOM_PARAM(ARGN, VAR##_atom)                                                 \
   mlx::core::Device VAR = string2device(VAR##_atom)
 
+#define FUNCTION_PARAM(ARGN, VAR)                                              \
+  emlx::function *VAR;                                                         \
+  if (!nx::nif::get(env, argv[ARGN], VAR))                                     \
+    return nx::nif::error(env, "Unable to get " #VAR " function param.");
+
 #define SCALAR_PARAM(ARGN, VAR, IS_COMPLEX_VAR)                                \
   bool IS_COMPLEX_VAR = false;                                                 \
   double VAR;                                                                  \

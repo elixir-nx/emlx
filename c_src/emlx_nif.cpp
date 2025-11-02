@@ -3,11 +3,15 @@
 #include "mlx/mlx.h"
 #include "nx_nif_utils.hpp"
 
+#define NIF_CALL_NAMESPACE emlx_nif_call
+#define NIF_CALL_IMPLEMENTATION
+#include "nif_call.h"
+
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <numeric>
 #include <string>
-#include <cstring>
 
 using namespace mlx::core;
 
@@ -681,6 +685,64 @@ NIF(cumulative_min) {
     TENSOR(mlx::core::NATIVE_OP(*a, *b, device));                              \
   }
 
+NIF(compile) {
+  LIST_PARAM(0, std::vector<mlx::core::array>, arrays);
+  ERL_NIF_TERM tag = argv[1];
+
+  // Convert input arrays to a list and wrap in a tuple for the callback
+  ERL_NIF_TERM tensor_list = nx::nif::make_list(env, arrays);
+  ERL_NIF_TERM wrapped_args = enif_make_tuple1(env, tensor_list);
+
+  // Call back to Elixir to evaluate the Nx.Defn expression
+  NifCallResult result = make_nif_call(env, tag, wrapped_args);
+
+  if (!result.is_ok()) {
+    std::string error_msg = "nif_call failed during graph construction: ";
+    unsigned atom_length;
+    if (enif_get_atom_length(env, result.get_kind(), &atom_length,
+                             ERL_NIF_LATIN1)) {
+      std::string kind_str;
+      kind_str.resize(atom_length + 1);
+      if (enif_get_atom(env, result.get_kind(), &(*(kind_str.begin())),
+                        kind_str.size(), ERL_NIF_LATIN1)) {
+        kind_str.resize(atom_length);
+        error_msg += kind_str;
+      }
+    }
+    return nx::nif::error(env, error_msg.c_str());
+  }
+
+  // Get the output arrays from the Elixir callback
+  std::vector<mlx::core::array> output_arrays;
+  ERL_NIF_TERM output_list = result.get_value();
+  nx::nif::get_list(env, output_list, output_arrays);
+
+  // Create a function that returns the pre-computed outputs
+  // Note: Not using MLX's compile() since Nx.Defn already optimizes
+  emlx::function compiled_function =
+      [output_arrays](const std::vector<mlx::core::array> &inputs) {
+        return output_arrays;
+      };
+
+  return nx::nif::ok(env, create_function_resource(env, compiled_function));
+}
+
+NIF(call_compiled_cpu) {
+  FUNCTION_PARAM(0, compiled_function_ptr);
+  LIST_PARAM(1, std::vector<mlx::core::array>, args);
+
+  auto result = (*compiled_function_ptr)(args);
+  return nx::nif::ok(env, nx::nif::make_list(env, result));
+}
+
+NIF(call_compiled_gpu) {
+  FUNCTION_PARAM(0, compiled_function_ptr);
+  LIST_PARAM(1, std::vector<mlx::core::array>, args);
+
+  auto result = (*compiled_function_ptr)(args);
+  return nx::nif::ok(env, nx::nif::make_list(env, result));
+}
+
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
@@ -699,10 +761,16 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     return -1;
   }
 
+  // Initialize nif_call
+  if (nif_call_onload(env) != 0) {
+    return -1;
+  }
+
   return 0;
 }
 
-int upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM load_info) {
+int upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data,
+            ERL_NIF_TERM load_info) {
   // Silence "unused var" warnings.
   (void)(env);
   (void)(priv_data);
@@ -1087,8 +1155,11 @@ static ErlNifFunc nif_funcs[] = {
     {"max", 4, max},
     {"min", 4, min},
     {"clip", 4, clip},
-    {"tri_inv", 3, tri_inv}
-};
+    {"tri_inv", 3, tri_inv},
+    {"compile", 2, compile},
+    {"call_compiled_cpu", 2, call_compiled_cpu},
+    {"call_compiled_gpu", 2, call_compiled_gpu},
+    NIF_CALL_NIF_FUNC(nif_call_evaluated)};
 
 // Update the NIF initialization
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

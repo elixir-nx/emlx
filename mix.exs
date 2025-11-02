@@ -54,7 +54,8 @@ defmodule EMLX.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :inets, :ssl, :public_key, :crypto]
+      extra_applications: [:logger, :inets, :ssl, :public_key, :crypto],
+      mod: {EMLX.Application, []}
     ]
   end
 
@@ -65,6 +66,7 @@ defmodule EMLX.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       {:nx, "~> 0.10"},
+      {:nif_call, "~> 0.2.0"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
   end

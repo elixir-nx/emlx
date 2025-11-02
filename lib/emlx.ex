@@ -326,10 +326,133 @@ defmodule EMLX do
   @behaviour Nx.Defn.Compiler
 
   @impl Nx.Defn.Compiler
-  defdelegate __jit__(key, vars, fun, args_list, opts), to: Nx.Defn.Evaluator
+  def __jit__(key, vars, fun, args_list, opts) do
+    __compile__(key, vars, fun, opts).(args_list)
+  end
 
   @impl Nx.Defn.Compiler
-  defdelegate __compile__(key, vars, fun, opts), to: Nx.Defn.Evaluator
+  def __compile__(key, vars, fun, opts) do
+    backend = Nx.default_backend()
+
+    target_backend =
+      case backend do
+        EMLX.Backend ->
+          backend
+
+        {EMLX.Backend, _} ->
+          backend
+
+        Nx.BinaryBackend ->
+          EMLX.Backend
+
+        {Nx.BinaryBackend, _} ->
+          EMLX.Backend
+
+        other ->
+          raise ArgumentError,
+                "EMLX can only be used with the EMLX.Backend or Nx.BinaryBackend, got: #{inspect(other)}"
+      end
+
+    # Build the expression once with the vars
+    expr = fun.(vars)
+
+    fn [args] ->
+      # Extract MLX array references and determine device
+      {devices, nif_args} =
+        Enum.map(args, fn arg ->
+          case arg.() do
+            %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} ->
+              {device, ref}
+
+            %Nx.Tensor{data: %Nx.BinaryBackend{}} = t ->
+              %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} =
+                Nx.backend_copy(t, target_backend)
+
+              {device, ref}
+
+            other ->
+              %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref}}} = Nx.to_tensor(other)
+              {device, ref}
+          end
+        end)
+        |> Enum.unzip()
+
+      device =
+        Enum.reduce_while(devices, :cpu, fn
+          :gpu, _ -> {:halt, :gpu}
+          _, acc -> {:cont, acc}
+        end)
+
+      cache_key = {__MODULE__, :compiled_fun, key}
+
+      compiled_fun =
+        case :persistent_term.get(cache_key, :not_found) do
+          :not_found ->
+            eval_fun = Nx.Defn.Evaluator.__compile__(key, vars, fun, opts)
+
+            # The callback receives MLX array references wrapped in a tuple
+            # The NIF sends {[ref1, ref2, ...]} which gets List.wrapped to [{[ref1, ...]}]
+            # Then apply(callback, [{[ref1, ...]}]) calls callback.({[ref1, ...]})
+            callback = fn {refs} ->
+              # Convert refs back to tensors for evaluation
+              args_funs =
+                Enum.map(refs, fn ref ->
+                  fn -> EMLX.Backend.to_nx({device, ref}) end
+                end)
+
+              # Evaluate in this process
+              result = eval_fun.([args_funs])
+
+              # Extract the refs from the result tensors
+              result
+              |> Nx.Defn.Composite.flatten_list()
+              |> Enum.map(fn %Nx.Tensor{data: %{ref: {_device, ref}}} -> ref end)
+            end
+
+            # Register callback and compile
+            tag = NifCall.Runner.register(EMLX.Runner, callback)
+
+            try do
+              fun = nif_compile(nif_args, tag)
+              :persistent_term.put(cache_key, fun)
+              fun
+            after
+              # Unregister the callback after compilation completes
+              NifCall.Runner.unregister(EMLX.Runner, tag)
+            end
+
+          cached_fun ->
+            cached_fun
+        end
+
+      # Call the compiled MLX function with the current arguments
+      nif_result =
+        case device do
+          :cpu -> EMLX.NIF.call_compiled_cpu(compiled_fun, nif_args)
+          :gpu -> EMLX.NIF.call_compiled_gpu(compiled_fun, nif_args)
+        end
+
+      # Convert results back to Nx tensors
+      results =
+        nif_result
+        |> unwrap!()
+        |> Enum.map(fn ref -> EMLX.Backend.to_nx({device, ref}) end)
+
+      # Reconstruct the output structure
+      {result, []} =
+        Nx.Defn.Composite.traverse(expr, results, fn _node, [h | t] ->
+          {h, t}
+        end)
+
+      [result]
+    end
+  end
+
+  defp nif_compile(nif_args, tag) do
+    nif_args
+    |> EMLX.NIF.compile(tag)
+    |> unwrap!()
+  end
 
   @impl Nx.Defn.Compiler
   defdelegate __partitions_options__(opts), to: Nx.Defn.Evaluator

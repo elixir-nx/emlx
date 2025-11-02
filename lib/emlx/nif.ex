@@ -24,4 +24,22 @@ defmodule EMLX.NIF do
   def to_blob(_tensor, _limit) do
     :erlang.nif_error(:nif_not_loaded)
   end
+
+  # Compilation functions
+  def compile(_args, _tag) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def call_compiled_cpu(_compiled_fun, _args) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def call_compiled_gpu(_compiled_fun, _args) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  # nif_call callback
+  def nif_call_evaluated(_resource, _result) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end
