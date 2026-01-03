@@ -40,15 +40,23 @@ Nx.default_backend({EMLX.Backend, device: :cpu})
 
 # Setting the device to the GPU
 Nx.default_backend({EMLX.Backend, device: :gpu})
+
+# or use the application config using one of the alternatives above as the value:
+
+config :nx, :default_backend, EMLX.Backend
+config :nx, :default_backend, {EMLX.Backend, device: :cpu}
+config :nx, :default_backend, {EMLX.Backend, device: :gpu}
 ```
 
 If you want to use the JIT compiler, you can set the default compiler as shown below.
-
-Currently, the underlying implementation is not totally safe and could lead to a deadlocked dirty NIF, so this must be used with care.
-Defaulting to Nx.Defn.Evaluator is the safest option for now.
+In the current version, this delegates to `Nx.Defn.Evaluator` and sets EMLX as the backend of choice for the compiler.
 
 ```elixir
 Nx.Defn.default_options(compiler: EMLX)
+
+# Alternatively, we can set this in the application environment
+
+config :nx, :default_defn_options, compiler: EMLX
 ```
 
 ### MLX binaries
