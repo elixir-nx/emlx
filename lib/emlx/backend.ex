@@ -12,11 +12,11 @@ defmodule EMLX.Backend do
   ## Quantization Support
 
   The backend supports quantized tensors via direct fields on the struct.
-  When a tensor has scales/biases refs, operations like `Nx.dot` will
-  automatically dispatch to quantized kernels (e.g., `quantized_matmul`).
+  When a tensor has quantization scales/biases configured, operations like `Nx.dot/6` will
+  automatically dispatch to quantized kernels (e.g., `EMLX.quantized_matmul/6`).
 
-  Quantized tensors store scales and biases refs directly, with bits derived
-  from the tensor type (`{:s, 4}` or `{:s, 8}`):
+  Quantized tensors store scales and biases internally, with bits derived
+  from the tensor type (`{:s, 4}` or `{:f, 8}`):
 
       %Nx.Tensor{
         type: {:s, 4},  # Bits derived from type
@@ -55,14 +55,13 @@ defmodule EMLX.Backend do
   to automatically dispatch to `quantized_matmul`.
 
   The tensor type is set to `{:s, bits}` (e.g., `{:s, 4}` for 4-bit quantization),
-  which carries the bit width information. This follows Paulo's suggestion to
-  derive bits from the type rather than storing it in quantization_options.
+  which carries the bit width information.
 
   ## Parameters
 
-  - `weight_ref` - EMLX device ref for packed uint32 weights
-  - `scales_ref` - EMLX device ref for per-group scale factors
-  - `biases_ref` - EMLX device ref for per-group zero points
+  - `weight_ref` - EMLX array ref for packed uint32 weights
+  - `scales_ref` - EMLX array ref for per-group scale factors
+  - `biases_ref` - EMLX array ref for per-group zero points
   - `original_shape` - Shape before quantization {out_features, in_features}
   - `opts` - Options: `:bits` (default 4), `:group_size` (default 64)
 
