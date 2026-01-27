@@ -5,7 +5,7 @@ defmodule EMLX.Quantization do
   This module provides the primary user-facing API for 4-bit and 8-bit
   quantization, enabling efficient LLM inference with MLX.
 
-  ## Why Quantization?
+  ## Why Quantize Data?
 
   Large language models like Qwen3-8B or LLaMA-7B require 16GB+ of memory
   at float16 precision. 4-bit quantization reduces this to ~4-5GB while
