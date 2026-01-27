@@ -970,6 +970,63 @@ NIF(as_strided) {
   TENSOR(mlx::core::as_strided(*t, shape, strides, offset, device));
 }
 
+// ============================================================================
+// Quantization Operations (for 4-bit model support)
+// ============================================================================
+
+// quantized_matmul - Multiplies x with a quantized weight matrix w
+// This is the key operation for efficient 4-bit inference
+// MLX API: quantized_matmul(x, w, scales, biases, transpose, group_size, bits, stream)
+NIF(quantized_matmul) {
+  TENSOR_PARAM(0, x);       // Input tensor [batch, seq, hidden]
+  TENSOR_PARAM(1, w);       // Quantized weights [out/8, in] (uint32 packed)
+  TENSOR_PARAM(2, scales);  // Scales [out/group_size, in] (bfloat16)
+  TENSOR_PARAM(3, biases);  // Biases [out/group_size, in] (bfloat16)
+  PARAM(4, bool, transpose);
+  PARAM(5, int, group_size);
+  PARAM(6, int, bits);
+  DEVICE_PARAM(7, device);
+
+  TENSOR(mlx::core::quantized_matmul(
+      *x, *w, *scales, *biases, transpose, group_size, bits, device));
+}
+
+// dequantize - Converts quantized weights back to float
+// Useful for debugging and verification
+// MLX API: dequantize(w, scales, biases, group_size, bits, stream)
+NIF(dequantize) {
+  TENSOR_PARAM(0, w);       // Quantized weights (uint32 packed)
+  TENSOR_PARAM(1, scales);  // Scales (bfloat16)
+  TENSOR_PARAM(2, biases);  // Biases (bfloat16)
+  PARAM(3, int, group_size);
+  PARAM(4, int, bits);
+  DEVICE_PARAM(5, device);
+
+  TENSOR(mlx::core::dequantize(*w, *scales, *biases, group_size, bits, device));
+}
+
+// quantize - Quantizes a float tensor to packed format
+// Returns tuple of {weights, scales, biases}
+// MLX API: quantize(w, group_size, bits, stream) -> tuple<array, array, array>
+NIF(quantize) {
+  TENSOR_PARAM(0, w);       // Float weights to quantize
+  PARAM(1, int, group_size);
+  PARAM(2, int, bits);
+  DEVICE_PARAM(3, device);
+
+  try {
+    auto [qw, scales, biases] = mlx::core::quantize(*w, group_size, bits, device);
+
+    ERL_NIF_TERM result_tuple[3];
+    result_tuple[0] = create_tensor_resource(env, qw);
+    result_tuple[1] = create_tensor_resource(env, scales);
+    result_tuple[2] = create_tensor_resource(env, biases);
+
+    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+  }
+  CATCH()
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"strides", 1, strides},
     {"as_strided", 5, as_strided},
@@ -1087,7 +1144,11 @@ static ErlNifFunc nif_funcs[] = {
     {"max", 4, max},
     {"min", 4, min},
     {"clip", 4, clip},
-    {"tri_inv", 3, tri_inv}
+    {"tri_inv", 3, tri_inv},
+    // Quantization operations
+    {"quantized_matmul", 8, quantized_matmul},
+    {"dequantize", 6, dequantize},
+    {"quantize", 4, quantize}
 };
 
 // Update the NIF initialization

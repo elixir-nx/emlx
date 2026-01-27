@@ -258,6 +258,97 @@ defmodule EMLX do
   defvalue scalar_type(tensor)
   defvalue shape(tensor)
 
+  ## Quantization operations (for 4-bit model support)
+
+  @doc """
+  Performs quantized matrix multiplication.
+
+  This is the key operation for efficient 4-bit inference. It multiplies `x` with
+  quantized weights `w` (packed as uint32), using scales and biases for
+  dequantization during the computation.
+
+  ## Parameters
+    - `x` - Input tensor (e.g., {batch, seq, hidden})
+    - `w` - Quantized weights as uint32 (8 int4 values packed per uint32)
+    - `scales` - Per-group scale factors (bfloat16)
+    - `biases` - Per-group zero points (bfloat16)
+    - `transpose` - Whether to transpose weights (default: true)
+    - `group_size` - Number of weights per scale/bias group (default: 64)
+    - `bits` - Quantization bits (default: 4)
+  """
+  @mlx_function {:quantized_matmul, 8}
+  def quantized_matmul(
+        {dev_x, ref_x} = _tensor_x,
+        {dev_w, ref_w} = _tensor_w,
+        {dev_s, ref_s} = _tensor_scales,
+        {dev_b, ref_b} = _tensor_biases,
+        transpose \\ true,
+        group_size \\ 64,
+        bits \\ 4
+      )
+      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and
+           is_tensor(dev_s, ref_s) and is_tensor(dev_b, ref_b) do
+    device = merge_device(merge_device(dev_x, dev_w), merge_device(dev_s, dev_b))
+    mlx_device = mlx_device!(device, -1)
+
+    EMLX.NIF.quantized_matmul(ref_x, ref_w, ref_s, ref_b, transpose, group_size, bits, mlx_device)
+    |> unwrap_tensor!(device)
+  end
+
+  @doc """
+  Dequantizes packed weights to floating point.
+
+  Converts quantized weights back to their original floating point representation.
+  Useful for debugging and verification.
+
+  ## Parameters
+    - `w` - Quantized weights as uint32 (packed int4 values)
+    - `scales` - Per-group scale factors
+    - `biases` - Per-group zero points
+    - `group_size` - Number of weights per group (default: 64)
+    - `bits` - Quantization bits (default: 4)
+  """
+  @mlx_function {:dequantize, 6}
+  def dequantize(
+        {dev_w, ref_w} = _tensor_w,
+        {dev_s, ref_s} = _tensor_scales,
+        {dev_b, ref_b} = _tensor_biases,
+        group_size \\ 64,
+        bits \\ 4
+      )
+      when is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) and is_tensor(dev_b, ref_b) do
+    device = merge_device(dev_w, merge_device(dev_s, dev_b))
+    mlx_device = mlx_device!(device, -1)
+
+    EMLX.NIF.dequantize(ref_w, ref_s, ref_b, group_size, bits, mlx_device)
+    |> unwrap_tensor!(device)
+  end
+
+  @doc """
+  Quantizes a floating point tensor to packed format.
+
+  Returns a tuple of `{quantized_weights, scales, biases}` where:
+    - `quantized_weights` - Packed uint32 tensor (8 int4 values per uint32)
+    - `scales` - Per-group scale factors
+    - `biases` - Per-group zero points
+
+  ## Parameters
+    - `w` - Float tensor to quantize
+    - `group_size` - Number of weights per group (default: 64)
+    - `bits` - Quantization bits (default: 4)
+  """
+  @mlx_function {:quantize, 4}
+  def quantize({dev_w, ref_w} = _tensor_w, group_size \\ 64, bits \\ 4)
+      when is_tensor(dev_w, ref_w) do
+    device = dev_w
+    mlx_device = mlx_device!(device, -1)
+
+    {weights_ref, scales_ref, biases_ref} =
+      EMLX.NIF.quantize(ref_w, group_size, bits, mlx_device) |> unwrap!()
+
+    {{device, weights_ref}, {device, scales_ref}, {device, biases_ref}}
+  end
+
   def to_blob({device, ref} = tensor) when is_tensor(device, ref) do
     # Two-step to_blob: eval on main scheduler, then copy on dirty scheduler
     eval(tensor)
@@ -322,6 +413,56 @@ defmodule EMLX do
   deftensor squeeze(tensor, axes)
   defvalue item(tensor)
   defvalue strides(tensor)
+
+  # ============================================================================
+  # Quantized Tensor Operations (Backend-Integrated)
+  # ============================================================================
+
+  @doc """
+  Creates a quantized Nx.Tensor with backend-level quantization options.
+
+  This creates an Nx.Tensor where the EMLX.Backend struct contains
+  quantization metadata. When this tensor is used in `Nx.dot`, the
+  backend automatically dispatches to `quantized_matmul`.
+
+  ## Parameters
+
+  - `weight_ref` - EMLX device ref for packed uint32 weights
+  - `scales_ref` - EMLX device ref for per-group scale factors
+  - `biases_ref` - EMLX device ref for per-group zero points
+  - `original_shape` - Shape before quantization {out_features, in_features}
+
+  ## Options
+
+  - `:bits` - Quantization bits (default: 4)
+  - `:group_size` - Weights per scale/bias group (default: 64)
+
+  ## Example
+
+      # Quantize weights
+      {q_weight, scales, biases} = EMLX.quantize(weight_tensor, 64, 4)
+
+      # Create quantized Nx.Tensor
+      quantized = EMLX.quantized_tensor(q_weight, scales, biases, {512, 4096})
+
+      # Standard Nx.dot automatically uses quantized_matmul!
+      result = Nx.dot(input, quantized)
+  """
+  def quantized_tensor(weight_ref, scales_ref, biases_ref, original_shape, opts \\ []) do
+    EMLX.Backend.quantized_tensor(weight_ref, scales_ref, biases_ref, original_shape, opts)
+  end
+
+  @doc """
+  Converts an EMLX device ref back to an Nx.Tensor.
+
+  ## Example
+
+      result_ref = EMLX.some_operation(input)
+      result_tensor = EMLX.to_nx(result_ref)
+  """
+  def to_nx({device, ref} = device_ref) when is_atom(device) and is_reference(ref) do
+    EMLX.Backend.to_nx(device_ref)
+  end
 
   @behaviour Nx.Defn.Compiler
 
