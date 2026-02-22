@@ -988,7 +988,7 @@ NIF(set_memory_limit) {
   ErlNifUInt64 limit;
   if (!enif_get_uint64(env, argv[0], &limit))
     return nx::nif::error(env, "Unable to get limit param.");
-  size_t prev = mlx::core::set_memory_limit(static_cast<size_t>(limit));
+  uint64_t prev = static_cast<uint64_t>(mlx::core::set_memory_limit(static_cast<size_t>(limit)));
   return nx::nif::ok(env, enif_make_uint64(env, prev));
 }
 
@@ -996,7 +996,7 @@ NIF(set_cache_limit) {
   ErlNifUInt64 limit;
   if (!enif_get_uint64(env, argv[0], &limit))
     return nx::nif::error(env, "Unable to get limit param.");
-  size_t prev = mlx::core::set_cache_limit(static_cast<size_t>(limit));
+  uint64_t prev = static_cast<uint64_t>(mlx::core::set_cache_limit(static_cast<size_t>(limit)));
   return nx::nif::ok(env, enif_make_uint64(env, prev));
 }
 
