@@ -24,4 +24,24 @@ defmodule EMLX.NIF do
   def to_blob(_tensor, _limit) do
     :erlang.nif_error(:nif_not_loaded)
   end
+
+  def memory_info do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def clear_cache do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def reset_peak_memory do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def set_memory_limit(_limit) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def set_cache_limit(_limit) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end

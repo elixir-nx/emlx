@@ -1,5 +1,6 @@
 #include "erl_nif.h"
 #include "mlx/backend/common/utils.h"
+#include "mlx/memory.h"
 #include "mlx/mlx.h"
 #include "nx_nif_utils.hpp"
 
@@ -952,6 +953,53 @@ NIF(clip) {
   TENSOR(mlx::core::clip(*t, *min, *max, device));
 }
 
+NIF(memory_info) {
+  size_t active = mlx::core::get_active_memory();
+  size_t peak = mlx::core::get_peak_memory();
+  size_t cache = mlx::core::get_cache_memory();
+
+  ERL_NIF_TERM keys[] = {
+    enif_make_atom(env, "active_memory"),
+    enif_make_atom(env, "peak_memory"),
+    enif_make_atom(env, "cache_memory")
+  };
+  ERL_NIF_TERM values[] = {
+    enif_make_uint64(env, active),
+    enif_make_uint64(env, peak),
+    enif_make_uint64(env, cache)
+  };
+
+  ERL_NIF_TERM map;
+  enif_make_map_from_arrays(env, keys, values, 3, &map);
+  return nx::nif::ok(env, map);
+}
+
+NIF(clear_cache) {
+  mlx::core::clear_cache();
+  return nx::nif::ok(env);
+}
+
+NIF(reset_peak_memory) {
+  mlx::core::reset_peak_memory();
+  return nx::nif::ok(env);
+}
+
+NIF(set_memory_limit) {
+  ErlNifUInt64 limit;
+  if (!enif_get_uint64(env, argv[0], &limit))
+    return nx::nif::error(env, "Unable to get limit param.");
+  size_t prev = mlx::core::set_memory_limit(static_cast<size_t>(limit));
+  return nx::nif::ok(env, enif_make_uint64(env, prev));
+}
+
+NIF(set_cache_limit) {
+  ErlNifUInt64 limit;
+  if (!enif_get_uint64(env, argv[0], &limit))
+    return nx::nif::error(env, "Unable to get limit param.");
+  size_t prev = mlx::core::set_cache_limit(static_cast<size_t>(limit));
+  return nx::nif::ok(env, enif_make_uint64(env, prev));
+}
+
 NIF(strides) {
   TENSOR_PARAM(0, t);
 
@@ -1087,7 +1135,12 @@ static ErlNifFunc nif_funcs[] = {
     {"max", 4, max},
     {"min", 4, min},
     {"clip", 4, clip},
-    {"tri_inv", 3, tri_inv}
+    {"tri_inv", 3, tri_inv},
+    {"memory_info", 0, memory_info},
+    {"clear_cache", 0, clear_cache},
+    {"reset_peak_memory", 0, reset_peak_memory},
+    {"set_memory_limit", 1, set_memory_limit},
+    {"set_cache_limit", 1, set_cache_limit}
 };
 
 // Update the NIF initialization
