@@ -18,7 +18,7 @@ defmodule EMLX.MemoryTest do
     t = Nx.iota({1024, 1024}, type: :f32, backend: EMLX.Backend)
     EMLX.eval(EMLX.Backend.from_nx(t))
     after_alloc = EMLX.memory_info().active_memory
-    assert after_alloc > before
+    assert after_alloc >= before + 1024 * 1024 * 4
   end
 
   test "clear_cache releases unused memory" do
@@ -27,6 +27,8 @@ defmodule EMLX.MemoryTest do
     Nx.backend_deallocate(t)
     EMLX.clear_cache()
     info = EMLX.memory_info()
+    assert is_integer(info.active_memory)
+    assert is_integer(info.peak_memory)
     assert info.cache_memory == 0
   end
 

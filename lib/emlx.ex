@@ -347,6 +347,12 @@ defmodule EMLX do
     * `:active_memory` - bytes currently allocated and in use
     * `:peak_memory` - highest active memory since last reset
     * `:cache_memory` - bytes in the allocator cache (freed but not returned to OS)
+
+  ## Examples
+
+      iex> info = EMLX.memory_info()
+      iex> is_integer(info.active_memory) and is_integer(info.peak_memory) and is_integer(info.cache_memory)
+      true
   """
   def memory_info, do: EMLX.NIF.memory_info() |> unwrap!()
 
@@ -355,12 +361,24 @@ defmodule EMLX do
 
   Useful after inference batches to prevent memory growth. Does not affect
   tensors that are still referenced.
+
+  ## Examples
+
+      EMLX.clear_cache()
+      #=> :ok
   """
+  @spec clear_cache() :: :ok
   def clear_cache, do: EMLX.NIF.clear_cache() |> unwrap!()
 
   @doc """
   Resets the peak memory counter to zero.
+
+  ## Examples
+
+      EMLX.reset_peak_memory()
+      #=> :ok
   """
+  @spec reset_peak_memory() :: :ok
   def reset_peak_memory, do: EMLX.NIF.reset_peak_memory() |> unwrap!()
 
   @doc """
@@ -368,6 +386,11 @@ defmodule EMLX do
 
   The memory limit is a guideline for maximum memory usage during graph
   evaluation. Defaults to 1.5× the device's recommended working set size.
+
+  ## Examples
+
+      prev = EMLX.set_memory_limit(8_000_000_000)
+      EMLX.set_memory_limit(prev)
   """
   def set_memory_limit(limit) when is_integer(limit) and limit >= 0 do
     EMLX.NIF.set_memory_limit(limit) |> unwrap!()
@@ -378,6 +401,11 @@ defmodule EMLX do
 
   When cached memory exceeds this limit, it will be reclaimed on the next
   allocation. Set to 0 to disable caching entirely.
+
+  ## Examples
+
+      prev = EMLX.set_cache_limit(500_000_000)
+      EMLX.set_cache_limit(prev)
   """
   def set_cache_limit(limit) when is_integer(limit) and limit >= 0 do
     EMLX.NIF.set_cache_limit(limit) |> unwrap!()
