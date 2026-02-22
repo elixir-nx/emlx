@@ -282,25 +282,26 @@ NIF(to_blob) {
   // Create result binary
   void *result_data = (void *)enif_make_new_binary(env, byte_size, &result);
 
-  // The MLX array data may not be contiguous in memory, even after the
-  // reshape+flatten operations. See:
-  // https://github.com/ml-explore/mlx/discussions/1608#discussioncomment-11332071
-  //
-  // Set up contiguous iterator
-  std::vector<int> slice_sizes(t->shape().begin(), t->shape().end());
-  ContiguousIterator iterator(slice_sizes, t->strides(), t->ndim());
-
-  // Copy data element by element using iterator
-  size_t element_size = t->itemsize();
   const char *src_data = static_cast<const char *>(t->data<void>());
   char *dst_data = static_cast<char *>(result_data);
 
-  size_t num_elements = byte_size / element_size;
-  for (size_t i = 0; i < num_elements; i++) {
-    size_t src_offset = iterator.loc;
-    std::memcpy(dst_data + (i * element_size),
-                src_data + (src_offset * element_size), element_size);
-    iterator.step();
+  if (t->flags().row_contiguous) {
+    // Fast path: single memcpy for row-contiguous data
+    std::memcpy(dst_data, src_data, byte_size);
+  } else {
+    // Slow path: element-by-element copy for non-contiguous arrays.
+    // See: https://github.com/ml-explore/mlx/discussions/1608#discussioncomment-11332071
+    std::vector<int> slice_sizes(t->shape().begin(), t->shape().end());
+    ContiguousIterator iterator(slice_sizes, t->strides(), t->ndim());
+
+    size_t element_size = t->itemsize();
+    size_t num_elements = byte_size / element_size;
+    for (size_t i = 0; i < num_elements; i++) {
+      size_t src_offset = iterator.loc;
+      std::memcpy(dst_data + (i * element_size),
+                  src_data + (src_offset * element_size), element_size);
+      iterator.step();
+    }
   }
 
   return nx::nif::ok(env, result);
