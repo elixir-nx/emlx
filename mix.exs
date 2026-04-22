@@ -64,7 +64,8 @@ defmodule EMLX.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:nx, "~> 0.10"},
+      # temporary; revert to version pin once Nx.runtime_call/4 is in a release
+      {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
   end
