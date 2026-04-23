@@ -182,6 +182,17 @@ defmodule EMLX do
   deftensor argsort(tensor, axis)
   deftensor tri_inv(tensor, upper)
 
+  ## Native linalg ops
+  deftensor linalg_lu(tensor)
+  deftensor linalg_qr(tensor)
+  deftensor linalg_svd(tensor, compute_uv)
+  deftensor linalg_cholesky(tensor, upper)
+  deftensor linalg_eigh(tensor, uplo)
+  deftensor linalg_inv(tensor)
+  deftensor linalg_pinv(tensor)
+  deftensor linalg_solve(tensorA, tensorB)
+  deftensor linalg_solve_triangular(tensorA, tensorB, upper)
+
   deftensor conv_general(
               tensor_input,
               tensor_kernel,

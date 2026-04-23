@@ -447,6 +447,97 @@ NIF(tri_inv) {
   TENSOR(mlx::core::linalg::tri_inv(*tensor, upper, device));
 }
 
+NIF(linalg_lu) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  try {
+    auto result = mlx::core::linalg::lu(*tensor, device);
+    return nx::nif::ok(env, nx::nif::make_list(env, result));
+  }
+  CATCH()
+}
+
+NIF(linalg_qr) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  try {
+    auto [q, r] = mlx::core::linalg::qr(*tensor, device);
+    return nx::nif::ok(env, enif_make_tuple2(
+      env,
+      create_tensor_resource(env, q),
+      create_tensor_resource(env, r)));
+  }
+  CATCH()
+}
+
+NIF(linalg_svd) {
+  TENSOR_PARAM(0, tensor);
+  PARAM(1, bool, compute_uv);
+  DEVICE_PARAM(2, device);
+
+  try {
+    auto result = mlx::core::linalg::svd(*tensor, compute_uv, device);
+    return nx::nif::ok(env, nx::nif::make_list(env, result));
+  }
+  CATCH()
+}
+
+NIF(linalg_cholesky) {
+  TENSOR_PARAM(0, tensor);
+  PARAM(1, bool, upper);
+  DEVICE_PARAM(2, device);
+
+  TENSOR(mlx::core::linalg::cholesky(*tensor, upper, device));
+}
+
+NIF(linalg_eigh) {
+  TENSOR_PARAM(0, tensor);
+  ATOM_PARAM(1, uplo);
+  DEVICE_PARAM(2, device);
+
+  try {
+    auto [eigenvalues, eigenvectors] = mlx::core::linalg::eigh(*tensor, uplo, device);
+    return nx::nif::ok(env, enif_make_tuple2(
+      env,
+      create_tensor_resource(env, eigenvalues),
+      create_tensor_resource(env, eigenvectors)));
+  }
+  CATCH()
+}
+
+NIF(linalg_inv) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  TENSOR(mlx::core::linalg::inv(*tensor, device));
+}
+
+NIF(linalg_pinv) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  TENSOR(mlx::core::linalg::pinv(*tensor, device));
+}
+
+NIF(linalg_solve) {
+  TENSOR_PARAM(0, tensorA);
+  TENSOR_PARAM(1, tensorB);
+  DEVICE_PARAM(2, device);
+
+  TENSOR(mlx::core::linalg::solve(*tensorA, *tensorB, device));
+}
+
+NIF(linalg_solve_triangular) {
+  TENSOR_PARAM(0, tensorA);
+  TENSOR_PARAM(1, tensorB);
+  PARAM(2, bool, upper);
+  DEVICE_PARAM(3, device);
+
+  TENSOR(mlx::core::linalg::solve_triangular(*tensorA, *tensorB, upper, device));
+}
+
 NIF(conv_general) {
   TENSOR_PARAM(0, tensor_input);
   TENSOR_PARAM(1, tensor_kernel);
@@ -1148,6 +1239,15 @@ static ErlNifFunc nif_funcs[] = {
     {"min", 4, min},
     {"clip", 4, clip},
     {"tri_inv", 3, tri_inv},
+    {"linalg_lu", 2, linalg_lu},
+    {"linalg_qr", 2, linalg_qr},
+    {"linalg_svd", 3, linalg_svd},
+    {"linalg_cholesky", 3, linalg_cholesky},
+    {"linalg_eigh", 3, linalg_eigh},
+    {"linalg_inv", 2, linalg_inv},
+    {"linalg_pinv", 2, linalg_pinv},
+    {"linalg_solve", 3, linalg_solve},
+    {"linalg_solve_triangular", 4, linalg_solve_triangular},
     {"memory_info", 0, memory_info},
     {"clear_cache", 0, clear_cache},
     {"reset_peak_memory", 0, reset_peak_memory},
