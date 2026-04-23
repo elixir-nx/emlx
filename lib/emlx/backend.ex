@@ -6,6 +6,98 @@ defmodule EMLX.Backend do
 
   require Logger
 
+  # Compile-time debug flags. Both default to false (zero runtime cost when off).
+  # Enable only in development via config/dev.exs:
+  #   config :emlx, enable_bounds_check: true
+  #   config :emlx, detect_non_finites: true
+  # After flipping a flag run: mix compile --force
+  @enable_bounds_check Application.compile_env(:emlx, :enable_bounds_check, false)
+  @detect_non_finites Application.compile_env(:emlx, :detect_non_finites, false)
+
+  # Each macro expands to the assertion body when its flag is true, or to nil
+  # when false — leaving no trace in the BEAM opcodes (no call instruction,
+  # no atom reference). Development-only; breaks MLX lazy-graph fusion.
+
+  # Checks a multi-axis indices tensor (shape [..., num_axes]) against the tensor
+  # dims on each corresponding axis. Raises ArgumentError on the first OOB value.
+  defmacrop assert_in_bounds!(tensor, indices, axes) do
+    if @enable_bounds_check do
+      quote do
+        Enum.each(Enum.with_index(unquote(axes)), fn {axis, col} ->
+          limit = elem(unquote(tensor).shape, axis)
+
+          col_ref =
+            unquote(indices)
+            |> Nx.slice_along_axis(col, 1, axis: -1)
+            |> Nx.squeeze(axes: [-1])
+            |> from_nx()
+
+          limit_ref = EMLX.scalar_tensor(limit, :uint32, :cpu)
+
+          any_oob =
+            col_ref
+            |> EMLX.astype(:uint32)
+            |> EMLX.greater_equal(limit_ref)
+            |> EMLX.any([], false)
+
+          EMLX.eval(any_oob)
+
+          if EMLX.item(any_oob) == 1 do
+            raise ArgumentError,
+                  "index out of bounds on axis #{axis}: all values must be in [0, #{limit}). " <>
+                    "Tensor shape: #{inspect(unquote(tensor).shape)}"
+          end
+        end)
+      end
+    end
+  end
+
+  # Checks a flat index tensor (all values in [0, limit)) for a single axis.
+  defmacrop assert_in_bounds_take!(tensor, indices, axis) do
+    if @enable_bounds_check do
+      quote do
+        limit = elem(unquote(tensor).shape, unquote(axis))
+        idx_ref = from_nx(unquote(indices))
+        limit_ref = EMLX.scalar_tensor(limit, :uint32, :cpu)
+
+        any_oob =
+          idx_ref
+          |> EMLX.astype(:uint32)
+          |> EMLX.greater_equal(limit_ref)
+          |> EMLX.any([], false)
+
+        EMLX.eval(any_oob)
+
+        if EMLX.item(any_oob) == 1 do
+          raise ArgumentError,
+                "index out of bounds on axis #{unquote(axis)}: all values must be in [0, #{limit}). " <>
+                  "Tensor shape: #{inspect(unquote(tensor).shape)}"
+        end
+      end
+    else
+      quote do: nil
+    end
+  end
+
+  # Checks a raw MLX ref for NaN or Inf. Forces two eval syncs — development only.
+  defmacrop assert_no_nan_inf!(tensor_ref, op) do
+    if @detect_non_finites do
+      quote do
+        has_nan = unquote(tensor_ref) |> EMLX.is_nan() |> EMLX.any([], false)
+        has_inf = unquote(tensor_ref) |> EMLX.is_infinity() |> EMLX.any([], false)
+        EMLX.eval(has_nan)
+        EMLX.eval(has_inf)
+
+        if EMLX.item(has_nan) == 1 or EMLX.item(has_inf) == 1 do
+          raise ArgumentError,
+                "#{unquote(op)} produced NaN or Inf. Disable :detect_non_finites for production."
+        end
+      end
+    else
+      quote do: nil
+    end
+  end
+
   defstruct [:ref, :shape, :type, :data]
 
   @impl true
@@ -914,34 +1006,37 @@ defmodule EMLX.Backend do
     computation_out_type =
       if Nx.Type.integer?(out_type), do: Nx.Type.to_floating(out_type), else: out_type
 
-    if left_batched_axes != [] or right_batched_axes != [] do
-      einsum_spec =
-        dot_spec_to_einsum_spec(
-          left.shape,
-          right.shape,
-          left_axes,
-          left_batched_axes,
-          right_axes,
-          right_batched_axes
-        )
+    result_ref =
+      if left_batched_axes != [] or right_batched_axes != [] do
+        einsum_spec =
+          dot_spec_to_einsum_spec(
+            left.shape,
+            right.shape,
+            left_axes,
+            left_batched_axes,
+            right_axes,
+            right_batched_axes
+          )
 
-      EMLX.einsum(
-        to_typed_ref(left_mx, left_type, computation_out_type),
-        to_typed_ref(right_mx, right_type, computation_out_type),
-        einsum_spec
-      )
-      |> to_typed_ref(computation_out_type, out_type)
-      |> to_nx(out)
-    else
-      EMLX.tensordot(
-        to_typed_ref(left_mx, left_type, computation_out_type),
-        to_typed_ref(right_mx, right_type, computation_out_type),
-        left_axes,
-        right_axes
-      )
-      |> to_typed_ref(computation_out_type, out_type)
-      |> to_nx(out)
-    end
+        EMLX.einsum(
+          to_typed_ref(left_mx, left_type, computation_out_type),
+          to_typed_ref(right_mx, right_type, computation_out_type),
+          einsum_spec
+        )
+        |> to_typed_ref(computation_out_type, out_type)
+      else
+        EMLX.tensordot(
+          to_typed_ref(left_mx, left_type, computation_out_type),
+          to_typed_ref(right_mx, right_type, computation_out_type),
+          left_axes,
+          right_axes
+        )
+        |> to_typed_ref(computation_out_type, out_type)
+      end
+
+    assert_no_nan_inf!(result_ref, :dot)
+
+    to_nx(result_ref, out)
   end
 
   # Unary Ops
@@ -1499,6 +1594,8 @@ defmodule EMLX.Backend do
   def gather(out, tensor, indices, opts) do
     axes = opts[:axes]
 
+    assert_in_bounds!(tensor, indices, axes)
+
     num_axes = Nx.axis_size(indices, -1)
 
     slice_sizes =
@@ -1540,6 +1637,9 @@ defmodule EMLX.Backend do
 
   defp indexed_op(nif_op, out, target, indices, updates, opts) do
     axes = opts[:axes] || Nx.axes(target)
+
+    assert_in_bounds!(target, indices, axes)
+
     num_axes = Nx.axis_size(indices, -1)
 
     indices_list =
@@ -1668,6 +1768,8 @@ defmodule EMLX.Backend do
 
   @impl true
   def block(%Nx.Block.TakeAlongAxis{axis: axis}, out, [tensor, idx], _fun) do
+    assert_in_bounds_take!(tensor, idx, axis)
+
     tensor
     |> from_nx()
     |> EMLX.take_along_axis(from_nx(idx), axis)
@@ -1676,6 +1778,8 @@ defmodule EMLX.Backend do
 
   @impl true
   def block(%Nx.Block.Take{axis: axis}, out, [tensor, indices], _fun) do
+    assert_in_bounds_take!(tensor, indices, axis)
+
     tensor
     |> from_nx()
     |> EMLX.take(from_nx(indices), axis)
