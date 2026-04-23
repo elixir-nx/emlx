@@ -168,6 +168,51 @@ defmodule EMLX.Backend do
   end
 
   @impl true
+  def to_pointer(%T{data: %Backend{ref: ref}}, _opts) do
+    # Eval happens inside tensor_data_ptr (same pattern as to_blob).
+    # The pointer is valid until another mx::eval on the same array or until
+    # the Elixir tensor term is GC'd. On Apple Silicon (unified memory) the
+    # address is accessible from both CPU and GPU.
+    {addr, byte_size} = EMLX.tensor_data_ptr(ref)
+    %Nx.Pointer{kind: :local, address: addr, data_size: byte_size}
+  end
+
+  @impl true
+  def from_pointer(
+        %Nx.Pointer{kind: :local, address: addr, data_size: ptr_byte_size},
+        type,
+        shape,
+        backend_opts,
+        opts
+      ) do
+    out = Nx.template(shape, type, names: opts[:names] || List.duplicate(nil, tuple_size(shape)))
+    {_kind, bits} = type
+    byte_size = Nx.size(out) * div(bits, 8)
+
+    if ptr_byte_size != nil and ptr_byte_size != byte_size do
+      raise ArgumentError,
+            "EMLX.Backend.from_pointer/5: pointer data_size #{ptr_byte_size} does not match " <>
+              "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
+    end
+
+    # Default to :gpu for GPU interop; caller can override via backend opts.
+    device = backend_opts[:device] || :gpu
+
+    case EMLX.NIF.array_from_ptr(addr, shape, to_mlx_type(type), byte_size, nil) do
+      {:ok, ref} ->
+        to_nx({device, ref}, out)
+
+      {:error, msg} ->
+        raise EMLX.NIFError, List.to_string(msg)
+    end
+  end
+
+  def from_pointer(%Nx.Pointer{kind: kind}, _type, _shape, _backend_opts, _opts) do
+    raise ArgumentError,
+          "EMLX.Backend.from_pointer/5 only supports :local pointers, got kind: #{inspect(kind)}"
+  end
+
+  @impl true
   def inspect(%T{} = tensor, inspect_opts) do
     limit = if inspect_opts.limit == :infinity, do: :infinity, else: inspect_opts.limit + 1
 
@@ -1960,17 +2005,6 @@ defmodule EMLX.Backend do
     end
   end
 
-  for {op, arity} <- [
-        to_pointer: 2,
-        from_pointer: 5
-      ] do
-    @impl true
-    args = List.duplicate(Macro.var(:_, __MODULE__), arity)
-
-    def unquote(op)(unquote_splicing(args)) do
-      raise "Nx.Backend.#{unquote(op)}/#{unquote(arity)} not implemented yet in EMLX"
-    end
-  end
 
   # Helper function to handle different scalar types
   defp constant_serialize_scalar(scalar) when is_number(scalar), do: scalar

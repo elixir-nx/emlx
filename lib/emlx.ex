@@ -281,6 +281,19 @@ defmodule EMLX do
     EMLX.NIF.to_blob(ref, limit) |> unwrap!()
   end
 
+  @doc """
+  Returns `{address, byte_size}` for the tensor's raw GPU buffer.
+
+  Evals the tensor first (same pattern as `to_blob/1`). The pointer is valid
+  as long as no further MLX evaluation is triggered on the array and the
+  Elixir tensor term is kept alive. On Apple Silicon the address is accessible
+  from both CPU and GPU due to unified memory.
+  """
+  def tensor_data_ptr({device, ref} = tensor) when is_tensor(device, ref) do
+    eval(tensor)
+    EMLX.NIF.tensor_data_ptr(ref) |> unwrap!()
+  end
+
   defp unwrap!(:ok), do: :ok
   defp unwrap!({:ok, result}), do: result
   defp unwrap!({:error, error}), do: raise(EMLX.NIFError, List.to_string(error))

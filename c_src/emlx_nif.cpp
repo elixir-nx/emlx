@@ -785,6 +785,56 @@ NIF(cumulative_min) {
     TENSOR(mlx::core::NATIVE_OP(*a, *b, device));                              \
   }
 
+// Returns the raw data pointer of an evaluated tensor as a {address, byte_size}
+// tuple of uint64 values. The Elixir caller must call EMLX.eval/1 first so
+// that data<void>() is non-null and stable (MLX arrays are immutable once
+// materialised). On Apple Silicon the pointer is accessible from both CPU and
+// GPU due to unified memory. Primary use case: sharing tensors with Python MLX
+// via Pythonx using the Nx.Backend.to_pointer/from_pointer protocol.
+NIF(tensor_data_ptr) {
+  TENSOR_PARAM(0, t);
+
+  if (t->data<void>() == nullptr) {
+    return nx::nif::error(
+        env, "Tensor has not been evaluated; call EMLX.eval/1 before to_pointer");
+  }
+
+  size_t addr = reinterpret_cast<size_t>(t->data<void>());
+  size_t byte_size = t->nbytes();
+
+  ERL_NIF_TERM addr_term = nx::nif::make(env, addr);
+  ERL_NIF_TERM size_term = nx::nif::make(env, byte_size);
+  return nx::nif::ok(env, enif_make_tuple2(env, addr_term, size_term));
+}
+
+// Wraps an external raw pointer as an MLX array with a no-op deleter.
+// The caller is responsible for keeping the backing buffer alive for the
+// duration of use (see include/emlx.h for the lifetime contract).
+// argv[0]: address  (uint64 / size_t)
+// argv[1]: shape    (tuple of ints)
+// argv[2]: dtype    (atom, e.g. :float32)
+// argv[3]: byte_size (uint64, validated but not used by the MLX ctor)
+// argv[4]: deleter  (reserved / ignored; pass nil)
+NIF(array_from_ptr) {
+  PARAM(0, size_t, raw_addr);
+  SHAPE_PARAM(1, shape);
+  TYPE_PARAM(2, dtype);
+  // argv[3] byte_size and argv[4] deleter are accepted but deferred.
+
+  if (raw_addr == 0) {
+    return nx::nif::error(env, "Null pointer passed to array_from_ptr");
+  }
+
+  try {
+    void *ptr = reinterpret_cast<void *>(raw_addr);
+    // No-op deleter: the caller owns the buffer.
+    auto arr =
+        mlx::core::array(ptr, to_shape(shape), dtype, [](void *) {});
+    return nx::nif::ok(env, create_tensor_resource(env, std::move(arr)));
+  }
+  CATCH()
+}
+
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
@@ -1252,8 +1302,10 @@ static ErlNifFunc nif_funcs[] = {
     {"clear_cache", 0, clear_cache},
     {"reset_peak_memory", 0, reset_peak_memory},
     {"set_memory_limit", 1, set_memory_limit},
-    {"set_cache_limit", 1, set_cache_limit}
+    {"set_cache_limit", 1, set_cache_limit},
+    {"tensor_data_ptr", 1, tensor_data_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"array_from_ptr", 5, array_from_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
-// Update the NIF initialization
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
+
