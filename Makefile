@@ -26,10 +26,11 @@ endif
 LDFLAGS = -L$(MLX_LIB_DIR) -lmlx -shared
 
 # Platform-specific settings
-UNAME_S = $(shell uname -s)
+UNAME_S := $(shell uname -s)
 
-ifeq ($(UNAME_S), Darwin)
-    LDFLAGS += -flat_namespace -undefined dynamic_lookup -rpath @loader_path/mlx/lib
+ifeq ($(UNAME_S),Darwin)
+    LDFLAGS += -undefined dynamic_lookup -flat_namespace -rpath @loader_path/mlx/lib
+    LDFLAGS += -framework Metal -framework Foundation -framework Accelerate
 		MAKE_DEFAULT_JOBS = $(shell sysctl -n hw.ncpu)
 else
     LDFLAGS += -Wl,-rpath,'$$ORIGIN/mlx/lib'
