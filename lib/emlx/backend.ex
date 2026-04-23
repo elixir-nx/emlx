@@ -168,13 +168,30 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def to_pointer(%T{data: %Backend{ref: ref}}, _opts) do
-    # Eval happens inside tensor_data_ptr (same pattern as to_blob).
-    # The pointer is valid until another mx::eval on the same array or until
-    # the Elixir tensor term is GC'd. On Apple Silicon (unified memory) the
-    # address is accessible from both CPU and GPU.
-    {addr, byte_size} = EMLX.tensor_data_ptr(ref)
-    %Nx.Pointer{kind: :local, address: addr, data_size: byte_size}
+  def to_pointer(%T{data: %Backend{ref: ref}}, opts) do
+    opts = Keyword.validate!(opts, mode: :local, permissions: 0o400)
+
+    case opts[:mode] do
+      :local ->
+        # Eval happens inside tensor_data_ptr (same pattern as to_blob).
+        # The pointer is valid until another mx::eval on the same array or
+        # until the Elixir tensor term is GC'd. On Apple Silicon (unified
+        # memory) the address is accessible from both CPU and GPU.
+        {addr, byte_size} = EMLX.tensor_data_ptr(ref)
+        %Nx.Pointer{kind: :local, address: addr, data_size: byte_size}
+
+      :ipc ->
+        # Copies tensor data into a POSIX shm segment (copy semantics — MLX
+        # arrays are immutable so zero-copy cross-process sharing is not
+        # possible). The receiver opens the shm and unlinks it automatically
+        # via EMLX.NIF.array_from_shm/4's deleter.
+        {shm_name, byte_size} = EMLX.tensor_to_shm(ref, opts[:permissions])
+        %Nx.Pointer{kind: :ipc, handle: shm_name, data_size: byte_size}
+
+      mode ->
+        raise ArgumentError,
+              "EMLX.Backend.to_pointer/2 expects mode: :local or :ipc, got: #{inspect(mode)}"
+    end
   end
 
   @impl true
@@ -207,9 +224,38 @@ defmodule EMLX.Backend do
     end
   end
 
+  @impl true
+  def from_pointer(
+        %Nx.Pointer{kind: :ipc, handle: shm_name, data_size: ptr_byte_size},
+        type,
+        shape,
+        backend_opts,
+        opts
+      ) do
+    out = Nx.template(shape, type, names: opts[:names] || List.duplicate(nil, tuple_size(shape)))
+    {_kind, bits} = type
+    byte_size = Nx.size(out) * div(bits, 8)
+
+    if ptr_byte_size != nil and ptr_byte_size != byte_size do
+      raise ArgumentError,
+            "EMLX.Backend.from_pointer/5: pointer data_size #{ptr_byte_size} does not match " <>
+              "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
+    end
+
+    device = backend_opts[:device] || :gpu
+
+    case EMLX.NIF.array_from_shm(shm_name, shape, to_mlx_type(type), byte_size) do
+      {:ok, ref} ->
+        to_nx({device, ref}, out)
+
+      {:error, msg} ->
+        raise EMLX.NIFError, List.to_string(msg)
+    end
+  end
+
   def from_pointer(%Nx.Pointer{kind: kind}, _type, _shape, _backend_opts, _opts) do
     raise ArgumentError,
-          "EMLX.Backend.from_pointer/5 only supports :local pointers, got kind: #{inspect(kind)}"
+          "EMLX.Backend.from_pointer/5 only supports :local and :ipc pointers, got kind: #{inspect(kind)}"
   end
 
   @impl true
@@ -2004,7 +2050,6 @@ defmodule EMLX.Backend do
       raise "#{unquote(op)} not supported in EMLX"
     end
   end
-
 
   # Helper function to handle different scalar types
   defp constant_serialize_scalar(scalar) when is_number(scalar), do: scalar

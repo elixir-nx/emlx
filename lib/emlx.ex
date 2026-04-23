@@ -294,6 +294,33 @@ defmodule EMLX do
     EMLX.NIF.tensor_data_ptr(ref) |> unwrap!()
   end
 
+  @doc """
+  Copies tensor data into a new POSIX shared-memory segment and returns
+  `{shm_name, byte_size}`.
+
+  Note: this involves a **memcpy** — MLX arrays are immutable so zero-copy
+  cross-process sharing is not possible.  `permissions` is a Unix mode integer
+  (e.g. `0o400` for owner-read-only).
+
+  The shm name persists until the receiver opens and unlinks it (which
+  `EMLX.NIF.array_from_shm/4` does automatically).
+  """
+  def tensor_to_shm({device, ref} = tensor, permissions) when is_tensor(device, ref) do
+    eval(tensor)
+    EMLX.NIF.tensor_to_shm(ref, permissions) |> unwrap!()
+  end
+
+  @doc """
+  Unlinks a POSIX shared-memory segment by its handle name.
+
+  Call this if the receiver never opens the `%Nx.Pointer{kind: :ipc}` returned
+  by `Nx.to_pointer/2` — otherwise the shm name persists until the next reboot.
+  Safe to call even if the segment has already been unlinked (ENOENT is ignored).
+  """
+  def shm_unlink(name) when is_binary(name) do
+    EMLX.NIF.shm_unlink_handle(name) |> unwrap!()
+  end
+
   defp unwrap!(:ok), do: :ok
   defp unwrap!({:ok, result}), do: result
   defp unwrap!({:error, error}), do: raise(EMLX.NIFError, List.to_string(error))

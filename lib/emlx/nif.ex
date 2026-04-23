@@ -52,4 +52,16 @@ defmodule EMLX.NIF do
   def array_from_ptr(_addr, _shape, _dtype, _byte_size, _deleter) do
     :erlang.nif_error(:nif_not_loaded)
   end
+
+  def tensor_to_shm(_tensor, _permissions) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def array_from_shm(_name, _shape, _dtype, _byte_size) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def shm_unlink_handle(_name) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end
