@@ -193,6 +193,10 @@ defmodule EMLX do
   deftensor linalg_solve(tensorA, tensorB)
   deftensor linalg_solve_triangular(tensorA, tensorB, upper)
 
+  ## Native pooling (window scatter) ops
+  deftensor window_scatter_max(tensor_t, tensor_source, tensor_init_value, window, low_pad, high_pad, strides)
+  deftensor window_scatter_min(tensor_t, tensor_source, tensor_init_value, window, low_pad, high_pad, strides)
+
   deftensor conv_general(
               tensor_input,
               tensor_kernel,
