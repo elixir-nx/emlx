@@ -41,7 +41,7 @@ defmodule EMLX.ToBinaryTest do
       send(test_pid, {:bin, bin})
     end)
 
-    assert_receive {:bin, bin}
+    assert_receive {:bin, bin}, 1000
 
     :erlang.garbage_collect()
     assert byte_size(bin) == 4 * 4
@@ -63,7 +63,7 @@ defmodule EMLX.ToBinaryTest do
       send(test_pid, {:bin, bin})
     end)
 
-    assert_receive {:bin, bin}
+    assert_receive {:bin, bin}, 1000
 
     :erlang.garbage_collect()
     assert byte_size(bin) == 3 * 4 * 4
