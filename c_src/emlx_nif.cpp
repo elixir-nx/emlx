@@ -116,6 +116,9 @@ public:
 
   mlx::core::array *data() const { return ptr; }
 
+  // Raw ERTS resource pointer for use with enif_make_resource_binary.
+  void *resource_ptr() const { return static_cast<void *>(ptr); }
+
   bool is_valid() const { return ptr != nullptr; }
 
   ERL_NIF_TERM error() { return err; }
@@ -273,37 +276,46 @@ NIF(astype) {
 }
 
 NIF(to_blob) {
-  ERL_NIF_TERM result;
   TENSOR_PARAM(0, t);
 
   size_t byte_size = t->nbytes();
-  int limit = 0;
-  bool has_received_limit = (argc == 2);
-
-  if (has_received_limit) {
+  if (argc == 2) {
     PARAM(1, int, param_limit);
-    limit = param_limit;
-    byte_size = limit * t->itemsize();
+    byte_size = static_cast<size_t>(param_limit) * t->itemsize();
   }
 
-  // Create result binary
-  void *result_data = (void *)enif_make_new_binary(env, byte_size, &result);
-
-  const char *src_data = static_cast<const char *>(t->data<void>());
-  char *dst_data = static_cast<char *>(result_data);
+  ERL_NIF_TERM resource_bin;
 
   if (t->flags().row_contiguous) {
-    // Fast path: single memcpy for row-contiguous data
-    std::memcpy(dst_data, src_data, byte_size);
+    // Zero-copy: alias the MLX buffer via the existing tensor resource.
+    // Invariant: lib/emlx.ex calls eval(tensor) before this NIF, so
+    // data<void>() is guaranteed non-null and stable (MLX arrays are immutable
+    // once materialised). enif_make_resource_binary keeps the resource alive
+    // until the binary is GC'd, decoupling the binary lifetime from Elixir GC
+    // of the tensor term.
+    resource_bin = enif_make_resource_binary(env, t_tp.resource_ptr(),
+                                             t->data<void>(), byte_size);
   } else {
-    // Slow path: make a row-contiguous copy then memcpy.
-    // ContiguousIterator is not exported from libmlx in 0.31+.
+    // Non-contiguous: materialise a fresh row-major copy, wrap it in a minimal
+    // ERTS resource, and alias that buffer zero-copy.
+    // The resource holds only sizeof(mlx::core::array) — no TensorP refcount/
+    // deleted-flag tail — because it is never exposed to TensorP or the Elixir
+    // side; only the binary holds a reference and default_dtor<array>
+    // (~array()) is the sole destructor path.
     auto ct = mlx::core::contiguous(*t);
     mlx::core::eval(ct);
-    std::memcpy(dst_data, ct.data<void>(), byte_size);
-  }
 
-  return nx::nif::ok(env, result);
+    auto *ct_ptr = static_cast<mlx::core::array *>(enif_alloc_resource(
+        resource_object<mlx::core::array>::type, sizeof(mlx::core::array)));
+    if (!ct_ptr)
+      return enif_make_badarg(env);
+
+    new (ct_ptr) mlx::core::array(std::move(ct));
+    resource_bin =
+        enif_make_resource_binary(env, ct_ptr, ct_ptr->data<void>(), byte_size);
+    enif_release_resource(ct_ptr);
+  }
+  return nx::nif::ok(env, resource_bin);
 }
 
 uint64_t elem_count(std::vector<int> shape) {
