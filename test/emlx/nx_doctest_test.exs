@@ -14,7 +14,8 @@ defmodule EMLX.Nx.DoctestTest do
                                  {:unix, _} ->
                                    [
                                      # aarch64
-                                     ifft: 2
+                                     ifft: 2,
+                                     irfft: 2
                                    ]
 
                                  _ ->
@@ -227,6 +228,15 @@ defmodule EMLX.Nx.DoctestTest do
           names: [:x],
           type: :f64
         )
+      )
+    end
+  end
+
+  describe "Linux rounding error approximations" do
+    test "irfft/2 real-valued input (4th element rounds to ~0 on aarch64)" do
+      assert_all_close(
+        Nx.irfft(Nx.tensor([5.0, 1.0, -1.0, 1.0])),
+        Nx.tensor([1.0, 1.0, 1.0, 0.0, 1.0, 1.0], type: :f32)
       )
     end
   end
