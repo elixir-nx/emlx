@@ -1,6 +1,5 @@
 defmodule EMLX.Nx.DoctestTest do
-  use ExUnit.Case, async: true
-  import Nx.Testing
+  use EMLX.Case, async: true
 
   setup do
     Nx.default_backend(EMLX.Backend)
@@ -66,7 +65,7 @@ defmodule EMLX.Nx.DoctestTest do
     window_reduce: 5,
     population_count: 1,
     count_leading_zeros: 1,
-    # f8_e4m3fn is not supported by MLX 0.25.1; skip all tensor/2 doctests
+    # f8_e4m3fn is not supported by MLX; skip all tensor/2 doctests
     tensor: 2
   ]
 

@@ -1,11 +1,5 @@
 defmodule EMLX.Nx.LinalgTest do
-  use ExUnit.Case, async: true
-  import Nx.Testing
-
-  setup do
-    Nx.default_backend(EMLX.Backend)
-    :ok
-  end
+  use EMLX.Case, async: true
 
   # Note: most of these are depending on gather
   @not_implemented_yet [

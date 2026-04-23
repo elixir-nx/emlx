@@ -1,6 +1,6 @@
 # Private configuration
 PRIV_DIR = $(MIX_APP_PATH)/priv
-BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)$(MLX_VARIANT)/objs
+BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)/objs
 EMLX_SO = $(PRIV_DIR)/libemlx.so
 EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
 
@@ -14,7 +14,7 @@ MLX_SO = $(MLX_LIB_DIR)/libmlx.dylib
 $(info LIBMLX_ENABLE_DEBUG=$(LIBMLX_ENABLE_DEBUG))
 # Build flags
 CFLAGS = -fPIC -I$(ERTS_INCLUDE_DIR) -I$(MLX_INCLUDE_DIR) -Wall \
-         -std=c++17
+         -std=c++20
 ifeq ($(LIBMLX_ENABLE_DEBUG),true)
 		CFLAGS += -g
 		CMAKE_BUILD_TYPE = Debug
@@ -26,10 +26,11 @@ endif
 LDFLAGS = -L$(MLX_LIB_DIR) -lmlx -shared
 
 # Platform-specific settings
-UNAME_S = $(shell uname -s)
+UNAME_S := $(shell uname -s)
 
-ifeq ($(UNAME_S), Darwin)
-    LDFLAGS += -flat_namespace -undefined dynamic_lookup -rpath @loader_path/mlx/lib
+ifeq ($(UNAME_S),Darwin)
+    LDFLAGS += -undefined dynamic_lookup -flat_namespace -rpath @loader_path/mlx/lib
+    LDFLAGS += -framework Metal -framework Foundation -framework Accelerate
 		MAKE_DEFAULT_JOBS = $(shell sysctl -n hw.ncpu)
 else
     LDFLAGS += -Wl,-rpath,'$$ORIGIN/mlx/lib'
@@ -82,7 +83,10 @@ $(MLX_SO): $(MLX_SRC_DIR)
 			-D BUILD_SHARED_LIBS=ON \
 			. && \
 		cmake --build "$(MLX_BUILD_DIR)" --config "$(CMAKE_BUILD_TYPE)" -j$(MAKE_JOBS) && \
-		cmake --install "$(MLX_BUILD_DIR)" --config "$(CMAKE_BUILD_TYPE)" ; \
+		cmake --install "$(MLX_BUILD_DIR)" --config "$(CMAKE_BUILD_TYPE)" && \
+		if [ -f "$(MLX_BUILD_DIR)/jaccl/libjaccl.dylib" ]; then \
+			cp "$(MLX_BUILD_DIR)/jaccl/libjaccl.dylib" "$(MLX_LIB_DIR)/" ; \
+		fi ; \
 	fi
 
 $(EMLX_SO): $(PRIV_DIR) $(MLX_SO) $(OBJECTS)
