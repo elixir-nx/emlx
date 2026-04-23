@@ -1527,93 +1527,37 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def window_scatter_min(out, tensor, source, init_value, window_dims_tuple, opts) do
-    window_scatter_function(
-      &Nx.argmin(&1, axis: -1, tie_break: :high),
-      out,
-      tensor,
-      source,
-      init_value,
-      window_dims_tuple,
-      opts
+  def window_scatter_min(out, tensor, source, init_value, window_dims, opts) do
+    {low_pad, high_pad} = Enum.unzip(opts[:padding])
+    strides = opts[:strides] || List.duplicate(1, tuple_size(window_dims))
+
+    EMLX.window_scatter_min(
+      from_nx(tensor),
+      from_nx(source),
+      init_value |> Nx.backend_transfer(EMLX.Backend) |> from_nx(),
+      Tuple.to_list(window_dims),
+      low_pad,
+      high_pad,
+      strides
     )
+    |> to_nx(out)
   end
 
   @impl true
-  def window_scatter_max(out, tensor, source, init_value, window_dims_tuple, opts) do
-    window_scatter_function(
-      &Nx.argmax(&1, axis: -1),
-      out,
-      tensor,
-      source,
-      init_value,
-      window_dims_tuple,
-      opts
+  def window_scatter_max(out, tensor, source, init_value, window_dims, opts) do
+    {low_pad, high_pad} = Enum.unzip(opts[:padding])
+    strides = opts[:strides] || List.duplicate(1, tuple_size(window_dims))
+
+    EMLX.window_scatter_max(
+      from_nx(tensor),
+      from_nx(source),
+      init_value |> Nx.backend_transfer(EMLX.Backend) |> from_nx(),
+      Tuple.to_list(window_dims),
+      low_pad,
+      high_pad,
+      strides
     )
-  end
-
-  defp window_scatter_function(function, out, tensor, source, init_value, window_dims_tuple, opts) do
-    unfold_flat = fn tensor ->
-      {device, _} = t_mx = from_nx(tensor)
-      pad_value_mx = EMLX.scalar_tensor(0, EMLX.scalar_type(t_mx), device)
-
-      {low_pad, high_pad} = Enum.unzip(opts[:padding])
-
-      padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_value_mx)
-
-      unfolded_mx =
-        sliding_window_view(
-          padded_mx,
-          EMLX.shape(padded_mx),
-          window_dims_tuple,
-          opts[:strides]
-        )
-
-      unfolded_shape = EMLX.shape(unfolded_mx)
-      unfolded = to_nx(unfolded_mx)
-
-      {to_keep, to_flatten} =
-        unfolded_shape
-        |> Tuple.to_list()
-        |> Enum.split(-tuple_size(window_dims_tuple))
-
-      flat_shape =
-        to_keep
-        |> List.to_tuple()
-        |> then(&Tuple.insert_at(&1, tuple_size(&1), Enum.product(to_flatten)))
-
-      Nx.reshape(unfolded, flat_shape)
-    end
-
-    arg_idx =
-      tensor
-      |> then(unfold_flat)
-      |> then(function)
-
-    indices_to_flatten =
-      tensor
-      |> Nx.axes()
-      |> Enum.map(fn axis ->
-        tensor
-        |> Nx.shape()
-        |> Nx.iota(axis: axis, backend: EMLX.Backend)
-        |> then(unfold_flat)
-        |> Nx.take_along_axis(Nx.new_axis(arg_idx, -1), axis: -1)
-      end)
-      |> Nx.concatenate(axis: -1)
-
-    num_axes = tuple_size(out.shape)
-    num_rows = div(Nx.size(indices_to_flatten), num_axes)
-    indices = Nx.reshape(indices_to_flatten, {num_rows, num_axes})
-
-    flat_source = Nx.flatten(source)
-
-    init_value
-    |> Nx.backend_transfer(EMLX.Backend)
-    |> Nx.broadcast(out.shape)
-    |> Nx.indexed_add(indices, flat_source)
-    |> Nx.as_type(out.type)
-    |> Nx.rename(out.names)
+    |> to_nx(out)
   end
 
   @impl true
