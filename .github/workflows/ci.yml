@@ -43,6 +43,9 @@ jobs:
           echo "${OTP_PATH}" >> $GITHUB_PATH
           echo "${ELIXIR_PATH}" >> $GITHUB_PATH
 
+      - name: Install system dependencies
+        run: sudo apt-get install -y libopenblas0
+
       - name: Compile and check warnings
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
