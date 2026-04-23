@@ -658,34 +658,6 @@ defmodule EMLX.Backend do
     end
   end
 
-  ops = [:cumulative_sum, :cumulative_product, :cumulative_max, :cumulative_min]
-
-  for op <- ops do
-    @impl true
-    def unquote(op)(out, tensor, opts) do
-      axis = opts[:axis] || 0
-      reverse = opts[:reverse] || false
-
-      # Calculate the expected output shape based on the input shape and axes
-      inclusive = true
-
-      result =
-        tensor
-        |> from_nx()
-        |> EMLX.unquote(op)(axis, reverse, inclusive)
-        |> EMLX.astype(to_mlx_type(out.type))
-
-      # Get the actual shape after summation
-      actual_shape = EMLX.shape(result)
-      # FIXME: MLX returns whatever the original type is, but Nx expects u8 -> u32
-      # scalar_type = EMLX.scalar_type(result)
-
-      # Create a new output tensor with the correct shape
-      %{out | shape: actual_shape}
-      |> then(&to_nx(result, &1))
-    end
-  end
-
   @impl true
   def stack(out, tensors, axis) do
     tensors
@@ -739,26 +711,6 @@ defmodule EMLX.Backend do
     |> from_nx()
     |> EMLX.logical_not()
     |> EMLX.where(on_false_torch, on_true_torch)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def take_along_axis(out, tensor, idx, opts) do
-    axis = opts[:axis]
-
-    tensor
-    |> from_nx()
-    |> EMLX.take_along_axis(from_nx(idx), axis)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def take(out, tensor, indices, opts) do
-    axis = opts[:axis]
-
-    tensor
-    |> from_nx()
-    |> EMLX.take(from_nx(indices), axis)
     |> to_nx(out)
   end
 
@@ -1005,7 +957,6 @@ defmodule EMLX.Backend do
       :real,
       :imag,
       :is_nan,
-      :logical_not,
       :bitwise_not
     ] ++
       [
@@ -1121,38 +1072,6 @@ defmodule EMLX.Backend do
     tensor
     |> from_nx()
     |> EMLX.ifft(length, axis)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def fft2(out, tensor, opts) do
-    lengths = opts[:lengths]
-    axes = opts[:axes] || [-2, -1]
-
-    tensor
-    |> from_nx()
-    |> EMLX.fft2(lengths, axes)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def ifft2(out, tensor, opts) do
-    lengths = opts[:lengths]
-    axes = opts[:axes] || [-2, -1]
-
-    tensor
-    |> from_nx()
-    |> EMLX.ifft2(lengths, axes)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def all_close(out, a, b, opts) do
-    atol = opts[:atol] || 1.0e-4
-    rtol = opts[:rtol] || 1.0e-8
-    equal_nan = opts[:equal_nan] == true
-
-    EMLX.allclose(from_nx(a), from_nx(b), atol, rtol, equal_nan)
     |> to_nx(out)
   end
 
@@ -1802,6 +1721,88 @@ defmodule EMLX.Backend do
     |> to_nx(out)
   end
 
+  cumulative_blocks = [
+    {Nx.Block.CumulativeSum, :cumulative_sum},
+    {Nx.Block.CumulativeProduct, :cumulative_product},
+    {Nx.Block.CumulativeMax, :cumulative_max},
+    {Nx.Block.CumulativeMin, :cumulative_min}
+  ]
+
+  for {block_mod, mlx_op} <- cumulative_blocks do
+    @impl true
+    def block(%unquote(block_mod){axis: axis, reverse: reverse}, out, [tensor], _fun) do
+      axis = axis || 0
+      reverse = reverse || false
+      inclusive = true
+
+      result =
+        tensor
+        |> from_nx()
+        |> EMLX.unquote(mlx_op)(axis, reverse, inclusive)
+        |> EMLX.astype(to_mlx_type(out.type))
+
+      actual_shape = EMLX.shape(result)
+      %{out | shape: actual_shape} |> then(&to_nx(result, &1))
+    end
+  end
+
+  @impl true
+  def block(%Nx.Block.LogicalNot{}, out, [tensor], _fun) do
+    tensor
+    |> from_nx()
+    |> EMLX.logical_not()
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.TakeAlongAxis{axis: axis}, out, [tensor, idx], _fun) do
+    tensor
+    |> from_nx()
+    |> EMLX.take_along_axis(from_nx(idx), axis)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.Take{axis: axis}, out, [tensor, indices], _fun) do
+    tensor
+    |> from_nx()
+    |> EMLX.take(from_nx(indices), axis)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.FFT2{lengths: lengths, axes: axes}, out, [tensor], _fun) do
+    axes = axes || [-2, -1]
+
+    tensor
+    |> from_nx()
+    |> EMLX.fft2(lengths, axes)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.IFFT2{lengths: lengths, axes: axes}, out, [tensor], _fun) do
+    axes = axes || [-2, -1]
+
+    tensor
+    |> from_nx()
+    |> EMLX.ifft2(lengths, axes)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.AllClose{atol: atol, rtol: rtol, equal_nan: equal_nan}, out, [a, b], _fun) do
+    a
+    |> from_nx()
+    |> EMLX.allclose(from_nx(b), atol || 1.0e-4, rtol || 1.0e-8, equal_nan == true)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(struct, _output, args, fun) do
+    apply(fun, [struct | args])
+  end
+
   for {op, arity} <- [
         reduce: 5,
         window_reduce: 6,
@@ -1816,7 +1817,6 @@ defmodule EMLX.Backend do
   end
 
   for {op, arity} <- [
-        lu: 3,
         to_pointer: 2,
         from_pointer: 5
       ] do
