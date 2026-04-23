@@ -1678,6 +1678,7 @@ defmodule EMLX.Backend do
           EMLX.linalg_solve_triangular(a_t, b_mx, !effective_upper)
         else
           b_t = EMLX.transpose(b_mx, [-2, -1])
+
           EMLX.linalg_solve_triangular(a_t, b_t, !effective_upper)
           |> EMLX.transpose([-2, -1])
         end

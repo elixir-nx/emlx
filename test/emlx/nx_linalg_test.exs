@@ -36,8 +36,10 @@ defmodule EMLX.Nx.LinalgTest do
       # Both matrices must be non-singular for MLX native LU
       {p, l, u} =
         Nx.LinAlg.lu(
-          Nx.tensor([[[2.0, 1.0, 3.0], [1.0, 4.0, 2.0], [5.0, 1.0, 1.0]],
-                     [[1.0, 2.0, 0.0], [0.0, 3.0, 1.0], [0.0, 0.0, 2.0]]])
+          Nx.tensor([
+            [[2.0, 1.0, 3.0], [1.0, 4.0, 2.0], [5.0, 1.0, 1.0]],
+            [[1.0, 2.0, 0.0], [0.0, 3.0, 1.0], [0.0, 0.0, 2.0]]
+          ])
         )
 
       # Verify P @ L @ U ≈ original for each batch element
@@ -45,8 +47,10 @@ defmodule EMLX.Nx.LinalgTest do
 
       assert_all_close(
         result,
-        Nx.tensor([[[2.0, 1.0, 3.0], [1.0, 4.0, 2.0], [5.0, 1.0, 1.0]],
-                   [[1.0, 2.0, 0.0], [0.0, 3.0, 1.0], [0.0, 0.0, 2.0]]]),
+        Nx.tensor([
+          [[2.0, 1.0, 3.0], [1.0, 4.0, 2.0], [5.0, 1.0, 1.0]],
+          [[1.0, 2.0, 0.0], [0.0, 3.0, 1.0], [0.0, 0.0, 2.0]]
+        ]),
         rtol: 1.0e-5
       )
     end
@@ -88,10 +92,14 @@ defmodule EMLX.Nx.LinalgTest do
 
   describe "native linalg: cholesky/1" do
     test "L @ L^T reconstruction" do
-      a = Nx.tensor([[6.0, 3.0, 4.0, 8.0],
-                     [3.0, 6.0, 5.0, 1.0],
-                     [4.0, 5.0, 10.0, 7.0],
-                     [8.0, 1.0, 7.0, 25.0]])
+      a =
+        Nx.tensor([
+          [6.0, 3.0, 4.0, 8.0],
+          [3.0, 6.0, 5.0, 1.0],
+          [4.0, 5.0, 10.0, 7.0],
+          [8.0, 1.0, 7.0, 25.0]
+        ])
+
       l = Nx.LinAlg.cholesky(a)
       assert_all_close(Nx.dot(l, Nx.transpose(l)), a, rtol: 1.0e-5)
     end
@@ -102,10 +110,12 @@ defmodule EMLX.Nx.LinalgTest do
       # symmetric positive-definite matrix
       a = Nx.tensor([[4.0, 2.0], [2.0, 3.0]])
       {eigenvalues, eigenvectors} = Nx.LinAlg.eigh(a)
+
       reconstructed =
         eigenvectors
         |> Nx.dot(Nx.make_diagonal(eigenvalues))
         |> Nx.dot(Nx.transpose(eigenvectors))
+
       assert_all_close(reconstructed, a, rtol: 1.0e-4)
     end
   end
