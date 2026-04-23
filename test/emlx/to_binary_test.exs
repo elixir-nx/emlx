@@ -1,5 +1,5 @@
 defmodule EMLX.ToBinaryTest do
-  use ExUnit.Case, async: true
+  use EMLX.Case, async: true
 
   test "to_binary for contiguous tensor" do
     t = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)

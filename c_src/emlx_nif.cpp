@@ -1,6 +1,4 @@
 #include "erl_nif.h"
-#include "mlx/backend/common/utils.h"
-#include "mlx/memory.h"
 #include "mlx/mlx.h"
 #include "nx_nif_utils.hpp"
 
@@ -60,6 +58,15 @@ inline const mlx::core::Device string2device(const std::string &atom) {
     return mlx::core::Device(mlx::core::Device::DeviceType::gpu, 0);
   }
   throw std::runtime_error("Unknown device: " + atom);
+}
+
+// MLX 0.31+ uses Shape = SmallVector<int> and Strides = SmallVector<long long>
+// which no longer accept implicit construction from std::vector.
+static inline mlx::core::Shape to_shape(const std::vector<int> &v) {
+  return mlx::core::Shape(v.begin(), v.end());
+}
+static inline mlx::core::Strides to_strides(const std::vector<int64_t> &v) {
+  return mlx::core::Strides(v.begin(), v.end());
 }
 
 // Class to manage the refcount of MLX tensors
@@ -238,7 +245,7 @@ NIF(ones) {
   TYPE_PARAM(1, type);
   DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::ones(shape, type, device));
+  TENSOR(mlx::core::ones(to_shape(shape), type, device));
 }
 
 NIF(zeros) {
@@ -246,7 +253,7 @@ NIF(zeros) {
   TYPE_PARAM(1, type);
   DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::zeros(shape, type, device));
+  TENSOR(mlx::core::zeros(to_shape(shape), type, device));
 }
 
 NIF(reshape) {
@@ -254,7 +261,7 @@ NIF(reshape) {
   SHAPE_PARAM(1, shape);
   DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::reshape(*t, shape, device));
+  TENSOR(mlx::core::reshape(*t, to_shape(shape), device));
 }
 
 NIF(astype) {
@@ -289,19 +296,11 @@ NIF(to_blob) {
     // Fast path: single memcpy for row-contiguous data
     std::memcpy(dst_data, src_data, byte_size);
   } else {
-    // Slow path: element-by-element copy for non-contiguous arrays.
-    // See: https://github.com/ml-explore/mlx/discussions/1608#discussioncomment-11332071
-    std::vector<int> slice_sizes(t->shape().begin(), t->shape().end());
-    ContiguousIterator iterator(slice_sizes, t->strides(), t->ndim());
-
-    size_t element_size = t->itemsize();
-    size_t num_elements = byte_size / element_size;
-    for (size_t i = 0; i < num_elements; i++) {
-      size_t src_offset = iterator.loc;
-      std::memcpy(dst_data + (i * element_size),
-                  src_data + (src_offset * element_size), element_size);
-      iterator.step();
-    }
+    // Slow path: make a row-contiguous copy then memcpy.
+    // ContiguousIterator is not exported from libmlx in 0.31+.
+    auto ct = mlx::core::contiguous(*t);
+    mlx::core::eval(ct);
+    std::memcpy(dst_data, ct.data<void>(), byte_size);
   }
 
   return nx::nif::ok(env, result);
@@ -334,7 +333,7 @@ NIF(from_blob) {
     auto deleter = [](allocator::Buffer buf) { allocator::free(buf); };
 
     // Create MLX array from the buffer
-    TENSOR(mlx::core::array(mlx_buf, shape, type, deleter));
+    TENSOR(mlx::core::array(mlx_buf, to_shape(shape), type, deleter));
   } catch (const std::exception &e) {
     return nx::nif::error(env, e.what());
   } catch (...) {
@@ -362,9 +361,9 @@ NIF(full) {
   DEVICE_PARAM(3, device);
 
   if (is_complex) {
-    TENSOR(mlx::core::full(shape, complex_scalar, type, device));
+    TENSOR(mlx::core::full(to_shape(shape), complex_scalar, type, device));
   } else {
-    TENSOR(mlx::core::full(shape, scalar, type, device));
+    TENSOR(mlx::core::full(to_shape(shape), scalar, type, device));
   }
 }
 
@@ -398,7 +397,7 @@ NIF(broadcast_to) {
   SHAPE_PARAM(1, shape);
   DEVICE_PARAM(2, device);
 
-  auto result = mlx::core::broadcast_to(*t, shape, device);
+  auto result = mlx::core::broadcast_to(*t, to_shape(shape), device);
 
   TENSOR(result);
 }
@@ -468,8 +467,8 @@ NIF(pad) {
   TENSOR_PARAM(4, pad_value);
   DEVICE_PARAM(5, device);
 
-  TENSOR(mlx::core::pad(*t, axes, low_pad_size, high_pad_size, *pad_value,
-                        "constant", device))
+  TENSOR(mlx::core::pad(*t, axes, to_shape(low_pad_size), to_shape(high_pad_size),
+                        *pad_value, "constant", device))
 };
 
 NIF(sort) {
@@ -544,7 +543,7 @@ NIF(gather) {
   LIST_PARAM(3, std::vector<int>, slice_sizes);
   DEVICE_PARAM(4, device);
 
-  TENSOR(mlx::core::gather(*t, indices, axes, slice_sizes, device));
+  TENSOR(mlx::core::gather(*t, indices, axes, to_shape(slice_sizes), device));
 }
 
 NIF(scatter_add) {
@@ -872,7 +871,7 @@ NIF(slice) {
   LIST_PARAM(2, std::vector<int>, stops);
   LIST_PARAM(3, std::vector<int>, strides);
   DEVICE_PARAM(4, device);
-  TENSOR(mlx::core::slice(*t, starts, stops, strides, device));
+  TENSOR(mlx::core::slice(*t, to_shape(starts), to_shape(stops), to_shape(strides), device));
 }
 
 NIF(slice_update) {
@@ -881,7 +880,7 @@ NIF(slice_update) {
   LIST_PARAM(2, std::vector<int>, starts);
   LIST_PARAM(3, std::vector<int>, stops);
   DEVICE_PARAM(4, device);
-  TENSOR(mlx::core::slice_update(*t, *tensor_updates, starts, stops, device));
+  TENSOR(mlx::core::slice_update(*t, *tensor_updates, to_shape(starts), to_shape(stops), device));
 }
 
 NIF(squeeze) {
@@ -896,7 +895,7 @@ NIF(emlx_fft) {
   PARAM(1, int, n);
   PARAM(2, int, axis);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::fft(*t, n, axis, device));
+  TENSOR(mlx::core::fft::fft(*t, n, axis, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(ifft) {
@@ -904,7 +903,7 @@ NIF(ifft) {
   PARAM(1, int, n);
   PARAM(2, int, axis);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::ifft(*t, n, axis, device));
+  TENSOR(mlx::core::fft::ifft(*t, n, axis, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(emlx_fft2) {
@@ -912,7 +911,7 @@ NIF(emlx_fft2) {
   LIST_PARAM(1, std::vector<int>, n);
   LIST_PARAM(2, std::vector<int>, axes);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::fft2(*t, n, axes, device));
+  TENSOR(mlx::core::fft::fft2(*t, to_shape(n), axes, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(ifft2) {
@@ -920,7 +919,7 @@ NIF(ifft2) {
   LIST_PARAM(1, std::vector<int>, n);
   LIST_PARAM(2, std::vector<int>, axes);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::ifft2(*t, n, axes, device));
+  TENSOR(mlx::core::fft::ifft2(*t, to_shape(n), axes, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(view) {
@@ -1004,9 +1003,9 @@ NIF(set_cache_limit) {
 NIF(strides) {
   TENSOR_PARAM(0, t);
 
-  auto strides = t->strides();
-
-  return nx::nif::ok(env, nx::nif::make_list(env, strides));
+  auto raw = t->strides();
+  std::vector<int64_t> strides_vec(raw.begin(), raw.end());
+  return nx::nif::ok(env, nx::nif::make_list(env, strides_vec));
 }
 
 NIF(as_strided) {
@@ -1016,7 +1015,7 @@ NIF(as_strided) {
   PARAM(3, int, offset);
   DEVICE_PARAM(4, device);
 
-  TENSOR(mlx::core::as_strided(*t, shape, strides, offset, device));
+  TENSOR(mlx::core::as_strided(*t, to_shape(shape), to_strides(strides), offset, device));
 }
 
 static ErlNifFunc nif_funcs[] = {

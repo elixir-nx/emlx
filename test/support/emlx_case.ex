@@ -11,4 +11,9 @@ defmodule EMLX.Case do
       import Nx.Testing
     end
   end
+
+  setup do
+    Nx.default_backend(EMLX.Backend)
+    :ok
+  end
 end

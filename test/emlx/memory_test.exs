@@ -1,5 +1,5 @@
 defmodule EMLX.MemoryTest do
-  use ExUnit.Case, async: false
+  use EMLX.Case, async: false
 
   test "memory_info returns active, peak, and cache" do
     info = EMLX.memory_info()

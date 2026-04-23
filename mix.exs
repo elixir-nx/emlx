@@ -3,7 +3,7 @@ defmodule EMLX.MixProject do
 
   @app :emlx
   @version "0.2.0"
-  @mlx_version "0.25.1"
+  @mlx_version "0.31.2"
   @source_url "https://github.com/elixir-nx/emlx"
 
   require Logger
