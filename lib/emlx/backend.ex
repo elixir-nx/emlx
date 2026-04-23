@@ -1645,75 +1645,43 @@ defmodule EMLX.Backend do
       raise "complex numbers not supported yet"
     end
 
-    a_mx =
-      case opts[:transform_a] do
-        :none ->
-          to_typed_ref(from_nx(a), a.type, {:f, 32})
+    # Check for singular matrix: a lower/upper triangular is singular iff any diagonal is zero
+    a_diag = Nx.take_diagonal(a)
 
-        :transpose ->
-          a |> from_nx() |> to_typed_ref(a.type, {:f, 32}) |> EMLX.transpose([-2, -1])
-      end
+    if Nx.any(Nx.equal(a_diag, 0)) |> Nx.to_number() == 1 do
+      raise ArgumentError, "can't solve for singular matrix"
+    end
 
+    a_typed = to_typed_ref(from_nx(a), a.type, {:f, 32})
     b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32})
 
     upper = !opts[:lower]
 
-    a_inv_mx = EMLX.tri_inv(a_mx, upper)
+    # Apply transform_a: transposing flips the upper/lower triangularity.
+    # For real types, :conjugate is equivalent to :transpose.
+    {a_mx, effective_upper} =
+      case opts[:transform_a] do
+        :none -> {a_typed, upper}
+        t when t in [:transpose, :conjugate] -> {EMLX.transpose(a_typed, [-2, -1]), !upper}
+      end
 
     out_mx =
       if opts[:left_side] do
-        # Solve AX = B -> X = tri_inv(A)@B
-        {batch_axes, [_m, n]} = Nx.axes(EMLX.shape(a_inv_mx)) |> Enum.split(-2)
-
-        {b_batch_axes, b_contract_axes} =
-          if Nx.rank(b) == 1 do
-            {[], [0]}
-          else
-            case Nx.axes(b) |> Enum.split(length(batch_axes)) do
-              {batch, [x]} ->
-                {batch, [x]}
-
-              {batch, [m, _n]} ->
-                {batch, [m]}
-            end
-          end
-
-        EMLX.einsum(
-          a_inv_mx,
-          b_mx,
-          dot_spec_to_einsum_spec(
-            EMLX.shape(a_inv_mx),
-            EMLX.shape(b_mx),
-            [n],
-            batch_axes,
-            b_contract_axes,
-            b_batch_axes
-          )
-        )
+        # Solve AX = B directly via solve_triangular
+        EMLX.linalg_solve_triangular(a_mx, b_mx, effective_upper)
       else
-        # Solve XA = B -> X = B@tri_inv(A)
-        {batch_axes, [m, _n]} = Nx.axes(EMLX.shape(a_inv_mx)) |> Enum.split(-2)
+        # Solve XA = B → A^T x = b (works for both 1D and 2D b)
+        a_t = EMLX.transpose(a_mx, [-2, -1])
 
-        {b_batch_axes, b_contract_axes} =
-          if Nx.rank(b) == 1 do
-            {[], [0]}
-          else
-            {batch, [_m, n]} = Nx.axes(b) |> Enum.split(-2)
-            {batch, [n]}
-          end
+        if Nx.rank(b) == 1 do
+          # b is 1D: solve_triangular handles A^T x = b directly
+          EMLX.linalg_solve_triangular(a_t, b_mx, !effective_upper)
+        else
+          b_t = EMLX.transpose(b_mx, [-2, -1])
 
-        EMLX.einsum(
-          b_mx,
-          a_inv_mx,
-          dot_spec_to_einsum_spec(
-            EMLX.shape(b_mx),
-            EMLX.shape(a_inv_mx),
-            b_contract_axes,
-            b_batch_axes,
-            [m],
-            batch_axes
-          )
-        )
+          EMLX.linalg_solve_triangular(a_t, b_t, !effective_upper)
+          |> EMLX.transpose([-2, -1])
+        end
       end
 
     out_mx
@@ -1796,6 +1764,78 @@ defmodule EMLX.Backend do
     |> from_nx()
     |> EMLX.allclose(from_nx(b), atol || 1.0e-4, rtol || 1.0e-8, equal_nan == true)
     |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.Cholesky{}, out, [tensor], _fun) do
+    from_nx(tensor)
+    |> to_typed_ref(tensor.type, {:f, 32})
+    |> EMLX.linalg_cholesky(false)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.Solve{}, out, [a, b], _fun) do
+    a_f = to_typed_ref(from_nx(a), a.type, {:f, 32})
+    b_f = to_typed_ref(from_nx(b), b.type, {:f, 32})
+
+    EMLX.linalg_solve(a_f, b_f)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.QR{mode: :reduced}, {out_q, out_r}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    {q, r} = EMLX.linalg_qr(t)
+    {to_nx(q, out_q), to_nx(r, out_r)}
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.QR{mode: :complete} = struct, _output, args, fun) do
+    # MLX only supports reduced QR; fall back to defn for :complete mode
+    apply(fun, [struct | args])
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.Eigh{}, {out_eigenvals, out_eigenvecs}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    {eigenvalues, eigenvectors} = EMLX.linalg_eigh(t, :L)
+    {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.SVD{full_matrices?: full?}, {out_u, out_s, out_v}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    [u, s, vt] = EMLX.linalg_svd(t, true)
+
+    # MLX always returns full matrices; truncate for full_matrices?: false
+    {u_final, vt_final} =
+      if full? do
+        {u, vt}
+      else
+        # Truncate U to {m, k} and Vt to {k, n} where k = min(m, n)
+        {_m, k} = out_u.shape
+        u_sliced = EMLX.slice(u, [0, 0], [elem(EMLX.shape(u), 0), k], [1, 1])
+        {_k2, n} = out_v.shape
+        vt_sliced = EMLX.slice(vt, [0, 0], [k, n], [1, 1])
+        {u_sliced, vt_sliced}
+      end
+
+    {to_nx(u_final, out_u), to_nx(s, out_s), to_nx(vt_final, out_v)}
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.LU{}, {out_p, out_l, out_u}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    [p_pivot, l, u] = EMLX.linalg_lu(t)
+
+    # MLX returns P as a uint32 pivot index vector; convert to permutation matrix
+    n = elem(out_p.shape, tuple_size(out_p.shape) - 1)
+    p_nx = to_nx(p_pivot)
+    eye = Nx.eye(n, type: out_p.type, backend: Backend)
+    p_matrix = Nx.take(eye, p_nx, axis: 0)
+
+    {p_matrix, to_nx(l, out_l), to_nx(u, out_u)}
   end
 
   @impl true
