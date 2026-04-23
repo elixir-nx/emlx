@@ -74,7 +74,8 @@ defmodule EMLX.PoolingTest do
           source,
           init_value,
           {3},
-          padding: [{0, 0}], strides: [1]
+          padding: [{0, 0}],
+          strides: [1]
         )
 
       result_list = Nx.to_flat_list(Nx.backend_transfer(result, Nx.BinaryBackend))
