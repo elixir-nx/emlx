@@ -29,18 +29,19 @@ defmodule EMLX.ToBinaryTest do
   # A segfault here means the resource binary does not hold the MLX buffer alive.
   test "binary remains readable after original tensor is GC'd" do
     test_pid = self()
-      spawn(fn ->
-        t = Nx.iota({4}, type: :f32, backend: EMLX.Backend)
 
-        # Creates the resource binary, which should pin the MLX buffer
-        bin =
-          t
-          |> EMLX.Backend.from_nx()
-          |> EMLX.to_blob()
+    spawn(fn ->
+      t = Nx.iota({4}, type: :f32, backend: EMLX.Backend)
 
-          # t goes out of scope here
-        send(test_pid, {:bin, bin})
-      end)
+      # Creates the resource binary, which should pin the MLX buffer
+      bin =
+        t
+        |> EMLX.Backend.from_nx()
+        |> EMLX.to_blob()
+
+      # t goes out of scope here
+      send(test_pid, {:bin, bin})
+    end)
 
     assert_receive {:bin, bin}
 
@@ -53,15 +54,17 @@ defmodule EMLX.ToBinaryTest do
   # Non-contiguous refcount safety: same test via the ct resource path.
   test "non-contiguous binary remains readable after original tensor is GC'd" do
     test_pid = self()
-      spawn(fn ->
-        t = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend) |> Nx.transpose()
-        bin =
-          t
-          |> EMLX.Backend.from_nx()
-          |> EMLX.to_blob()
 
-        send(test_pid, {:bin, bin})
-      end)
+    spawn(fn ->
+      t = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend) |> Nx.transpose()
+
+      bin =
+        t
+        |> EMLX.Backend.from_nx()
+        |> EMLX.to_blob()
+
+      send(test_pid, {:bin, bin})
+    end)
 
     assert_receive {:bin, bin}
 
