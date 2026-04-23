@@ -83,7 +83,10 @@ $(MLX_SO): $(MLX_SRC_DIR)
 			-D BUILD_SHARED_LIBS=ON \
 			. && \
 		cmake --build "$(MLX_BUILD_DIR)" --config "$(CMAKE_BUILD_TYPE)" -j$(MAKE_JOBS) && \
-		cmake --install "$(MLX_BUILD_DIR)" --config "$(CMAKE_BUILD_TYPE)" ; \
+		cmake --install "$(MLX_BUILD_DIR)" --config "$(CMAKE_BUILD_TYPE)" && \
+		if [ -f "$(MLX_BUILD_DIR)/jaccl/libjaccl.dylib" ]; then \
+			cp "$(MLX_BUILD_DIR)/jaccl/libjaccl.dylib" "$(MLX_LIB_DIR)/" ; \
+		fi ; \
 	fi
 
 $(EMLX_SO): $(PRIV_DIR) $(MLX_SO) $(OBJECTS)

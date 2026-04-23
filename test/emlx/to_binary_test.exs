@@ -34,10 +34,8 @@ defmodule EMLX.ToBinaryTest do
       t = Nx.iota({4}, type: :f32, backend: EMLX.Backend)
 
       # Creates the resource binary, which should pin the MLX buffer
-      bin =
-        t
-        |> EMLX.Backend.from_nx()
-        |> EMLX.to_blob()
+      dev_ref = EMLX.Backend.from_nx(t)
+      bin = EMLX.to_blob(dev_ref)
 
       # t goes out of scope here
       send(test_pid, {:bin, bin})
@@ -58,10 +56,9 @@ defmodule EMLX.ToBinaryTest do
     spawn(fn ->
       t = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend) |> Nx.transpose()
 
-      bin =
-        t
-        |> EMLX.Backend.from_nx()
-        |> EMLX.to_blob()
+      # Creates the resource binary, which should pin the MLX buffer
+      dev_ref = EMLX.Backend.from_nx(t)
+      bin = EMLX.to_blob(dev_ref)
 
       send(test_pid, {:bin, bin})
     end)
