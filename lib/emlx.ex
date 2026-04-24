@@ -55,13 +55,13 @@ defmodule EMLX.Macro do
       def unquote(name)(unquote_splicing(args)) do
         unquote(tensors)
         {user_device, index} = normalize_device!(var!(device))
-        var!(device) = mlx_device!(user_device, index)
-        worker = resolve_worker(user_device)
+        {worker, effective_device} = resolve_worker(user_device)
+        var!(device) = mlx_device!(effective_device, index)
 
         job_ref =
           EMLX.NIF.unquote(name)(worker, unquote_splicing(args)) |> unwrap!()
 
-        await_worker(job_ref) |> wrap_tensor(user_device)
+        await_worker(job_ref) |> wrap_tensor(effective_device)
       end
     end
   end
@@ -89,13 +89,13 @@ defmodule EMLX.Macro do
       @mlx_function {unquote(name), unquote(length(args) + 2)}
       def unquote(name)(unquote_splicing(args)) do
         {unquote(tensors), device} = prepare_tensors!(unquote(tensors))
-        worker = resolve_worker(device)
+        {worker, effective_device} = resolve_worker(device)
 
         job_ref =
-          EMLX.NIF.unquote(name)(worker, unquote_splicing(args), device)
+          EMLX.NIF.unquote(name)(worker, unquote_splicing(args), effective_device)
           |> unwrap!()
 
-        await_worker(job_ref) |> wrap_tensor(device)
+        await_worker(job_ref) |> wrap_tensor(effective_device)
       end
     end
   end
@@ -330,14 +330,14 @@ defmodule EMLX do
     # that the contiguous fallback in `to_blob_term` runs on the same OS
     # thread that owns the tensor's stream encoder.
     eval(tensor)
-    worker = resolve_worker(device)
+    {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.to_blob(worker, ref) |> unwrap!()
     await_worker(job_ref)
   end
 
   def to_blob({device, ref} = tensor, limit) when is_tensor(device, ref) do
     eval(tensor)
-    worker = resolve_worker(device)
+    {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.to_blob(worker, ref, limit) |> unwrap!()
     await_worker(job_ref)
   end
@@ -368,7 +368,7 @@ defmodule EMLX do
   """
   def tensor_to_shm({device, ref} = tensor, permissions) when is_tensor(device, ref) do
     eval(tensor)
-    worker = resolve_worker(device)
+    {worker, _effective_device} = resolve_worker(device)
     # Worker-routed: `tensor_to_shm`'s NIF body may call `mx::contiguous`
     # + `mx::eval` on a non-contiguous tensor, which both touch the
     # thread-local Metal encoder. Must run on the worker.
@@ -444,21 +444,45 @@ defmodule EMLX do
        (CPU or GPU) is used — see `EMLX.Application`.
   """
   def eval({device, ref}) when is_tensor(device, ref) do
-    worker = resolve_worker(device)
+    {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
     await_worker(job_ref)
   end
 
   # ── Worker resolution ──────────────────────────────────────────────────────
   #
-  # `Process.get(:emlx_command_queue)` is set by EMLX.CommandQueue.with_queue/2
-  # (Phase 3). When unset, we fall back to the application default for the
-  # tensor's device. The lookup is intentionally tiny on the hot path —
-  # `:persistent_term.get/1` is O(1) and lock-free.
+  # `Process.get(:emlx_command_queue)` is set by EMLX.CommandQueue.with_queue/2.
+  # The value is `{worker_ref, device}` so we know the queue's device without a
+  # second lookup. Returns `{worker, effective_device}` — callers must use
+  # `effective_device` for both the NIF device argument and `wrap_tensor/2`.
+  #
+  # When no queue is bound, we fall back to the application-default worker for
+  # the requested device.
 
   @doc false
   def resolve_worker(device) do
-    Process.get(:emlx_command_queue) || EMLX.Application.default_worker(device)
+    case Process.get(:emlx_command_queue) do
+      nil -> {EMLX.Application.default_worker(device), device}
+      {worker, ^device} -> {worker, device}
+      {worker, bound_device} -> resolve_cross_device(device, worker, bound_device)
+    end
+  end
+
+  # CPU and GPU operations do not share thread-local Metal encoder state, so
+  # routing a CPU tensor through a GPU queue (or vice-versa) is safe — MLX
+  # inserts the necessary cross-stream synchronization internally. We therefore
+  # do NOT force an intermediate eval; we let MLX manage the graph dependency.
+  defp resolve_cross_device(requested, worker, bound) do
+    if Application.get_env(:emlx, :cross_device_promotion, false) do
+      if Application.get_env(:emlx, :warn_cross_device, false) do
+        require Logger
+        Logger.warning("[EMLX] cross-device promotion: #{requested} tensor routed to #{bound} queue")
+      end
+
+      {worker, bound}
+    else
+      {EMLX.Application.default_worker(requested), requested}
+    end
   end
 
   defp await_worker(job_ref) do
@@ -487,7 +511,7 @@ defmodule EMLX do
   stream encoder.
   """
   def item({device, ref}) when is_tensor(device, ref) do
-    worker = resolve_worker(device)
+    {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.item(worker, ref) |> unwrap!()
     await_worker(job_ref)
   end
