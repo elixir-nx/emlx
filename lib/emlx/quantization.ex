@@ -1,235 +1,173 @@
 defmodule EMLX.Quantization do
   @moduledoc """
-  Utilities for creating and working with quantized tensors on Apple Silicon.
+  Affine group-wise int2/int4/int8 quantization for Apple Silicon inference.
 
-  This module provides the primary user-facing API for 4-bit and 8-bit
-  quantization, enabling efficient LLM inference with MLX.
+  Quantized weights are represented as annotated `Nx.Tensor` values — the
+  tensor carries the original logical shape and type (e.g. `{:s, 4}` for
+  4-bit), while the `EMLX.Backend` struct stores the packed uint32 data and
+  a `EMLX.Quantization.Config` with scales, biases, group_size, and bits.
 
-  ## Why Quantize Data?
+  `Nx.dot` automatically dispatches to `mx::quantized_matmul` when it detects
+  a quantized operand on `EMLX.Backend` — no explicit call site changes needed.
 
-  Large language models like Qwen3-8B or LLaMA-7B require 16GB+ of memory
-  at float16 precision. 4-bit quantization reduces this to ~4-5GB while
-  maintaining reasonable quality, enabling inference on consumer hardware.
+  ## Basic usage
 
-  Performance on Apple M-series:
-  - **Memory**: 4-5GB vs 16GB for fp16
-  - **Speed**: ~135 tok/s with quantized_matmul
-  - **Quality**: ~95% of fp16 perplexity for most tasks
-
-  ## MLX 4-bit Format
-
-  MLX uses group-wise affine quantization:
-
-      dequantized[i] = scales[i/group_size] * (packed_int4[i] - biases[i/group_size])
-
-  Weights are packed as uint32 (8 int4 values per uint32). With `group_size=64`:
-  - Weight `[out, in]` becomes `[out, in/8]` as uint32
-  - Scales: `[out, in/group_size]` as bfloat16
-  - Biases: `[out, in/group_size]` as bfloat16
-
-  ## Basic Usage
-
-      # 1. Quantize a weight matrix
+      # Quantize a dense weight
       weight = Nx.iota({512, 4096}, type: :f32)
       weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
+      qw = EMLX.Quantization.from_dense(weight)
 
-      {q_weight, scales, biases} = EMLX.Quantization.quantize(weight)
-
-      # 2. Create a quantized tensor for Nx operations
-      qt = EMLX.Quantization.tensor(q_weight, scales, biases, {512, 4096})
-
-      # 3. Use with standard Nx.dot - automatically dispatches to quantized_matmul
+      # Standard Nx.dot dispatches to mx::quantized_matmul automatically
       input = Nx.iota({1, 8, 4096}, type: :f32)
-      result = Nx.dot(input, [2], qt, [1])  # [1, 8, 512]
+      result = Nx.dot(input, [2], qw, [1])
 
-  ## Transparent Nx Integration
+  ## Inside defn
 
-  Quantized tensors work with standard Nx operations. The EMLX backend
-  detects quantization metadata and dispatches to optimized kernels:
+  `quantize/2`, `dequantize/1`, and `quantized_matmul/2` are all
+  `deftransform` functions backed by `Nx.runtime_call`, so they are safe
+  to call inside `Nx.Defn.jit`-traced forward passes:
 
-      # This calls EMLX.quantized_matmul under the hood
-      result = Nx.dot(input, quantized_weight)
+      defn my_layer(x, qw) do
+        dense = EMLX.Quantization.dequantize(qw)
+        Nx.dot(x, [2], dense, [1])
+      end
 
-  The tensor type `{:s, 4}` indicates 4-bit signed quantization.
-  Bits are derived from the type, not stored separately.
+  `Nx.dot` with a quantized tensor also dispatches transparently via
+  `EMLX.Backend.dot/7` at execution time, so explicit `dequantize` is
+  only needed when you want the dense weight for a non-dot operation.
 
-  ## Loading Pre-quantized Models
+  ## See also
 
-  For models already in MLX 4-bit format (e.g., from Hugging Face):
+  * `EMLX.Quantization.Config` — internal metadata struct
+  """
 
-      # Load from safetensors
-      weight = load_tensor("model.layers.0.self_attn.q_proj.weight")
-      scales = load_tensor("model.layers.0.self_attn.q_proj.scales")
-      biases = load_tensor("model.layers.0.self_attn.q_proj.biases")
+  import Nx.Defn
+  alias EMLX.Quantization.Config
 
-      # Convert to EMLX refs
-      w_ref = EMLX.Backend.from_nx(weight)
-      s_ref = EMLX.Backend.from_nx(scales)
-      b_ref = EMLX.Backend.from_nx(biases)
+  @doc """
+  Quantize a dense 2-D tensor via `Nx.runtime_call`.
 
-      # Create quantized tensor
-      qt = EMLX.Quantization.tensor(w_ref, s_ref, b_ref, {out_dim, in_dim})
-
-  ## Debugging with Dequantization
-
-      # Dequantize to verify values
-      {q_weight, scales, biases} = EMLX.Quantization.quantize(weight)
-      recovered = EMLX.Quantization.dequantize(q_weight, scales, biases)
-
-      # Compare (4-bit is lossy, ~5-10% error typical)
-      original_mean = Nx.mean(weight) |> Nx.to_number()
-      recovered_mean = Nx.mean(EMLX.Backend.to_nx(recovered)) |> Nx.to_number()
+  At execution time the callback receives the real tensor and runs
+  `mx::quantize`. Returns an annotated quantized `Nx.Tensor` with the same
+  logical shape as the input and type `{:s, N}`. Safe to call inside
+  `Nx.Defn.jit`-traced forward passes.
 
   ## Options
 
-  - `:bits` - 4 or 8 (default: 4). 4-bit is more memory efficient, 8-bit is more accurate.
-  - `:group_size` - Number of weights sharing a scale factor (default: 64).
-    Smaller groups = better accuracy but more overhead.
-
-  ## See Also
-
-  - `EMLX.quantize/3` - Low-level quantization NIF
-  - `EMLX.dequantize/5` - Low-level dequantization NIF
-  - `EMLX.quantized_matmul/7` - Low-level quantized matrix multiply NIF
-  - `EMLX.Backend` - Backend struct with quantization fields
+  * `:type` — Nx storage type: `{:s, 2}`, `{:s, 4}` (default), or `{:s, 8}`.
+  * `:group_size` — 32, 64, or 128 (default 64). Must evenly divide the last
+    dimension of `tensor`.
   """
+  deftransform quantize(tensor, opts \\ []) do
+    type = Keyword.get(opts, :type, {:s, 4})
+    out = Nx.template(Nx.shape(tensor), type)
+    Nx.runtime_call(out, tensor, opts, &__MODULE__.quantize_callback/2)
+  end
 
-  alias Nx.Tensor, as: T
-
-  @doc """
-  Creates a quantized Nx.Tensor from packed weights and scales/biases.
-
-  The returned tensor has type `{:s, bits}` and can be used directly with
-  `Nx.dot`, which will automatically dispatch to `quantized_matmul`.
-
-  ## Parameters
-
-  - `weight_ref` - EMLX device ref for packed uint32 weights
-  - `scales_ref` - EMLX device ref for per-group scale factors
-  - `biases_ref` - EMLX device ref for per-group zero points
-  - `original_shape` - Shape before quantization `{out_features, in_features}`
-  - `opts` - Options:
-    - `:bits` - Bits per weight (default 4)
-    - `:group_size` - Quantization group size (default 64)
-
-  ## Example
-
-      {q_weight, scales, biases} = EMLX.Quantization.quantize(weight)
-      qt = EMLX.Quantization.tensor(q_weight, scales, biases, {512, 4096})
-
-      # Use with standard Nx operations
-      result = Nx.dot(input, qt)
-  """
-  def tensor(weight_ref, scales_ref, biases_ref, original_shape, opts \\ []) do
-    EMLX.Backend.quantized_tensor(weight_ref, scales_ref, biases_ref, original_shape, opts)
+  @doc false
+  def quantize_callback(%Nx.Tensor{} = tensor, opts) do
+    EMLX.quantize(tensor, opts)
   end
 
   @doc """
-  Quantizes a float tensor to packed 4-bit or 8-bit format.
+  Construct an annotated quantized `Nx.Tensor` from pre-computed device refs.
 
-  Returns `{quantized_weights, scales, biases}` where:
-  - `quantized_weights` - Packed uint32 tensor (8 int4 values per uint32 for 4-bit)
-  - `scales` - Per-group scale factors (bfloat16)
-  - `biases` - Per-group zero points (bfloat16)
+  Use this when you already have packed weights from a checkpoint. For
+  quantizing a dense tensor from scratch, prefer `from_dense/2`.
 
-  ## Parameters
+  ## Options
 
-  - `tensor` - Float tensor to quantize (Nx.Tensor or EMLX device ref)
-  - `opts` - Options:
-    - `:group_size` - Number of weights sharing a scale factor (default 64)
-    - `:bits` - Bits per weight, 4 or 8 (default 4)
-
-  ## Example
-
-      weight = Nx.iota({512, 4096}, type: :f32)
-      {q_weight, scales, biases} = EMLX.Quantization.quantize(weight)
-
-      # With custom options
-      {q_weight, scales, biases} = EMLX.Quantization.quantize(weight, group_size: 128, bits: 4)
+  * `:type` — Nx storage type: `{:s, 2}`, `{:s, 4}` (default), or `{:s, 8}`.
+  * `:group_size` — quantization group size (default 64).
   """
-  def quantize(tensor, opts \\ [])
-
-  def quantize(%T{} = tensor, opts) do
+  @spec quantized_tensor(term(), term(), term(), tuple(), keyword()) :: Nx.Tensor.t()
+  def quantized_tensor(weight_ref, scales_ref, biases_ref, original_shape, opts \\ []) do
+    type = Keyword.get(opts, :type, {:s, 4})
+    {_, bits} = type
     group_size = Keyword.get(opts, :group_size, 64)
-    bits = Keyword.get(opts, :bits, 4)
 
-    tensor
-    |> EMLX.Backend.from_nx()
-    |> EMLX.quantize(group_size, bits)
-  end
+    scales = EMLX.Backend.to_nx(scales_ref)
+    biases = EMLX.Backend.to_nx(biases_ref)
+    config = %Config{scales: scales, biases: biases, group_size: group_size, bits: bits}
 
-  def quantize({device, ref} = device_ref, opts) when is_atom(device) and is_reference(ref) do
-    group_size = Keyword.get(opts, :group_size, 64)
-    bits = Keyword.get(opts, :bits, 4)
+    weight_shape = EMLX.shape(weight_ref)
+    template = Nx.template(original_shape, type)
 
-    EMLX.quantize(device_ref, group_size, bits)
-  end
-
-  @doc """
-  Dequantizes packed weights back to floating point.
-
-  Useful for debugging and verification. The dequantized values will be
-  approximate due to quantization loss.
-
-  ## Parameters
-
-  - `weights` - Packed uint32 weights (EMLX device ref)
-  - `scales` - Per-group scale factors (EMLX device ref)
-  - `biases` - Per-group zero points (EMLX device ref)
-  - `opts` - Options:
-    - `:group_size` - Quantization group size (default 64)
-    - `:bits` - Bits per weight (default 4)
-
-  ## Example
-
-      {q_weight, scales, biases} = EMLX.Quantization.quantize(weight)
-      recovered = EMLX.Quantization.dequantize(q_weight, scales, biases)
-
-      # Check roundtrip accuracy
-      Nx.all_close(weight, recovered, atol: 0.1)
-  """
-  def dequantize(weights, scales, biases, opts \\ []) do
-    group_size = Keyword.get(opts, :group_size, 64)
-    bits = Keyword.get(opts, :bits, 4)
-
-    EMLX.dequantize(weights, scales, biases, group_size, bits)
+    %Nx.Tensor{
+      template
+      | data: %EMLX.Backend{
+          ref: weight_ref,
+          shape: weight_shape,
+          type: {:u, 32},
+          quantization_config: config
+        }
+    }
   end
 
   @doc """
-  Returns true if the tensor is quantized.
+  Dequantize a quantized `Nx.Tensor` via `Nx.runtime_call`.
 
-  ## Example
+  At execution time the callback receives the real tensor, unpacks
+  `quantization_config`, and calls `mx::dequantize`. Safe to call inside
+  `Nx.Defn.jit`-traced forward passes.
 
-      qt = EMLX.Quantization.tensor(q_weight, scales, biases, {512, 4096})
-      EMLX.Quantization.quantized?(qt)  #=> true
-
-      regular = Nx.iota({4, 4})
-      EMLX.Quantization.quantized?(regular)  #=> false
+  The output has the same shape as the input (the quantized tensor's logical
+  shape equals the dense shape).
   """
-  def quantized?(%T{} = tensor) do
-    EMLX.Backend.quantized?(tensor)
+  deftransform dequantize(qw) do
+    # Infer float type from scales when we have the real backend (eager / evaluator).
+    # Falls back to :f32 during JIT tracing where qw.data is Nx.Defn.Expr.
+    out_type =
+      case qw do
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{scales: s}}} -> Nx.type(s)
+        _ -> :f32
+      end
+
+    out = Nx.template(Nx.shape(qw), out_type)
+    Nx.runtime_call(out, qw, [], &__MODULE__.dequantize_callback/2)
   end
+
+  @doc false
+  def dequantize_callback(%Nx.Tensor{} = qw, _opts) do
+    EMLX.dequantize(qw)
+  end
+
+  @doc """
+  Run a quantized matmul via `Nx.runtime_call`.
+
+  At execution time the callback unpacks `quantization_config` from `qw` and
+  calls `mx::quantized_matmul`. Safe to call inside `Nx.Defn.jit`-traced
+  forward passes.
+
+  Output shape is `{batch_dims..., out_features}` where `out_features` is the
+  first dimension of `qw`. Output type is `:bf16`.
+  """
+  deftransform quantized_matmul(activation, qw) do
+    {out_features, _} = Nx.shape(qw)
+    act_batch = Nx.shape(activation) |> Tuple.to_list() |> Enum.drop(-1)
+    out_shape = List.to_tuple(act_batch ++ [out_features])
+
+    out_type =
+      case qw do
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{scales: s}}} -> Nx.type(s)
+        _ -> Nx.Type.merge(Nx.type(activation), Nx.type(qw))
+      end
+
+    out = Nx.template(out_shape, out_type)
+    Nx.runtime_call(out, {activation, qw}, [], &__MODULE__.quantized_matmul_callback/2)
+  end
+
+  @doc false
+  def quantized_matmul_callback({%Nx.Tensor{} = activation, %Nx.Tensor{} = qw}, _opts) do
+    EMLX.quantized_matmul(activation, qw)
+  end
+
+  @doc """
+  Returns `true` if the tensor has quantization metadata on its backend.
+  """
+  @spec quantized?(term()) :: boolean()
+  def quantized?(%Nx.Tensor{data: %EMLX.Backend{quantization_config: cfg}}) when not is_nil(cfg),
+    do: true
 
   def quantized?(_), do: false
-
-  @doc """
-  Gets quantization options from a tensor, or nil if not quantized.
-
-  Returns a map with `:scales`, `:biases`, and `:group_size`.
-  The bit width is derived from the tensor type (`{:s, 4}` or `{:s, 8}`).
-
-  ## Example
-
-      qt = EMLX.Quantization.tensor(q_weight, scales, biases, {512, 4096}, bits: 4)
-
-      opts = EMLX.Quantization.options(qt)
-      opts.group_size  #=> 64
-
-      Nx.type(qt)  #=> {:s, 4}
-  """
-  def options(%T{} = tensor) do
-    EMLX.Backend.quantization_options(tensor)
-  end
-
-  def options(_), do: nil
 end

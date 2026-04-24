@@ -1,5 +1,5 @@
 defmodule EMLXTest do
-  use EMLX.Case
+  use EMLX.Case, async: true
   doctest EMLX
 
   test "__jit__" do

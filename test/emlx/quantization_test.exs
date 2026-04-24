@@ -1,5 +1,5 @@
 defmodule EMLX.QuantizationTest do
-  use EMLX.Case
+  use EMLX.Case, async: true
 
   describe "quantize/3" do
     test "quantizes float tensor to packed format" do
@@ -7,9 +7,7 @@ defmodule EMLX.QuantizationTest do
       # group_size=64 means we need at least 64 elements in the last dimension
       tensor = Nx.iota({64, 64}, type: :f32) |> Nx.divide(1000)
       emlx_tensor = EMLX.Backend.from_nx(tensor)
-
-      # Quantize with default settings (group_size=64, bits=4)
-      {quantized, scales, biases} = EMLX.quantize(emlx_tensor)
+      {quantized, scales, biases} = EMLX.quantize(emlx_tensor, 64, 4)
 
       # Verify we get three tensors back
       assert is_tuple(quantized)

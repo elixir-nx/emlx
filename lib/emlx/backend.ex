@@ -101,30 +101,11 @@ defmodule EMLX.Backend do
   @moduledoc """
   EMLX backend for Nx tensors, providing GPU acceleration via Apple's MLX.
 
-  ## Quantization Support
-
-  The backend supports quantized tensors via direct fields on the struct.
-  When a tensor has quantization scales/biases configured, operations like `Nx.dot/6` will
-  automatically dispatch to quantized kernels (e.g., `EMLX.quantized_matmul/6`).
-
-  Quantized tensors store scales and biases internally, with bits derived
-  from the tensor type (`{:s, 4}` or `{:f, 8}`):
-
-      %Nx.Tensor{
-        type: {:s, 4},  # Bits derived from type
-        data: %EMLX.Backend{
-          ref: weight_ref,
-          scales: scales_ref,
-          biases: biases_ref,
-          group_size: 64
-        }
-      }
-
-  When `Nx.dot(input, quantized_weight)` is called, the backend detects
-  scales/biases and calls `quantized_matmul` instead of `tensordot`.
+  For quantized inference, see `EMLX.Quantization` and
+  `EMLX.Quantization.Config`.
   """
 
-  defstruct [:ref, :shape, :type, :data, :scales, :biases, :group_size]
+  defstruct [:ref, :shape, :type, :data, :quantization_config]
 
   @impl true
   def init(opts) do
@@ -139,57 +120,6 @@ defmodule EMLX.Backend do
   end
 
   def from_nx(%T{} = other_backend), do: Nx.backend_transfer(other_backend, Backend) |> from_nx()
-
-  @doc """
-  Creates a quantized Nx.Tensor from packed weights and scales/biases.
-
-  The tensor type is set to `{:s, bits}` (e.g., `{:s, 4}` for 4-bit quantization),
-  which carries the bit width information. When `Nx.dot` is called with this tensor,
-  the backend automatically dispatches to `quantized_matmul`.
-
-  ## Parameters
-
-  - `weight_ref` - EMLX device ref for packed uint32 weights
-  - `scales_ref` - EMLX device ref for per-group scale factors
-  - `biases_ref` - EMLX device ref for per-group zero points
-  - `original_shape` - Shape before quantization {out_features, in_features}
-  - `opts` - Options: `:bits` (default 4), `:group_size` (default 64)
-  """
-  def quantized_tensor(weight_ref, scales_ref, biases_ref, original_shape, opts \\ []) do
-    bits = Keyword.get(opts, :bits, 4)
-    group_size = Keyword.get(opts, :group_size, 64)
-
-    weight_shape = EMLX.shape(weight_ref)
-    quantized_type = {:s, bits}
-    template = Nx.template(original_shape, quantized_type)
-
-    %T{
-      template
-      | data: %Backend{
-          ref: weight_ref,
-          shape: weight_shape,
-          type: {:u, 32},
-          scales: scales_ref,
-          biases: biases_ref,
-          group_size: group_size
-        }
-    }
-  end
-
-  @doc """
-  Returns true if the tensor is quantized (has scales/biases refs).
-  """
-  def quantized?(%T{data: %Backend{scales: scales}}) when not is_nil(scales), do: true
-  def quantized?(_), do: false
-
-  @doc """
-  Gets quantization options from a tensor, or nil if not quantized.
-  """
-  def quantization_options(%T{data: %Backend{scales: s, biases: b, group_size: g}}) when not is_nil(s) do
-    %{scales: s, biases: b, group_size: g}
-  end
-
-  def quantization_options(_), do: nil
 
   @doc """
   Converts an MLX array to an Nx tensor.
@@ -1168,47 +1098,72 @@ defmodule EMLX.Backend do
         right_axes,
         right_batched_axes
       ) do
-    right_scales = case right.data do
-      %Backend{scales: s} -> s
-      _ -> nil
-    end
-
-    left_scales = case left.data do
-      %Backend{scales: s} -> s
-      _ -> nil
-    end
+    right_quantized = EMLX.Quantization.quantized?(right)
+    left_quantized = EMLX.Quantization.quantized?(left)
 
     cond do
-      not is_nil(right_scales) ->
-        quantized_dot_right(out, left, right)
+      right_quantized and left_quantized ->
+        raise ArgumentError,
+              "EMLX.Backend.dot/7 does not support two quantized operands. " <>
+                "Dequantize one of them first."
 
-      not is_nil(left_scales) ->
-        quantized_dot_left(out, left, right)
+      right_quantized ->
+        quantized_dot(out, left, right, true)
+
+      left_quantized ->
+        quantized_dot(out, right, left, false)
 
       true ->
-        standard_dot(out, left, left_type, left_axes, left_batched_axes,
-                     right, right_type, right_axes, right_batched_axes, out_type)
+        standard_dot(
+          out,
+          left,
+          left_type,
+          left_axes,
+          left_batched_axes,
+          right,
+          right_type,
+          right_axes,
+          right_batched_axes,
+          out_type
+        )
     end
   end
 
-  defp quantized_dot_right(out, left, %T{type: {:s, bits}, data: %Backend{} = backend}) do
-    left_mx = from_nx(left)
-    %Backend{ref: weight_ref, scales: scales, biases: biases, group_size: group_size} = backend
+  # Dispatch a dot where `qw_tensor` is the quantized operand.
+  # `transpose` reflects whether the weight was stored in transposed layout
+  # (`true` when it was the right operand, `false` when it was the left operand).
+  defp quantized_dot(out, activation, qw_tensor, transpose) do
+    %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
 
-    result = EMLX.quantized_matmul(left_mx, weight_ref, scales, biases, true, group_size, bits)
+    %EMLX.Quantization.Config{scales: scales_nx, biases: biases_nx, group_size: gs, bits: bits} =
+      cfg
+
+    result =
+      EMLX.quantized_matmul(
+        from_nx(activation),
+        weight_ref,
+        from_nx(scales_nx),
+        from_nx(biases_nx),
+        transpose,
+        gs,
+        bits
+      )
+
     to_nx(result, out)
   end
 
-  defp quantized_dot_left(out, %T{type: {:s, bits}, data: %Backend{} = backend}, right) do
-    right_mx = from_nx(right)
-    %Backend{ref: weight_ref, scales: scales, biases: biases, group_size: group_size} = backend
-
-    result = EMLX.quantized_matmul(right_mx, weight_ref, scales, biases, false, group_size, bits)
-    to_nx(result, out)
-  end
-
-  defp standard_dot(out, left, left_type, left_axes, left_batched_axes,
-                    right, right_type, right_axes, right_batched_axes, out_type) do
+  defp standard_dot(
+         out,
+         left,
+         left_type,
+         left_axes,
+         left_batched_axes,
+         right,
+         right_type,
+         right_axes,
+         right_batched_axes,
+         out_type
+       ) do
     left_mx = from_nx(left)
     right_mx = from_nx(right)
 
