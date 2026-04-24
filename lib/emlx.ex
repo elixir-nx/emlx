@@ -341,7 +341,7 @@ defmodule EMLX do
     - `group_size` - Number of weights per scale/bias group (default: 64)
     - `bits` - Quantization bits (default: 4)
   """
-  @mlx_function {:quantized_matmul, 8}
+  @mlx_function {:quantized_matmul, 9}
   def quantized_matmul(
         {dev_x, ref_x} = _tensor_x,
         {dev_w, ref_w} = _tensor_w,
@@ -354,10 +354,13 @@ defmodule EMLX do
       when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and
            is_tensor(dev_s, ref_s) and is_tensor(dev_b, ref_b) do
     device = merge_device(merge_device(dev_x, dev_w), merge_device(dev_s, dev_b))
-    mlx_device = mlx_device!(device, -1)
+    {worker, effective_device} = resolve_worker(device)
 
-    EMLX.NIF.quantized_matmul(ref_x, ref_w, ref_s, ref_b, transpose, group_size, bits, mlx_device)
-    |> unwrap_tensor!(device)
+    job_ref =
+      EMLX.NIF.quantized_matmul(worker, ref_x, ref_w, ref_s, ref_b, transpose, group_size, bits, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
   end
 
   @doc """
@@ -373,7 +376,7 @@ defmodule EMLX do
     - `group_size` - Number of weights per group (default: 64)
     - `bits` - Quantization bits (default: 4)
   """
-  @mlx_function {:dequantize, 6}
+  @mlx_function {:dequantize, 7}
   def dequantize(
         {dev_w, ref_w} = _tensor_w,
         {dev_s, ref_s} = _tensor_scales,
@@ -383,10 +386,13 @@ defmodule EMLX do
       )
       when is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) and is_tensor(dev_b, ref_b) do
     device = merge_device(dev_w, merge_device(dev_s, dev_b))
-    mlx_device = mlx_device!(device, -1)
+    {worker, effective_device} = resolve_worker(device)
 
-    EMLX.NIF.dequantize(ref_w, ref_s, ref_b, group_size, bits, mlx_device)
-    |> unwrap_tensor!(device)
+    job_ref =
+      EMLX.NIF.dequantize(worker, ref_w, ref_s, ref_b, group_size, bits, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
   end
 
   @doc """
@@ -402,16 +408,18 @@ defmodule EMLX do
     - `group_size` - Number of weights per group (default: 64)
     - `bits` - Quantization bits (default: 4)
   """
-  @mlx_function {:quantize, 4}
+  @mlx_function {:quantize, 5}
   def quantize({dev_w, ref_w} = _tensor_w, group_size \\ 64, bits \\ 4)
       when is_tensor(dev_w, ref_w) do
     device = dev_w
-    mlx_device = mlx_device!(device, -1)
+    {worker, effective_device} = resolve_worker(device)
 
     {weights_ref, scales_ref, biases_ref} =
-      EMLX.NIF.quantize(ref_w, group_size, bits, mlx_device) |> unwrap!()
+      EMLX.NIF.quantize(worker, ref_w, group_size, bits, effective_device)
+      |> unwrap!()
+      |> await_worker()
 
-    {{device, weights_ref}, {device, scales_ref}, {device, biases_ref}}
+    {{effective_device, weights_ref}, {effective_device, scales_ref}, {effective_device, biases_ref}}
   end
 
   def to_blob({device, ref} = tensor) when is_tensor(device, ref) do

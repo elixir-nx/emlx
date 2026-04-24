@@ -1509,7 +1509,7 @@ NIF(quantized_matmul) {
   DEVICE_PARAM(7, device);
 
   TENSOR(mlx::core::quantized_matmul(
-      *x, *w, *scales, *biases, transpose, group_size, bits, device));
+      *x, *w, *scales, *biases, transpose, group_size, bits, "affine", device));
 }
 
 // dequantize - Converts quantized weights back to float
@@ -1523,7 +1523,7 @@ NIF(dequantize) {
   PARAM(4, int, bits);
   DEVICE_PARAM(5, device);
 
-  TENSOR(mlx::core::dequantize(*w, *scales, *biases, group_size, bits, device));
+  TENSOR(mlx::core::dequantize(*w, *scales, *biases, group_size, bits, "affine", std::nullopt, std::nullopt, device));
 }
 
 // quantize - Quantizes a float tensor to packed format
@@ -1536,17 +1536,21 @@ NIF(quantize) {
   DEVICE_PARAM(3, device);
 
   try {
-    auto [qw, scales, biases] = mlx::core::quantize(*w, group_size, bits, device);
+    auto result = mlx::core::quantize(*w, group_size, bits, "affine", std::nullopt, device);
 
     ERL_NIF_TERM result_tuple[3];
-    result_tuple[0] = create_tensor_resource(env, qw);
-    result_tuple[1] = create_tensor_resource(env, scales);
-    result_tuple[2] = create_tensor_resource(env, biases);
+    result_tuple[0] = create_tensor_resource(env, result[0]);
+    result_tuple[1] = create_tensor_resource(env, result[1]);
+    result_tuple[2] = create_tensor_resource(env, result[2]);
 
     return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
   }
   CATCH()
 }
+
+ASYNC_NIF(quantized_matmul)
+ASYNC_NIF(dequantize)
+ASYNC_NIF(quantize)
 
 // Build a sliding window view of a padded tensor.
 // padded: [...] of ndim n; window/strides: per-axis lists of length n.
@@ -2055,10 +2059,10 @@ static ErlNifFunc nif_funcs[] = {
     // ── Worker control NIFs.
     {"command_queue_new", 1, command_queue_new},
     {"command_queue_synchronize", 1, command_queue_synchronize},
-    // Quantization operations
-    {"quantized_matmul", 8, quantized_matmul},
-    {"dequantize", 6, dequantize},
-    {"quantize", 4, quantize}};
+    // Quantization operations (async — must run on a worker thread)
+    {"quantized_matmul", 9, quantized_matmul_async},
+    {"dequantize", 7, dequantize_async},
+    {"quantize", 5, quantize_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 
