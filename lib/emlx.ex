@@ -433,6 +433,109 @@ defmodule EMLX do
      {effective_device, biases_ref}}
   end
 
+  # ── mlx::fast ops ───────────────────────────────────────────────────────────
+
+  @doc """
+  Fused RMS normalisation (`mlx::fast::rms_norm`).
+
+  Single Metal shader. Normalises over the last axis of `x` and scales by
+  `weight`. Output shape and type match `x`.
+
+  Prefer `EMLX.Fast.rms_norm/3` inside `defn`; call this directly only from
+  eager (non-defn) code.
+  """
+  @mlx_function {:fast_rms_norm, 5}
+  def fast_rms_norm({dev_x, ref_x}, {dev_w, ref_w}, eps)
+      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) do
+    device = merge_device(dev_x, dev_w)
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_rms_norm(worker, ref_x, ref_w, eps * 1.0, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Fused rotary position embedding (`mlx::fast::rope`).
+
+  Single Metal shader. Applies RoPE with a scalar position `offset`.
+
+  - `a`           — input `{B, ..., T, D}`
+  - `dims`        — number of feature dims to rotate (≤ last-axis size, must be even)
+  - `traditional` — `false` for split-half (Qwen3); `true` for interleaved
+  - `base`        — angular frequency base (e.g. 10_000 or 1_000_000)
+  - `scale`       — position scale (1.0 unless using NTK-aware scaling)
+  - `offset`      — integer token position (length of KV cache already filled)
+
+  Prefer `EMLX.Fast.rope/6` inside `defn`.
+  """
+  @mlx_function {:fast_rope, 8}
+  def fast_rope({dev_a, ref_a}, dims, traditional, base, scale, offset)
+      when is_tensor(dev_a, ref_a) do
+    {worker, effective_device} = resolve_worker(dev_a)
+
+    job_ref =
+      EMLX.NIF.fast_rope(worker, ref_a, dims, traditional, base * 1.0, scale * 1.0, offset, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Flash-attention style SDPA, no mask (`mlx::fast::scaled_dot_product_attention`).
+
+  GQA-native: `k`/`v` may have fewer heads than `q` — no pre-tiling needed.
+
+  - `q`     — `{B, N_q,  T_q,  D}`
+  - `k`     — `{B, N_kv, T_kv, D}`
+  - `v`     — `{B, N_kv, T_kv, D}`
+  - `scale` — scalar (typically `1 / sqrt(D)`)
+
+  Prefer `EMLX.Fast.scaled_dot_product_attention/4` inside `defn`.
+  """
+  @mlx_function {:fast_sdpa, 6}
+  def fast_sdpa({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale)
+      when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and is_tensor(dev_v, ref_v) do
+    device = merge_device(dev_q, merge_device(dev_k, dev_v))
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_sdpa(worker, ref_q, ref_k, ref_v, scale * 1.0, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Flash-attention SDPA with an additive or boolean `mask`.
+
+  `mask` must be broadcast-compatible with `{B, N_q, T_q, T_kv}`.
+  Boolean `false` entries are treated as `-∞`.
+
+  Prefer `EMLX.Fast.scaled_dot_product_attention/5` inside `defn`.
+  """
+  @mlx_function {:fast_sdpa_masked, 7}
+  def fast_sdpa_masked(
+        {dev_q, ref_q},
+        {dev_k, ref_k},
+        {dev_v, ref_v},
+        {dev_m, ref_m},
+        scale
+      )
+      when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
+             is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) do
+    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, dev_m)))
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_sdpa_masked(worker, ref_q, ref_k, ref_v, scale * 1.0, ref_m, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
   @doc """
   Quantize a dense 2-D `Nx.Tensor` and return an annotated quantized tensor.
 

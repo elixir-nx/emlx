@@ -29,3 +29,6 @@ emlx-*.tar
 # Validation subproject build artifacts (not the mix.lock — that is committed).
 /validation/_build/
 /validation/deps/
+
+# Local-only planning + measurement notes for ongoing perf investigations.
+/quantization-perf-improvements/

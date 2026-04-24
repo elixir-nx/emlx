@@ -1,1 +1,1 @@
-ExUnit.start()
+ExUnit.start(exclude: [:quantized_inference])

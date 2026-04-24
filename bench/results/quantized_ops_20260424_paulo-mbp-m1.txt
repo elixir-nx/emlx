@@ -1,0 +1,5 @@
+# emlx quantized ops benchmark
+# Date: 2026-04-24
+# Host: paulo-mbp-m1
+# Hardware: see system_info below
+# Stage: A1 (emlx#108 perf investigation)

@@ -1552,6 +1552,72 @@ ASYNC_NIF(quantized_matmul)
 ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
+// ============================================================================
+// mlx::fast ops — single fused Metal shaders
+// ============================================================================
+
+// fast_rms_norm — fused RMS normalisation
+// MLX: mlx::fast::rms_norm(x, weight, eps, stream) → array, same shape as x
+// weight is optional<array> in the C++ API; TENSOR_PARAM gives array* which
+// implicitly converts to optional<array>.
+NIF(fast_rms_norm) {
+  TENSOR_PARAM(0, x);
+  TENSOR_PARAM(1, weight);
+  PARAM(2, double, eps);
+  DEVICE_PARAM(3, device);
+
+  TENSOR(fast::rms_norm(*x, *weight, (float)eps, device));
+}
+ASYNC_NIF(fast_rms_norm)
+
+// fast_rope — fused rotary position embedding (scalar offset arity)
+// MLX: mlx::fast::rope(x, dims, traditional, base, scale, offset, freqs, stream)
+// base is optional<float>; we always supply it.
+// traditional=false → split-half (Qwen3 convention).
+NIF(fast_rope) {
+  TENSOR_PARAM(0, a);
+  PARAM(1, int, dims);
+  PARAM(2, bool, traditional);
+  PARAM(3, double, base);
+  PARAM(4, double, scale);
+  PARAM(5, int, offset);
+  DEVICE_PARAM(6, device);
+
+  TENSOR(fast::rope(*a, dims, traditional, (float)base, (float)scale,
+                   offset, std::nullopt, device));
+}
+ASYNC_NIF(fast_rope)
+
+// fast_sdpa — flash-attention SDPA, no mask
+// MLX: mlx::fast::scaled_dot_product_attention(q, k, v, scale, mask_mode, mask_arr, sinks, stream)
+// GQA-native: k/v may have fewer heads than q.
+NIF(fast_sdpa) {
+  TENSOR_PARAM(0, q);
+  TENSOR_PARAM(1, k);
+  TENSOR_PARAM(2, v);
+  PARAM(3, double, scale);
+  DEVICE_PARAM(4, device);
+
+  TENSOR(fast::scaled_dot_product_attention(
+      *q, *k, *v, (float)scale, "", std::nullopt, std::nullopt, device));
+}
+ASYNC_NIF(fast_sdpa)
+
+// fast_sdpa_masked — flash-attention SDPA with additive or boolean mask
+// mask_mode="array" tells MLX to treat mask_arr as an additive bias/bool mask.
+NIF(fast_sdpa_masked) {
+  TENSOR_PARAM(0, q);
+  TENSOR_PARAM(1, k);
+  TENSOR_PARAM(2, v);
+  PARAM(3, double, scale);
+  TENSOR_PARAM(4, mask);
+  DEVICE_PARAM(5, device);
+
+  TENSOR(fast::scaled_dot_product_attention(
+      *q, *k, *v, (float)scale, "array", *mask, std::nullopt, device));
+}
+ASYNC_NIF(fast_sdpa_masked)
+
 // Build a sliding window view of a padded tensor.
 // padded: [...] of ndim n; window/strides: per-axis lists of length n.
 // Returns a view of shape [o0,...,on-1, w0,...,wn-1] where
@@ -2062,7 +2128,12 @@ static ErlNifFunc nif_funcs[] = {
     // Quantization operations (async — must run on a worker thread)
     {"quantized_matmul", 9, quantized_matmul_async},
     {"dequantize", 7, dequantize_async},
-    {"quantize", 5, quantize_async}};
+    {"quantize", 5, quantize_async},
+    // mlx::fast ops (arity = params + 1 for the worker queue arg)
+    {"fast_rms_norm", 5, fast_rms_norm_async},
+    {"fast_rope", 8, fast_rope_async},
+    {"fast_sdpa", 6, fast_sdpa_async},
+    {"fast_sdpa_masked", 7, fast_sdpa_masked_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 
