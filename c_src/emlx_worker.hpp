@@ -51,7 +51,20 @@ public:
     thread_ = std::thread(&Worker::thread_main, this, std::move(stream_promise));
     // Blocks (or rethrows) until the worker thread has registered its
     // stream and signalled ready.
-    stream_ = stream_future.get();
+    //
+    // If stream_future.get() throws (worker thread set an exception),
+    // the thread has already exited cleanly. We must join before
+    // re-throwing, because ~thread() on a joinable thread calls
+    // std::terminate() — which is the "terminate called without an
+    // active exception" crash seen on Linux with no GPU.
+    try {
+      stream_ = stream_future.get();
+    } catch (...) {
+      if (thread_.joinable()) {
+        thread_.join();
+      }
+      throw;
+    }
   }
 
   // Sets the stop flag, drains any in-flight jobs already past the

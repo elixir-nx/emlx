@@ -1057,6 +1057,15 @@ NIF(command_queue_new) {
   try {
     mlx::core::Device device = string2device(device_atom);
 
+    // Guard before spawning any threads: mlx::core::new_stream on an
+    // unavailable device (e.g. gpu on Linux/CPU-only libmlx) does not
+    // throw — it calls std::terminate() internally, which we cannot
+    // catch. Check availability here and surface a clean {:error, _}
+    // so EMLX.Application can skip the GPU worker on unsupported hosts.
+    if (!mlx::core::is_available(device)) {
+      return nx::nif::error(env, "device not available");
+    }
+
     auto *worker_ptr = static_cast<emlx::Worker *>(enif_alloc_resource(
         resource_object<emlx::Worker>::type, sizeof(emlx::Worker)));
     if (!worker_ptr) {
