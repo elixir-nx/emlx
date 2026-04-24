@@ -54,7 +54,8 @@ defmodule EMLX.MixProject do
 
   def application do
     [
-      extra_applications: [:logger, :inets, :ssl, :public_key, :crypto]
+      extra_applications: [:logger, :inets, :ssl, :public_key, :crypto],
+      mod: {EMLX.Application, []}
     ]
   end
 

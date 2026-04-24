@@ -27,6 +27,11 @@ defmodule EMLX.Macro do
 
   @doc """
   Function that receives a device and allocates a tensor.
+
+  Routes through an `EMLX.CommandQueue` worker because MLX 0.31.2 pins
+  every GPU stream to the OS thread that created it. The macro injects
+  `worker = EMLX.resolve_worker(device)` and prepends `worker` to the
+  NIF call, then awaits the tagged-ref reply via `await_worker/1`.
   """
   defmacro defdevice(call) do
     {name, args} = Macro.decompose_call(call)
@@ -42,14 +47,21 @@ defmodule EMLX.Macro do
       end
 
     quote do
-      @mlx_function {unquote(name), unquote(length(args))}
+      # NIF arity is original + 1 because the wrapper prepends `worker` as
+      # argv[0]. The original `device` arg is preserved (kept for MLX's
+      # `to_stream(device) -> default_stream(device)` lookup, which on the
+      # worker thread returns the worker's stream — see emlx_async.hpp).
+      @mlx_function {unquote(name), unquote(length(args) + 1)}
       def unquote(name)(unquote_splicing(args)) do
         unquote(tensors)
         {user_device, index} = normalize_device!(var!(device))
         var!(device) = mlx_device!(user_device, index)
+        worker = resolve_worker(user_device)
 
-        EMLX.NIF.unquote(name)(unquote_splicing(args))
-        |> unwrap_tensor!(user_device)
+        job_ref =
+          EMLX.NIF.unquote(name)(worker, unquote_splicing(args)) |> unwrap!()
+
+        await_worker(job_ref) |> wrap_tensor(user_device)
       end
     end
   end
@@ -57,22 +69,10 @@ defmodule EMLX.Macro do
   @doc """
   Generates a call that returns a tensor (or a tuple/list of tensors).
 
-  All tensor variables must start with the name tensor.
+  All tensor variables must start with the name tensor. Routes through an
+  `EMLX.CommandQueue` worker (see `defdevice/1`).
   """
   defmacro deftensor(call) do
-    defcall(call, :unwrap_tensor!, [Macro.var(:device, __MODULE__)])
-  end
-
-  @doc """
-  Generates a call that returns a value (not a tensor).
-
-  All tensor variables must start with the name tensor.
-  """
-  defmacro defvalue(call) do
-    defcall(call, :unwrap!, [])
-  end
-
-  defp defcall(call, unwrapper, extra) do
     {name, args} = Macro.decompose_call(call)
     tensors = tensors(args)
 
@@ -81,12 +81,45 @@ defmodule EMLX.Macro do
     end
 
     quote do
-      @mlx_function {unquote(name), unquote(length(args) + length(extra))}
+      # NIF arity = original + 2: leading `worker` + trailing `device`. The
+      # device atom is still passed through so the underlying sync NIF body
+      # (e.g. `mlx::core::add(*a, *b, device)`) gets a `StreamOrDevice` that
+      # MLX resolves to the worker's stream via the worker thread's default
+      # stream slot.
+      @mlx_function {unquote(name), unquote(length(args) + 2)}
       def unquote(name)(unquote_splicing(args)) do
         {unquote(tensors), device} = prepare_tensors!(unquote(tensors))
+        worker = resolve_worker(device)
 
-        EMLX.NIF.unquote(name)(unquote_splicing(args ++ extra))
-        |> unquote(unwrapper)(unquote_splicing(extra))
+        job_ref =
+          EMLX.NIF.unquote(name)(worker, unquote_splicing(args), device)
+          |> unwrap!()
+
+        await_worker(job_ref) |> wrap_tensor(device)
+      end
+    end
+  end
+
+  @doc """
+  Generates a call that returns a value (not a tensor). NOT worker-routed —
+  use only for pure metadata / refcount NIFs (`scalar_type`, `shape`,
+  `strides`, `deallocate`). Graph-touching value NIFs (e.g. `item`) must be
+  hand-written so they thread a worker through `EMLX.NIF.<op>(worker, ...)`
+  and await a tagged-ref reply.
+  """
+  defmacro defvalue(call) do
+    {name, args} = Macro.decompose_call(call)
+    tensors = tensors(args)
+
+    if tensors == [] do
+      raise ArgumentError, "at least one tensor required in #{name}/#{length(args)}"
+    end
+
+    quote do
+      @mlx_function {unquote(name), unquote(length(args))}
+      def unquote(name)(unquote_splicing(args)) do
+        {unquote(tensors), _device} = prepare_tensors!(unquote(tensors))
+        EMLX.NIF.unquote(name)(unquote_splicing(args)) |> unwrap!()
       end
     end
   end
@@ -291,15 +324,22 @@ defmodule EMLX do
   defvalue shape(tensor)
 
   def to_blob({device, ref} = tensor) when is_tensor(device, ref) do
-    # Two-step to_blob: eval on main scheduler, then copy on dirty scheduler
+    # Eval first so the underlying MLX array is materialised; then ask the
+    # worker for the contiguous-copy + zero-copy resource binary. Both
+    # operations are routed through the same worker resolution path so
+    # that the contiguous fallback in `to_blob_term` runs on the same OS
+    # thread that owns the tensor's stream encoder.
     eval(tensor)
-    EMLX.NIF.to_blob(ref) |> unwrap!()
+    worker = resolve_worker(device)
+    job_ref = EMLX.NIF.to_blob(worker, ref) |> unwrap!()
+    await_worker(job_ref)
   end
 
   def to_blob({device, ref} = tensor, limit) when is_tensor(device, ref) do
-    # Two-step to_blob: eval on main scheduler, then copy on dirty scheduler
     eval(tensor)
-    EMLX.NIF.to_blob(ref, limit) |> unwrap!()
+    worker = resolve_worker(device)
+    job_ref = EMLX.NIF.to_blob(worker, ref, limit) |> unwrap!()
+    await_worker(job_ref)
   end
 
   @doc """
@@ -328,7 +368,12 @@ defmodule EMLX do
   """
   def tensor_to_shm({device, ref} = tensor, permissions) when is_tensor(device, ref) do
     eval(tensor)
-    EMLX.NIF.tensor_to_shm(ref, permissions) |> unwrap!()
+    worker = resolve_worker(device)
+    # Worker-routed: `tensor_to_shm`'s NIF body may call `mx::contiguous`
+    # + `mx::eval` on a non-contiguous tensor, which both touch the
+    # thread-local Metal encoder. Must run on the worker.
+    job_ref = EMLX.NIF.tensor_to_shm(worker, ref, permissions) |> unwrap!()
+    await_worker(job_ref)
   end
 
   @doc """
@@ -346,18 +391,16 @@ defmodule EMLX do
   defp unwrap!({:ok, result}), do: result
   defp unwrap!({:error, error}), do: raise(EMLX.NIFError, List.to_string(error))
 
-  defp unwrap_tensor!(tagged_result, device) do
-    case unwrap!(tagged_result) do
-      ref when is_reference(ref) ->
-        {device, ref}
+  # Wraps a worker-thread payload in {device, ref} envelopes.
+  # Already-unwrapped (no leading {:ok, _}) — `await_worker/1` peels that
+  # off when the worker delivers the reply.
+  defp wrap_tensor(ref, device) when is_reference(ref), do: {device, ref}
 
-      list when is_list(list) ->
-        Enum.map(list, &{device, &1})
+  defp wrap_tensor(list, device) when is_list(list),
+    do: Enum.map(list, &{device, &1})
 
-      tuple when is_tuple(tuple) ->
-        tuple |> Tuple.to_list() |> Enum.map(&{device, &1}) |> List.to_tuple()
-    end
-  end
+  defp wrap_tensor(tuple, device) when is_tuple(tuple),
+    do: tuple |> Tuple.to_list() |> Enum.map(&{device, &1}) |> List.to_tuple()
 
   defp prepare_tensors_list!(tensors_list, device) do
     Enum.map_reduce(tensors_list, device, fn
@@ -387,13 +430,67 @@ defmodule EMLX do
   defp merge_device(_, _), do: :cpu
 
   defvalue deallocate(tensor_ref)
-  defvalue eval(tensor)
+
+  @doc """
+  Evaluates a (possibly lazy) MLX tensor by routing the work through an
+  `EMLX.CommandQueue`. Blocks the caller until the worker thread has
+  finished `mlx::core::eval/1` for this tensor.
+
+  Resolves the queue via `resolve_worker/1`:
+
+    1. If the calling process has bound a queue with
+       `EMLX.CommandQueue.with_queue/2`, that queue is used.
+    2. Otherwise the application-default worker for the tensor's device
+       (CPU or GPU) is used — see `EMLX.Application`.
+  """
+  def eval({device, ref}) when is_tensor(device, ref) do
+    worker = resolve_worker(device)
+    job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
+    await_worker(job_ref)
+  end
+
+  # ── Worker resolution ──────────────────────────────────────────────────────
+  #
+  # `Process.get(:emlx_command_queue)` is set by EMLX.CommandQueue.with_queue/2
+  # (Phase 3). When unset, we fall back to the application default for the
+  # tensor's device. The lookup is intentionally tiny on the hot path —
+  # `:persistent_term.get/1` is O(1) and lock-free.
+
+  @doc false
+  def resolve_worker(device) do
+    Process.get(:emlx_command_queue) || EMLX.Application.default_worker(device)
+  end
+
+  defp await_worker(job_ref) do
+    receive do
+      # Worker NIFs (sync bodies) return one of:
+      #   nx::nif::ok(env)         => :ok
+      #   nx::nif::ok(env, term)   => {:ok, term}
+      #   nx::nif::error(env, msg) => {:error, msg}
+      # The async wrapper forwards the payload as-is in {ref, payload}.
+      {^job_ref, :ok} -> :ok
+      {^job_ref, {:ok, result}} -> result
+      {^job_ref, {:error, reason}} -> raise(EMLX.NIFError, List.to_string(reason))
+    end
+  end
 
   deftensor slice(tensor, starts, stops, strides)
   deftensor slice_update(tensor, tensor_updates, starts, stops)
   deftensor squeeze(tensor, axes)
-  defvalue item(tensor)
   defvalue strides(tensor)
+
+  @doc """
+  Returns the scalar value of a 0-d tensor as a number.
+
+  Worker-routed: the NIF body calls `mlx::core::eval(*t)` and `t->item<T>()`,
+  both of which require running on the OS thread that owns the tensor's
+  stream encoder.
+  """
+  def item({device, ref}) when is_tensor(device, ref) do
+    worker = resolve_worker(device)
+    job_ref = EMLX.NIF.item(worker, ref) |> unwrap!()
+    await_worker(job_ref)
+  end
 
   @behaviour Nx.Defn.Compiler
 

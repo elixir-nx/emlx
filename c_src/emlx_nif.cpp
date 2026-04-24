@@ -1,3 +1,5 @@
+#include "emlx_async.hpp"
+#include "emlx_worker.hpp"
 #include "erl_nif.h"
 #include "mlx/mlx.h"
 #include "nx_nif_utils.hpp"
@@ -200,6 +202,15 @@ ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
 #define NIF(NAME)                                                              \
   ERL_NIF_TERM NAME(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
+// One-line async wrapper: declare `NIF(OP) { ... }` then `ASYNC_NIF(OP)`.
+// Register in `nif_funcs[]` at `original_arity + 1` (command queue is argv[0]).
+// Example: {"add", 4, add_async}  // was {"add", 3, add}
+#define ASYNC_NIF(OP)                                                          \
+  ERL_NIF_TERM OP##_async(ErlNifEnv *env, int argc,                            \
+                          const ERL_NIF_TERM argv[]) {                         \
+    return emlx::async_dispatch<OP>(env, argc, argv);                          \
+  }
+
 #define PARAM(ARGN, TYPE, VAR)                                                 \
   TYPE VAR;                                                                    \
   GET(ARGN, VAR)
@@ -281,6 +292,48 @@ NIF(astype) {
   TENSOR(mlx::core::astype(*t, type, device));
 }
 
+// Builds the resource binary for `to_blob` in `out_env`. Used by both the
+// legacy direct-call NIF and `command_queue_post_to_blob` (which builds the
+// term inside the worker thread for delivery via enif_send). May throw
+// std::runtime_error on resource allocation failure.
+//
+// `out_env` is the env the binary will live in (the caller env for the
+// legacy path; a process-independent msg_env for the worker path).
+static ERL_NIF_TERM to_blob_term(ErlNifEnv *out_env, mlx::core::array *t,
+                                 size_t byte_size) {
+  if (t->flags().row_contiguous) {
+    // Zero-copy: alias the MLX buffer via the existing tensor resource.
+    // Invariant: lib/emlx.ex calls eval(tensor) before this NIF, so
+    // data<void>() is guaranteed non-null and stable (MLX arrays are immutable
+    // once materialised). enif_make_resource_binary keeps the resource alive
+    // until the binary is GC'd, decoupling the binary lifetime from Elixir GC
+    // of the tensor term.
+    return enif_make_resource_binary(out_env, static_cast<void *>(t),
+                                     t->data<void>(), byte_size);
+  }
+
+  // Non-contiguous: materialise a fresh row-major copy, wrap it in a minimal
+  // ERTS resource, and alias that buffer zero-copy.
+  // The resource holds only sizeof(mlx::core::array) — no TensorP refcount/
+  // deleted-flag tail — because it is never exposed to TensorP or the Elixir
+  // side; only the binary holds a reference and default_dtor<array>
+  // (~array()) is the sole destructor path.
+  auto ct = mlx::core::contiguous(*t);
+  mlx::core::eval(ct);
+
+  auto *ct_ptr = static_cast<mlx::core::array *>(enif_alloc_resource(
+      resource_object<mlx::core::array>::type, sizeof(mlx::core::array)));
+  if (!ct_ptr) {
+    throw std::runtime_error("Unable to allocate contiguous-copy resource");
+  }
+
+  new (ct_ptr) mlx::core::array(std::move(ct));
+  ERL_NIF_TERM resource_bin = enif_make_resource_binary(
+      out_env, ct_ptr, ct_ptr->data<void>(), byte_size);
+  enif_release_resource(ct_ptr);
+  return resource_bin;
+}
+
 NIF(to_blob) {
   TENSOR_PARAM(0, t);
 
@@ -290,38 +343,10 @@ NIF(to_blob) {
     byte_size = static_cast<size_t>(param_limit) * t->itemsize();
   }
 
-  ERL_NIF_TERM resource_bin;
-
-  if (t->flags().row_contiguous) {
-    // Zero-copy: alias the MLX buffer via the existing tensor resource.
-    // Invariant: lib/emlx.ex calls eval(tensor) before this NIF, so
-    // data<void>() is guaranteed non-null and stable (MLX arrays are immutable
-    // once materialised). enif_make_resource_binary keeps the resource alive
-    // until the binary is GC'd, decoupling the binary lifetime from Elixir GC
-    // of the tensor term.
-    resource_bin = enif_make_resource_binary(env, t_tp.resource_ptr(),
-                                             t->data<void>(), byte_size);
-  } else {
-    // Non-contiguous: materialise a fresh row-major copy, wrap it in a minimal
-    // ERTS resource, and alias that buffer zero-copy.
-    // The resource holds only sizeof(mlx::core::array) — no TensorP refcount/
-    // deleted-flag tail — because it is never exposed to TensorP or the Elixir
-    // side; only the binary holds a reference and default_dtor<array>
-    // (~array()) is the sole destructor path.
-    auto ct = mlx::core::contiguous(*t);
-    mlx::core::eval(ct);
-
-    auto *ct_ptr = static_cast<mlx::core::array *>(enif_alloc_resource(
-        resource_object<mlx::core::array>::type, sizeof(mlx::core::array)));
-    if (!ct_ptr)
-      return enif_make_badarg(env);
-
-    new (ct_ptr) mlx::core::array(std::move(ct));
-    resource_bin =
-        enif_make_resource_binary(env, ct_ptr, ct_ptr->data<void>(), byte_size);
-    enif_release_resource(ct_ptr);
+  try {
+    return nx::nif::ok(env, to_blob_term(env, t, byte_size));
   }
-  return nx::nif::ok(env, resource_bin);
+  CATCH()
 }
 
 uint64_t elem_count(std::vector<int> shape) {
@@ -1004,6 +1029,116 @@ NIF(array_from_ptr) {
   CATCH()
 }
 
+// ─── Worker / EMLX.CommandQueue NIFs ────────────────────────────────────────
+//
+// Lifecycle for posted jobs:
+//   1. Caller's NIF env (`env`) is short-lived — we cannot hand its terms
+//      to the worker thread.
+//   2. We allocate a process-independent ErlNifEnv (`msg_env`) per job.
+//      The job_ref and the reply tuple live in `msg_env`.
+//   3. The job_ref is also enif_make_copy'd into the caller's `env` so
+//      the wrapper in lib/emlx.ex can `receive {^job_ref, _}`.
+//   4. The lambda posted to the worker captures `t_ptr`, `t_refcount`,
+//      `caller_pid`, `msg_env`, and `job_ref_msg` by value. Tensor
+//      lifetime across the post boundary is held two ways:
+//        - enif_keep_resource on t_ptr (ERTS resource refcount)
+//        - ++(*t_refcount) on the embedded TensorP refcount
+//      Both are dropped at the end of the lambda.
+//   5. After enif_send, msg_env is freed inside the lambda.
+//
+// Stop semantics: if the Worker is destroyed (NIF resource refcount drops
+// to zero), pending jobs already in the queue at destructor time still
+// run and still send their reply. Jobs posted *after* the destructor
+// begins throw on post() and the NIF returns {:error, _} synchronously.
+
+NIF(command_queue_new) {
+  ATOM_PARAM(0, device_atom);
+
+  try {
+    mlx::core::Device device = string2device(device_atom);
+
+    auto *worker_ptr = static_cast<emlx::Worker *>(enif_alloc_resource(
+        resource_object<emlx::Worker>::type, sizeof(emlx::Worker)));
+    if (!worker_ptr) {
+      return enif_make_badarg(env);
+    }
+
+    try {
+      new (worker_ptr) emlx::Worker(device);
+    } catch (...) {
+      // Placement new failed before constructor completed; the resource
+      // memory is uninitialised so we must NOT call ~Worker. Just release
+      // the bare allocation and re-throw to the outer handler.
+      enif_release_resource(worker_ptr);
+      throw;
+    }
+
+    ERL_NIF_TERM ref = enif_make_resource(env, worker_ptr);
+    enif_release_resource(worker_ptr);
+    return nx::nif::ok(env, ref);
+  }
+  CATCH()
+}
+
+// Posts a no-op barrier job that calls mx::synchronize(stream). The
+// Elixir wrapper blocks in `receive` until the reply lands, which only
+// happens after every preceding job on this worker has completed AND
+// MLX has flushed the GPU command buffer.
+NIF(command_queue_synchronize) {
+  emlx::Worker *worker;
+  if (!enif_get_resource(env, argv[0], resource_object<emlx::Worker>::type,
+                         (void **)&worker)) {
+    return nx::nif::error(env, "Invalid command queue ref");
+  }
+
+  ErlNifPid caller_pid;
+  enif_self(env, &caller_pid);
+
+  ErlNifEnv *msg_env = enif_alloc_env();
+  if (!msg_env) {
+    return nx::nif::error(env, "Failed to allocate msg env");
+  }
+  ERL_NIF_TERM job_ref_msg = enif_make_ref(msg_env);
+  ERL_NIF_TERM job_ref_caller = enif_make_copy(env, job_ref_msg);
+
+  mlx::core::Stream stream = worker->stream();
+
+  try {
+    worker->post([stream, caller_pid, msg_env, job_ref_msg]() mutable {
+      ERL_NIF_TERM result;
+      try {
+        mlx::core::synchronize(stream);
+        result = enif_make_tuple2(msg_env, enif_make_atom(msg_env, "ok"),
+                                  enif_make_atom(msg_env, "ok"));
+      } catch (const std::exception &e) {
+        result = enif_make_tuple2(
+            msg_env, enif_make_atom(msg_env, "error"),
+            enif_make_string(msg_env, e.what(), ERL_NIF_LATIN1));
+      } catch (...) {
+        result = enif_make_tuple2(
+            msg_env, enif_make_atom(msg_env, "error"),
+            enif_make_string(msg_env, "Unknown error in synchronize",
+                             ERL_NIF_LATIN1));
+      }
+
+      ERL_NIF_TERM msg = enif_make_tuple2(msg_env, job_ref_msg, result);
+      ErlNifPid pid = caller_pid;
+      enif_send(NULL, &pid, msg_env, msg);
+      enif_free_env(msg_env);
+    });
+  } catch (const std::exception &e) {
+    enif_free_env(msg_env);
+    return nx::nif::error(env, e.what());
+  }
+
+  return nx::nif::ok(env, job_ref_caller);
+}
+
+// `eval` and `to_blob` are now worker-routed via `ASYNC_NIF` (see the
+// async wrapper block near `nif_funcs[]`). The bespoke
+// `command_queue_post_eval` / `command_queue_post_to_blob` NIFs were
+// removed in favour of that uniform dispatch.
+
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
@@ -1011,6 +1146,13 @@ static int open_resources(ErlNifEnv *env) {
   }
 
   if (!open_resource<emlx::function>(env, mod, "CompiledFunction")) {
+    return -1;
+  }
+
+  // emlx::Worker — backs EMLX.CommandQueue and the application default
+  // worker. Default destructor (~Worker) signals stop, drains pending
+  // jobs, and joins the OS thread.
+  if (!open_resource<emlx::Worker>(env, mod, "CommandQueue")) {
     return -1;
   }
 
@@ -1545,146 +1687,308 @@ NIF(window_scatter_min) {
                              device));
 }
 
+// ─── Async wrappers ────────────────────────────────────────────────────────
+//
+// MLX 0.31.2's thread-local Metal CommandEncoders + thread-local default
+// streams force every graph-touching op for a given GPU stream to run on
+// the OS thread that created the stream. Each NIF below is the existing
+// sync body wrapped by `emlx::async_dispatch<sync>`: the wrapper extracts
+// the worker from `argv[0]`, copies `argv[1..]` into a process-independent
+// `msg_env`, posts a lambda to the worker thread, and `enif_send`s
+// `{job_ref, payload}` back to the caller. The sync body runs unchanged
+// on the worker thread; `DEVICE_PARAM` resolutions transparently pick up
+// the worker's stream via MLX's `to_stream(s, default_) -> default_stream`
+// thread-local lookup (the worker called `set_default_stream` for its
+// stream during `thread_main`).
+//
+// Sync (non-routed) NIFs preserved below. These either touch no MLX graph state
+// or read fields that are safe across threads (resource allocator, cache
+// limits, evaluated buffer pointers).
+
+ASYNC_NIF(eval)
+ASYNC_NIF(to_blob)
+ASYNC_NIF(tensor_to_shm)
+ASYNC_NIF(item)
+ASYNC_NIF(from_blob)
+ASYNC_NIF(scalar_tensor)
+
+ASYNC_NIF(ones)
+ASYNC_NIF(full)
+ASYNC_NIF(arange)
+ASYNC_NIF(eye)
+ASYNC_NIF(reshape)
+ASYNC_NIF(astype)
+ASYNC_NIF(view)
+ASYNC_NIF(broadcast_to)
+ASYNC_NIF(transpose)
+ASYNC_NIF(pad)
+ASYNC_NIF(sort)
+ASYNC_NIF(argsort)
+ASYNC_NIF(slice)
+ASYNC_NIF(slice_update)
+ASYNC_NIF(squeeze)
+ASYNC_NIF(as_strided)
+
+ASYNC_NIF(stack)
+ASYNC_NIF(where)
+ASYNC_NIF(concatenate)
+ASYNC_NIF(take_along_axis)
+ASYNC_NIF(take)
+ASYNC_NIF(gather)
+ASYNC_NIF(scatter_add)
+ASYNC_NIF(scatter)
+
+ASYNC_NIF(all)
+ASYNC_NIF(any)
+ASYNC_NIF(sum)
+ASYNC_NIF(product)
+ASYNC_NIF(argmax)
+ASYNC_NIF(argmin)
+ASYNC_NIF(cumulative_sum)
+ASYNC_NIF(cumulative_product)
+ASYNC_NIF(cumulative_max)
+ASYNC_NIF(cumulative_min)
+ASYNC_NIF(max)
+ASYNC_NIF(min)
+ASYNC_NIF(clip)
+
+ASYNC_NIF(abs)
+ASYNC_NIF(ceil)
+ASYNC_NIF(conjugate)
+ASYNC_NIF(floor)
+ASYNC_NIF(negate)
+ASYNC_NIF(round)
+ASYNC_NIF(sign)
+ASYNC_NIF(real)
+ASYNC_NIF(imag)
+ASYNC_NIF(is_nan)
+ASYNC_NIF(is_infinity)
+ASYNC_NIF(logical_not)
+ASYNC_NIF(sigmoid)
+ASYNC_NIF(asin)
+ASYNC_NIF(asinh)
+ASYNC_NIF(acos)
+ASYNC_NIF(acosh)
+ASYNC_NIF(cos)
+ASYNC_NIF(cosh)
+ASYNC_NIF(atan)
+ASYNC_NIF(atanh)
+ASYNC_NIF(erf)
+ASYNC_NIF(erf_inv)
+ASYNC_NIF(exp)
+ASYNC_NIF(expm1)
+ASYNC_NIF(log)
+ASYNC_NIF(log1p)
+ASYNC_NIF(rsqrt)
+ASYNC_NIF(sin)
+ASYNC_NIF(sinh)
+ASYNC_NIF(sqrt)
+ASYNC_NIF(tan)
+ASYNC_NIF(tanh)
+
+ASYNC_NIF(add)
+ASYNC_NIF(subtract)
+ASYNC_NIF(multiply)
+ASYNC_NIF(pow)
+ASYNC_NIF(remainder)
+ASYNC_NIF(divide)
+ASYNC_NIF(atan2)
+ASYNC_NIF(bitwise_and)
+ASYNC_NIF(bitwise_or)
+ASYNC_NIF(bitwise_xor)
+ASYNC_NIF(bitwise_not)
+ASYNC_NIF(left_shift)
+ASYNC_NIF(right_shift)
+ASYNC_NIF(minimum)
+ASYNC_NIF(maximum)
+ASYNC_NIF(quotient)
+ASYNC_NIF(equal)
+ASYNC_NIF(not_equal)
+ASYNC_NIF(greater)
+ASYNC_NIF(less)
+ASYNC_NIF(greater_equal)
+ASYNC_NIF(less_equal)
+ASYNC_NIF(logical_and)
+ASYNC_NIF(logical_or)
+ASYNC_NIF(logical_xor)
+
+ASYNC_NIF(emlx_fft)
+ASYNC_NIF(ifft)
+ASYNC_NIF(emlx_fft2)
+ASYNC_NIF(ifft2)
+ASYNC_NIF(allclose)
+ASYNC_NIF(isclose)
+ASYNC_NIF(tri_inv)
+
+ASYNC_NIF(linalg_lu)
+ASYNC_NIF(linalg_qr)
+ASYNC_NIF(linalg_svd)
+ASYNC_NIF(linalg_cholesky)
+ASYNC_NIF(linalg_eigh)
+ASYNC_NIF(linalg_inv)
+ASYNC_NIF(linalg_pinv)
+ASYNC_NIF(linalg_solve)
+ASYNC_NIF(linalg_solve_triangular)
+ASYNC_NIF(conv_general)
+ASYNC_NIF(einsum)
+ASYNC_NIF(tensordot)
+
+ASYNC_NIF(window_scatter_max)
+ASYNC_NIF(window_scatter_min)
+
 static ErlNifFunc nif_funcs[] = {
+    {"eval", 2, eval_async},
+    {"to_blob", 2, to_blob_async},
+    {"to_blob", 3, to_blob_async},
+    {"tensor_to_shm", 3, tensor_to_shm_async},
+    {"item", 2, item_async},
+    {"from_blob", 5, from_blob_async},
+    {"scalar_tensor", 4, scalar_tensor_async},
+
+    {"ones", 4, ones_async},
+    {"full", 5, full_async},
+    {"arange", 6, arange_async},
+    {"eye", 5, eye_async},
+    {"reshape", 4, reshape_async},
+    {"astype", 4, astype_async},
+    {"view", 4, view_async},
+    {"broadcast_to", 4, broadcast_to_async},
+    {"transpose", 4, transpose_async},
+    {"pad", 7, pad_async},
+    {"sort", 4, sort_async},
+    {"argsort", 4, argsort_async},
+    {"slice", 6, slice_async},
+    {"slice_update", 6, slice_update_async},
+    {"squeeze", 4, squeeze_async},
+    {"as_strided", 6, as_strided_async},
+
+    {"stack", 4, stack_async},
+    {"where", 5, where_async},
+    {"concatenate", 4, concatenate_async},
+    {"take_along_axis", 5, take_along_axis_async},
+    {"take", 5, take_async},
+    {"gather", 6, gather_async},
+    {"scatter_add", 6, scatter_add_async},
+    {"scatter", 6, scatter_async},
+
+    {"all", 5, all_async},
+    {"any", 5, any_async},
+    {"sum", 5, sum_async},
+    {"product", 5, product_async},
+    {"argmax", 4, argmax_async},
+    {"argmax", 5, argmax_async},
+    {"argmin", 4, argmin_async},
+    {"argmin", 5, argmin_async},
+    {"cumulative_sum", 6, cumulative_sum_async},
+    {"cumulative_product", 6, cumulative_product_async},
+    {"cumulative_max", 6, cumulative_max_async},
+    {"cumulative_min", 6, cumulative_min_async},
+    {"max", 5, max_async},
+    {"min", 5, min_async},
+    {"clip", 5, clip_async},
+
+    {"abs", 3, abs_async},
+    {"ceil", 3, ceil_async},
+    {"conjugate", 3, conjugate_async},
+    {"floor", 3, floor_async},
+    {"negate", 3, negate_async},
+    {"round", 3, round_async},
+    {"sign", 3, sign_async},
+    {"real", 3, real_async},
+    {"imag", 3, imag_async},
+    {"is_nan", 3, is_nan_async},
+    {"is_infinity", 3, is_infinity_async},
+    {"logical_not", 3, logical_not_async},
+    {"sigmoid", 3, sigmoid_async},
+    {"asin", 3, asin_async},
+    {"asinh", 3, asinh_async},
+    {"acos", 3, acos_async},
+    {"acosh", 3, acosh_async},
+    {"cos", 3, cos_async},
+    {"cosh", 3, cosh_async},
+    {"atan", 3, atan_async},
+    {"atanh", 3, atanh_async},
+    {"erf", 3, erf_async},
+    {"erf_inv", 3, erf_inv_async},
+    {"exp", 3, exp_async},
+    {"expm1", 3, expm1_async},
+    {"log", 3, log_async},
+    {"log1p", 3, log1p_async},
+    {"rsqrt", 3, rsqrt_async},
+    {"sin", 3, sin_async},
+    {"sinh", 3, sinh_async},
+    {"sqrt", 3, sqrt_async},
+    {"tan", 3, tan_async},
+    {"tanh", 3, tanh_async},
+
+    {"add", 4, add_async},
+    {"subtract", 4, subtract_async},
+    {"multiply", 4, multiply_async},
+    {"pow", 4, pow_async},
+    {"remainder", 4, remainder_async},
+    {"divide", 4, divide_async},
+    {"atan2", 4, atan2_async},
+    {"bitwise_and", 4, bitwise_and_async},
+    {"bitwise_or", 4, bitwise_or_async},
+    {"bitwise_xor", 4, bitwise_xor_async},
+    {"bitwise_not", 3, bitwise_not_async},
+    {"left_shift", 4, left_shift_async},
+    {"right_shift", 4, right_shift_async},
+    {"minimum", 4, minimum_async},
+    {"maximum", 4, maximum_async},
+    {"quotient", 4, quotient_async},
+    {"equal", 4, equal_async},
+    {"not_equal", 4, not_equal_async},
+    {"greater", 4, greater_async},
+    {"less", 4, less_async},
+    {"greater_equal", 4, greater_equal_async},
+    {"less_equal", 4, less_equal_async},
+    {"logical_and", 4, logical_and_async},
+    {"logical_or", 4, logical_or_async},
+    {"logical_xor", 4, logical_xor_async},
+
+    {"fft", 5, emlx_fft_async},
+    {"ifft", 5, ifft_async},
+    {"fft2", 5, emlx_fft2_async},
+    {"ifft2", 5, ifft2_async},
+    {"allclose", 7, allclose_async},
+    {"isclose", 7, isclose_async},
+    {"tri_inv", 4, tri_inv_async},
+
+    {"linalg_lu", 3, linalg_lu_async},
+    {"linalg_qr", 3, linalg_qr_async},
+    {"linalg_svd", 4, linalg_svd_async},
+    {"linalg_cholesky", 4, linalg_cholesky_async},
+    {"linalg_eigh", 4, linalg_eigh_async},
+    {"linalg_inv", 3, linalg_inv_async},
+    {"linalg_pinv", 3, linalg_pinv_async},
+    {"linalg_solve", 4, linalg_solve_async},
+    {"linalg_solve_triangular", 5, linalg_solve_triangular_async},
+    {"conv_general", 10, conv_general_async},
+    {"einsum", 5, einsum_async},
+    {"tensordot", 6, tensordot_async},
+
+    {"window_scatter_max", 9, window_scatter_max_async},
+    {"window_scatter_min", 9, window_scatter_min_async},
+
+    // ── Sync (non-routed) NIFs.
     {"strides", 1, strides},
-    {"as_strided", 5, as_strided},
     {"scalar_type", 1, scalar_type},
-    {"eval", 1, eval},
-    {"view", 3, view},
-    {"stack", 3, stack},
-    {"where", 4, where},
-    {"concatenate", 3, concatenate},
-    {"take_along_axis", 4, take_along_axis},
-    {"take", 4, take},
-    {"gather", 5, gather},
-    {"scatter_add", 5, scatter_add},
-    {"scatter", 5, scatter},
-    {"slice", 5, slice},
-    {"slice_update", 5, slice_update},
-    {"squeeze", 3, squeeze},
-    {"item", 1, item, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"all", 4, all},
-    {"any", 4, any},
-    {"sum", 4, sum},
-    {"product", 4, product},
-    {"argmax", 3, argmax},
-    {"argmax", 4, argmax},
-    {"argmin", 3, argmin},
-    {"argmin", 4, argmin},
-    {"cumulative_sum", 5, cumulative_sum},
-    {"cumulative_product", 5, cumulative_product},
-    {"cumulative_max", 5, cumulative_max},
-    {"cumulative_min", 5, cumulative_min},
     {"shape", 1, shape},
-    {"reshape", 3, reshape},
-    {"astype", 3, astype},
-    {"to_blob", 1, to_blob, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"to_blob", 2, to_blob, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"from_blob", 4, from_blob},
-    {"scalar_tensor", 3, scalar_tensor},
-    {"ones", 3, ones},
-    {"full", 4, full},
-    {"arange", 5, arange},
-    {"eye", 4, eye},
-    {"broadcast_to", 3, broadcast_to},
-    {"tensordot", 5, tensordot},
-    {"einsum", 4, einsum},
-    {"conv_general", 9, conv_general},
-    {"transpose", 3, transpose},
-    {"pad", 6, pad},
-    {"sort", 3, sort},
-    {"argsort", 3, argsort},
-    {"abs", 2, abs},
-    {"ceil", 2, ceil},
-    {"conjugate", 2, conjugate},
-    {"floor", 2, floor},
-    {"negate", 2, negate},
-    {"round", 2, round},
-    {"sign", 2, sign},
-    {"real", 2, real},
-    {"imag", 2, imag},
-    {"is_nan", 2, is_nan},
-    {"is_infinity", 2, is_infinity},
-    {"logical_not", 2, logical_not},
-    {"sigmoid", 2, sigmoid},
-    {"asin", 2, asin},
-    {"asinh", 2, asinh},
-    {"acos", 2, acos},
-    {"acosh", 2, acosh},
-    {"cos", 2, cos},
-    {"cosh", 2, cosh},
-    {"atan", 2, atan},
-    {"atanh", 2, atanh},
-    {"erf", 2, erf},
-    {"erf_inv", 2, erf_inv},
-    {"exp", 2, exp},
-    {"expm1", 2, expm1},
-    {"log", 2, log},
-    {"log1p", 2, log1p},
-    {"rsqrt", 2, rsqrt},
-    {"sin", 2, sin},
-    {"sinh", 2, sinh},
-    {"sqrt", 2, sqrt},
-    {"tan", 2, tan},
-    {"tanh", 2, tanh},
-    {"add", 3, add},
-    {"subtract", 3, subtract},
-    {"multiply", 3, multiply},
-    {"pow", 3, pow},
-    {"remainder", 3, remainder},
-    {"divide", 3, divide},
-    {"atan2", 3, atan2},
-    {"bitwise_and", 3, bitwise_and},
-    {"bitwise_or", 3, bitwise_or},
-    {"bitwise_xor", 3, bitwise_xor},
-    {"bitwise_not", 2, bitwise_not},
-    {"left_shift", 3, left_shift},
-    {"right_shift", 3, right_shift},
-    {"minimum", 3, minimum},
-    {"maximum", 3, maximum},
-    {"quotient", 3, quotient},
-    {"equal", 3, equal},
-    {"not_equal", 3, not_equal},
-    {"greater", 3, greater},
-    {"less", 3, less},
-    {"greater_equal", 3, greater_equal},
-    {"less_equal", 3, less_equal},
-    {"logical_and", 3, logical_and},
-    {"logical_or", 3, logical_or},
-    {"logical_xor", 3, logical_xor},
-    {"fft", 4, emlx_fft},
-    {"ifft", 4, ifft},
-    {"fft2", 4, emlx_fft2},
-    {"ifft2", 4, ifft2},
-    {"allclose", 6, allclose},
-    {"isclose", 6, isclose},
     {"deallocate", 1, deallocate},
-    {"max", 4, max},
-    {"min", 4, min},
-    {"clip", 4, clip},
-    {"tri_inv", 3, tri_inv},
-    {"linalg_lu", 2, linalg_lu},
-    {"linalg_qr", 2, linalg_qr},
-    {"linalg_svd", 3, linalg_svd},
-    {"linalg_cholesky", 3, linalg_cholesky},
-    {"linalg_eigh", 3, linalg_eigh},
-    {"linalg_inv", 2, linalg_inv},
-    {"linalg_pinv", 2, linalg_pinv},
-    {"linalg_solve", 3, linalg_solve},
-    {"linalg_solve_triangular", 4, linalg_solve_triangular},
-    {"window_scatter_max", 8, window_scatter_max},
-    {"window_scatter_min", 8, window_scatter_min},
+    {"array_from_shm", 4, array_from_shm, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"shm_unlink_handle", 1, shm_unlink_handle},
+    {"tensor_data_ptr", 1, tensor_data_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"array_from_ptr", 5, array_from_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"memory_info", 0, memory_info},
     {"clear_cache", 0, clear_cache},
     {"reset_peak_memory", 0, reset_peak_memory},
     {"set_memory_limit", 1, set_memory_limit},
     {"set_cache_limit", 1, set_cache_limit},
-    {"tensor_data_ptr", 1, tensor_data_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"array_from_ptr", 5, array_from_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"tensor_to_shm", 2, tensor_to_shm, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"array_from_shm", 4, array_from_shm, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"shm_unlink_handle", 1, shm_unlink_handle}
-};
+
+    // ── Worker control NIFs.
+    {"command_queue_new", 1, command_queue_new},
+    {"command_queue_synchronize", 1, command_queue_synchronize}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 
