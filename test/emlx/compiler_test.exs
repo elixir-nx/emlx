@@ -19,11 +19,13 @@ defmodule EMLX.CompilerTest do
   end
 
   describe "__partitions_options__/1" do
+    @tag :metal
     test "returns a single-element list by default" do
       partitions = EMLX.__partitions_options__([])
       assert length(partitions) == 1
     end
 
+    @tag :metal
     test "default partition has a :device key and a :command_queue struct" do
       [opts] = EMLX.__partitions_options__([])
       assert Keyword.get(opts, :device) == :gpu
@@ -36,11 +38,13 @@ defmodule EMLX.CompilerTest do
       assert %CommandQueue{device: :cpu} = Keyword.get(opts, :command_queue)
     end
 
+    @tag :metal
     test "max_concurrency: 2 returns two partitions" do
       partitions = EMLX.__partitions_options__(max_concurrency: 2)
       assert length(partitions) == 2
     end
 
+    @tag :metal
     test "partitions for max_concurrency: 2 have distinct queue refs" do
       [opts1, opts2] = EMLX.__partitions_options__(max_concurrency: 2)
       q1 = Keyword.get(opts1, :command_queue)
@@ -100,6 +104,7 @@ defmodule EMLX.CompilerTest do
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6
     end
 
+    @tag :metal
     test "with :command_queue, the jit closure installs the queue during execution" do
       q = CommandQueue.new!(:gpu)
 
@@ -141,6 +146,7 @@ defmodule EMLX.CompilerTest do
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6
     end
 
+    @tag :metal
     test "with :command_queue, the compiled closure installs the queue during execution" do
       q = CommandQueue.new!(:gpu)
 

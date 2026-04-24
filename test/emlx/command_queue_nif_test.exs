@@ -8,6 +8,8 @@ defmodule EMLX.CommandQueueNIFTest do
   # shared global state).
   use ExUnit.Case, async: true
 
+  @moduletag :metal
+
   alias EMLX.NIF
 
   defp ok!({:ok, value}), do: value
