@@ -8,8 +8,6 @@ defmodule EMLX.ValidationCase do
   end
 
   setup do
-    EMLX.GPUPool.checkout()
-    on_exit(fn -> EMLX.GPUPool.checkin() end)
     Nx.default_backend({EMLX.Backend, device: :gpu})
     :ok
   end
