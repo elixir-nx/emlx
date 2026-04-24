@@ -1,17 +1,21 @@
-backend =
-  if String.downcase(System.get_env("EMLX_TEST_DEFAULT_GPU", "false")) in [
-       "1",
-       "true",
-       "yes",
-       "t",
-       "y"
-     ] do
-    {EMLX.Backend, device: :gpu}
+use_gpu? =
+  String.downcase(System.get_env("EMLX_TEST_DEFAULT_GPU", "false")) in [
+    "1",
+    "true",
+    "yes",
+    "t",
+    "y"
+  ]
+
+{default_device, backend} =
+  if use_gpu? do
+    {:gpu, {EMLX.Backend, device: :gpu}}
   else
-    EMLX.Backend
+    {:cpu, EMLX.Backend}
   end
 
 Application.put_env(:nx, :default_backend, backend)
+Application.put_env(:emlx, :default_device, default_device)
 
 # ── Distributed (peer) test setup ────────────────────────────────────────────
 # Mirrors EXLA's approach: try to start epmd + a named primary node, then

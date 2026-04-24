@@ -795,7 +795,7 @@ defmodule EMLX do
   @impl Nx.Defn.Compiler
   def __partitions_options__(opts) do
     n = Keyword.get(opts, :max_concurrency, 1)
-    device = Keyword.get(opts, :device, :gpu)
+    device = Keyword.get(opts, :device, default_device())
 
     # Allocate one CommandQueue (and its OS thread) per partition. This runs
     # inside Nx.Serving's GenServer init/1 — queues are owned by module_state.
@@ -807,8 +807,20 @@ defmodule EMLX do
 
   @impl Nx.Defn.Compiler
   def __to_backend__(opts) do
-    device = Keyword.get(opts, :device, :gpu)
+    device = Keyword.get(opts, :device, default_device())
     {EMLX.Backend, device: device}
+  end
+
+  @doc """
+  Returns the default MLX device for this process.
+
+  Reads `:default_device` from the `:emlx` application environment, falling
+  back to `:gpu`. Override in tests or config via:
+
+      Application.put_env(:emlx, :default_device, :cpu)
+  """
+  def default_device do
+    Application.get_env(:emlx, :default_device, :gpu)
   end
 
   # Splits opts into {emlx_compiler_opts, rest_opts}. The rest_opts are
