@@ -40,7 +40,8 @@ distributed_exclude =
       true = :erpc.call(peer, :code, :set_path, [:code.get_path()])
       :ok = :erpc.call(peer, Application, :put_env, [:emlx, :default_device, default_device])
       :ok = :erpc.call(peer, Application, :put_env, [:nx, :default_backend, backend])
-      {:ok, _} = :erpc.call(peer, :application, :ensure_all_started, [[:nx, :emlx]])
+      {:ok, _} = :erpc.call(peer, :application, :ensure_all_started, [:nx])
+      {:ok, _} = :erpc.call(peer, :application, :ensure_all_started, [:emlx])
       Application.put_env(:emlx, :test_peer_nodes, [peer])
       []
 
