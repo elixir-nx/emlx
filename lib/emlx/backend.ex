@@ -98,7 +98,14 @@ defmodule EMLX.Backend do
     end
   end
 
-  defstruct [:ref, :shape, :type, :data]
+  @moduledoc """
+  EMLX backend for Nx tensors, providing GPU acceleration via Apple's MLX.
+
+  For quantized inference, see `EMLX.Quantization` and
+  `EMLX.Quantization.Config`.
+  """
+
+  defstruct [:ref, :shape, :type, :data, :quantization_config]
 
   @impl true
   def init(opts) do
@@ -212,7 +219,7 @@ defmodule EMLX.Backend do
               "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
     end
 
-    device = backend_opts[:device] || :cpu
+    device = backend_opts[:device] || EMLX.default_device()
 
     case EMLX.NIF.array_from_ptr(addr, shape, to_mlx_type(type), byte_size, nil) do
       {:ok, ref} ->
@@ -241,7 +248,7 @@ defmodule EMLX.Backend do
               "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
     end
 
-    device = backend_opts[:device] || :cpu
+    device = backend_opts[:device] || EMLX.default_device()
 
     case EMLX.NIF.array_from_shm(shm_name, shape, to_mlx_type(type), byte_size) do
       {:ok, ref} ->
@@ -1090,6 +1097,68 @@ defmodule EMLX.Backend do
         right_axes,
         right_batched_axes
       ) do
+    right_quantized = EMLX.Quantization.quantized?(right)
+    left_quantized = EMLX.Quantization.quantized?(left)
+
+    if left_quantized do
+      raise ArgumentError,
+            "EMLX.Backend.dot/7 does not support a quantized left operand. " <>
+              "Dequantize it first with EMLX.dequantize/1."
+    end
+
+    if right_quantized do
+      quantized_dot(out, left, right)
+    else
+      standard_dot(
+        out,
+        left,
+        left_type,
+        left_axes,
+        left_batched_axes,
+        right,
+        right_type,
+        right_axes,
+        right_batched_axes,
+        out_type
+      )
+    end
+  end
+
+  # Dispatch a dot where `qw_tensor` is the quantized right operand.
+  # MLX's quantized_matmul always treats w as the right operand; weights are
+  # stored in (out, in) layout so transpose=true gives x @ w.T.
+  defp quantized_dot(out, activation, qw_tensor) do
+    %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
+
+    %EMLX.Quantization.Config{scales: scales_nx, biases: biases_nx, group_size: gs, bits: bits} =
+      cfg
+
+    result =
+      EMLX.quantized_matmul(
+        from_nx(activation),
+        weight_ref,
+        from_nx(scales_nx),
+        from_nx(biases_nx),
+        true,
+        gs,
+        bits
+      )
+
+    to_nx(result, out)
+  end
+
+  defp standard_dot(
+         out,
+         left,
+         left_type,
+         left_axes,
+         left_batched_axes,
+         right,
+         right_type,
+         right_axes,
+         right_batched_axes,
+         out_type
+       ) do
     left_mx = from_nx(left)
     right_mx = from_nx(right)
 
@@ -1617,37 +1686,93 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def window_scatter_min(out, tensor, source, init_value, window_dims, opts) do
-    {low_pad, high_pad} = Enum.unzip(opts[:padding])
-    strides = opts[:strides] || List.duplicate(1, tuple_size(window_dims))
-
-    EMLX.window_scatter_min(
-      from_nx(tensor),
-      from_nx(source),
-      init_value |> Nx.backend_transfer(EMLX.Backend) |> from_nx(),
-      Tuple.to_list(window_dims),
-      low_pad,
-      high_pad,
-      strides
+  def window_scatter_min(out, tensor, source, init_value, window_dims_tuple, opts) do
+    window_scatter_function(
+      &Nx.argmin(&1, axis: -1, tie_break: :high),
+      out,
+      tensor,
+      source,
+      init_value,
+      window_dims_tuple,
+      opts
     )
-    |> to_nx(out)
   end
 
   @impl true
-  def window_scatter_max(out, tensor, source, init_value, window_dims, opts) do
-    {low_pad, high_pad} = Enum.unzip(opts[:padding])
-    strides = opts[:strides] || List.duplicate(1, tuple_size(window_dims))
-
-    EMLX.window_scatter_max(
-      from_nx(tensor),
-      from_nx(source),
-      init_value |> Nx.backend_transfer(EMLX.Backend) |> from_nx(),
-      Tuple.to_list(window_dims),
-      low_pad,
-      high_pad,
-      strides
+  def window_scatter_max(out, tensor, source, init_value, window_dims_tuple, opts) do
+    window_scatter_function(
+      &Nx.argmax(&1, axis: -1),
+      out,
+      tensor,
+      source,
+      init_value,
+      window_dims_tuple,
+      opts
     )
-    |> to_nx(out)
+  end
+
+  defp window_scatter_function(function, out, tensor, source, init_value, window_dims_tuple, opts) do
+    unfold_flat = fn tensor ->
+      {device, _} = t_mx = from_nx(tensor)
+      pad_value_mx = EMLX.scalar_tensor(0, EMLX.scalar_type(t_mx), device)
+
+      {low_pad, high_pad} = Enum.unzip(opts[:padding])
+
+      padded_mx = EMLX.pad(t_mx, Nx.axes(tensor), low_pad, high_pad, pad_value_mx)
+
+      unfolded_mx =
+        sliding_window_view(
+          padded_mx,
+          EMLX.shape(padded_mx),
+          window_dims_tuple,
+          opts[:strides]
+        )
+
+      unfolded_shape = EMLX.shape(unfolded_mx)
+      unfolded = to_nx(unfolded_mx)
+
+      {to_keep, to_flatten} =
+        unfolded_shape
+        |> Tuple.to_list()
+        |> Enum.split(-tuple_size(window_dims_tuple))
+
+      flat_shape =
+        to_keep
+        |> List.to_tuple()
+        |> then(&Tuple.insert_at(&1, tuple_size(&1), Enum.product(to_flatten)))
+
+      Nx.reshape(unfolded, flat_shape)
+    end
+
+    arg_idx =
+      tensor
+      |> then(unfold_flat)
+      |> then(function)
+
+    indices_to_flatten =
+      tensor
+      |> Nx.axes()
+      |> Enum.map(fn axis ->
+        tensor
+        |> Nx.shape()
+        |> Nx.iota(axis: axis, backend: EMLX.Backend)
+        |> then(unfold_flat)
+        |> Nx.take_along_axis(Nx.new_axis(arg_idx, -1), axis: -1)
+      end)
+      |> Nx.concatenate(axis: -1)
+
+    num_axes = tuple_size(out.shape)
+    num_rows = div(Nx.size(indices_to_flatten), num_axes)
+    indices = Nx.reshape(indices_to_flatten, {num_rows, num_axes})
+
+    flat_source = Nx.flatten(source)
+
+    init_value
+    |> Nx.backend_transfer(EMLX.Backend)
+    |> Nx.broadcast(out.shape)
+    |> Nx.indexed_add(indices, flat_source)
+    |> Nx.as_type(out.type)
+    |> Nx.rename(out.names)
   end
 
   @impl true

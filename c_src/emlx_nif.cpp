@@ -1491,6 +1491,67 @@ NIF(as_strided) {
   TENSOR(mlx::core::as_strided(*t, to_shape(shape), to_strides(strides), offset, device));
 }
 
+// ============================================================================
+// Quantization Operations (for 4-bit model support)
+// ============================================================================
+
+// quantized_matmul - Multiplies x with a quantized weight matrix w
+// This is the key operation for efficient 4-bit inference
+// MLX API: quantized_matmul(x, w, scales, biases, transpose, group_size, bits, stream)
+NIF(quantized_matmul) {
+  TENSOR_PARAM(0, x);       // Input tensor [batch, seq, hidden]
+  TENSOR_PARAM(1, w);       // Quantized weights [out/8, in] (uint32 packed)
+  TENSOR_PARAM(2, scales);  // Scales [out/group_size, in] (bfloat16)
+  TENSOR_PARAM(3, biases);  // Biases [out/group_size, in] (bfloat16)
+  PARAM(4, bool, transpose);
+  PARAM(5, int, group_size);
+  PARAM(6, int, bits);
+  DEVICE_PARAM(7, device);
+
+  TENSOR(mlx::core::quantized_matmul(
+      *x, *w, *scales, *biases, transpose, group_size, bits, "affine", device));
+}
+
+// dequantize - Converts quantized weights back to float
+// Useful for debugging and verification
+// MLX API: dequantize(w, scales, biases, group_size, bits, stream)
+NIF(dequantize) {
+  TENSOR_PARAM(0, w);       // Quantized weights (uint32 packed)
+  TENSOR_PARAM(1, scales);  // Scales (bfloat16)
+  TENSOR_PARAM(2, biases);  // Biases (bfloat16)
+  PARAM(3, int, group_size);
+  PARAM(4, int, bits);
+  DEVICE_PARAM(5, device);
+
+  TENSOR(mlx::core::dequantize(*w, *scales, *biases, group_size, bits, "affine", std::nullopt, std::nullopt, device));
+}
+
+// quantize - Quantizes a float tensor to packed format
+// Returns tuple of {weights, scales, biases}
+// MLX API: quantize(w, group_size, bits, stream) -> tuple<array, array, array>
+NIF(quantize) {
+  TENSOR_PARAM(0, w);       // Float weights to quantize
+  PARAM(1, int, group_size);
+  PARAM(2, int, bits);
+  DEVICE_PARAM(3, device);
+
+  try {
+    auto result = mlx::core::quantize(*w, group_size, bits, "affine", std::nullopt, device);
+
+    ERL_NIF_TERM result_tuple[3];
+    result_tuple[0] = create_tensor_resource(env, result[0]);
+    result_tuple[1] = create_tensor_resource(env, result[1]);
+    result_tuple[2] = create_tensor_resource(env, result[2]);
+
+    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+  }
+  CATCH()
+}
+
+ASYNC_NIF(quantized_matmul)
+ASYNC_NIF(dequantize)
+ASYNC_NIF(quantize)
+
 // Build a sliding window view of a padded tensor.
 // padded: [...] of ndim n; window/strides: per-axis lists of length n.
 // Returns a view of shape [o0,...,on-1, w0,...,wn-1] where
@@ -1997,7 +2058,11 @@ static ErlNifFunc nif_funcs[] = {
 
     // ── Worker control NIFs.
     {"command_queue_new", 1, command_queue_new},
-    {"command_queue_synchronize", 1, command_queue_synchronize}};
+    {"command_queue_synchronize", 1, command_queue_synchronize},
+    // Quantization operations (async — must run on a worker thread)
+    {"quantized_matmul", 9, quantized_matmul_async},
+    {"dequantize", 7, dequantize_async},
+    {"quantize", 5, quantize_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 

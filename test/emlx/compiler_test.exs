@@ -9,8 +9,9 @@ defmodule EMLX.CompilerTest do
   alias EMLX.CommandQueue
 
   describe "__to_backend__/1" do
-    test "defaults to EMLX.Backend on :gpu" do
-      assert {EMLX.Backend, device: :gpu} = EMLX.__to_backend__([])
+    test "defaults to EMLX.Backend with the configured default device" do
+      assert {EMLX.Backend, device: device} = EMLX.__to_backend__([])
+      assert device == EMLX.default_device()
     end
 
     test "honours an explicit :device opt" do
@@ -28,8 +29,9 @@ defmodule EMLX.CompilerTest do
     @tag :metal
     test "default partition has a :device key and a :command_queue struct" do
       [opts] = EMLX.__partitions_options__([])
-      assert Keyword.get(opts, :device) == :gpu
-      assert %CommandQueue{device: :gpu} = Keyword.get(opts, :command_queue)
+      assert Keyword.get(opts, :device) == EMLX.default_device()
+      assert %CommandQueue{device: device} = Keyword.get(opts, :command_queue)
+      assert device == EMLX.default_device()
     end
 
     test "honours :device opt" do
