@@ -5,6 +5,8 @@ defmodule EMLX.Quantization.ModuleTest do
   """
   use EMLX.Case, async: true
 
+  @moduletag :metal
+
   alias EMLX.Quantization
 
   describe "EMLX.quantize/2" do

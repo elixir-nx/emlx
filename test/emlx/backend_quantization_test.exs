@@ -5,6 +5,8 @@ defmodule EMLX.BackendQuantizationTest do
   """
   use EMLX.Case, async: true
 
+  @moduletag :metal
+
   alias EMLX.Quantization
 
   describe "EMLX.Backend struct" do

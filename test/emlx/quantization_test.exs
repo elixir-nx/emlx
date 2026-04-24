@@ -1,6 +1,8 @@
 defmodule EMLX.QuantizationTest do
   use EMLX.Case, async: true
 
+  @moduletag :metal
+
   describe "quantize/3" do
     test "quantizes float tensor to packed format" do
       # Create a tensor with shape suitable for quantization
