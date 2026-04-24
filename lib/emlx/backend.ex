@@ -1101,38 +1101,34 @@ defmodule EMLX.Backend do
     right_quantized = EMLX.Quantization.quantized?(right)
     left_quantized = EMLX.Quantization.quantized?(left)
 
-    cond do
-      right_quantized and left_quantized ->
-        raise ArgumentError,
-              "EMLX.Backend.dot/7 does not support two quantized operands. " <>
-                "Dequantize one of them first."
+    if left_quantized do
+      raise ArgumentError,
+            "EMLX.Backend.dot/7 does not support a quantized left operand. " <>
+              "Dequantize it first with EMLX.dequantize/1."
+    end
 
-      right_quantized ->
-        quantized_dot(out, left, right, true)
-
-      left_quantized ->
-        quantized_dot(out, right, left, false)
-
-      true ->
-        standard_dot(
-          out,
-          left,
-          left_type,
-          left_axes,
-          left_batched_axes,
-          right,
-          right_type,
-          right_axes,
-          right_batched_axes,
-          out_type
-        )
+    if right_quantized do
+      quantized_dot(out, left, right)
+    else
+      standard_dot(
+        out,
+        left,
+        left_type,
+        left_axes,
+        left_batched_axes,
+        right,
+        right_type,
+        right_axes,
+        right_batched_axes,
+        out_type
+      )
     end
   end
 
-  # Dispatch a dot where `qw_tensor` is the quantized operand.
-  # `transpose` reflects whether the weight was stored in transposed layout
-  # (`true` when it was the right operand, `false` when it was the left operand).
-  defp quantized_dot(out, activation, qw_tensor, transpose) do
+  # Dispatch a dot where `qw_tensor` is the quantized right operand.
+  # MLX's quantized_matmul always treats w as the right operand; weights are
+  # stored in (out, in) layout so transpose=true gives x @ w.T.
+  defp quantized_dot(out, activation, qw_tensor) do
     %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
 
     %EMLX.Quantization.Config{scales: scales_nx, biases: biases_nx, group_size: gs, bits: bits} =
@@ -1144,7 +1140,7 @@ defmodule EMLX.Backend do
         weight_ref,
         from_nx(scales_nx),
         from_nx(biases_nx),
-        transpose,
+        true,
         gs,
         bits
       )

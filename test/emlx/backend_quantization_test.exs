@@ -87,13 +87,16 @@ defmodule EMLX.BackendQuantizationTest do
       assert ratio > 0.1 and ratio < 10
     end
 
-    test "raises when both dot operands are quantized" do
-      weight = Nx.iota({64, 64}, type: :f32) |> Nx.divide(100)
+    test "raises when left operand is quantized" do
+      weight = Nx.iota({64, 128}, type: :f32) |> Nx.divide(1000)
       weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
       qw = EMLX.quantize(weight, [])
 
-      assert_raise ArgumentError, fn ->
-        Nx.dot(qw, [1], qw, [0])
+      input = Nx.iota({128, 4}, type: :f32) |> Nx.divide(100)
+      input = Nx.backend_transfer(input, {EMLX.Backend, device: :gpu})
+
+      assert_raise ArgumentError, ~r/quantized left operand/, fn ->
+        Nx.dot(qw, [1], input, [0])
       end
     end
   end

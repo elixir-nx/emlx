@@ -178,12 +178,12 @@ defmodule EMLX.Quantization.ModuleTest do
       assert Nx.all_close(result_explicit, result_dot, atol: 1.0e-4) |> Nx.to_number() == 1
     end
 
-    test "raises when both dot operands are quantized" do
+    test "raises when left operand is quantized" do
       weight = Nx.iota({64, 64}, type: :f32) |> Nx.divide(100)
       weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
       qw = EMLX.quantize(weight, group_size: 64, bits: 4)
 
-      assert_raise ArgumentError, fn ->
+      assert_raise ArgumentError, ~r/quantized left operand/, fn ->
         Nx.dot(qw, [1], qw, [0])
       end
     end
