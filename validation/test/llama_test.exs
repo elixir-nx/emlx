@@ -17,7 +17,7 @@ defmodule EMLX.Validation.LlamaTest do
       mix test test/llama_test.exs --only validation
   """
 
-  use EMLX.ValidationCase, async: false
+  use EMLX.ValidationCase, async: true
 
   @moduletag :validation
   @moduletag capture_log: true

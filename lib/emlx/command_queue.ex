@@ -24,6 +24,21 @@ defmodule EMLX.CommandQueue do
   restores the previous value (supporting nested calls). `EMLX.resolve_worker/1`
   reads this key to bypass the application-default worker.
 
+  ## Inherited queue and `EMLX.Backend`
+
+  Every EMLX NIF call (including those made from inside `EMLX.Backend`
+  callbacks) inherits the bound queue automatically through
+  `EMLX.resolve_worker/1`. This means that if your code calls a standard
+  `Nx` operation inside a `with_queue/2` block — even indirectly via a
+  library that uses `EMLX.Backend` — the work routes through the bound
+  queue. This is almost always the desired behaviour (e.g. all ops in a
+  Bumblebee forward pass go to the same Metal command queue).
+
+  There is deliberately **no opt-out mechanism**: if you need work to run on
+  a different queue, open a nested `with_queue/2` for the inner scope. The
+  inner binding shadows the outer one for its duration and is restored on
+  exit.
+
   ## Cross-device promotion
 
   When a tensor's device does not match the bound queue's device, the
@@ -53,6 +68,42 @@ defmodule EMLX.CommandQueue do
     case EMLX.NIF.command_queue_new(device) do
       {:ok, ref} -> {:ok, %__MODULE__{ref: ref, device: device}}
       {:error, _} = err -> err
+    end
+  end
+
+  @doc """
+  Like `new/1` but raises `EMLX.NIFError` on failure instead of returning
+  `{:error, reason}`.
+
+  Useful in one-liner contexts (e.g. `__partitions_options__/1`) where the
+  caller has no reasonable recovery path if the device is unavailable.
+  """
+  @spec new!(:cpu | :gpu) :: t()
+  def new!(device) do
+    case new(device) do
+      {:ok, q} -> q
+      {:error, reason} -> raise(EMLX.NIFError, List.to_string(reason))
+    end
+  end
+
+  @doc """
+  Blocks the calling process until all previously enqueued jobs on `queue`
+  have finished and MLX has flushed its GPU command buffer.
+
+  Internally posts a barrier job that calls `mlx::core::synchronize(stream)`
+  on the worker thread, then blocks in `receive` until the reply arrives.
+  """
+  @spec synchronize(t()) :: :ok
+  def synchronize(%__MODULE__{ref: ref}) do
+    case EMLX.NIF.command_queue_synchronize(ref) do
+      {:ok, job_ref} ->
+        receive do
+          {^job_ref, {:ok, _}} -> :ok
+          {^job_ref, {:error, reason}} -> raise(EMLX.NIFError, List.to_string(reason))
+        end
+
+      {:error, reason} ->
+        raise(EMLX.NIFError, List.to_string(reason))
     end
   end
 

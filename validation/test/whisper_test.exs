@@ -15,7 +15,7 @@ defmodule EMLX.Validation.WhisperTest do
       mix test test/whisper_test.exs --only validation
   """
 
-  use EMLX.ValidationCase, async: false
+  use EMLX.ValidationCase, async: true
 
   @moduletag :validation
   @moduletag capture_log: true

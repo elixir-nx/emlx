@@ -14,7 +14,7 @@ defmodule EMLX.Validation.DistilBERTTest do
       mix test test/distilbert_test.exs --only validation
   """
 
-  use EMLX.ValidationCase, async: false
+  use EMLX.ValidationCase, async: true
 
   @moduletag :validation
   @moduletag capture_log: true

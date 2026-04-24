@@ -518,19 +518,60 @@ defmodule EMLX do
 
   @behaviour Nx.Defn.Compiler
 
-  @impl Nx.Defn.Compiler
-  defdelegate __jit__(key, vars, fun, args_list, opts), to: Nx.Defn.Evaluator
+  # Known EMLX-specific compiler opts. `:command_queue` is injected by
+  # `__partitions_options__/1` but may also be passed directly by callers
+  # that manage their own queues (equivalent to a manual `with_queue`).
+  @valid_compiler_keys [:device, :max_concurrency, :command_queue]
 
   @impl Nx.Defn.Compiler
-  defdelegate __compile__(key, vars, fun, opts), to: Nx.Defn.Evaluator
+  def __jit__(key, vars, fun, args_list, opts) do
+    __compile__(key, vars, fun, opts).(args_list)
+  end
 
   @impl Nx.Defn.Compiler
-  defdelegate __partitions_options__(opts), to: Nx.Defn.Evaluator
+  def __compile__(key, vars, fun, opts) do
+    Keyword.validate!(opts, @valid_compiler_keys)
+    {compiler_opts, rest_opts} = split_compiler_opts(opts)
+    queue = Keyword.get(compiler_opts, :command_queue)
+
+    inner =
+      Nx.Defn.Evaluator.__compile__(key, vars, fun,
+        Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
+      )
+
+    if queue do
+      # Capture the queue ref in a closure so each invocation of the compiled
+      # function routes through the correct CommandQueue. The queue lives as
+      # long as the Nx.Serving module_state that holds this compiled function.
+      fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> inner.(inputs) end) end
+    else
+      inner
+    end
+  end
+
+  @impl Nx.Defn.Compiler
+  def __partitions_options__(opts) do
+    n = Keyword.get(opts, :max_concurrency, 1)
+    device = Keyword.get(opts, :device, :gpu)
+
+    # Allocate one CommandQueue (and its OS thread) per partition. This runs
+    # inside Nx.Serving's GenServer init/1 — queues are owned by module_state.
+    # For N ≤ 8 the synchronous pthread_create calls take a few milliseconds.
+    for _i <- 1..n do
+      [device: device, command_queue: EMLX.CommandQueue.new!(device)]
+    end
+  end
 
   @impl Nx.Defn.Compiler
   def __to_backend__(opts) do
     device = Keyword.get(opts, :device, :gpu)
     {EMLX.Backend, device: device}
+  end
+
+  # Splits opts into {emlx_compiler_opts, rest_opts}. The rest_opts are
+  # forwarded to Nx.Defn.Evaluator; EMLX-specific keys are consumed here.
+  defp split_compiler_opts(opts) do
+    Enum.split_with(opts, fn {k, _v} -> k in @valid_compiler_keys end)
   end
 
   @doc """

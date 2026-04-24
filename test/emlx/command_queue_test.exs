@@ -35,6 +35,43 @@ defmodule EMLX.CommandQueueTest do
     end
   end
 
+  # ── CommandQueue.new!/1 ────────────────────────────────────────────────────
+
+  describe "CommandQueue.new!/1" do
+    test "returns the struct directly for a valid device" do
+      assert %CommandQueue{ref: ref, device: :gpu} = CommandQueue.new!(:gpu)
+      assert is_reference(ref)
+    end
+
+    test "raises EMLX.NIFError for an unknown device" do
+      assert_raise EMLX.NIFError, fn -> CommandQueue.new!(:tpu) end
+    end
+  end
+
+  # ── CommandQueue.synchronize/1 ─────────────────────────────────────────────
+
+  describe "CommandQueue.synchronize/1" do
+    test "returns :ok on a freshly created CPU queue" do
+      q = CommandQueue.new!(:cpu)
+      assert :ok = CommandQueue.synchronize(q)
+    end
+
+    test "returns :ok on a freshly created GPU queue" do
+      q = CommandQueue.new!(:gpu)
+      assert :ok = CommandQueue.synchronize(q)
+    end
+
+    test "returns :ok after enqueuing work via with_queue" do
+      q = CommandQueue.new!(:gpu)
+
+      CommandQueue.with_queue(q, fn ->
+        Nx.add(Nx.tensor([1, 2, 3], backend: EMLX.Backend), Nx.tensor([4, 5, 6], backend: EMLX.Backend))
+      end)
+
+      assert :ok = CommandQueue.synchronize(q)
+    end
+  end
+
   # ── CommandQueue.with_queue/2 ──────────────────────────────────────────────
 
   describe "CommandQueue.with_queue/2" do
