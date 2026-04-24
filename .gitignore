@@ -25,3 +25,7 @@ emlx-*.tar
 # Temporary files, for example, from tests.
 /tmp/
 /cache
+
+# Validation subproject build artifacts (not the mix.lock — that is committed).
+/validation/_build/
+/validation/deps/

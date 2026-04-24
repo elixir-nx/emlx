@@ -1775,3 +1775,22 @@ defmodule EMLX.NxTest do
     end
   end
 end
+
+defmodule EMLX.RuntimeCallTest do
+  use EMLX.Case, async: true
+  import Nx.Defn
+
+  defmodule Callbacks do
+    def identity(x, _opts), do: x
+  end
+
+  defn smoke(x) do
+    Nx.runtime_call(Nx.template(x.shape, x.type), x, [], &Callbacks.identity/2)
+  end
+
+  test "Nx.runtime_call/4 round-trips a tensor through a defn JIT" do
+    t = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
+    result = Nx.Defn.jit(&smoke/1).(t)
+    assert Nx.all_close(result, t) |> Nx.to_number() == 1
+  end
+end

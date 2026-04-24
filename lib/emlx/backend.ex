@@ -6,6 +6,98 @@ defmodule EMLX.Backend do
 
   require Logger
 
+  # Compile-time debug flags. Both default to false (zero runtime cost when off).
+  # Enable only in development via config/dev.exs:
+  #   config :emlx, enable_bounds_check: true
+  #   config :emlx, detect_non_finites: true
+  # After flipping a flag run: mix compile --force
+  @enable_bounds_check Application.compile_env(:emlx, :enable_bounds_check, false)
+  @detect_non_finites Application.compile_env(:emlx, :detect_non_finites, false)
+
+  # Each macro expands to the assertion body when its flag is true, or to nil
+  # when false — leaving no trace in the BEAM opcodes (no call instruction,
+  # no atom reference). Development-only; breaks MLX lazy-graph fusion.
+
+  # Checks a multi-axis indices tensor (shape [..., num_axes]) against the tensor
+  # dims on each corresponding axis. Raises ArgumentError on the first OOB value.
+  defmacrop assert_in_bounds!(tensor, indices, axes) do
+    if @enable_bounds_check do
+      quote do
+        Enum.each(Enum.with_index(unquote(axes)), fn {axis, col} ->
+          limit = elem(unquote(tensor).shape, axis)
+
+          col_ref =
+            unquote(indices)
+            |> Nx.slice_along_axis(col, 1, axis: -1)
+            |> Nx.squeeze(axes: [-1])
+            |> from_nx()
+
+          limit_ref = EMLX.scalar_tensor(limit, :uint32, :cpu)
+
+          any_oob =
+            col_ref
+            |> EMLX.astype(:uint32)
+            |> EMLX.greater_equal(limit_ref)
+            |> EMLX.any([], false)
+
+          EMLX.eval(any_oob)
+
+          if EMLX.item(any_oob) == 1 do
+            raise ArgumentError,
+                  "index out of bounds on axis #{axis}: all values must be in [0, #{limit}). " <>
+                    "Tensor shape: #{inspect(unquote(tensor).shape)}"
+          end
+        end)
+      end
+    end
+  end
+
+  # Checks a flat index tensor (all values in [0, limit)) for a single axis.
+  defmacrop assert_in_bounds_take!(tensor, indices, axis) do
+    if @enable_bounds_check do
+      quote do
+        limit = elem(unquote(tensor).shape, unquote(axis))
+        idx_ref = from_nx(unquote(indices))
+        limit_ref = EMLX.scalar_tensor(limit, :uint32, :cpu)
+
+        any_oob =
+          idx_ref
+          |> EMLX.astype(:uint32)
+          |> EMLX.greater_equal(limit_ref)
+          |> EMLX.any([], false)
+
+        EMLX.eval(any_oob)
+
+        if EMLX.item(any_oob) == 1 do
+          raise ArgumentError,
+                "index out of bounds on axis #{unquote(axis)}: all values must be in [0, #{limit}). " <>
+                  "Tensor shape: #{inspect(unquote(tensor).shape)}"
+        end
+      end
+    else
+      quote do: nil
+    end
+  end
+
+  # Checks a raw MLX ref for NaN or Inf. Forces two eval syncs — development only.
+  defmacrop assert_no_nan_inf!(tensor_ref, op) do
+    if @detect_non_finites do
+      quote do
+        has_nan = unquote(tensor_ref) |> EMLX.is_nan() |> EMLX.any([], false)
+        has_inf = unquote(tensor_ref) |> EMLX.is_infinity() |> EMLX.any([], false)
+        EMLX.eval(has_nan)
+        EMLX.eval(has_inf)
+
+        if EMLX.item(has_nan) == 1 or EMLX.item(has_inf) == 1 do
+          raise ArgumentError,
+                "#{unquote(op)} produced NaN or Inf. Disable :detect_non_finites for production."
+        end
+      end
+    else
+      quote do: nil
+    end
+  end
+
   @moduledoc """
   EMLX backend for Nx tensors, providing GPU acceleration via Apple's MLX.
 
@@ -36,7 +128,7 @@ defmodule EMLX.Backend do
 
   @impl true
   def init(opts) do
-    Keyword.validate!(opts, [:device])
+    Keyword.validate!(opts, device: :cpu)
   end
 
   @doc """
@@ -47,77 +139,6 @@ defmodule EMLX.Backend do
   end
 
   def from_nx(%T{} = other_backend), do: Nx.backend_transfer(other_backend, Backend) |> from_nx()
-
-  @doc """
-  Creates a quantized Nx.Tensor from packed weights and scales/biases.
-
-  This creates a tensor with quantization_options that will cause `Nx.dot`
-  to automatically dispatch to `quantized_matmul`.
-
-  The tensor type is set to `{:s, bits}` (e.g., `{:s, 4}` for 4-bit quantization),
-  which carries the bit width information.
-
-  ## Parameters
-
-  - `weight_ref` - EMLX array ref for packed uint32 weights
-  - `scales_ref` - EMLX array ref for per-group scale factors
-  - `biases_ref` - EMLX array ref for per-group zero points
-  - `original_shape` - Shape before quantization {out_features, in_features}
-  - `opts` - Options: `:bits` (default 4), `:group_size` (default 64)
-
-  ## Example
-
-      {q_weight, scales, biases} = EMLX.quantize(weight, 64, 4)
-      quantized_tensor = EMLX.Backend.quantized_tensor(
-        q_weight, scales, biases,
-        {512, 4096},
-        bits: 4, group_size: 64
-      )
-
-      # Now Nx.dot automatically uses quantized_matmul
-      result = Nx.dot(input, quantized_tensor)
-  """
-  def quantized_tensor(weight_ref, scales_ref, biases_ref, original_shape, opts \\ []) do
-    bits = Keyword.get(opts, :bits, 4)
-    group_size = Keyword.get(opts, :group_size, 64)
-
-    # Get weight shape from the device ref
-    weight_shape = EMLX.shape(weight_ref)
-
-    # Use {:s, bits} as the tensor type - this carries the bit width info
-    quantized_type = {:s, bits}
-
-    # Create template with original shape and quantized type
-    template = Nx.template(original_shape, quantized_type)
-
-    # Store refs directly on the backend struct (no nested map)
-    %T{
-      template
-      | data: %Backend{
-          ref: weight_ref,
-          shape: weight_shape,
-          type: {:u, 32},
-          scales: scales_ref,
-          biases: biases_ref,
-          group_size: group_size
-        }
-    }
-  end
-
-  @doc """
-  Returns true if the tensor is quantized (has scales/biases refs).
-  """
-  def quantized?(%T{data: %Backend{scales: scales}}) when not is_nil(scales), do: true
-  def quantized?(_), do: false
-
-  @doc """
-  Gets quantization options from a tensor, or nil if not quantized.
-  Returns a map with :scales, :biases, :group_size for compatibility.
-  """
-  def quantization_options(%T{data: %Backend{scales: s, biases: b, group_size: g}}) when not is_nil(s) do
-    %{scales: s, biases: b, group_size: g}
-  end
-  def quantization_options(_), do: nil
 
   @doc """
   Converts an MLX array to an Nx tensor.
@@ -137,6 +158,7 @@ defmodule EMLX.Backend do
   def to_nx({device, ref} = device_ref, %T{type: type, shape: shape} = t)
       when is_atom(device) and is_reference(ref) do
     # Get the MLX array's type
+
     mlx_type = EMLX.scalar_type(device_ref)
 
     # Convert if needed (similar to the torch byte conversion)
@@ -149,11 +171,7 @@ defmodule EMLX.Backend do
 
     %T{
       t
-      | data: %Backend{
-          ref: check_shape_and_type!(array, shape, type),
-          shape: shape,
-          type: type
-        }
+      | data: %Backend{ref: check_shape_and_type!(array, shape, type), shape: shape, type: type}
     }
   end
 
@@ -173,6 +191,97 @@ defmodule EMLX.Backend do
   @impl true
   def backend_deallocate(%T{data: %Backend{ref: ref}}) do
     EMLX.deallocate(ref)
+  end
+
+  @impl true
+  def to_pointer(%T{data: %Backend{ref: ref}}, opts) do
+    opts = Keyword.validate!(opts, mode: :local, permissions: 0o400)
+
+    case opts[:mode] do
+      :local ->
+        # Eval happens inside tensor_data_ptr (same pattern as to_blob).
+        # The pointer is valid until another mx::eval on the same array or
+        # until the Elixir tensor term is GC'd. On Apple Silicon (unified
+        # memory) the address is accessible from both CPU and GPU.
+        {addr, byte_size} = EMLX.tensor_data_ptr(ref)
+        %Nx.Pointer{kind: :local, address: addr, data_size: byte_size}
+
+      :ipc ->
+        # Copies tensor data into a POSIX shm segment (copy semantics — MLX
+        # arrays are immutable so zero-copy cross-process sharing is not
+        # possible). The receiver opens the shm and unlinks it automatically
+        # via EMLX.NIF.array_from_shm/4's deleter.
+        {shm_name, byte_size} = EMLX.tensor_to_shm(ref, opts[:permissions])
+        %Nx.Pointer{kind: :ipc, handle: shm_name, data_size: byte_size}
+
+      mode ->
+        raise ArgumentError,
+              "EMLX.Backend.to_pointer/2 expects mode: :local or :ipc, got: #{inspect(mode)}"
+    end
+  end
+
+  @impl true
+  def from_pointer(
+        %Nx.Pointer{kind: :local, address: addr, data_size: ptr_byte_size},
+        type,
+        shape,
+        backend_opts,
+        opts
+      ) do
+    out = Nx.template(shape, type, names: opts[:names] || List.duplicate(nil, tuple_size(shape)))
+    {_kind, bits} = type
+    byte_size = Nx.size(out) * div(bits, 8)
+
+    if ptr_byte_size != nil and ptr_byte_size != byte_size do
+      raise ArgumentError,
+            "EMLX.Backend.from_pointer/5: pointer data_size #{ptr_byte_size} does not match " <>
+              "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
+    end
+
+    # Default to :gpu for GPU interop; caller can override via backend opts.
+    device = backend_opts[:device] || :gpu
+
+    case EMLX.NIF.array_from_ptr(addr, shape, to_mlx_type(type), byte_size, nil) do
+      {:ok, ref} ->
+        to_nx({device, ref}, out)
+
+      {:error, msg} ->
+        raise EMLX.NIFError, List.to_string(msg)
+    end
+  end
+
+  @impl true
+  def from_pointer(
+        %Nx.Pointer{kind: :ipc, handle: shm_name, data_size: ptr_byte_size},
+        type,
+        shape,
+        backend_opts,
+        opts
+      ) do
+    out = Nx.template(shape, type, names: opts[:names] || List.duplicate(nil, tuple_size(shape)))
+    {_kind, bits} = type
+    byte_size = Nx.size(out) * div(bits, 8)
+
+    if ptr_byte_size != nil and ptr_byte_size != byte_size do
+      raise ArgumentError,
+            "EMLX.Backend.from_pointer/5: pointer data_size #{ptr_byte_size} does not match " <>
+              "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
+    end
+
+    device = backend_opts[:device] || :gpu
+
+    case EMLX.NIF.array_from_shm(shm_name, shape, to_mlx_type(type), byte_size) do
+      {:ok, ref} ->
+        to_nx({device, ref}, out)
+
+      {:error, msg} ->
+        raise EMLX.NIFError, List.to_string(msg)
+    end
+  end
+
+  def from_pointer(%Nx.Pointer{kind: kind}, _type, _shape, _backend_opts, _opts) do
+    raise ArgumentError,
+          "EMLX.Backend.from_pointer/5 only supports :local and :ipc pointers, got kind: #{inspect(kind)}"
   end
 
   @impl true
@@ -758,34 +867,6 @@ defmodule EMLX.Backend do
     end
   end
 
-  ops = [:cumulative_sum, :cumulative_product, :cumulative_max, :cumulative_min]
-
-  for op <- ops do
-    @impl true
-    def unquote(op)(out, tensor, opts) do
-      axis = opts[:axis] || 0
-      reverse = opts[:reverse] || false
-
-      # Calculate the expected output shape based on the input shape and axes
-      inclusive = true
-
-      result =
-        tensor
-        |> from_nx()
-        |> EMLX.unquote(op)(axis, reverse, inclusive)
-        |> EMLX.astype(to_mlx_type(out.type))
-
-      # Get the actual shape after summation
-      actual_shape = EMLX.shape(result)
-      # FIXME: MLX returns whatever the original type is, but Nx expects u8 -> u32
-      # scalar_type = EMLX.scalar_type(result)
-
-      # Create a new output tensor with the correct shape
-      %{out | shape: actual_shape}
-      |> then(&to_nx(result, &1))
-    end
-  end
-
   @impl true
   def stack(out, tensors, axis) do
     tensors
@@ -839,26 +920,6 @@ defmodule EMLX.Backend do
     |> from_nx()
     |> EMLX.logical_not()
     |> EMLX.where(on_false_torch, on_true_torch)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def take_along_axis(out, tensor, idx, opts) do
-    axis = opts[:axis]
-
-    tensor
-    |> from_nx()
-    |> EMLX.take_along_axis(from_nx(idx), axis)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def take(out, tensor, indices, opts) do
-    axis = opts[:axis]
-
-    tensor
-    |> from_nx()
-    |> EMLX.take(from_nx(indices), axis)
     |> to_nx(out)
   end
 
@@ -1048,88 +1109,51 @@ defmodule EMLX.Backend do
   @impl true
   def dot(
         %T{type: out_type} = out,
-        %T{type: left_type, data: %Backend{} = left_backend} = left,
+        %T{type: left_type} = left,
         left_axes,
         # MLX doesn't support batched axes
         left_batched_axes,
-        %T{type: right_type, data: %Backend{} = right_backend} = right,
+        %T{type: right_type} = right,
         right_axes,
         right_batched_axes
       ) do
-    # Check for quantized tensors (scales field is non-nil)
-    cond do
-      # Right operand is quantized: input @ quantized_weight.T
-      not is_nil(right_backend.scales) ->
-        quantized_dot_right(out, left, right)
-
-      # Left operand is quantized (transposed case): quantized_weight @ input
-      not is_nil(left_backend.scales) ->
-        quantized_dot_left(out, left, right)
-
-      # Standard dot
-      true ->
-        standard_dot(out, left, left_type, left_axes, left_batched_axes,
-                     right, right_type, right_axes, right_batched_axes, out_type)
-    end
-  end
-
-  # Handle case where right operand is quantized
-  defp quantized_dot_right(out, left, %T{type: {:s, bits}, data: %Backend{} = backend} = _right) do
-    left_mx = from_nx(left)
-    %Backend{ref: weight_ref, scales: scales, biases: biases, group_size: group_size} = backend
-
-    # quantized_matmul with transpose=true: left @ weight.T
-    result = EMLX.quantized_matmul(left_mx, weight_ref, scales, biases, true, group_size, bits)
-    to_nx(result, out)
-  end
-
-  # Handle case where left operand is quantized
-  defp quantized_dot_left(out, %T{type: {:s, bits}, data: %Backend{} = backend} = _left, right) do
-    right_mx = from_nx(right)
-    %Backend{ref: weight_ref, scales: scales, biases: biases, group_size: group_size} = backend
-
-    # quantized_matmul with transpose=false: weight @ right
-    result = EMLX.quantized_matmul(right_mx, weight_ref, scales, biases, false, group_size, bits)
-    to_nx(result, out)
-  end
-
-  # Standard non-quantized dot
-  defp standard_dot(out, left, left_type, left_axes, left_batched_axes,
-                    right, right_type, right_axes, right_batched_axes, out_type) do
     left_mx = from_nx(left)
     right_mx = from_nx(right)
 
     computation_out_type =
       if Nx.Type.integer?(out_type), do: Nx.Type.to_floating(out_type), else: out_type
 
-    if left_batched_axes != [] or right_batched_axes != [] do
-      einsum_spec =
-        dot_spec_to_einsum_spec(
-          left.shape,
-          right.shape,
-          left_axes,
-          left_batched_axes,
-          right_axes,
-          right_batched_axes
-        )
+    result_ref =
+      if left_batched_axes != [] or right_batched_axes != [] do
+        einsum_spec =
+          dot_spec_to_einsum_spec(
+            left.shape,
+            right.shape,
+            left_axes,
+            left_batched_axes,
+            right_axes,
+            right_batched_axes
+          )
 
-      EMLX.einsum(
-        to_typed_ref(left_mx, left_type, computation_out_type),
-        to_typed_ref(right_mx, right_type, computation_out_type),
-        einsum_spec
-      )
-      |> to_typed_ref(computation_out_type, out_type)
-      |> to_nx(out)
-    else
-      EMLX.tensordot(
-        to_typed_ref(left_mx, left_type, computation_out_type),
-        to_typed_ref(right_mx, right_type, computation_out_type),
-        left_axes,
-        right_axes
-      )
-      |> to_typed_ref(computation_out_type, out_type)
-      |> to_nx(out)
-    end
+        EMLX.einsum(
+          to_typed_ref(left_mx, left_type, computation_out_type),
+          to_typed_ref(right_mx, right_type, computation_out_type),
+          einsum_spec
+        )
+        |> to_typed_ref(computation_out_type, out_type)
+      else
+        EMLX.tensordot(
+          to_typed_ref(left_mx, left_type, computation_out_type),
+          to_typed_ref(right_mx, right_type, computation_out_type),
+          left_axes,
+          right_axes
+        )
+        |> to_typed_ref(computation_out_type, out_type)
+      end
+
+    assert_no_nan_inf!(result_ref, :dot)
+
+    to_nx(result_ref, out)
   end
 
   # Unary Ops
@@ -1145,7 +1169,6 @@ defmodule EMLX.Backend do
       :real,
       :imag,
       :is_nan,
-      :logical_not,
       :bitwise_not
     ] ++
       [
@@ -1261,38 +1284,6 @@ defmodule EMLX.Backend do
     tensor
     |> from_nx()
     |> EMLX.ifft(length, axis)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def fft2(out, tensor, opts) do
-    lengths = opts[:lengths]
-    axes = opts[:axes] || [-2, -1]
-
-    tensor
-    |> from_nx()
-    |> EMLX.fft2(lengths, axes)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def ifft2(out, tensor, opts) do
-    lengths = opts[:lengths]
-    axes = opts[:axes] || [-2, -1]
-
-    tensor
-    |> from_nx()
-    |> EMLX.ifft2(lengths, axes)
-    |> to_nx(out)
-  end
-
-  @impl true
-  def all_close(out, a, b, opts) do
-    atol = opts[:atol] || 1.0e-4
-    rtol = opts[:rtol] || 1.0e-8
-    equal_nan = opts[:equal_nan] == true
-
-    EMLX.allclose(from_nx(a), from_nx(b), atol, rtol, equal_nan)
     |> to_nx(out)
   end
 
@@ -1776,6 +1767,8 @@ defmodule EMLX.Backend do
   def gather(out, tensor, indices, opts) do
     axes = opts[:axes]
 
+    assert_in_bounds!(tensor, indices, axes)
+
     num_axes = Nx.axis_size(indices, -1)
 
     slice_sizes =
@@ -1817,6 +1810,9 @@ defmodule EMLX.Backend do
 
   defp indexed_op(nif_op, out, target, indices, updates, opts) do
     axes = opts[:axes] || Nx.axes(target)
+
+    assert_in_bounds!(target, indices, axes)
+
     num_axes = Nx.axis_size(indices, -1)
 
     indices_list =
@@ -1866,80 +1862,206 @@ defmodule EMLX.Backend do
       raise "complex numbers not supported yet"
     end
 
-    a_mx =
-      case opts[:transform_a] do
-        :none ->
-          to_typed_ref(from_nx(a), a.type, {:f, 32})
+    # Check for singular matrix: a lower/upper triangular is singular iff any diagonal is zero
+    a_diag = Nx.take_diagonal(a)
 
-        :transpose ->
-          a |> from_nx() |> to_typed_ref(a.type, {:f, 32}) |> EMLX.transpose([-2, -1])
-      end
+    if Nx.any(Nx.equal(a_diag, 0)) |> Nx.to_number() == 1 do
+      raise ArgumentError, "can't solve for singular matrix"
+    end
 
+    a_typed = to_typed_ref(from_nx(a), a.type, {:f, 32})
     b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32})
 
     upper = !opts[:lower]
 
-    a_inv_mx = EMLX.tri_inv(a_mx, upper)
+    # Apply transform_a: transposing flips the upper/lower triangularity.
+    # For real types, :conjugate is equivalent to :transpose.
+    {a_mx, effective_upper} =
+      case opts[:transform_a] do
+        :none -> {a_typed, upper}
+        t when t in [:transpose, :conjugate] -> {EMLX.transpose(a_typed, [-2, -1]), !upper}
+      end
 
     out_mx =
       if opts[:left_side] do
-        # Solve AX = B -> X = tri_inv(A)@B
-        {batch_axes, [_m, n]} = Nx.axes(EMLX.shape(a_inv_mx)) |> Enum.split(-2)
-
-        {b_batch_axes, b_contract_axes} =
-          if Nx.rank(b) == 1 do
-            {[], [0]}
-          else
-            case Nx.axes(b) |> Enum.split(length(batch_axes)) do
-              {batch, [x]} ->
-                {batch, [x]}
-
-              {batch, [m, _n]} ->
-                {batch, [m]}
-            end
-          end
-
-        EMLX.einsum(
-          a_inv_mx,
-          b_mx,
-          dot_spec_to_einsum_spec(
-            EMLX.shape(a_inv_mx),
-            EMLX.shape(b_mx),
-            [n],
-            batch_axes,
-            b_contract_axes,
-            b_batch_axes
-          )
-        )
+        # Solve AX = B directly via solve_triangular
+        EMLX.linalg_solve_triangular(a_mx, b_mx, effective_upper)
       else
-        # Solve XA = B -> X = B@tri_inv(A)
-        {batch_axes, [m, _n]} = Nx.axes(EMLX.shape(a_inv_mx)) |> Enum.split(-2)
+        # Solve XA = B → A^T x = b (works for both 1D and 2D b)
+        a_t = EMLX.transpose(a_mx, [-2, -1])
 
-        {b_batch_axes, b_contract_axes} =
-          if Nx.rank(b) == 1 do
-            {[], [0]}
-          else
-            {batch, [_m, n]} = Nx.axes(b) |> Enum.split(-2)
-            {batch, [n]}
-          end
+        if Nx.rank(b) == 1 do
+          # b is 1D: solve_triangular handles A^T x = b directly
+          EMLX.linalg_solve_triangular(a_t, b_mx, !effective_upper)
+        else
+          b_t = EMLX.transpose(b_mx, [-2, -1])
 
-        EMLX.einsum(
-          b_mx,
-          a_inv_mx,
-          dot_spec_to_einsum_spec(
-            EMLX.shape(b_mx),
-            EMLX.shape(a_inv_mx),
-            b_contract_axes,
-            b_batch_axes,
-            [m],
-            batch_axes
-          )
-        )
+          EMLX.linalg_solve_triangular(a_t, b_t, !effective_upper)
+          |> EMLX.transpose([-2, -1])
+        end
       end
 
     out_mx
     |> EMLX.astype(to_mlx_type(out.type))
     |> to_nx(out)
+  end
+
+  cumulative_blocks = [
+    {Nx.Block.CumulativeSum, :cumulative_sum},
+    {Nx.Block.CumulativeProduct, :cumulative_product},
+    {Nx.Block.CumulativeMax, :cumulative_max},
+    {Nx.Block.CumulativeMin, :cumulative_min}
+  ]
+
+  for {block_mod, mlx_op} <- cumulative_blocks do
+    @impl true
+    def block(%unquote(block_mod){axis: axis, reverse: reverse}, out, [tensor], _fun) do
+      axis = axis || 0
+      reverse = reverse || false
+      inclusive = true
+
+      result =
+        tensor
+        |> from_nx()
+        |> EMLX.unquote(mlx_op)(axis, reverse, inclusive)
+        |> EMLX.astype(to_mlx_type(out.type))
+
+      actual_shape = EMLX.shape(result)
+      %{out | shape: actual_shape} |> then(&to_nx(result, &1))
+    end
+  end
+
+  @impl true
+  def block(%Nx.Block.LogicalNot{}, out, [tensor], _fun) do
+    tensor
+    |> from_nx()
+    |> EMLX.logical_not()
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.TakeAlongAxis{axis: axis}, out, [tensor, idx], _fun) do
+    assert_in_bounds_take!(tensor, idx, axis)
+
+    tensor
+    |> from_nx()
+    |> EMLX.take_along_axis(from_nx(idx), axis)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.Take{axis: axis}, out, [tensor, indices], _fun) do
+    assert_in_bounds_take!(tensor, indices, axis)
+
+    tensor
+    |> from_nx()
+    |> EMLX.take(from_nx(indices), axis)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.FFT2{lengths: lengths, axes: axes}, out, [tensor], _fun) do
+    axes = axes || [-2, -1]
+
+    tensor
+    |> from_nx()
+    |> EMLX.fft2(lengths, axes)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.IFFT2{lengths: lengths, axes: axes}, out, [tensor], _fun) do
+    axes = axes || [-2, -1]
+
+    tensor
+    |> from_nx()
+    |> EMLX.ifft2(lengths, axes)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.AllClose{atol: atol, rtol: rtol, equal_nan: equal_nan}, out, [a, b], _fun) do
+    a
+    |> from_nx()
+    |> EMLX.allclose(from_nx(b), atol || 1.0e-4, rtol || 1.0e-8, equal_nan == true)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.Cholesky{}, out, [tensor], _fun) do
+    from_nx(tensor)
+    |> to_typed_ref(tensor.type, {:f, 32})
+    |> EMLX.linalg_cholesky(false)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.Solve{}, out, [a, b], _fun) do
+    a_f = to_typed_ref(from_nx(a), a.type, {:f, 32})
+    b_f = to_typed_ref(from_nx(b), b.type, {:f, 32})
+
+    EMLX.linalg_solve(a_f, b_f)
+    |> to_nx(out)
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.QR{mode: :reduced}, {out_q, out_r}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    {q, r} = EMLX.linalg_qr(t)
+    {to_nx(q, out_q), to_nx(r, out_r)}
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.QR{mode: :complete} = struct, _output, args, fun) do
+    # MLX only supports reduced QR; fall back to defn for :complete mode
+    apply(fun, [struct | args])
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.Eigh{}, {out_eigenvals, out_eigenvecs}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    {eigenvalues, eigenvectors} = EMLX.linalg_eigh(t, :L)
+    {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.SVD{full_matrices?: full?}, {out_u, out_s, out_v}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    [u, s, vt] = EMLX.linalg_svd(t, true)
+
+    # MLX always returns full matrices; truncate for full_matrices?: false
+    {u_final, vt_final} =
+      if full? do
+        {u, vt}
+      else
+        # Truncate U to {m, k} and Vt to {k, n} where k = min(m, n)
+        {_m, k} = out_u.shape
+        u_sliced = EMLX.slice(u, [0, 0], [elem(EMLX.shape(u), 0), k], [1, 1])
+        {_k2, n} = out_v.shape
+        vt_sliced = EMLX.slice(vt, [0, 0], [k, n], [1, 1])
+        {u_sliced, vt_sliced}
+      end
+
+    {to_nx(u_final, out_u), to_nx(s, out_s), to_nx(vt_final, out_v)}
+  end
+
+  @impl true
+  def block(%Nx.Block.LinAlg.LU{}, {out_p, out_l, out_u}, [tensor], _fun) do
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    [p_pivot, l, u] = EMLX.linalg_lu(t)
+
+    # MLX returns P as a uint32 pivot index vector; convert to permutation matrix
+    n = elem(out_p.shape, tuple_size(out_p.shape) - 1)
+    p_nx = to_nx(p_pivot)
+    eye = Nx.eye(n, type: out_p.type, backend: Backend)
+    p_matrix = Nx.take(eye, p_nx, axis: 0)
+
+    {p_matrix, to_nx(l, out_l), to_nx(u, out_u)}
+  end
+
+  @impl true
+  def block(struct, _output, args, fun) do
+    apply(fun, [struct | args])
   end
 
   for {op, arity} <- [
@@ -1952,19 +2074,6 @@ defmodule EMLX.Backend do
     @impl true
     def unquote(op)(unquote_splicing(args)) do
       raise "#{unquote(op)} not supported in EMLX"
-    end
-  end
-
-  for {op, arity} <- [
-        lu: 3,
-        to_pointer: 2,
-        from_pointer: 5
-      ] do
-    @impl true
-    args = List.duplicate(Macro.var(:_, __MODULE__), arity)
-
-    def unquote(op)(unquote_splicing(args)) do
-      raise "Nx.Backend.#{unquote(op)}/#{unquote(arity)} not implemented yet in EMLX"
     end
   end
 

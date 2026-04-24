@@ -1,0 +1,82 @@
+name: Validation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'lib/**'
+      - 'c_src/**'
+      - 'validation/**'
+      - 'mix.exs'
+      - 'mix.lock'
+  workflow_dispatch:
+
+concurrency:
+  group: validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validation:
+    name: Validation suite (macOS arm64)
+    runs-on: macos-26
+    env:
+      MIX_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Elixir and Erlang
+        id: setup
+        run: |
+          curl -fsSO https://elixir-lang.org/install.sh
+          sh install.sh elixir@1.17.0 otp@25.3.2.15
+
+          OTP_MAJOR="25"
+          export OTP_PATH=$HOME/.elixir-install/installs/otp/25.3.2.15/bin
+          export ELIXIR_PATH=$HOME/.elixir-install/installs/elixir/1.17.0-otp-${OTP_MAJOR}/bin
+          echo "path=${OTP_PATH}:${ELIXIR_PATH}" >> $GITHUB_OUTPUT
+          echo "${OTP_PATH}" >> $GITHUB_PATH
+          echo "${ELIXIR_PATH}" >> $GITHUB_PATH
+
+      - name: Setup Mix
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Cache root deps and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/deps
+            ${{ github.workspace }}/_build
+          key: ${{ runner.os }}-validation-root-${{ hashFiles('mix.lock', 'mix.exs', 'c_src/**') }}-v1
+
+      - name: Cache validation deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/validation/deps
+            ${{ github.workspace }}/validation/_build
+          key: ${{ runner.os }}-validation-deps-${{ hashFiles('validation/mix.lock') }}-v1
+
+      - name: Build EMLX (root project)
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          mix deps.get
+          mix compile
+
+      - name: Install validation dependencies
+        working-directory: validation
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          mix deps.get
+
+      - name: Run validation suite
+        working-directory: validation
+        env:
+          EMLX_TEST_DEFAULT_GPU: "true"
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          mix test --only validation

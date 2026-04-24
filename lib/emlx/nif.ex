@@ -17,11 +17,76 @@ defmodule EMLX.NIF do
     :erlang.load_nif(path, 0)
   end
 
-  def to_blob(_tensor) do
+  # Worker-routed NIF stubs. The first argument is always an
+  # EMLX.CommandQueue resource ref; the C++ wrapper (emlx_async.hpp)
+  # extracts it and posts the rest to the worker thread, returning a
+  # job ref for the caller to `receive` on.
+  def to_blob(_worker, _tensor) do
     :erlang.nif_error(:nif_not_loaded)
   end
 
-  def to_blob(_tensor, _limit) do
+  def to_blob(_worker, _tensor, _limit) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def eval(_worker, _tensor_ref) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def item(_worker, _tensor_ref) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def memory_info do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def clear_cache do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def reset_peak_memory do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def set_memory_limit(_limit) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def set_cache_limit(_limit) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def tensor_data_ptr(_tensor) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def array_from_ptr(_addr, _shape, _dtype, _byte_size, _deleter) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def tensor_to_shm(_worker, _tensor, _permissions) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def array_from_shm(_name, _shape, _dtype, _byte_size) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def shm_unlink_handle(_name) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  # ── Worker / EMLX.CommandQueue control NIFs ───────────────────────────────
+  # `command_queue_post_eval` and `command_queue_post_to_blob` were folded
+  # into the generic async dispatch path; their public entry points are
+  # `eval/2` and `to_blob/{2,3}` above.
+
+  def command_queue_new(_device) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def command_queue_synchronize(_queue_ref) do
     :erlang.nif_error(:nif_not_loaded)
   end
 end

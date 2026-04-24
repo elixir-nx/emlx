@@ -12,9 +12,11 @@ on both macOS and Linux.
 
 The M-Series Macs have an unified memory architecture, which allows for more passing data between the CPU and GPU to be effectively a no-op.
 
-Besides the backend, this library also provides an Nx.Defn.Compiler implementation that allows for JIT compilation of Nx functions to MLX kernels.
-Using this compiler is not much different from just using the default `Nx.Defn.Evaluator`, but because it sets an explicit `EMLX.eval` call,
-it allows for better caching of Nx-defined functions by MLX itself.
+Besides the backend, this library also provides a `Nx.Defn.Compiler` implementation that JIT-compiles Nx functions with smart use of MLX command queues.
+
+- **Worker-thread dispatch** — MLX ops run on dedicated threads instead of BEAM dirty schedulers, eliminating scheduler starvation under load.
+- **Per-process Metal command queues (`EMLX.CommandQueue`)** — each BEAM process can get its own GPU command queue for true process-level GPU isolation.
+- **GPU pointer interop** — `Nx.Backend.from_pointer/5` and `to_pointer/2` for zero-copy Metal buffer sharing with other languages, such as with Python via Pythonx.
 
 Metal does not support 64-bit floats, so neither MLX nor EMLX do either.
 
@@ -49,7 +51,6 @@ config :nx, :default_backend, {EMLX.Backend, device: :gpu}
 ```
 
 If you want to use the JIT compiler, you can set the default compiler as shown below.
-In the current version, this delegates to `Nx.Defn.Evaluator` and sets EMLX as the backend of choice for the compiler.
 
 ```elixir
 Nx.Defn.default_options(compiler: EMLX)

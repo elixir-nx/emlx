@@ -1,5 +1,6 @@
+#include "emlx_async.hpp"
+#include "emlx_worker.hpp"
 #include "erl_nif.h"
-#include "mlx/backend/common/utils.h"
 #include "mlx/mlx.h"
 #include "nx_nif_utils.hpp"
 
@@ -8,6 +9,12 @@
 #include <numeric>
 #include <string>
 #include <cstring>
+#include <random>
+#include <optional>
+#include <cstdio>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace mlx::core;
 
@@ -61,6 +68,15 @@ inline const mlx::core::Device string2device(const std::string &atom) {
   throw std::runtime_error("Unknown device: " + atom);
 }
 
+// MLX 0.31+ uses Shape = SmallVector<int> and Strides = SmallVector<long long>
+// which no longer accept implicit construction from std::vector.
+static inline mlx::core::Shape to_shape(const std::vector<int> &v) {
+  return mlx::core::Shape(v.begin(), v.end());
+}
+static inline mlx::core::Strides to_strides(const std::vector<int64_t> &v) {
+  return mlx::core::Strides(v.begin(), v.end());
+}
+
 // Class to manage the refcount of MLX tensors
 class TensorP {
 public:
@@ -107,6 +123,9 @@ public:
   }
 
   mlx::core::array *data() const { return ptr; }
+
+  // Raw ERTS resource pointer for use with enif_make_resource_binary.
+  void *resource_ptr() const { return static_cast<void *>(ptr); }
 
   bool is_valid() const { return ptr != nullptr; }
 
@@ -183,6 +202,15 @@ ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
 #define NIF(NAME)                                                              \
   ERL_NIF_TERM NAME(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
 
+// One-line async wrapper: declare `NIF(OP) { ... }` then `ASYNC_NIF(OP)`.
+// Register in `nif_funcs[]` at `original_arity + 1` (command queue is argv[0]).
+// Example: {"add", 4, add_async}  // was {"add", 3, add}
+#define ASYNC_NIF(OP)                                                          \
+  ERL_NIF_TERM OP##_async(ErlNifEnv *env, int argc,                            \
+                          const ERL_NIF_TERM argv[]) {                         \
+    return emlx::async_dispatch<OP>(env, argc, argv);                          \
+  }
+
 #define PARAM(ARGN, TYPE, VAR)                                                 \
   TYPE VAR;                                                                    \
   GET(ARGN, VAR)
@@ -237,7 +265,7 @@ NIF(ones) {
   TYPE_PARAM(1, type);
   DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::ones(shape, type, device));
+  TENSOR(mlx::core::ones(to_shape(shape), type, device));
 }
 
 NIF(zeros) {
@@ -245,7 +273,7 @@ NIF(zeros) {
   TYPE_PARAM(1, type);
   DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::zeros(shape, type, device));
+  TENSOR(mlx::core::zeros(to_shape(shape), type, device));
 }
 
 NIF(reshape) {
@@ -253,7 +281,7 @@ NIF(reshape) {
   SHAPE_PARAM(1, shape);
   DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::reshape(*t, shape, device));
+  TENSOR(mlx::core::reshape(*t, to_shape(shape), device));
 }
 
 NIF(astype) {
@@ -264,45 +292,61 @@ NIF(astype) {
   TENSOR(mlx::core::astype(*t, type, device));
 }
 
+// Builds the resource binary for `to_blob` in `out_env`. Used by both the
+// legacy direct-call NIF and `command_queue_post_to_blob` (which builds the
+// term inside the worker thread for delivery via enif_send). May throw
+// std::runtime_error on resource allocation failure.
+//
+// `out_env` is the env the binary will live in (the caller env for the
+// legacy path; a process-independent msg_env for the worker path).
+static ERL_NIF_TERM to_blob_term(ErlNifEnv *out_env, mlx::core::array *t,
+                                 size_t byte_size) {
+  if (t->flags().row_contiguous) {
+    // Zero-copy: alias the MLX buffer via the existing tensor resource.
+    // Invariant: lib/emlx.ex calls eval(tensor) before this NIF, so
+    // data<void>() is guaranteed non-null and stable (MLX arrays are immutable
+    // once materialised). enif_make_resource_binary keeps the resource alive
+    // until the binary is GC'd, decoupling the binary lifetime from Elixir GC
+    // of the tensor term.
+    return enif_make_resource_binary(out_env, static_cast<void *>(t),
+                                     t->data<void>(), byte_size);
+  }
+
+  // Non-contiguous: materialise a fresh row-major copy, wrap it in a minimal
+  // ERTS resource, and alias that buffer zero-copy.
+  // The resource holds only sizeof(mlx::core::array) — no TensorP refcount/
+  // deleted-flag tail — because it is never exposed to TensorP or the Elixir
+  // side; only the binary holds a reference and default_dtor<array>
+  // (~array()) is the sole destructor path.
+  auto ct = mlx::core::contiguous(*t);
+  mlx::core::eval(ct);
+
+  auto *ct_ptr = static_cast<mlx::core::array *>(enif_alloc_resource(
+      resource_object<mlx::core::array>::type, sizeof(mlx::core::array)));
+  if (!ct_ptr) {
+    throw std::runtime_error("Unable to allocate contiguous-copy resource");
+  }
+
+  new (ct_ptr) mlx::core::array(std::move(ct));
+  ERL_NIF_TERM resource_bin = enif_make_resource_binary(
+      out_env, ct_ptr, ct_ptr->data<void>(), byte_size);
+  enif_release_resource(ct_ptr);
+  return resource_bin;
+}
+
 NIF(to_blob) {
-  ERL_NIF_TERM result;
   TENSOR_PARAM(0, t);
 
   size_t byte_size = t->nbytes();
-  int limit = 0;
-  bool has_received_limit = (argc == 2);
-
-  if (has_received_limit) {
+  if (argc == 2) {
     PARAM(1, int, param_limit);
-    limit = param_limit;
-    byte_size = limit * t->itemsize();
+    byte_size = static_cast<size_t>(param_limit) * t->itemsize();
   }
 
-  // Create result binary
-  void *result_data = (void *)enif_make_new_binary(env, byte_size, &result);
-
-  // The MLX array data may not be contiguous in memory, even after the
-  // reshape+flatten operations. See:
-  // https://github.com/ml-explore/mlx/discussions/1608#discussioncomment-11332071
-  //
-  // Set up contiguous iterator
-  std::vector<int> slice_sizes(t->shape().begin(), t->shape().end());
-  ContiguousIterator iterator(slice_sizes, t->strides(), t->ndim());
-
-  // Copy data element by element using iterator
-  size_t element_size = t->itemsize();
-  const char *src_data = static_cast<const char *>(t->data<void>());
-  char *dst_data = static_cast<char *>(result_data);
-
-  size_t num_elements = byte_size / element_size;
-  for (size_t i = 0; i < num_elements; i++) {
-    size_t src_offset = iterator.loc;
-    std::memcpy(dst_data + (i * element_size),
-                src_data + (src_offset * element_size), element_size);
-    iterator.step();
+  try {
+    return nx::nif::ok(env, to_blob_term(env, t, byte_size));
   }
-
-  return nx::nif::ok(env, result);
+  CATCH()
 }
 
 uint64_t elem_count(std::vector<int> shape) {
@@ -332,7 +376,7 @@ NIF(from_blob) {
     auto deleter = [](allocator::Buffer buf) { allocator::free(buf); };
 
     // Create MLX array from the buffer
-    TENSOR(mlx::core::array(mlx_buf, shape, type, deleter));
+    TENSOR(mlx::core::array(mlx_buf, to_shape(shape), type, deleter));
   } catch (const std::exception &e) {
     return nx::nif::error(env, e.what());
   } catch (...) {
@@ -360,9 +404,9 @@ NIF(full) {
   DEVICE_PARAM(3, device);
 
   if (is_complex) {
-    TENSOR(mlx::core::full(shape, complex_scalar, type, device));
+    TENSOR(mlx::core::full(to_shape(shape), complex_scalar, type, device));
   } else {
-    TENSOR(mlx::core::full(shape, scalar, type, device));
+    TENSOR(mlx::core::full(to_shape(shape), scalar, type, device));
   }
 }
 
@@ -396,7 +440,7 @@ NIF(broadcast_to) {
   SHAPE_PARAM(1, shape);
   DEVICE_PARAM(2, device);
 
-  auto result = mlx::core::broadcast_to(*t, shape, device);
+  auto result = mlx::core::broadcast_to(*t, to_shape(shape), device);
 
   TENSOR(result);
 }
@@ -434,6 +478,97 @@ NIF(tri_inv) {
   TENSOR(mlx::core::linalg::tri_inv(*tensor, upper, device));
 }
 
+NIF(linalg_lu) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  try {
+    auto result = mlx::core::linalg::lu(*tensor, device);
+    return nx::nif::ok(env, nx::nif::make_list(env, result));
+  }
+  CATCH()
+}
+
+NIF(linalg_qr) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  try {
+    auto [q, r] = mlx::core::linalg::qr(*tensor, device);
+    return nx::nif::ok(env, enif_make_tuple2(
+      env,
+      create_tensor_resource(env, q),
+      create_tensor_resource(env, r)));
+  }
+  CATCH()
+}
+
+NIF(linalg_svd) {
+  TENSOR_PARAM(0, tensor);
+  PARAM(1, bool, compute_uv);
+  DEVICE_PARAM(2, device);
+
+  try {
+    auto result = mlx::core::linalg::svd(*tensor, compute_uv, device);
+    return nx::nif::ok(env, nx::nif::make_list(env, result));
+  }
+  CATCH()
+}
+
+NIF(linalg_cholesky) {
+  TENSOR_PARAM(0, tensor);
+  PARAM(1, bool, upper);
+  DEVICE_PARAM(2, device);
+
+  TENSOR(mlx::core::linalg::cholesky(*tensor, upper, device));
+}
+
+NIF(linalg_eigh) {
+  TENSOR_PARAM(0, tensor);
+  ATOM_PARAM(1, uplo);
+  DEVICE_PARAM(2, device);
+
+  try {
+    auto [eigenvalues, eigenvectors] = mlx::core::linalg::eigh(*tensor, uplo, device);
+    return nx::nif::ok(env, enif_make_tuple2(
+      env,
+      create_tensor_resource(env, eigenvalues),
+      create_tensor_resource(env, eigenvectors)));
+  }
+  CATCH()
+}
+
+NIF(linalg_inv) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  TENSOR(mlx::core::linalg::inv(*tensor, device));
+}
+
+NIF(linalg_pinv) {
+  TENSOR_PARAM(0, tensor);
+  DEVICE_PARAM(1, device);
+
+  TENSOR(mlx::core::linalg::pinv(*tensor, device));
+}
+
+NIF(linalg_solve) {
+  TENSOR_PARAM(0, tensorA);
+  TENSOR_PARAM(1, tensorB);
+  DEVICE_PARAM(2, device);
+
+  TENSOR(mlx::core::linalg::solve(*tensorA, *tensorB, device));
+}
+
+NIF(linalg_solve_triangular) {
+  TENSOR_PARAM(0, tensorA);
+  TENSOR_PARAM(1, tensorB);
+  PARAM(2, bool, upper);
+  DEVICE_PARAM(3, device);
+
+  TENSOR(mlx::core::linalg::solve_triangular(*tensorA, *tensorB, upper, device));
+}
+
 NIF(conv_general) {
   TENSOR_PARAM(0, tensor_input);
   TENSOR_PARAM(1, tensor_kernel);
@@ -466,8 +601,8 @@ NIF(pad) {
   TENSOR_PARAM(4, pad_value);
   DEVICE_PARAM(5, device);
 
-  TENSOR(mlx::core::pad(*t, axes, low_pad_size, high_pad_size, *pad_value,
-                        "constant", device))
+  TENSOR(mlx::core::pad(*t, axes, to_shape(low_pad_size), to_shape(high_pad_size),
+                        *pad_value, "constant", device))
 };
 
 NIF(sort) {
@@ -542,7 +677,7 @@ NIF(gather) {
   LIST_PARAM(3, std::vector<int>, slice_sizes);
   DEVICE_PARAM(4, device);
 
-  TENSOR(mlx::core::gather(*t, indices, axes, slice_sizes, device));
+  TENSOR(mlx::core::gather(*t, indices, axes, to_shape(slice_sizes), device));
 }
 
 NIF(scatter_add) {
@@ -681,6 +816,338 @@ NIF(cumulative_min) {
     TENSOR(mlx::core::NATIVE_OP(*a, *b, device));                              \
   }
 
+// Generate a unique POSIX shared-memory name of the form /emlx_<16hex>.
+// Names must begin with '/' and be short enough for shm_open on all platforms.
+// Uses thread_local state so concurrent NIF calls don't race on the RNG.
+static std::string generate_shm_name() {
+  thread_local std::mt19937_64 gen(std::random_device{}());
+  thread_local std::uniform_int_distribution<uint64_t> dist;
+  char buf[32];
+  snprintf(buf, sizeof(buf), "/emlx_%016llx", (unsigned long long)dist(gen));
+  return std::string(buf);
+}
+
+// ── IPC shared-memory interop ─────────────────────────────────────────────────
+//
+// These two NIFs implement the :ipc mode of Nx.Backend.to_pointer / from_pointer
+// using POSIX shared memory (shm_open + mmap).  MLX arrays are immutable, so
+// the sender *copies* tensor data into the shm segment — there is no zero-copy
+// path here (documented as copy semantics in the Elixir layer).
+//
+// Lifecycle:
+//   Sender  (tensor_to_shm): creates shm, memcpy, munmap+close fd.  Name persists
+//   Receiver (array_from_shm): shm_open, mmap, shm_unlink immediately (keeps object
+//   alive via fd), creates mlx::array with a deleter that munmap+closes on GC.
+
+// Creates a POSIX shm segment containing a contiguous copy of the tensor's data.
+// argv[0]: tensor_ref   (must already be eval'd — Elixir calls eval before this NIF)
+// argv[1]: permissions  (mode_t expressed as uint64, e.g. 0o400 = 256)
+// Returns: {:ok, {name_binary, byte_size}} on success.
+NIF(tensor_to_shm) {
+  TENSOR_PARAM(0, t);
+  PARAM(1, size_t, permissions);
+
+  if (t->data<void>() == nullptr) {
+    return nx::nif::error(env,
+        "Tensor not evaluated; call EMLX.eval/1 before to_pointer with mode: :ipc");
+  }
+
+  // Ensure contiguous layout before exposing to shared memory.
+  size_t byte_size;
+  void *src_ptr;
+
+  // Use optional to avoid default-constructing mlx::core::array.
+  std::optional<mlx::core::array> ct_opt;
+  if (t->flags().row_contiguous) {
+    byte_size = t->nbytes();
+    src_ptr = t->data<void>();
+  } else {
+    ct_opt.emplace(mlx::core::contiguous(*t));
+    mlx::core::eval(*ct_opt);
+    byte_size = ct_opt->nbytes();
+    src_ptr = ct_opt->data<void>();
+  }
+
+  // O_EXCL ensures we create a fresh segment; retry on the rare collision.
+  int fd = -1;
+  std::string shm_name;
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    shm_name = generate_shm_name();
+    fd = shm_open(shm_name.c_str(), O_CREAT | O_EXCL | O_RDWR, (mode_t)permissions);
+    if (fd != -1 || errno != EEXIST) break;
+  }
+  if (fd == -1) {
+    return nx::nif::error(env, "shm_open failed in tensor_to_shm");
+  }
+
+  if (ftruncate(fd, (off_t)byte_size) == -1) {
+    close(fd);
+    shm_unlink(shm_name.c_str());
+    return nx::nif::error(env, "ftruncate failed in tensor_to_shm");
+  }
+
+  void *ptr = mmap(NULL, byte_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (ptr == MAP_FAILED) {
+    close(fd);
+    shm_unlink(shm_name.c_str());
+    return nx::nif::error(env, "mmap failed in tensor_to_shm");
+  }
+
+  std::memcpy(ptr, src_ptr, byte_size);
+
+  munmap(ptr, byte_size);
+  close(fd);
+  // shm object persists under shm_name until the receiver calls shm_unlink.
+
+  // Return the shm name as a binary (not a charlist) so %Nx.Pointer{handle: ...}
+  // holds a conventional Elixir binary that other backends can consume.
+  // ERTS API: enif_make_new_binary(env, size, &term) returns the writable ptr.
+  ERL_NIF_TERM name_term;
+  unsigned char *bin_data = enif_make_new_binary(env, shm_name.size(), &name_term);
+  std::memcpy(bin_data, shm_name.data(), shm_name.size());
+  ERL_NIF_TERM size_term = nx::nif::make(env, byte_size);
+  return nx::nif::ok(env, enif_make_tuple2(env, name_term, size_term));
+}
+
+// Opens an existing POSIX shm segment and wraps it as an MLX array.
+// The shm is unlinked immediately after mmap so cleanup is automatic:
+// when the returned MLX array is GC'd, its deleter calls munmap + close.
+// argv[0]: name_binary  (POSIX shm name string)
+// argv[1]: shape        (tuple of ints)
+// argv[2]: dtype        (atom, e.g. :float32)
+// argv[3]: byte_size    (uint64, validated against computed size)
+// Returns: {:ok, tensor_ref} on success.
+NIF(array_from_shm) {
+  std::string shm_name;
+  if (!nx::nif::get(env, argv[0], shm_name))
+    return nx::nif::error(env, "Unable to get shm name param");
+
+  SHAPE_PARAM(1, shape);
+  TYPE_PARAM(2, dtype);
+  PARAM(3, size_t, byte_size);
+
+  if (shm_name.empty()) {
+    return nx::nif::error(env, "Empty shm name");
+  }
+
+  // Try read-write first; fall back to read-only if permission denied.
+  int writable = 1;
+  int fd = shm_open(shm_name.c_str(), O_RDWR, 0);
+  if (fd == -1 && errno == EACCES) {
+    fd = shm_open(shm_name.c_str(), O_RDONLY, 0);
+    writable = 0;
+  }
+  if (fd == -1) {
+    return nx::nif::error(env, "shm_open failed in array_from_shm");
+  }
+
+  int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+  void *ptr = mmap(NULL, byte_size, prot, MAP_SHARED, fd, 0);
+  if (ptr == MAP_FAILED) {
+    close(fd);
+    return nx::nif::error(env, "mmap failed in array_from_shm");
+  }
+
+  // Unlink immediately: the name is removed, but the object lives as long as
+  // this fd (and thus this mmap) is open.  The deleter owns cleanup.
+  shm_unlink(shm_name.c_str());
+
+  try {
+    // Capture fd and byte_size in the deleter; MLX calls it exactly once.
+    auto deleter = [fd, byte_size](void *p) {
+      munmap(p, byte_size);
+      close(fd);
+    };
+    auto arr = mlx::core::array(ptr, to_shape(shape), dtype, deleter);
+    return nx::nif::ok(env, create_tensor_resource(env, std::move(arr)));
+  }
+  CATCH()
+}
+
+// Unlinks a POSIX shm segment by name.  Call this if the receiver never opens
+// the pointer returned by tensor_to_shm — otherwise the shm name persists in
+// /dev/shm until the next reboot.
+// argv[0]: name binary (the handle from %Nx.Pointer{kind: :ipc, handle: name})
+NIF(shm_unlink_handle) {
+  std::string shm_name;
+  if (!nx::nif::get(env, argv[0], shm_name))
+    return nx::nif::error(env, "Unable to get shm name param");
+
+  if (shm_unlink(shm_name.c_str()) == -1 && errno != ENOENT) {
+    return nx::nif::error(env, "shm_unlink failed");
+  }
+  return nx::nif::ok(env);
+}
+
+// Returns the raw data pointer of an evaluated tensor as a {address, byte_size}
+// tuple of uint64 values. The Elixir caller must call EMLX.eval/1 first so
+// that data<void>() is non-null and stable (MLX arrays are immutable once
+// materialised). On Apple Silicon the pointer is accessible from both CPU and
+// GPU due to unified memory. Primary use case: sharing tensors with Python MLX
+// via Pythonx using the Nx.Backend.to_pointer/from_pointer protocol.
+NIF(tensor_data_ptr) {
+  TENSOR_PARAM(0, t);
+
+  if (t->data<void>() == nullptr) {
+    return nx::nif::error(
+        env, "Tensor has not been evaluated; call EMLX.eval/1 before to_pointer");
+  }
+
+  size_t addr = reinterpret_cast<size_t>(t->data<void>());
+  size_t byte_size = t->nbytes();
+
+  ERL_NIF_TERM addr_term = nx::nif::make(env, addr);
+  ERL_NIF_TERM size_term = nx::nif::make(env, byte_size);
+  return nx::nif::ok(env, enif_make_tuple2(env, addr_term, size_term));
+}
+
+// Wraps an external raw pointer as an MLX array with a no-op deleter.
+// The caller is responsible for keeping the backing buffer alive for the
+// duration of use (see include/emlx.h for the lifetime contract).
+// argv[0]: address  (uint64 / size_t)
+// argv[1]: shape    (tuple of ints)
+// argv[2]: dtype    (atom, e.g. :float32)
+// argv[3]: byte_size (uint64, validated but not used by the MLX ctor)
+// argv[4]: deleter  (reserved / ignored; pass nil)
+NIF(array_from_ptr) {
+  PARAM(0, size_t, raw_addr);
+  SHAPE_PARAM(1, shape);
+  TYPE_PARAM(2, dtype);
+  // argv[3] byte_size and argv[4] deleter are accepted but deferred.
+
+  if (raw_addr == 0) {
+    return nx::nif::error(env, "Null pointer passed to array_from_ptr");
+  }
+
+  try {
+    void *ptr = reinterpret_cast<void *>(raw_addr);
+    // No-op deleter: the caller owns the buffer.
+    auto arr =
+        mlx::core::array(ptr, to_shape(shape), dtype, [](void *) {});
+    return nx::nif::ok(env, create_tensor_resource(env, std::move(arr)));
+  }
+  CATCH()
+}
+
+// ─── Worker / EMLX.CommandQueue NIFs ────────────────────────────────────────
+//
+// Lifecycle for posted jobs:
+//   1. Caller's NIF env (`env`) is short-lived — we cannot hand its terms
+//      to the worker thread.
+//   2. We allocate a process-independent ErlNifEnv (`msg_env`) per job.
+//      The job_ref and the reply tuple live in `msg_env`.
+//   3. The job_ref is also enif_make_copy'd into the caller's `env` so
+//      the wrapper in lib/emlx.ex can `receive {^job_ref, _}`.
+//   4. The lambda posted to the worker captures `t_ptr`, `t_refcount`,
+//      `caller_pid`, `msg_env`, and `job_ref_msg` by value. Tensor
+//      lifetime across the post boundary is held two ways:
+//        - enif_keep_resource on t_ptr (ERTS resource refcount)
+//        - ++(*t_refcount) on the embedded TensorP refcount
+//      Both are dropped at the end of the lambda.
+//   5. After enif_send, msg_env is freed inside the lambda.
+//
+// Stop semantics: if the Worker is destroyed (NIF resource refcount drops
+// to zero), pending jobs already in the queue at destructor time still
+// run and still send their reply. Jobs posted *after* the destructor
+// begins throw on post() and the NIF returns {:error, _} synchronously.
+
+NIF(command_queue_new) {
+  ATOM_PARAM(0, device_atom);
+
+  try {
+    mlx::core::Device device = string2device(device_atom);
+
+    // Guard before spawning any threads: mlx::core::new_stream on an
+    // unavailable device (e.g. gpu on Linux/CPU-only libmlx) does not
+    // throw — it calls std::terminate() internally, which we cannot
+    // catch. Check availability here and surface a clean {:error, _}
+    // so EMLX.Application can skip the GPU worker on unsupported hosts.
+    if (!mlx::core::is_available(device)) {
+      return nx::nif::error(env, "device not available");
+    }
+
+    auto *worker_ptr = static_cast<emlx::Worker *>(enif_alloc_resource(
+        resource_object<emlx::Worker>::type, sizeof(emlx::Worker)));
+    if (!worker_ptr) {
+      return enif_make_badarg(env);
+    }
+
+    try {
+      new (worker_ptr) emlx::Worker(device);
+    } catch (...) {
+      // Placement new failed before constructor completed; the resource
+      // memory is uninitialised so we must NOT call ~Worker. Just release
+      // the bare allocation and re-throw to the outer handler.
+      enif_release_resource(worker_ptr);
+      throw;
+    }
+
+    ERL_NIF_TERM ref = enif_make_resource(env, worker_ptr);
+    enif_release_resource(worker_ptr);
+    return nx::nif::ok(env, ref);
+  }
+  CATCH()
+}
+
+// Posts a no-op barrier job that calls mx::synchronize(stream). The
+// Elixir wrapper blocks in `receive` until the reply lands, which only
+// happens after every preceding job on this worker has completed AND
+// MLX has flushed the GPU command buffer.
+NIF(command_queue_synchronize) {
+  emlx::Worker *worker;
+  if (!enif_get_resource(env, argv[0], resource_object<emlx::Worker>::type,
+                         (void **)&worker)) {
+    return nx::nif::error(env, "Invalid command queue ref");
+  }
+
+  ErlNifPid caller_pid;
+  enif_self(env, &caller_pid);
+
+  ErlNifEnv *msg_env = enif_alloc_env();
+  if (!msg_env) {
+    return nx::nif::error(env, "Failed to allocate msg env");
+  }
+  ERL_NIF_TERM job_ref_msg = enif_make_ref(msg_env);
+  ERL_NIF_TERM job_ref_caller = enif_make_copy(env, job_ref_msg);
+
+  mlx::core::Stream stream = worker->stream();
+
+  try {
+    worker->post([stream, caller_pid, msg_env, job_ref_msg]() mutable {
+      ERL_NIF_TERM result;
+      try {
+        mlx::core::synchronize(stream);
+        result = enif_make_tuple2(msg_env, enif_make_atom(msg_env, "ok"),
+                                  enif_make_atom(msg_env, "ok"));
+      } catch (const std::exception &e) {
+        result = enif_make_tuple2(
+            msg_env, enif_make_atom(msg_env, "error"),
+            enif_make_string(msg_env, e.what(), ERL_NIF_LATIN1));
+      } catch (...) {
+        result = enif_make_tuple2(
+            msg_env, enif_make_atom(msg_env, "error"),
+            enif_make_string(msg_env, "Unknown error in synchronize",
+                             ERL_NIF_LATIN1));
+      }
+
+      ERL_NIF_TERM msg = enif_make_tuple2(msg_env, job_ref_msg, result);
+      ErlNifPid pid = caller_pid;
+      enif_send(NULL, &pid, msg_env, msg);
+      enif_free_env(msg_env);
+    });
+  } catch (const std::exception &e) {
+    enif_free_env(msg_env);
+    return nx::nif::error(env, e.what());
+  }
+
+  return nx::nif::ok(env, job_ref_caller);
+}
+
+// `eval` and `to_blob` are now worker-routed via `ASYNC_NIF` (see the
+// async wrapper block near `nif_funcs[]`). The bespoke
+// `command_queue_post_eval` / `command_queue_post_to_blob` NIFs were
+// removed in favour of that uniform dispatch.
+
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
@@ -688,6 +1155,13 @@ static int open_resources(ErlNifEnv *env) {
   }
 
   if (!open_resource<emlx::function>(env, mod, "CompiledFunction")) {
+    return -1;
+  }
+
+  // emlx::Worker — backs EMLX.CommandQueue and the application default
+  // worker. Default destructor (~Worker) signals stop, drains pending
+  // jobs, and joins the OS thread.
+  if (!open_resource<emlx::Worker>(env, mod, "CommandQueue")) {
     return -1;
   }
 
@@ -870,7 +1344,7 @@ NIF(slice) {
   LIST_PARAM(2, std::vector<int>, stops);
   LIST_PARAM(3, std::vector<int>, strides);
   DEVICE_PARAM(4, device);
-  TENSOR(mlx::core::slice(*t, starts, stops, strides, device));
+  TENSOR(mlx::core::slice(*t, to_shape(starts), to_shape(stops), to_shape(strides), device));
 }
 
 NIF(slice_update) {
@@ -879,7 +1353,7 @@ NIF(slice_update) {
   LIST_PARAM(2, std::vector<int>, starts);
   LIST_PARAM(3, std::vector<int>, stops);
   DEVICE_PARAM(4, device);
-  TENSOR(mlx::core::slice_update(*t, *tensor_updates, starts, stops, device));
+  TENSOR(mlx::core::slice_update(*t, *tensor_updates, to_shape(starts), to_shape(stops), device));
 }
 
 NIF(squeeze) {
@@ -894,7 +1368,7 @@ NIF(emlx_fft) {
   PARAM(1, int, n);
   PARAM(2, int, axis);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::fft(*t, n, axis, device));
+  TENSOR(mlx::core::fft::fft(*t, n, axis, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(ifft) {
@@ -902,7 +1376,7 @@ NIF(ifft) {
   PARAM(1, int, n);
   PARAM(2, int, axis);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::ifft(*t, n, axis, device));
+  TENSOR(mlx::core::fft::ifft(*t, n, axis, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(emlx_fft2) {
@@ -910,7 +1384,7 @@ NIF(emlx_fft2) {
   LIST_PARAM(1, std::vector<int>, n);
   LIST_PARAM(2, std::vector<int>, axes);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::fft2(*t, n, axes, device));
+  TENSOR(mlx::core::fft::fft2(*t, to_shape(n), axes, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(ifft2) {
@@ -918,7 +1392,7 @@ NIF(ifft2) {
   LIST_PARAM(1, std::vector<int>, n);
   LIST_PARAM(2, std::vector<int>, axes);
   DEVICE_PARAM(3, device);
-  TENSOR(mlx::core::fft::ifft2(*t, n, axes, device));
+  TENSOR(mlx::core::fft::ifft2(*t, to_shape(n), axes, mlx::core::fft::FFTNorm::Backward, device));
 }
 
 NIF(view) {
@@ -952,12 +1426,59 @@ NIF(clip) {
   TENSOR(mlx::core::clip(*t, *min, *max, device));
 }
 
+NIF(memory_info) {
+  size_t active = mlx::core::get_active_memory();
+  size_t peak = mlx::core::get_peak_memory();
+  size_t cache = mlx::core::get_cache_memory();
+
+  ERL_NIF_TERM keys[] = {
+    enif_make_atom(env, "active_memory"),
+    enif_make_atom(env, "peak_memory"),
+    enif_make_atom(env, "cache_memory")
+  };
+  ERL_NIF_TERM values[] = {
+    enif_make_uint64(env, active),
+    enif_make_uint64(env, peak),
+    enif_make_uint64(env, cache)
+  };
+
+  ERL_NIF_TERM map;
+  enif_make_map_from_arrays(env, keys, values, 3, &map);
+  return nx::nif::ok(env, map);
+}
+
+NIF(clear_cache) {
+  mlx::core::clear_cache();
+  return nx::nif::ok(env);
+}
+
+NIF(reset_peak_memory) {
+  mlx::core::reset_peak_memory();
+  return nx::nif::ok(env);
+}
+
+NIF(set_memory_limit) {
+  ErlNifUInt64 limit;
+  if (!enif_get_uint64(env, argv[0], &limit))
+    return nx::nif::error(env, "Unable to get limit param.");
+  uint64_t prev = static_cast<uint64_t>(mlx::core::set_memory_limit(static_cast<size_t>(limit)));
+  return nx::nif::ok(env, enif_make_uint64(env, prev));
+}
+
+NIF(set_cache_limit) {
+  ErlNifUInt64 limit;
+  if (!enif_get_uint64(env, argv[0], &limit))
+    return nx::nif::error(env, "Unable to get limit param.");
+  uint64_t prev = static_cast<uint64_t>(mlx::core::set_cache_limit(static_cast<size_t>(limit)));
+  return nx::nif::ok(env, enif_make_uint64(env, prev));
+}
+
 NIF(strides) {
   TENSOR_PARAM(0, t);
 
-  auto strides = t->strides();
-
-  return nx::nif::ok(env, nx::nif::make_list(env, strides));
+  auto raw = t->strides();
+  std::vector<int64_t> strides_vec(raw.begin(), raw.end());
+  return nx::nif::ok(env, nx::nif::make_list(env, strides_vec));
 }
 
 NIF(as_strided) {
@@ -967,7 +1488,7 @@ NIF(as_strided) {
   PARAM(3, int, offset);
   DEVICE_PARAM(4, device);
 
-  TENSOR(mlx::core::as_strided(*t, shape, strides, offset, device));
+  TENSOR(mlx::core::as_strided(*t, to_shape(shape), to_strides(strides), offset, device));
 }
 
 // ============================================================================
@@ -1027,129 +1548,517 @@ NIF(quantize) {
   CATCH()
 }
 
+// Build a sliding window view of a padded tensor.
+// padded: [...] of ndim n; window/strides: per-axis lists of length n.
+// Returns a view of shape [o0,...,on-1, w0,...,wn-1] where
+// oi = (padded_shape[i] - window[i]) / strides[i] + 1.
+static mlx::core::array sliding_window_view_cpp(
+    const mlx::core::array &padded,
+    const std::vector<int> &window,
+    const std::vector<int> &strides,
+    const mlx::core::Device &device) {
+  int n = padded.ndim();
+  auto ps = padded.shape();  // SmallVector<int>
+
+  // Doubled element strides: output dims share the same strides as window dims.
+  auto orig_strides = padded.strides();
+  std::vector<int64_t> view_strides(orig_strides.begin(), orig_strides.end());
+  for (auto s : orig_strides) view_strides.push_back(s);
+
+  // view_shape = [ps[i]-window[i]+1, ..., w0, ..., wn-1]
+  std::vector<int> view_shape;
+  for (int i = 0; i < n; ++i) view_shape.push_back(ps[i] - window[i] + 1);
+  for (int w : window) view_shape.push_back(w);
+
+  auto strided = mlx::core::as_strided(padded, to_shape(view_shape),
+                                       to_strides(view_strides), 0, device);
+
+  // Slice: strides=[strides..., 1...], stops=view_shape
+  std::vector<int> starts(2 * n, 0);
+  std::vector<int> stops = view_shape;
+  std::vector<int> slstrides = strides;
+  for (int i = 0; i < n; ++i) slstrides.push_back(1);
+
+  return mlx::core::slice(strided, to_shape(starts), to_shape(stops),
+                          to_shape(slstrides), device);
+}
+
+// Shared implementation for window_scatter_max/min.
+// When scatter_max=true: first-occurrence argmax.
+// When scatter_max=false: last-occurrence argmin via mask*arange trick.
+static mlx::core::array window_scatter_impl(
+    const mlx::core::array &tensor_t,
+    const mlx::core::array &tensor_source,
+    const mlx::core::array &tensor_init_value,
+    const std::vector<int> &window,
+    const std::vector<int> &low_pad,
+    const std::vector<int> &high_pad,
+    const std::vector<int> &strides,
+    bool scatter_max,
+    const mlx::core::Device &device) {
+  int n = tensor_t.ndim();
+
+  // 1. Cast init_value to the input dtype.
+  auto init_casted =
+      mlx::core::astype(tensor_init_value, tensor_t.dtype(), device);
+
+  // 2. Pad input with init_value on all axes.
+  std::vector<int> all_axes(n);
+  std::iota(all_axes.begin(), all_axes.end(), 0);
+  auto padded =
+      mlx::core::pad(tensor_t, all_axes, to_shape(low_pad), to_shape(high_pad),
+                     init_casted, "constant", device);
+
+  auto padded_shape = padded.shape();
+  std::vector<int> padded_shape_vec(padded_shape.begin(), padded_shape.end());
+
+  // 3. Sliding window view: [o0,...,on-1, w0,...,wn-1].
+  auto window_view =
+      sliding_window_view_cpp(padded, window, strides, device);
+
+  // out_shape = first n dims of window_view
+  std::vector<int> out_shape(window_view.shape().begin(),
+                             window_view.shape().begin() + n);
+
+  // K = product of window dims
+  int K = 1;
+  for (int w : window) K *= w;
+
+  // 4. Flatten window dims: [..., K]
+  std::vector<int> flat_shape = out_shape;
+  flat_shape.push_back(K);
+  auto windows_flat =
+      mlx::core::reshape(window_view, to_shape(flat_shape), device);
+
+  // 5. Find argmax / tie-broken argmin over last axis.
+  auto arg_idx = [&]() -> mlx::core::array {
+    if (scatter_max) {
+      return mlx::core::argmax(windows_flat, n, false, device);
+    }
+    // Tie-broken argmin (last-occurrence):
+    // m = min over last axis (keepdims), mask where equal, argmax(mask*arange).
+    auto m = mlx::core::min(windows_flat, std::vector<int>{n}, true, device);
+    auto mask = mlx::core::astype(
+        mlx::core::equal(windows_flat, m, device), mlx::core::uint32, device);
+    auto arange_k = mlx::core::astype(
+        mlx::core::arange(0, K, 1, device), mlx::core::uint32, device);
+    std::vector<int> arange_shape(n + 1, 1);
+    arange_shape[n] = K;
+    auto arange_k_nd =
+        mlx::core::reshape(arange_k, to_shape(arange_shape), device);
+    auto weighted = mlx::core::multiply(mask, arange_k_nd, device);
+    return mlx::core::argmax(weighted, n, false, device);
+  }();
+
+  // 6. Expand arg_idx to [..., 1] for take_along_axis.
+  std::vector<int> arg_exp_shape = out_shape;
+  arg_exp_shape.push_back(1);
+  auto arg_idx_exp =
+      mlx::core::reshape(arg_idx, to_shape(arg_exp_shape), device);
+
+  // 7. For each axis, compute absolute padded-tensor indices.
+  std::vector<mlx::core::array> abs_indices;
+  for (int a = 0; a < n; ++a) {
+    // 1-D iota along axis a of the padded shape.
+    auto arange_a = mlx::core::astype(
+        mlx::core::arange(0, (int)padded_shape[a], 1, device),
+        mlx::core::int32, device);
+
+    // Reshape to [1,...,padded_shape[a],...,1] (size pd[a] at axis a).
+    std::vector<int> iota_shape(n, 1);
+    iota_shape[a] = (int)padded_shape[a];
+    auto iota_nd =
+        mlx::core::reshape(arange_a, to_shape(iota_shape), device);
+
+    // Broadcast to full padded shape.
+    // NOTE: assumes padded is contiguous (as returned by mlx::pad), so its
+    // element strides are dense. The doubled-strides trick in
+    // sliding_window_view_cpp works correctly on broadcast_to's zero strides:
+    // for axis-a iota, the zero stride on non-a dims keeps the value constant,
+    // which is exactly the intended iota semantics.
+    auto iota_bc =
+        mlx::core::broadcast_to(iota_nd, to_shape(padded_shape_vec), device);
+
+    // Apply same sliding-window view + flatten.
+    auto iota_view =
+        sliding_window_view_cpp(iota_bc, window, strides, device);
+    auto iota_flat =
+        mlx::core::reshape(iota_view, to_shape(flat_shape), device);
+
+    // Pick the element at arg_idx position.
+    auto abs_a =
+        mlx::core::take_along_axis(iota_flat, arg_idx_exp, n, device);
+    // Squeeze last dim: [..., 1] → [o0,...,on-1]
+    abs_indices.push_back(
+        mlx::core::reshape(abs_a, to_shape(out_shape), device));
+  }
+
+  // 8. Scatter source into a buffer filled with init_value.
+  //    MLX scatter_add requires: updates.ndim == array.ndim + indices[0].ndim.
+  //    array.ndim = n (padded), indices[0].ndim = n (out_shape), so we need 2n.
+  //    Reshape source [o0,...,on-1] → [o0,...,on-1, 1,...,1] (n trailing singletons).
+  auto source_shape_2n = std::vector<int>(tensor_source.shape().begin(),
+                                          tensor_source.shape().end());
+  for (int i = 0; i < n; ++i) source_shape_2n.push_back(1);
+  auto updates =
+      mlx::core::reshape(tensor_source, to_shape(source_shape_2n), device);
+
+  auto buffer = mlx::core::broadcast_to(
+      mlx::core::reshape(init_casted, to_shape(std::vector<int>{}), device),
+      to_shape(padded_shape_vec), device);
+
+  std::vector<int> scatter_axes(n);
+  std::iota(scatter_axes.begin(), scatter_axes.end(), 0);
+  auto scattered = mlx::core::scatter_add(buffer, abs_indices, updates,
+                                          scatter_axes, device);
+
+  // 9. Slice back to original shape (strip padding).
+  auto orig_shape = tensor_t.shape();
+  std::vector<int> slice_starts = low_pad;
+  std::vector<int> slice_stops(n);
+  for (int i = 0; i < n; ++i)
+    slice_stops[i] = low_pad[i] + (int)orig_shape[i];
+  std::vector<int> slice_ones(n, 1);
+
+  return mlx::core::slice(scattered, to_shape(slice_starts),
+                          to_shape(slice_stops), to_shape(slice_ones), device);
+}
+
+NIF(window_scatter_max) {
+  TENSOR_PARAM(0, tensor_t);
+  TENSOR_PARAM(1, tensor_source);
+  TENSOR_PARAM(2, tensor_init_value);
+  LIST_PARAM(3, std::vector<int>, window);
+  LIST_PARAM(4, std::vector<int>, low_pad);
+  LIST_PARAM(5, std::vector<int>, high_pad);
+  LIST_PARAM(6, std::vector<int>, strides);
+  DEVICE_PARAM(7, device);
+
+  TENSOR(window_scatter_impl(*tensor_t, *tensor_source, *tensor_init_value,
+                             window, low_pad, high_pad, strides, true, device));
+}
+
+NIF(window_scatter_min) {
+  TENSOR_PARAM(0, tensor_t);
+  TENSOR_PARAM(1, tensor_source);
+  TENSOR_PARAM(2, tensor_init_value);
+  LIST_PARAM(3, std::vector<int>, window);
+  LIST_PARAM(4, std::vector<int>, low_pad);
+  LIST_PARAM(5, std::vector<int>, high_pad);
+  LIST_PARAM(6, std::vector<int>, strides);
+  DEVICE_PARAM(7, device);
+
+  TENSOR(window_scatter_impl(*tensor_t, *tensor_source, *tensor_init_value,
+                             window, low_pad, high_pad, strides, false,
+                             device));
+}
+
+// ─── Async wrappers ────────────────────────────────────────────────────────
+//
+// MLX 0.31.2's thread-local Metal CommandEncoders + thread-local default
+// streams force every graph-touching op for a given GPU stream to run on
+// the OS thread that created the stream. Each NIF below is the existing
+// sync body wrapped by `emlx::async_dispatch<sync>`: the wrapper extracts
+// the worker from `argv[0]`, copies `argv[1..]` into a process-independent
+// `msg_env`, posts a lambda to the worker thread, and `enif_send`s
+// `{job_ref, payload}` back to the caller. The sync body runs unchanged
+// on the worker thread; `DEVICE_PARAM` resolutions transparently pick up
+// the worker's stream via MLX's `to_stream(s, default_) -> default_stream`
+// thread-local lookup (the worker called `set_default_stream` for its
+// stream during `thread_main`).
+//
+// Sync (non-routed) NIFs preserved below. These either touch no MLX graph state
+// or read fields that are safe across threads (resource allocator, cache
+// limits, evaluated buffer pointers).
+
+ASYNC_NIF(eval)
+ASYNC_NIF(to_blob)
+ASYNC_NIF(tensor_to_shm)
+ASYNC_NIF(item)
+ASYNC_NIF(from_blob)
+ASYNC_NIF(scalar_tensor)
+
+ASYNC_NIF(ones)
+ASYNC_NIF(full)
+ASYNC_NIF(arange)
+ASYNC_NIF(eye)
+ASYNC_NIF(reshape)
+ASYNC_NIF(astype)
+ASYNC_NIF(view)
+ASYNC_NIF(broadcast_to)
+ASYNC_NIF(transpose)
+ASYNC_NIF(pad)
+ASYNC_NIF(sort)
+ASYNC_NIF(argsort)
+ASYNC_NIF(slice)
+ASYNC_NIF(slice_update)
+ASYNC_NIF(squeeze)
+ASYNC_NIF(as_strided)
+
+ASYNC_NIF(stack)
+ASYNC_NIF(where)
+ASYNC_NIF(concatenate)
+ASYNC_NIF(take_along_axis)
+ASYNC_NIF(take)
+ASYNC_NIF(gather)
+ASYNC_NIF(scatter_add)
+ASYNC_NIF(scatter)
+
+ASYNC_NIF(all)
+ASYNC_NIF(any)
+ASYNC_NIF(sum)
+ASYNC_NIF(product)
+ASYNC_NIF(argmax)
+ASYNC_NIF(argmin)
+ASYNC_NIF(cumulative_sum)
+ASYNC_NIF(cumulative_product)
+ASYNC_NIF(cumulative_max)
+ASYNC_NIF(cumulative_min)
+ASYNC_NIF(max)
+ASYNC_NIF(min)
+ASYNC_NIF(clip)
+
+ASYNC_NIF(abs)
+ASYNC_NIF(ceil)
+ASYNC_NIF(conjugate)
+ASYNC_NIF(floor)
+ASYNC_NIF(negate)
+ASYNC_NIF(round)
+ASYNC_NIF(sign)
+ASYNC_NIF(real)
+ASYNC_NIF(imag)
+ASYNC_NIF(is_nan)
+ASYNC_NIF(is_infinity)
+ASYNC_NIF(logical_not)
+ASYNC_NIF(sigmoid)
+ASYNC_NIF(asin)
+ASYNC_NIF(asinh)
+ASYNC_NIF(acos)
+ASYNC_NIF(acosh)
+ASYNC_NIF(cos)
+ASYNC_NIF(cosh)
+ASYNC_NIF(atan)
+ASYNC_NIF(atanh)
+ASYNC_NIF(erf)
+ASYNC_NIF(erf_inv)
+ASYNC_NIF(exp)
+ASYNC_NIF(expm1)
+ASYNC_NIF(log)
+ASYNC_NIF(log1p)
+ASYNC_NIF(rsqrt)
+ASYNC_NIF(sin)
+ASYNC_NIF(sinh)
+ASYNC_NIF(sqrt)
+ASYNC_NIF(tan)
+ASYNC_NIF(tanh)
+
+ASYNC_NIF(add)
+ASYNC_NIF(subtract)
+ASYNC_NIF(multiply)
+ASYNC_NIF(pow)
+ASYNC_NIF(remainder)
+ASYNC_NIF(divide)
+ASYNC_NIF(atan2)
+ASYNC_NIF(bitwise_and)
+ASYNC_NIF(bitwise_or)
+ASYNC_NIF(bitwise_xor)
+ASYNC_NIF(bitwise_not)
+ASYNC_NIF(left_shift)
+ASYNC_NIF(right_shift)
+ASYNC_NIF(minimum)
+ASYNC_NIF(maximum)
+ASYNC_NIF(quotient)
+ASYNC_NIF(equal)
+ASYNC_NIF(not_equal)
+ASYNC_NIF(greater)
+ASYNC_NIF(less)
+ASYNC_NIF(greater_equal)
+ASYNC_NIF(less_equal)
+ASYNC_NIF(logical_and)
+ASYNC_NIF(logical_or)
+ASYNC_NIF(logical_xor)
+
+ASYNC_NIF(emlx_fft)
+ASYNC_NIF(ifft)
+ASYNC_NIF(emlx_fft2)
+ASYNC_NIF(ifft2)
+ASYNC_NIF(allclose)
+ASYNC_NIF(isclose)
+ASYNC_NIF(tri_inv)
+
+ASYNC_NIF(linalg_lu)
+ASYNC_NIF(linalg_qr)
+ASYNC_NIF(linalg_svd)
+ASYNC_NIF(linalg_cholesky)
+ASYNC_NIF(linalg_eigh)
+ASYNC_NIF(linalg_inv)
+ASYNC_NIF(linalg_pinv)
+ASYNC_NIF(linalg_solve)
+ASYNC_NIF(linalg_solve_triangular)
+ASYNC_NIF(conv_general)
+ASYNC_NIF(einsum)
+ASYNC_NIF(tensordot)
+
+ASYNC_NIF(window_scatter_max)
+ASYNC_NIF(window_scatter_min)
+
 static ErlNifFunc nif_funcs[] = {
+    {"eval", 2, eval_async},
+    {"to_blob", 2, to_blob_async},
+    {"to_blob", 3, to_blob_async},
+    {"tensor_to_shm", 3, tensor_to_shm_async},
+    {"item", 2, item_async},
+    {"from_blob", 5, from_blob_async},
+    {"scalar_tensor", 4, scalar_tensor_async},
+
+    {"ones", 4, ones_async},
+    {"full", 5, full_async},
+    {"arange", 6, arange_async},
+    {"eye", 5, eye_async},
+    {"reshape", 4, reshape_async},
+    {"astype", 4, astype_async},
+    {"view", 4, view_async},
+    {"broadcast_to", 4, broadcast_to_async},
+    {"transpose", 4, transpose_async},
+    {"pad", 7, pad_async},
+    {"sort", 4, sort_async},
+    {"argsort", 4, argsort_async},
+    {"slice", 6, slice_async},
+    {"slice_update", 6, slice_update_async},
+    {"squeeze", 4, squeeze_async},
+    {"as_strided", 6, as_strided_async},
+
+    {"stack", 4, stack_async},
+    {"where", 5, where_async},
+    {"concatenate", 4, concatenate_async},
+    {"take_along_axis", 5, take_along_axis_async},
+    {"take", 5, take_async},
+    {"gather", 6, gather_async},
+    {"scatter_add", 6, scatter_add_async},
+    {"scatter", 6, scatter_async},
+
+    {"all", 5, all_async},
+    {"any", 5, any_async},
+    {"sum", 5, sum_async},
+    {"product", 5, product_async},
+    {"argmax", 4, argmax_async},
+    {"argmax", 5, argmax_async},
+    {"argmin", 4, argmin_async},
+    {"argmin", 5, argmin_async},
+    {"cumulative_sum", 6, cumulative_sum_async},
+    {"cumulative_product", 6, cumulative_product_async},
+    {"cumulative_max", 6, cumulative_max_async},
+    {"cumulative_min", 6, cumulative_min_async},
+    {"max", 5, max_async},
+    {"min", 5, min_async},
+    {"clip", 5, clip_async},
+
+    {"abs", 3, abs_async},
+    {"ceil", 3, ceil_async},
+    {"conjugate", 3, conjugate_async},
+    {"floor", 3, floor_async},
+    {"negate", 3, negate_async},
+    {"round", 3, round_async},
+    {"sign", 3, sign_async},
+    {"real", 3, real_async},
+    {"imag", 3, imag_async},
+    {"is_nan", 3, is_nan_async},
+    {"is_infinity", 3, is_infinity_async},
+    {"logical_not", 3, logical_not_async},
+    {"sigmoid", 3, sigmoid_async},
+    {"asin", 3, asin_async},
+    {"asinh", 3, asinh_async},
+    {"acos", 3, acos_async},
+    {"acosh", 3, acosh_async},
+    {"cos", 3, cos_async},
+    {"cosh", 3, cosh_async},
+    {"atan", 3, atan_async},
+    {"atanh", 3, atanh_async},
+    {"erf", 3, erf_async},
+    {"erf_inv", 3, erf_inv_async},
+    {"exp", 3, exp_async},
+    {"expm1", 3, expm1_async},
+    {"log", 3, log_async},
+    {"log1p", 3, log1p_async},
+    {"rsqrt", 3, rsqrt_async},
+    {"sin", 3, sin_async},
+    {"sinh", 3, sinh_async},
+    {"sqrt", 3, sqrt_async},
+    {"tan", 3, tan_async},
+    {"tanh", 3, tanh_async},
+
+    {"add", 4, add_async},
+    {"subtract", 4, subtract_async},
+    {"multiply", 4, multiply_async},
+    {"pow", 4, pow_async},
+    {"remainder", 4, remainder_async},
+    {"divide", 4, divide_async},
+    {"atan2", 4, atan2_async},
+    {"bitwise_and", 4, bitwise_and_async},
+    {"bitwise_or", 4, bitwise_or_async},
+    {"bitwise_xor", 4, bitwise_xor_async},
+    {"bitwise_not", 3, bitwise_not_async},
+    {"left_shift", 4, left_shift_async},
+    {"right_shift", 4, right_shift_async},
+    {"minimum", 4, minimum_async},
+    {"maximum", 4, maximum_async},
+    {"quotient", 4, quotient_async},
+    {"equal", 4, equal_async},
+    {"not_equal", 4, not_equal_async},
+    {"greater", 4, greater_async},
+    {"less", 4, less_async},
+    {"greater_equal", 4, greater_equal_async},
+    {"less_equal", 4, less_equal_async},
+    {"logical_and", 4, logical_and_async},
+    {"logical_or", 4, logical_or_async},
+    {"logical_xor", 4, logical_xor_async},
+
+    {"fft", 5, emlx_fft_async},
+    {"ifft", 5, ifft_async},
+    {"fft2", 5, emlx_fft2_async},
+    {"ifft2", 5, ifft2_async},
+    {"allclose", 7, allclose_async},
+    {"isclose", 7, isclose_async},
+    {"tri_inv", 4, tri_inv_async},
+
+    {"linalg_lu", 3, linalg_lu_async},
+    {"linalg_qr", 3, linalg_qr_async},
+    {"linalg_svd", 4, linalg_svd_async},
+    {"linalg_cholesky", 4, linalg_cholesky_async},
+    {"linalg_eigh", 4, linalg_eigh_async},
+    {"linalg_inv", 3, linalg_inv_async},
+    {"linalg_pinv", 3, linalg_pinv_async},
+    {"linalg_solve", 4, linalg_solve_async},
+    {"linalg_solve_triangular", 5, linalg_solve_triangular_async},
+    {"conv_general", 10, conv_general_async},
+    {"einsum", 5, einsum_async},
+    {"tensordot", 6, tensordot_async},
+
+    {"window_scatter_max", 9, window_scatter_max_async},
+    {"window_scatter_min", 9, window_scatter_min_async},
+
+    // ── Sync (non-routed) NIFs.
     {"strides", 1, strides},
-    {"as_strided", 5, as_strided},
     {"scalar_type", 1, scalar_type},
-    {"eval", 1, eval},
-    {"view", 3, view},
-    {"stack", 3, stack},
-    {"where", 4, where},
-    {"concatenate", 3, concatenate},
-    {"take_along_axis", 4, take_along_axis},
-    {"take", 4, take},
-    {"gather", 5, gather},
-    {"scatter_add", 5, scatter_add},
-    {"scatter", 5, scatter},
-    {"slice", 5, slice},
-    {"slice_update", 5, slice_update},
-    {"squeeze", 3, squeeze},
-    {"item", 1, item, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"all", 4, all},
-    {"any", 4, any},
-    {"sum", 4, sum},
-    {"product", 4, product},
-    {"argmax", 3, argmax},
-    {"argmax", 4, argmax},
-    {"argmin", 3, argmin},
-    {"argmin", 4, argmin},
-    {"cumulative_sum", 5, cumulative_sum},
-    {"cumulative_product", 5, cumulative_product},
-    {"cumulative_max", 5, cumulative_max},
-    {"cumulative_min", 5, cumulative_min},
     {"shape", 1, shape},
-    {"reshape", 3, reshape},
-    {"astype", 3, astype},
-    {"to_blob", 1, to_blob, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"to_blob", 2, to_blob, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"from_blob", 4, from_blob},
-    {"scalar_tensor", 3, scalar_tensor},
-    {"ones", 3, ones},
-    {"full", 4, full},
-    {"arange", 5, arange},
-    {"eye", 4, eye},
-    {"broadcast_to", 3, broadcast_to},
-    {"tensordot", 5, tensordot},
-    {"einsum", 4, einsum},
-    {"conv_general", 9, conv_general},
-    {"transpose", 3, transpose},
-    {"pad", 6, pad},
-    {"sort", 3, sort},
-    {"argsort", 3, argsort},
-    {"abs", 2, abs},
-    {"ceil", 2, ceil},
-    {"conjugate", 2, conjugate},
-    {"floor", 2, floor},
-    {"negate", 2, negate},
-    {"round", 2, round},
-    {"sign", 2, sign},
-    {"real", 2, real},
-    {"imag", 2, imag},
-    {"is_nan", 2, is_nan},
-    {"is_infinity", 2, is_infinity},
-    {"logical_not", 2, logical_not},
-    {"sigmoid", 2, sigmoid},
-    {"asin", 2, asin},
-    {"asinh", 2, asinh},
-    {"acos", 2, acos},
-    {"acosh", 2, acosh},
-    {"cos", 2, cos},
-    {"cosh", 2, cosh},
-    {"atan", 2, atan},
-    {"atanh", 2, atanh},
-    {"erf", 2, erf},
-    {"erf_inv", 2, erf_inv},
-    {"exp", 2, exp},
-    {"expm1", 2, expm1},
-    {"log", 2, log},
-    {"log1p", 2, log1p},
-    {"rsqrt", 2, rsqrt},
-    {"sin", 2, sin},
-    {"sinh", 2, sinh},
-    {"sqrt", 2, sqrt},
-    {"tan", 2, tan},
-    {"tanh", 2, tanh},
-    {"add", 3, add},
-    {"subtract", 3, subtract},
-    {"multiply", 3, multiply},
-    {"pow", 3, pow},
-    {"remainder", 3, remainder},
-    {"divide", 3, divide},
-    {"atan2", 3, atan2},
-    {"bitwise_and", 3, bitwise_and},
-    {"bitwise_or", 3, bitwise_or},
-    {"bitwise_xor", 3, bitwise_xor},
-    {"bitwise_not", 2, bitwise_not},
-    {"left_shift", 3, left_shift},
-    {"right_shift", 3, right_shift},
-    {"minimum", 3, minimum},
-    {"maximum", 3, maximum},
-    {"quotient", 3, quotient},
-    {"equal", 3, equal},
-    {"not_equal", 3, not_equal},
-    {"greater", 3, greater},
-    {"less", 3, less},
-    {"greater_equal", 3, greater_equal},
-    {"less_equal", 3, less_equal},
-    {"logical_and", 3, logical_and},
-    {"logical_or", 3, logical_or},
-    {"logical_xor", 3, logical_xor},
-    {"fft", 4, emlx_fft},
-    {"ifft", 4, ifft},
-    {"fft2", 4, emlx_fft2},
-    {"ifft2", 4, ifft2},
-    {"allclose", 6, allclose},
-    {"isclose", 6, isclose},
     {"deallocate", 1, deallocate},
-    {"max", 4, max},
-    {"min", 4, min},
-    {"clip", 4, clip},
-    {"tri_inv", 3, tri_inv},
+    {"array_from_shm", 4, array_from_shm, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"shm_unlink_handle", 1, shm_unlink_handle},
+    {"tensor_data_ptr", 1, tensor_data_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"array_from_ptr", 5, array_from_ptr, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"memory_info", 0, memory_info},
+    {"clear_cache", 0, clear_cache},
+    {"reset_peak_memory", 0, reset_peak_memory},
+    {"set_memory_limit", 1, set_memory_limit},
+    {"set_cache_limit", 1, set_cache_limit},
+
+    // ── Worker control NIFs.
+    {"command_queue_new", 1, command_queue_new},
+    {"command_queue_synchronize", 1, command_queue_synchronize},
     // Quantization operations
     {"quantized_matmul", 8, quantized_matmul},
     {"dequantize", 6, dequantize},
-    {"quantize", 4, quantize}
-};
+    {"quantize", 4, quantize}};
 
-// Update the NIF initialization
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
+
