@@ -219,8 +219,7 @@ defmodule EMLX.Backend do
               "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
     end
 
-    # Default to :gpu for GPU interop; caller can override via backend opts.
-    device = backend_opts[:device] || :gpu
+    device = backend_opts[:device] || EMLX.default_device()
 
     case EMLX.NIF.array_from_ptr(addr, shape, to_mlx_type(type), byte_size, nil) do
       {:ok, ref} ->
@@ -249,7 +248,7 @@ defmodule EMLX.Backend do
               "expected byte_size #{byte_size} for shape #{inspect(shape)} and type #{inspect(type)}"
     end
 
-    device = backend_opts[:device] || :gpu
+    device = backend_opts[:device] || EMLX.default_device()
 
     case EMLX.NIF.array_from_shm(shm_name, shape, to_mlx_type(type), byte_size) do
       {:ok, ref} ->
