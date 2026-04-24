@@ -476,7 +476,10 @@ defmodule EMLX do
     if Application.get_env(:emlx, :cross_device_promotion, false) do
       if Application.get_env(:emlx, :warn_cross_device, false) do
         require Logger
-        Logger.warning("[EMLX] cross-device promotion: #{requested} tensor routed to #{bound} queue")
+
+        Logger.warning(
+          "[EMLX] cross-device promotion: #{requested} tensor routed to #{bound} queue"
+        )
       end
 
       {worker, bound}
@@ -535,7 +538,10 @@ defmodule EMLX do
     queue = Keyword.get(compiler_opts, :command_queue)
 
     inner =
-      Nx.Defn.Evaluator.__compile__(key, vars, fun,
+      Nx.Defn.Evaluator.__compile__(
+        key,
+        vars,
+        fun,
         Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
       )
 

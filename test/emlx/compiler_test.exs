@@ -94,7 +94,9 @@ defmodule EMLX.CompilerTest do
 
       jitted = Nx.Defn.jit(&SumJitFn.add/2, compiler: EMLX)
 
-      result = jitted.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
+      result =
+        jitted.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
+
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6
     end
 
@@ -111,7 +113,8 @@ defmodule EMLX.CompilerTest do
 
       assert Process.get(:emlx_command_queue) == nil
 
-      result = jitted.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
+      result =
+        jitted.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
 
       assert Process.get(:emlx_command_queue) == nil
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6
@@ -127,11 +130,14 @@ defmodule EMLX.CompilerTest do
         defn add(a, b), do: Nx.add(a, b)
       end
 
-      compiled = Nx.Defn.compile(&SumFn.add/2, [Nx.template({}, :f32), Nx.template({}, :f32)],
-        compiler: EMLX
-      )
+      compiled =
+        Nx.Defn.compile(&SumFn.add/2, [Nx.template({}, :f32), Nx.template({}, :f32)],
+          compiler: EMLX
+        )
 
-      result = compiled.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
+      result =
+        compiled.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
+
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6
     end
 
@@ -153,7 +159,8 @@ defmodule EMLX.CompilerTest do
       # Call the wrapped closure; the queue should be active during execution.
       assert Process.get(:emlx_command_queue) == nil
 
-      result = compiled.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
+      result =
+        compiled.(Nx.tensor(1.0, backend: EMLX.Backend), Nx.tensor(2.0, backend: EMLX.Backend))
 
       assert Process.get(:emlx_command_queue) == nil
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6

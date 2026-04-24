@@ -65,7 +65,10 @@ defmodule EMLX.CommandQueueTest do
       q = CommandQueue.new!(:gpu)
 
       CommandQueue.with_queue(q, fn ->
-        Nx.add(Nx.tensor([1, 2, 3], backend: EMLX.Backend), Nx.tensor([4, 5, 6], backend: EMLX.Backend))
+        Nx.add(
+          Nx.tensor([1, 2, 3], backend: EMLX.Backend),
+          Nx.tensor([4, 5, 6], backend: EMLX.Backend)
+        )
       end)
 
       assert :ok = CommandQueue.synchronize(q)
@@ -164,6 +167,7 @@ defmodule EMLX.CommandQueueTest do
     setup do
       Application.delete_env(:emlx, :cross_device_promotion)
       Application.delete_env(:emlx, :warn_cross_device)
+
       on_exit(fn ->
         Application.delete_env(:emlx, :cross_device_promotion)
         Application.delete_env(:emlx, :warn_cross_device)
@@ -186,6 +190,7 @@ defmodule EMLX.CommandQueueTest do
     setup do
       Application.put_env(:emlx, :cross_device_promotion, true)
       Application.delete_env(:emlx, :warn_cross_device)
+
       on_exit(fn ->
         Application.delete_env(:emlx, :cross_device_promotion)
         Application.delete_env(:emlx, :warn_cross_device)
