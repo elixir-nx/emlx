@@ -537,6 +537,47 @@ defmodule EMLX do
   end
 
   @doc """
+  Fused layer normalisation (`mlx::fast::layer_norm`).
+
+  - `x`      — input tensor; normalised over the last axis.
+  - `weight` — `{hidden}` scale vector (gamma).
+  - `bias`   — `{hidden}` bias vector (beta).
+  - `eps`    — numerical stability constant (e.g. `1.0e-5`).
+
+  Prefer `EMLX.Fast.layer_norm/4` inside `defn`.
+  """
+  @mlx_function {:fast_layer_norm, 6}
+  def fast_layer_norm({dev_x, ref_x}, {dev_w, ref_w}, {dev_b, ref_b}, eps)
+      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and is_tensor(dev_b, ref_b) do
+    device = merge_device(dev_x, merge_device(dev_w, dev_b))
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_layer_norm(worker, ref_x, ref_w, ref_b, eps * 1.0, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Fused layer normalisation without bias (`mlx::fast::layer_norm`, weight-only variant).
+
+  Prefer `EMLX.Fast.layer_norm/3` inside `defn`.
+  """
+  @mlx_function {:fast_layer_norm_no_bias, 5}
+  def fast_layer_norm_no_bias({dev_x, ref_x}, {dev_w, ref_w}, eps)
+      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) do
+    device = merge_device(dev_x, dev_w)
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_layer_norm_no_bias(worker, ref_x, ref_w, eps * 1.0, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
   Fused RoPE with a per-batch offset array (`mlx::fast::rope`, array-offset overload).
 
   Calls the `const array& offset` overload of `mlx::fast::rope`, where `offset`
@@ -557,6 +598,40 @@ defmodule EMLX do
     job_ref =
       EMLX.NIF.fast_rope_ids(
         worker, ref_a, dims, traditional, base * 1.0, scale * 1.0, ref_off, effective_device
+      )
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Fused RoPE with precomputed inv-frequency vector (`mlx::fast::rope`, freqs overload).
+
+  - `a`          — input tensor; shape `{B, T, ..., D}`.
+  - `dims`       — number of feature dims to rotate.
+  - `traditional`— `false` for split-half (Qwen3/Bumblebee); `true` for interleaved.
+  - `scale`      — position scale (typically `1.0` when using precomputed freqs).
+  - `offset`     — `{B}` per-batch starting position tensor.
+  - `freqs`      — `{dims/2}` precomputed inverse-frequency tensor.
+
+  Prefer `EMLX.Fast.rope_with_freqs/6` inside `defn`.
+  """
+  @mlx_function {:fast_rope_with_freqs, 8}
+  def fast_rope_with_freqs(
+        {dev_a, ref_a},
+        dims,
+        traditional,
+        scale,
+        {dev_off, ref_off},
+        {dev_f, ref_f}
+      )
+      when is_tensor(dev_a, ref_a) and is_tensor(dev_off, ref_off) and is_tensor(dev_f, ref_f) do
+    device = merge_device(dev_a, merge_device(dev_off, dev_f))
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_rope_with_freqs(
+        worker, ref_a, dims, traditional, scale * 1.0, ref_off, ref_f, effective_device
       )
       |> unwrap!()
 
@@ -585,6 +660,44 @@ defmodule EMLX do
 
     job_ref =
       EMLX.NIF.fast_sdpa_causal(worker, ref_q, ref_k, ref_v, scale * 1.0, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Causal SDPA with a runtime `key_mask` check performed at the C++ level.
+
+  At the NIF level: evaluates `all(key_mask == 1)` (cheap for small/constant
+  tensors). If true → uses the pure causal Metal kernel (no mask allocation).
+  If false → builds a combined causal + key_mask additive float mask and calls
+  the masked kernel.
+
+  - `q`        — `{B, N_q,  T_q,  D}`
+  - `k`        — `{B, N_kv, T_kv, D}`
+  - `v`        — `{B, N_kv, T_kv, D}`
+  - `scale`    — scalar (typically `1 / sqrt(D)`)
+  - `key_mask` — `{B, T_kv}` boolean/int tensor (1 = attend, 0 = padding)
+
+  Prefer `EMLX.Fast.scaled_dot_product_attention_causal_key_masked/5` inside `defn`.
+  """
+  @mlx_function {:fast_sdpa_causal_key_masked, 7}
+  def fast_sdpa_causal_key_masked(
+        {dev_q, ref_q},
+        {dev_k, ref_k},
+        {dev_v, ref_v},
+        scale,
+        {dev_m, ref_m}
+      )
+      when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
+             is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) do
+    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, dev_m)))
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_sdpa_causal_key_masked(
+        worker, ref_q, ref_k, ref_v, scale * 1.0, ref_m, effective_device
+      )
       |> unwrap!()
 
     await_worker(job_ref) |> wrap_tensor(effective_device)

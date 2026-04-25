@@ -116,19 +116,24 @@ defmodule EMLX.Validation.Qwen3Quantized.Loader do
     # Norm weights are dense f16/bf16
     final_norm = tensors["model.norm.weight"] |> to_gpu.()
 
-    # lm_head: may be tied to embed_tokens
+    # lm_head: quantize for 4× bandwidth reduction on the {vocab_size, hidden} matmul.
+    # embed_tokens stays dense f16 because token lookups use Nx.take (gather), not dot.
     lm_head =
       cond do
         config.tie_word_embeddings ->
-          embed_tokens
-
-        Map.has_key?(tensors, "lm_head.weight") and
-          not Map.has_key?(tensors, "lm_head.scales") ->
-          # Dense lm_head
-          tensors["lm_head.weight"] |> to_gpu.()
+          # embed_tokens weight was already moved to GPU (and the checkpoint tensors consumed
+          # by backend_transfer). Re-quantize from the dequantized f16 tensor — precision
+          # loss is acceptable for a timing benchmark; the dispatched op is identical.
+          EMLX.quantize(embed_tokens, type: {:s, 4}, group_size: 64)
 
         Map.has_key?(tensors, "lm_head.scales") ->
           quantized_linear(tensors, "lm_head", config)
+
+        Map.has_key?(tensors, "lm_head.weight") ->
+          # Dense lm_head (bf16 in checkpoint): quantize for 4× bandwidth reduction
+          tensors["lm_head.weight"]
+          |> to_gpu.()
+          |> EMLX.quantize(type: {:s, 4}, group_size: 64)
 
         true ->
           embed_tokens

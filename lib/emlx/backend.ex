@@ -157,6 +157,37 @@ defmodule EMLX.Backend do
   end
 
   @impl true
+  def backend_copy(
+        %T{
+          shape: logical_shape,
+          type: logical_type,
+          names: names,
+          data: %Backend{ref: ref, shape: packed_shape, type: packed_type, quantization_config: %EMLX.Quantization.Config{} = cfg}
+        },
+        EMLX.Backend,
+        opts
+      ) do
+    # Preserve quantization_config when copying a quantized tensor to EMLX.Backend.
+    # The generic backend_copy goes through to_binary/from_binary which drops the config.
+    target_device = device_option(opts)
+    gpu_opts = {EMLX.Backend, device: target_device}
+
+    packed_size = Enum.reduce(Tuple.to_list(packed_shape), 1, &*/2)
+    packed_binary = EMLX.to_blob(ref, packed_size)
+    new_ref = EMLX.from_blob(packed_binary, packed_shape, :uint32, target_device)
+
+    new_scales = Nx.backend_transfer(cfg.scales, gpu_opts)
+    new_biases = Nx.backend_transfer(cfg.biases, gpu_opts)
+
+    %T{
+      shape: logical_shape,
+      type: logical_type,
+      names: names,
+      data: %Backend{ref: new_ref, shape: packed_shape, type: packed_type, quantization_config: %{cfg | scales: new_scales, biases: new_biases}}
+    }
+  end
+
+  @impl true
   def backend_copy(%T{type: type, shape: shape} = tensor, backend, opts) do
     Nx.from_binary(to_binary(tensor, Nx.size(tensor)), type, backend: {backend, opts})
     |> Nx.reshape(shape)
@@ -1107,7 +1138,7 @@ defmodule EMLX.Backend do
     end
 
     if right_quantized do
-      quantized_dot(out, left, right)
+      quantized_dot(out, left, right, right_axes)
     else
       standard_dot(
         out,
@@ -1125,13 +1156,31 @@ defmodule EMLX.Backend do
   end
 
   # Dispatch a dot where `qw_tensor` is the quantized right operand.
-  # MLX's quantized_matmul always treats w as the right operand; weights are
-  # stored in (out, in) layout so transpose=true gives x @ w.T.
-  defp quantized_dot(out, activation, qw_tensor) do
+  #
+  # MLX quantize always groups along the last (column) dimension, treating
+  # the weight as {out_features, in_features}. Two conventions exist:
+  #
+  #   - {out, in} layout (MLX / validation/ style): contracted via axis [1] (last).
+  #     quantized_matmul(act, w, ..., transpose=true) computes act @ w.T.
+  #
+  #   - {in, out} layout (Bumblebee / Jax style): contracted via axis [0] (first).
+  #     quantized_matmul(act, w, ..., transpose=false) computes act @ w directly.
+  #     Grouping is on the last dim (out_features) which is what EMLX.quantize produces.
+  #
+  # We detect the convention from `right_axes`: [last_dim] → transpose=true,
+  # [0] → transpose=false.
+  defp quantized_dot(out, activation, qw_tensor, right_axes) do
     %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
 
     %EMLX.Quantization.Config{scales: scales_nx, biases: biases_nx, group_size: gs, bits: bits} =
       cfg
+
+    weight_rank = tuple_size(qw_tensor.shape)
+    last_dim    = weight_rank - 1
+
+    # transpose=true when contracting on the last dim of the weight ({out, in} convention).
+    # transpose=false when contracting on axis 0 ({in, out} convention, e.g. Bumblebee kernels).
+    transpose = right_axes == [last_dim]
 
     result =
       EMLX.quantized_matmul(
@@ -1139,7 +1188,7 @@ defmodule EMLX.Backend do
         weight_ref,
         from_nx(scales_nx),
         from_nx(biases_nx),
-        true,
+        transpose,
         gs,
         bits
       )

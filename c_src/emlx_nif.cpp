@@ -1618,6 +1618,31 @@ NIF(fast_sdpa_masked) {
 }
 ASYNC_NIF(fast_sdpa_masked)
 
+// fast_layer_norm — fused layer normalisation
+// MLX: mlx::fast::layer_norm(x, weight?, bias?, eps, stream)
+// weight and bias are optional; we always provide both.
+NIF(fast_layer_norm) {
+  TENSOR_PARAM(0, x);
+  TENSOR_PARAM(1, weight);
+  TENSOR_PARAM(2, bias);
+  PARAM(3, double, eps);
+  DEVICE_PARAM(4, device);
+
+  TENSOR(fast::layer_norm(*x, *weight, *bias, (float)eps, device));
+}
+ASYNC_NIF(fast_layer_norm)
+
+// fast_layer_norm_no_bias — fused layer norm without bias (weight-only variant)
+NIF(fast_layer_norm_no_bias) {
+  TENSOR_PARAM(0, x);
+  TENSOR_PARAM(1, weight);
+  PARAM(2, double, eps);
+  DEVICE_PARAM(3, device);
+
+  TENSOR(fast::layer_norm(*x, *weight, std::nullopt, (float)eps, device));
+}
+ASYNC_NIF(fast_layer_norm_no_bias)
+
 // fast_rope_ids — fused RoPE with per-batch offset array (position_ids)
 // Calls the array-offset overload of mlx::fast::rope.
 // offset must be shape {B} — one starting position per batch example.
@@ -1635,6 +1660,69 @@ NIF(fast_rope_ids) {
                    *offset, std::nullopt, device));
 }
 ASYNC_NIF(fast_rope_ids)
+
+// fast_rope_with_freqs — fused RoPE with precomputed inv-frequency vector
+// Calls the freqs overload of mlx::fast::rope (base=nullopt, freqs supplied).
+// offset must be shape {B} — one starting position per batch example.
+// freqs must be shape {dims/2} — precomputed inverse frequencies.
+NIF(fast_rope_with_freqs) {
+  TENSOR_PARAM(0, a);
+  PARAM(1, int, dims);
+  PARAM(2, bool, traditional);
+  PARAM(3, double, scale);
+  TENSOR_PARAM(4, offset);
+  TENSOR_PARAM(5, freqs);
+  DEVICE_PARAM(6, device);
+
+  TENSOR(fast::rope(*a, dims, traditional, std::nullopt, (float)scale,
+                   *offset, *freqs, device));
+}
+ASYNC_NIF(fast_rope_with_freqs)
+
+// fast_sdpa_causal_key_masked — causal SDPA that checks key_mask at C++ level.
+// key_mask shape: {B, T_kv} — 1 = attend, 0 = padding.
+// If all values are 1 (no padding), dispatches to fast causal SDPA (no mask alloc).
+// Otherwise builds a combined causal + key_mask additive float mask and uses
+// masked SDPA. The all-ones check forces eval of only the small key_mask subgraph.
+NIF(fast_sdpa_causal_key_masked) {
+  TENSOR_PARAM(0, q);        // {B, N_q,  T_q,  D}
+  TENSOR_PARAM(1, k);        // {B, N_kv, T_kv, D}
+  TENSOR_PARAM(2, v);        // {B, N_kv, T_kv, D}
+  PARAM(3, double, scale);
+  TENSOR_PARAM(4, key_mask); // {B, T_kv} boolean / int
+  DEVICE_PARAM(5, device);
+
+  // key_mask values are 0/1 (int or bool); astype→bool_ then all() checks all non-zero.
+  bool trivial = all(astype(*key_mask, bool_)).item<bool>();
+
+  if (trivial) {
+    TENSOR(fast::scaled_dot_product_attention(
+        *q, *k, *v, (float)scale, "causal", std::nullopt, std::nullopt, device));
+  } else {
+    // Expand key_mask {B, T_kv} → {B, 1, 1, T_kv} for broadcasting.
+    auto km = reshape(*key_mask, {key_mask->shape(0), 1, 1, key_mask->shape(1)});
+    int T_q  = q->shape(2);
+    int T_kv = k->shape(2);
+    int kv_offset = T_kv - T_q;
+
+    // Causal boolean: position j is visible from query row i if j <= i + kv_offset.
+    auto row = reshape(arange(T_q, int32), {1, 1, T_q, 1});
+    auto col = reshape(arange(T_kv, int32), {1, 1, 1, T_kv});
+    auto causal_bool = less_equal(col, add(row, array(kv_offset, int32)));
+
+    // Combined: attend where key_mask=1 AND position is causally reachable.
+    auto keep = logical_and(km, causal_bool);
+
+    // Additive mask: 0.0 = attend, -inf = masked out.
+    auto zero_val = zeros({}, float32);
+    auto neginf_val = full({}, -std::numeric_limits<float>::infinity(), float32);
+    auto additive = where(keep, zero_val, neginf_val);
+
+    TENSOR(fast::scaled_dot_product_attention(
+        *q, *k, *v, (float)scale, "array", additive, std::nullopt, device));
+  }
+}
+ASYNC_NIF(fast_sdpa_causal_key_masked)
 
 // fast_sdpa_causal — flash-attention SDPA with built-in causal mask
 // mask_mode="causal" lets MLX construct the upper-triangular mask internally.
@@ -2167,7 +2255,11 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_sdpa", 6, fast_sdpa_async},
     {"fast_sdpa_masked", 7, fast_sdpa_masked_async},
     {"fast_rope_ids", 8, fast_rope_ids_async},
-    {"fast_sdpa_causal", 6, fast_sdpa_causal_async}};
+    {"fast_rope_with_freqs", 8, fast_rope_with_freqs_async},
+    {"fast_sdpa_causal_key_masked", 7, fast_sdpa_causal_key_masked_async},
+    {"fast_sdpa_causal", 6, fast_sdpa_causal_async},
+    {"fast_layer_norm", 6, fast_layer_norm_async},
+    {"fast_layer_norm_no_bias", 5, fast_layer_norm_no_bias_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 
