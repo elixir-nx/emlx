@@ -537,6 +537,60 @@ defmodule EMLX do
   end
 
   @doc """
+  Fused RoPE with a per-batch offset array (`mlx::fast::rope`, array-offset overload).
+
+  Calls the `const array& offset` overload of `mlx::fast::rope`, where `offset`
+  has shape `{B}` — one starting position per batch example. Positions within each
+  example are assumed to be sequential: `[offset[b], offset[b]+1, ..., offset[b]+T-1]`.
+
+  Typically you build `offset` by slicing `position_ids[:, 0]` (first token's
+  position for each batch example) before calling this function.
+
+  Prefer `EMLX.Fast.rope_with_positions/6` inside `defn`.
+  """
+  @mlx_function {:fast_rope_ids, 8}
+  def fast_rope_ids({dev_a, ref_a}, dims, traditional, base, scale, {dev_off, ref_off})
+      when is_tensor(dev_a, ref_a) and is_tensor(dev_off, ref_off) do
+    device = merge_device(dev_a, dev_off)
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_rope_ids(
+        worker, ref_a, dims, traditional, base * 1.0, scale * 1.0, ref_off, effective_device
+      )
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Flash-attention SDPA with built-in causal mask (`mlx::fast::scaled_dot_product_attention`,
+  `mask_mode="causal"`).
+
+  MLX constructs the upper-triangular causal mask internally — no explicit mask
+  tensor required. GQA-native: `k`/`v` may have fewer heads than `q`.
+
+  - `q`     — `{B, N_q,  T_q,  D}`
+  - `k`     — `{B, N_kv, T_kv, D}`
+  - `v`     — `{B, N_kv, T_kv, D}`
+  - `scale` — scalar (typically `1 / sqrt(D)`)
+
+  Prefer `EMLX.Fast.scaled_dot_product_attention_causal/4` inside `defn`.
+  """
+  @mlx_function {:fast_sdpa_causal, 6}
+  def fast_sdpa_causal({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale)
+      when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and is_tensor(dev_v, ref_v) do
+    device = merge_device(dev_q, merge_device(dev_k, dev_v))
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_sdpa_causal(worker, ref_q, ref_k, ref_v, scale * 1.0, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
   Quantize a dense 2-D `Nx.Tensor` and return an annotated quantized tensor.
 
   The returned tensor carries the original logical shape and type (e.g.

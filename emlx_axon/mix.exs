@@ -27,8 +27,8 @@ defmodule EMLX.Axon.MixProject do
       {:axon, "~> 0.7"},
       # Inherit emlx's Nx git pin to avoid constraint conflicts.
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
-      # Bumblebee is test-only — used in tests to build Qwen3 Axon models.
-      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: :test}
+      # Bumblebee — used in tests and dev bench scripts.
+      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: [:dev, :test]}
     ]
   end
 

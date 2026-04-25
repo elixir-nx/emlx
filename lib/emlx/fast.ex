@@ -9,9 +9,11 @@ defmodule EMLX.Fast do
   ## Functions
 
   - `rms_norm/3` — fused RMS normalisation
-  - `rope/6` — fused rotary position embedding
+  - `rope/6` — fused RoPE with scalar integer offset
+  - `rope_with_positions/6` — fused RoPE accepting a `position_ids` tensor
   - `scaled_dot_product_attention/4` — flash-attention SDPA (no mask)
   - `scaled_dot_product_attention/5` — flash-attention SDPA (additive/bool mask)
+  - `scaled_dot_product_attention_causal/4` — flash-attention SDPA with built-in causal mask
 
   ## Axon graph rewrite example
 
@@ -80,6 +82,55 @@ defmodule EMLX.Fast do
     |> EMLX.Backend.to_nx()
   end
 
+  @doc """
+  Fused RoPE accepting a `position_ids` tensor (`mlx::fast::rope`, array-offset overload).
+
+  Use this variant when the calling convention provides `position_ids` as a tensor
+  (e.g. from Bumblebee's rotary embedding layer) rather than a scalar integer offset.
+
+  - `a`            — input `{B, T, ..., D}` (Bumblebee convention: heads NOT yet transposed)
+  - `position_ids` — `{B, T}` integer tensor; each row holds the token positions for
+                     one batch example. **Positions must be sequential within each row**
+                     (standard causal LM). The starting offset for batch item `b` is
+                     taken as `position_ids[b, 0]`; subsequent positions are inferred
+                     by MLX as `offset + 0, offset + 1, ...`.
+  - `dims`         — number of feature dims to rotate.
+  - `traditional`  — `false` for split-half (Bumblebee / Qwen3); `true` for interleaved.
+  - `base`         — angular frequency base (e.g. `10_000`).
+  - `scale`        — position scale (`1.0` unless using NTK-aware scaling).
+
+  Output shape and type match `a`.
+
+  > ### Sequential positions only {: .warning}
+  > This function assumes positions within each batch example are contiguous
+  > starting from `position_ids[b, 0]`. Non-sequential position_ids (e.g.
+  > from packed sequences or custom position schemes) produce incorrect results.
+  """
+  deftransform rope_with_positions(a, position_ids, dims, traditional, base, scale) do
+    out = Nx.template(Nx.shape(a), Nx.type(a))
+
+    Nx.runtime_call(
+      out, {a, position_ids},
+      [dims: dims, traditional: traditional, base: base, scale: scale],
+      &__MODULE__.rope_with_positions_callback/2
+    )
+  end
+
+  @doc false
+  def rope_with_positions_callback({%Nx.Tensor{} = a, %Nx.Tensor{} = position_ids}, opts) do
+    # MLX's array-offset overload takes shape {B} — one starting position per batch.
+    # Extract the first position of each batch example as the per-batch offset.
+    batch_size = elem(Nx.shape(position_ids), 0)
+    offsets = position_ids[[.., 0]] |> Nx.reshape({batch_size})
+
+    EMLX.fast_rope_ids(
+      EMLX.Backend.from_nx(a),
+      opts[:dims], opts[:traditional], opts[:base], opts[:scale],
+      EMLX.Backend.from_nx(offsets)
+    )
+    |> EMLX.Backend.to_nx()
+  end
+
   # ── Scaled Dot-Product Attention ─────────────────────────────────────────────
 
   @doc """
@@ -137,6 +188,40 @@ defmodule EMLX.Fast do
       EMLX.fast_sdpa_masked(
         EMLX.Backend.from_nx(q), EMLX.Backend.from_nx(k), EMLX.Backend.from_nx(v),
         EMLX.Backend.from_nx(mask), opts[:scale]
+      )
+      |> EMLX.Backend.to_nx()
+
+    if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
+  end
+
+  @doc """
+  Flash-attention SDPA with a built-in causal mask (`mlx::fast::scaled_dot_product_attention`,
+  `mask_mode="causal"`).
+
+  MLX constructs the upper-triangular causal mask internally without materialising it,
+  making this equivalent to `scaled_dot_product_attention/5` with a causal boolean mask
+  but cheaper: no mask tensor allocation, and the mask is fused into the Metal kernel.
+
+  GQA-native: `k`/`v` may have fewer heads than `q` — no pre-tiling required.
+
+  Input/output layout matches `scaled_dot_product_attention/4`:
+  - `q`     — `{B, N_q,  T_q,  D}`
+  - `k`     — `{B, N_kv, T_kv, D}`
+  - `v`     — `{B, N_kv, T_kv, D}`
+  - `scale` — pre-computed scalar (typically `1 / sqrt(D)`)
+  - Output  — `{B, N_q, T_q, D}`, same dtype as `q`
+  """
+  deftransform scaled_dot_product_attention_causal(q, k, v, scale) do
+    out = Nx.template(Nx.shape(q), Nx.type(q))
+    Nx.runtime_call(out, {q, k, v}, [scale: scale], &__MODULE__.sdpa_causal_callback/2)
+  end
+
+  @doc false
+  def sdpa_causal_callback({%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v}, opts) do
+    out =
+      EMLX.fast_sdpa_causal(
+        EMLX.Backend.from_nx(q), EMLX.Backend.from_nx(k), EMLX.Backend.from_nx(v),
+        opts[:scale]
       )
       |> EMLX.Backend.to_nx()
 

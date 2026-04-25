@@ -1618,6 +1618,38 @@ NIF(fast_sdpa_masked) {
 }
 ASYNC_NIF(fast_sdpa_masked)
 
+// fast_rope_ids — fused RoPE with per-batch offset array (position_ids)
+// Calls the array-offset overload of mlx::fast::rope.
+// offset must be shape {B} — one starting position per batch example.
+// Assumes positions are sequential within each example: [offset[b], offset[b]+1, ..., offset[b]+T-1].
+NIF(fast_rope_ids) {
+  TENSOR_PARAM(0, a);
+  PARAM(1, int, dims);
+  PARAM(2, bool, traditional);
+  PARAM(3, double, base);
+  PARAM(4, double, scale);
+  TENSOR_PARAM(5, offset);
+  DEVICE_PARAM(6, device);
+
+  TENSOR(fast::rope(*a, dims, traditional, (float)base, (float)scale,
+                   *offset, std::nullopt, device));
+}
+ASYNC_NIF(fast_rope_ids)
+
+// fast_sdpa_causal — flash-attention SDPA with built-in causal mask
+// mask_mode="causal" lets MLX construct the upper-triangular mask internally.
+NIF(fast_sdpa_causal) {
+  TENSOR_PARAM(0, q);
+  TENSOR_PARAM(1, k);
+  TENSOR_PARAM(2, v);
+  PARAM(3, double, scale);
+  DEVICE_PARAM(4, device);
+
+  TENSOR(fast::scaled_dot_product_attention(
+      *q, *k, *v, (float)scale, "causal", std::nullopt, std::nullopt, device));
+}
+ASYNC_NIF(fast_sdpa_causal)
+
 // Build a sliding window view of a padded tensor.
 // padded: [...] of ndim n; window/strides: per-axis lists of length n.
 // Returns a view of shape [o0,...,on-1, w0,...,wn-1] where
@@ -2133,7 +2165,9 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_rms_norm", 5, fast_rms_norm_async},
     {"fast_rope", 8, fast_rope_async},
     {"fast_sdpa", 6, fast_sdpa_async},
-    {"fast_sdpa_masked", 7, fast_sdpa_masked_async}};
+    {"fast_sdpa_masked", 7, fast_sdpa_masked_async},
+    {"fast_rope_ids", 8, fast_rope_ids_async},
+    {"fast_sdpa_causal", 6, fast_sdpa_causal_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 
