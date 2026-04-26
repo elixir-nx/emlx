@@ -704,6 +704,29 @@ defmodule EMLX do
   end
 
   @doc """
+  Fused SwiGLU activation: `silu(gate) * up` where `silu(x) = x * sigmoid(x)`.
+
+  - `gate` — gate tensor; silu is applied element-wise.
+  - `up`   — up-projection tensor; same shape as `gate`.
+
+  Output has the same shape and dtype as `gate`.
+
+  Prefer `EMLX.Fast.swiglu/2` inside `defn`.
+  """
+  @mlx_function {:fast_swiglu, 4}
+  def fast_swiglu({dev_gate, ref_gate}, {dev_up, ref_up})
+      when is_tensor(dev_gate, ref_gate) and is_tensor(dev_up, ref_up) do
+    device = merge_device(dev_gate, dev_up)
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_swiglu(worker, ref_gate, ref_up, effective_device)
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
   Quantize a dense 2-D `Nx.Tensor` and return an annotated quantized tensor.
 
   The returned tensor carries the original logical shape and type (e.g.
@@ -1168,5 +1191,32 @@ defmodule EMLX do
   """
   def set_cache_limit(limit) when is_integer(limit) and limit >= 0 do
     EMLX.NIF.set_cache_limit(limit) |> unwrap!()
+  end
+
+  @doc """
+  Start a Metal GPU capture, writing a `.gputrace` to the given absolute path.
+
+  The file can be opened in Xcode's GPU Debugger (File → Open) to inspect
+  per-kernel timing, command counts, and pipeline occupancy.
+
+  Warm the model up first so JIT compilation is complete before capture begins.
+
+  ## Example
+
+      EMLX.metal_start_capture(Path.expand("~/Desktop/native_decode.gputrace"))
+      # ... run decode steps ...
+      EMLX.metal_stop_capture()
+  """
+  @spec metal_start_capture(String.t()) :: :ok
+  def metal_start_capture(path) when is_binary(path) do
+    EMLX.NIF.metal_start_capture(String.to_charlist(path)) |> unwrap!()
+  end
+
+  @doc """
+  Stop the active Metal GPU capture started with `metal_start_capture/1`.
+  """
+  @spec metal_stop_capture() :: :ok
+  def metal_stop_capture do
+    EMLX.NIF.metal_stop_capture() |> unwrap!()
   end
 end

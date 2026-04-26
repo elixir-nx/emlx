@@ -27,8 +27,8 @@ defmodule EMLX.Axon.MixProject do
       {:axon, "~> 0.7"},
       # Inherit emlx's Nx git pin to avoid constraint conflicts.
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
-      # Bumblebee — used in tests and dev bench scripts.
-      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: [:dev, :test]}
+      # Bumblebee — local patched build with 8-head GQA KV cache.
+      {:bumblebee, path: Path.expand("~/coding/bumblebee"), override: true, only: [:dev, :test]}
     ]
   end
 

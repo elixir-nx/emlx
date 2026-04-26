@@ -2,6 +2,7 @@
 #include "emlx_worker.hpp"
 #include "erl_nif.h"
 #include "mlx/mlx.h"
+#include "mlx/backend/metal/metal.h"
 #include "nx_nif_utils.hpp"
 
 #include <iostream>
@@ -1714,8 +1715,11 @@ NIF(fast_sdpa_causal_key_masked) {
     auto keep = logical_and(km, causal_bool);
 
     // Additive mask: 0.0 = attend, -inf = masked out.
-    auto zero_val = zeros({}, float32);
-    auto neginf_val = full({}, -std::numeric_limits<float>::infinity(), float32);
+    // Use Q's dtype so the mask does not promote the SDPA output above Q's type.
+    // (e.g. float32 mask + bfloat16 Q/K/V would force float32 output — rejected by MLX.)
+    auto mask_dtype = q->dtype();
+    auto zero_val = zeros({}, mask_dtype);
+    auto neginf_val = full({}, -std::numeric_limits<float>::infinity(), mask_dtype);
     auto additive = where(keep, zero_val, neginf_val);
 
     TENSOR(fast::scaled_dot_product_attention(
@@ -1723,6 +1727,20 @@ NIF(fast_sdpa_causal_key_masked) {
   }
 }
 ASYNC_NIF(fast_sdpa_causal_key_masked)
+
+// fast_swiglu — fused SwiGLU: silu(gate) * up
+// SiLU (Sigmoid Linear Unit): silu(x) = x * sigmoid(x).
+// gate and up must have the same shape; output has the same shape and dtype.
+NIF(fast_swiglu) {
+  TENSOR_PARAM(0, gate);
+  TENSOR_PARAM(1, up);
+  DEVICE_PARAM(2, device);
+
+  // silu(gate) * up where silu(x) = x * sigmoid(x).
+  // MLX's lazy graph evaluation fuses these into a single kernel dispatch.
+  TENSOR(multiply(multiply(*gate, sigmoid(*gate, device), device), *up, device));
+}
+ASYNC_NIF(fast_swiglu)
 
 // fast_sdpa_causal — flash-attention SDPA with built-in causal mask
 // mask_mode="causal" lets MLX construct the upper-triangular mask internally.
@@ -2092,6 +2110,38 @@ ASYNC_NIF(tensordot)
 ASYNC_NIF(window_scatter_max)
 ASYNC_NIF(window_scatter_min)
 
+// ── Metal GPU capture ────────────────────────────────────────────────────────
+// Writes a .gputrace file to `path` (absolute path, no default).
+// Open the result in Xcode's GPU Debugger (File → Open).
+
+static ERL_NIF_TERM metal_start_capture(ErlNifEnv *env, int argc,
+                                         const ERL_NIF_TERM argv[]) {
+  unsigned len = 0;
+  enif_get_list_length(env, argv[0], &len);
+  std::string path(len, '\0');
+  enif_get_string(env, argv[0], &path[0], len + 1, ERL_NIF_LATIN1);
+  try {
+    mlx::core::metal::start_capture(path);
+  } catch (const std::exception &e) {
+    return enif_make_tuple2(env,
+      enif_make_atom(env, "error"),
+      enif_make_string(env, e.what(), ERL_NIF_LATIN1));
+  }
+  return enif_make_atom(env, "ok");
+}
+
+static ERL_NIF_TERM metal_stop_capture(ErlNifEnv *env, int argc,
+                                        const ERL_NIF_TERM argv[]) {
+  try {
+    mlx::core::metal::stop_capture();
+  } catch (const std::exception &e) {
+    return enif_make_tuple2(env,
+      enif_make_atom(env, "error"),
+      enif_make_string(env, e.what(), ERL_NIF_LATIN1));
+  }
+  return enif_make_atom(env, "ok");
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"eval", 2, eval_async},
     {"to_blob", 2, to_blob_async},
@@ -2259,7 +2309,11 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_sdpa_causal_key_masked", 7, fast_sdpa_causal_key_masked_async},
     {"fast_sdpa_causal", 6, fast_sdpa_causal_async},
     {"fast_layer_norm", 6, fast_layer_norm_async},
-    {"fast_layer_norm_no_bias", 5, fast_layer_norm_no_bias_async}};
+    {"fast_layer_norm_no_bias", 5, fast_layer_norm_no_bias_async},
+    {"fast_swiglu", 4, fast_swiglu_async},
+    // Metal GPU capture (synchronous — no GPU work, just starts/stops the trace)
+    {"metal_start_capture", 1, metal_start_capture},
+    {"metal_stop_capture", 0, metal_stop_capture}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 

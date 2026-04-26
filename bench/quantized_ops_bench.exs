@@ -149,6 +149,65 @@ Benchee.run(
 File.close(file)
 IO.puts("\n==> Results written to #{results_file}")
 
+# ── A7-1: Transpose hypothesis ────────────────────────────────────────────────
+#
+# Hypothesis: transpose=false (Bumblebee {in,out} layout) is slower than
+# transpose=true ({out,in} layout) on the Metal quantized_matmul kernel.
+# If confirmed, A7-2 pre-transposes Bumblebee kernels to fix Gap A.
+#
+# Uses q_proj at Qwen3-0.6B decode shape (act {1,1,1024}, out 2048).
+
+IO.puts("\n=== A7-1 Transpose hypothesis (q_proj, 4-bit g64, decode shape) ===\n")
+
+{_, _, q_w_native, q_quant_weights, q_act_3d} =
+  Enum.find(weights, fn {n, _, _, _, _} -> n == :q_proj end)
+
+# Native path: {out, in} = {2048, 1024}, contract on axis [1] (last) → transpose=true
+{_, q_qw_true} = Enum.find(q_quant_weights, fn {v, _} -> v == "4bit_g64" end)
+
+# Bumblebee path: {in, out} = {1024, 2048}, contract on axis [0] (first) → transpose=false
+q_w_in_out  = Nx.transpose(q_w_native)
+q_qw_false  = EMLX.Quantization.quantize(q_w_in_out, type: {:s, 4}, group_size: 64)
+
+hyp_runs = 500
+
+warmup_hyp = fn f ->
+  for _ <- 1..50, do: Bench.Sync.eval!(f.())
+end
+
+time_hyp = fn f ->
+  t0 = System.monotonic_time(:microsecond)
+  for _ <- 1..hyp_runs, do: f.()
+  Bench.Sync.eval!(f.())
+  t1 = System.monotonic_time(:microsecond)
+  Float.round((t1 - t0) / (hyp_runs + 1), 2)
+end
+
+fn_true  = fn -> Nx.dot(q_act_3d, [2], q_qw_true,  [1]) end
+fn_false = fn -> Nx.dot(q_act_3d, [2], q_qw_false, [0]) end
+
+IO.puts("Warming up both paths...")
+warmup_hyp.(fn_true)
+warmup_hyp.(fn_false)
+
+IO.puts("Timing transpose=true  ({out,in} layout, axis [last])...")
+us_true = time_hyp.(fn_true)
+
+IO.puts("Timing transpose=false ({in,out} layout, axis [0])...")
+us_false = time_hyp.(fn_false)
+
+ratio = Float.round(us_false / max(us_true, 0.001), 2)
+
+IO.puts("""
+
+q_proj 4-bit g64 (decode shape, #{hyp_runs} iters):
+  transpose=true  (native {out,in}):    #{us_true} µs/op
+  transpose=false (bumblebee {in,out}): #{us_false} µs/op
+  slowdown ratio (false/true):          #{ratio}×
+
+=> #{if ratio > 1.3, do: "CONFIRMED: transpose=false is #{ratio}× slower. A7-2 is high priority.", else: "NOT CONFIRMED: format is not the bottleneck (ratio #{ratio}×). Profile before A7-2."}
+""")
+
 # ── Per-step kernel sum (4-bit, group=64) vs A0 baseline ─────────────────────
 # Collect median times for all linears at the primary variant and sum them.
 # This is the "kernel headroom" check from the A1 acceptance criteria.

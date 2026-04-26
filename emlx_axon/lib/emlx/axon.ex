@@ -14,6 +14,8 @@ defmodule EMLX.Axon do
   | `:layer_norm`        | `op_name: :layer_norm`                 | `EMLX.Fast.layer_norm/3,4`                    |
   | `:rotary_embedding`  | Bumblebee `apply_rotary_embedding/5`   | `EMLX.Fast.rope_with_positions/6`             |
   | `:sdpa`              | Bumblebee `attention_output_impl/3`    | `EMLX.Fast.scaled_dot_product_attention_causal/4` or unmasked |
+  | `:dropout`           | `op_name: :dropout` (inference)        | identity pass-through                          |
+  | `:swiglu`            | `:multiply(container(up, silu(gate)))` | `EMLX.Fast.swiglu/2`                          |
 
   ## Usage
 
@@ -50,10 +52,34 @@ defmodule EMLX.Axon do
     to the pure causal Metal kernel when it is. Padded batches get a combined
     causal + key_mask additive mask. Sliding-window attention falls back to the
     original `attention_output_impl`. Inference-only: dropout is elided.
+
+  - **`:dropout`** rewrite replaces `op_name: :dropout` nodes with an identity
+    pass-through. Dropout at inference time is always a no-op regardless of rate;
+    this eliminates 56 NIF-boundary crossings per decode step in Qwen3-0.6B without
+    any functional change. Not appropriate for training graphs.
+
+  - **`:swiglu`** rewrite matches `:multiply` nodes backed by a `:container` node whose
+    two parents include one `:silu` node (the Bumblebee SwiGLU pattern:
+    `multiply(container(up_proj, silu(gate_proj)))`). Replaces the multiply + container +
+    silu triple with a single `EMLX.Fast.swiglu/2` call. Does not match generic
+    multiplications or containers without a silu child.
+
+  - **`:attn_weights`** rewrite replaces `:bb_attn_weights` passthrough nodes (added by
+    the local Bumblebee patch) with a no-arg constant-zero layer, cutting the
+    `attention_weights_impl` sub-graph and its K-side `repeat_interleave` nodes out of the
+    reachable graph entirely. Inference-only: the attention weights tensor is never used
+    for token generation.
+
+  - **`:if_present`** rewrite replaces Bumblebee's KV-cache conditional nodes with their
+    "cache present" branch. In compiled serving the KV cache is always initialized (never
+    `%Axon.None{}`), so the else branch is dead code. Removing all 86 `:if_present` nodes
+    and their ~260 `:optional` wrappers eliminates significant per-step Axon dispatch
+    overhead without any functional change.
   """
 
   @bumblebee_rope_mfa {Bumblebee.Layers, :apply_rotary_embedding, 5}
   @bumblebee_attn_mfa {Bumblebee.Layers, :attention_output_impl, 3}
+  @bumblebee_repeat_interleave_mfa {Bumblebee.Layers, :"-repeat_interleave/3-fun-0-", 2}
 
   @doc """
   Rewrites all supported nodes in `model` to their `EMLX.Fast` equivalents.
@@ -75,7 +101,17 @@ defmodule EMLX.Axon do
     cache = :ets.new(:emlx_axon_rewrite_cache, [:set, :public])
 
     try do
-      enabled = Keyword.get(opts, :only, [:rms_norm, :layer_norm, :rotary_embedding, :sdpa])
+      enabled =
+        Keyword.get(opts, :only, [
+          :rms_norm,
+          :layer_norm,
+          :rotary_embedding,
+          :sdpa,
+          :dropout,
+          :swiglu,
+          :attn_weights,
+          :if_present
+        ])
 
       rewriters =
         []
@@ -83,6 +119,10 @@ defmodule EMLX.Axon do
         |> maybe_add(:layer_norm, layer_norm_rewriter(cache), enabled)
         |> maybe_add(:rotary_embedding, rotary_embedding_rewriter(cache), enabled)
         |> maybe_add(:sdpa, sdpa_rewriter(cache), enabled)
+        |> maybe_add(:dropout, dropout_rewriter(cache), enabled)
+        |> maybe_add(:swiglu, swiglu_rewriter(cache), enabled)
+        |> maybe_add(:attn_weights, attn_weights_rewriter(cache), enabled)
+        |> maybe_add(:if_present, if_present_rewriter(cache), enabled)
 
       Axon.rewrite_nodes(model, fn node ->
         Enum.find_value(rewriters, :skip, fn {_key, fun} ->
@@ -257,6 +297,191 @@ defmodule EMLX.Axon do
     end
   end
 
+  # ── dropout ──────────────────────────────────────────────────────────────────
+
+  @doc """
+  Returns the rewriter function for `dropout` nodes.
+
+  At inference time, dropout is always a pass-through regardless of rate. This
+  rewriter replaces every `:dropout` node with an identity layer, eliminating the
+  NIF-boundary crossing without any functional change.
+
+  **Not appropriate for training graphs** — only enable this rewriter when the
+  model will be used for inference only.
+  """
+  @spec dropout_rewriter(reference() | nil) ::
+          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+  def dropout_rewriter(cache \\ nil) do
+    _ = cache
+
+    fn
+      %Axon.Node{op_name: :dropout, name: name_fn} ->
+        fn [x], _placeholder ->
+          Axon.layer(fn x, _opts -> x end, [x], name: name_fn, op_name: :dropout_identity)
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  # ── Attention weights elision ─────────────────────────────────────────────
+
+  @doc """
+  Returns the rewriter function for Bumblebee aux attention-weights nodes.
+
+  Matches `:bb_attn_weights` nodes — a passthrough layer inserted by the local
+  Bumblebee patch around the `{output, weights}` return of `Layers.attention/8`.
+  Replaces the node with a no-arg constant-zero layer so the entire
+  `attention_weights_impl` sub-graph (and the K-side `repeat_interleave` it
+  consumes) becomes unreachable. Inference-only: attention weight tensors are
+  never used for token generation.
+  """
+  @spec attn_weights_rewriter(reference() | nil) ::
+          (Axon.Node.t() -> :skip | ([Axon.t(), ...], Axon.t() -> Axon.t()))
+  def attn_weights_rewriter(cache \\ nil) do
+    _ = cache
+
+    fn
+      %Axon.Node{op_name: :bb_attn_weights} ->
+        fn [weights_axon], _placeholder ->
+          # Build a constant-zero node and merge its nodes map with the existing
+          # graph so rewrite_nodes can locate original_id during the ID swap.
+          # The constant has no parents, so attention_weights_impl and K's
+          # repeat_interleave become orphaned and are pruned by Axon automatically.
+          %Axon{output: const_id, nodes: const_nodes} = Axon.constant(Nx.tensor(0.0))
+          merged = Map.merge(weights_axon.nodes, const_nodes)
+          %Axon{output: const_id, nodes: merged}
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  # ── if_present elision ───────────────────────────────────────────────────────
+
+  @doc """
+  Returns the rewriter function for `:if_present` nodes.
+
+  Bumblebee wraps every KV-cache operation in `Layers.if_present(cache, ...)` to
+  handle the case where no cache is provided. In compiled serving the cache is
+  always initialized (never `%Axon.None{}`), so the conditional is dead code.
+
+  The rewriter unconditionally selects the "cache present" branch (`on_true`) and
+  lets the "no cache" branch (`on_false`) and all its `:optional` wrappers become
+  unreachable, pruning them from the compiled graph.
+
+  **Do not enable for training graphs** — training models typically run without a
+  KV cache and rely on the `else` branch.
+  """
+  @spec if_present_rewriter(reference() | nil) ::
+          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+  def if_present_rewriter(_cache \\ nil) do
+    fn
+      # 3-parent :if_present: [optional(condition), optional(on_true), optional(on_false)]
+      %Axon.Node{op_name: :if_present, parent: [_, _, _]} ->
+        fn [_cond_opt, on_true_opt, _on_false_opt], _placeholder ->
+          # Skip the :optional wrapper to return the underlying on_true node.
+          # The cache is always non-None in compiled serving.
+          optional_node = on_true_opt.nodes[on_true_opt.output]
+
+          on_true_id =
+            case {optional_node.op_name, optional_node.parent} do
+              {:optional, [id]} -> id
+              # If the node isn't an :optional for some reason, use it as-is.
+              _ -> on_true_opt.output
+            end
+
+          %Axon{output: on_true_id, nodes: on_true_opt.nodes}
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  # ── SwiGLU ──────────────────────────────────────────────────────────────────
+
+  @doc """
+  Returns the rewriter function for SwiGLU nodes.
+
+  Matches `:multiply` nodes backed by a single `:container` parent whose two
+  children include one `:silu` node (the Bumblebee SwiGLU pattern:
+  `multiply(container(up_proj, silu(gate_proj)))`). Replaces the
+  multiply + container + silu triple with a single `EMLX.Fast.swiglu/2` call,
+  passing the gate's raw input (pre-silu) and the up-projection directly to the
+  fused NIF.
+
+  Generic `:multiply` nodes (no `:container` parent, or container without a
+  `:silu` child) are reconstructed identically.
+  """
+  @spec swiglu_rewriter(reference() | nil) ::
+          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+  def swiglu_rewriter(cache \\ nil) do
+    _ = cache
+
+    fn
+      # Bumblebee's SwiGLU: multiply(container(up_proj, silu(gate))).
+      # The :multiply node has ONE parent (the container), and the container
+      # has TWO parents: one :silu (the gate activation) and one other node
+      # (the up-projection).
+      %Axon.Node{op_name: :multiply, parent: [container_id], name: name_fn} ->
+        fn [container_axon], _placeholder ->
+          node_map = container_axon.nodes
+
+          case detect_swiglu_pattern(node_map, container_id) do
+            {gate_id, up_id} ->
+              gate_axon = %Axon{output: gate_id, nodes: node_map}
+              up_axon = %Axon{output: up_id, nodes: node_map}
+
+              Axon.layer(
+                fn gate, up, _opts -> EMLX.Fast.swiglu(gate, up) end,
+                [gate_axon, up_axon],
+                name: name_fn,
+                op_name: :fast_swiglu
+              )
+
+            :skip ->
+              # Not a SwiGLU container — reconstruct the original multiply.
+              Axon.layer(
+                fn container, _opts -> Nx.multiply(elem(container, 0), elem(container, 1)) end,
+                [container_axon],
+                name: name_fn,
+                op_name: :multiply
+              )
+          end
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
+  # Checks if `container_id` is a :container node with exactly two parents, one
+  # of which is a :silu node with a single parent (the gate input).
+  # Returns {gate_id, up_id} on match, or :skip otherwise.
+  defp detect_swiglu_pattern(nodes, container_id) do
+    container = nodes[container_id]
+
+    with %Axon.Node{op_name: :container, parent: [a_id, b_id]} <- container do
+      cond do
+        nodes[a_id].op_name == :silu and length(nodes[a_id].parent) == 1 ->
+          # a is silu(gate), b is up_proj
+          {hd(nodes[a_id].parent), b_id}
+
+        nodes[b_id].op_name == :silu and length(nodes[b_id].parent) == 1 ->
+          # b is silu(gate), a is up_proj
+          {hd(nodes[b_id].parent), a_id}
+
+        true ->
+          :skip
+      end
+    else
+      _ -> :skip
+    end
+  end
+
   # ── SDPA ─────────────────────────────────────────────────────────────────────
 
   @doc """
@@ -315,9 +540,13 @@ defmodule EMLX.Axon do
               # pure causal Metal kernel. Otherwise builds a combined additive
               # mask. No Nx.cond double-evaluation required.
               q_axon = %Axon{output: q_id, nodes: nodes}
-              k_axon = %Axon{output: k_id, nodes: nodes}
+              # Strip repeat_interleave from K and V if present — after the local
+              # Bumblebee GQA cache patch, expand runs after cache write, so
+              # mlx::fast::sdpa receives raw 8-head K/V and handles GQA natively.
+              k_axon = maybe_strip_repeat_interleave(nodes, k_id)
+              v_axon_8 = maybe_strip_repeat_interleave(nodes, v_axon.output)
               key_mask_axon = %Axon{output: key_mask_id, nodes: nodes}
-              build_sdpa_layer(q_axon, k_axon, v_axon, key_mask_axon, scale_opt)
+              build_sdpa_layer(q_axon, k_axon, v_axon_8, key_mask_axon, scale_opt)
 
             true ->
               # Non-causal, no mask (e.g. cross-attention in encoder-decoder models).
@@ -329,6 +558,21 @@ defmodule EMLX.Axon do
       else
         :skip
       end
+    end
+  end
+
+  # If `node_id` is a `repeat_interleave` custom node (GQA head expand), return
+  # an Axon wrapping its single parent (the 8-head tensor). Otherwise return the
+  # node unchanged. Safe to call when the patch is absent — the else branch is a no-op.
+  defp maybe_strip_repeat_interleave(nodes, node_id) do
+    node = nodes[node_id]
+
+    if node.op_name == :custom and
+         function_info(node.op) == @bumblebee_repeat_interleave_mfa and
+         length(node.parent) == 1 do
+      %Axon{output: hd(node.parent), nodes: nodes}
+    else
+      %Axon{output: node_id, nodes: nodes}
     end
   end
 

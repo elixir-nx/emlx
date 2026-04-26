@@ -57,6 +57,14 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
+  def metal_start_capture(_path) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def metal_stop_capture do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
   def tensor_data_ptr(_tensor) do
     :erlang.nif_error(:nif_not_loaded)
   end

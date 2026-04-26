@@ -18,6 +18,7 @@ defmodule EMLX.Fast do
   - `scaled_dot_product_attention/5` — flash-attention SDPA (additive/bool mask)
   - `scaled_dot_product_attention_causal/4` — flash-attention SDPA with built-in causal mask
   - `scaled_dot_product_attention_causal_key_masked/5` — causal SDPA; checks key_mask at C++ level, fast-paths to pure causal when all-ones
+  - `swiglu/2` — fused SwiGLU: `silu(gate) * up`
 
   ## Axon graph rewrite example
 
@@ -267,6 +268,30 @@ defmodule EMLX.Fast do
       EMLX.Backend.from_nx(offsets),
       EMLX.Backend.from_nx(freqs)
     )
+    |> EMLX.Backend.to_nx()
+  end
+
+  # ── SwiGLU ──────────────────────────────────────────────────────────────────
+
+  @doc """
+  Fused SwiGLU activation: `silu(gate) * up` where `silu(x) = x * sigmoid(x)`.
+
+  Eliminates the two-op `silu(gate_proj) * up_proj` pattern that appears in
+  Qwen3's FFN layers (28× per decode step).
+
+  - `gate` — gate-projection output; silu is applied element-wise.
+  - `up`   — up-projection output; same shape as `gate`.
+
+  Output has the same shape and dtype as `gate`.
+  """
+  deftransform swiglu(gate, up) do
+    out = Nx.template(Nx.shape(gate), Nx.type(gate))
+    Nx.runtime_call(out, {gate, up}, [], &__MODULE__.swiglu_callback/2)
+  end
+
+  @doc false
+  def swiglu_callback({%Nx.Tensor{} = gate, %Nx.Tensor{} = up}, _opts) do
+    EMLX.fast_swiglu(EMLX.Backend.from_nx(gate), EMLX.Backend.from_nx(up))
     |> EMLX.Backend.to_nx()
   end
 

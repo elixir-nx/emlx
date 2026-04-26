@@ -87,6 +87,45 @@ defmodule EMLX.FastTest do
     end
   end
 
+  # ── swiglu ──────────────────────────────────────────────────────────────────
+
+  describe "EMLX.Fast.swiglu/2" do
+    test "output shape and type match gate input" do
+      gate = Nx.iota({1, 1, 64}, type: :f16) |> Nx.divide(100) |> gpu()
+      up   = Nx.iota({1, 1, 64}, type: :f16) |> Nx.divide(100) |> gpu()
+
+      out = Fast.swiglu(gate, up)
+
+      assert Nx.shape(out) == {1, 1, 64}
+      assert Nx.type(out) == {:f, 16}
+    end
+
+    test "matches silu(gate) * up on f32 inputs" do
+      gate = Nx.tensor([[[1.0, -1.0, 2.0, 0.5]]], type: :f32) |> gpu()
+      up   = Nx.tensor([[[2.0,  3.0, 1.0, 4.0]]], type: :f32) |> gpu()
+
+      fast_out = Fast.swiglu(gate, up) |> Nx.backend_transfer()
+      # silu(x) = x * sigmoid(x)
+      prim_out = Nx.multiply(Nx.multiply(gate, Nx.sigmoid(gate)), up) |> Nx.backend_transfer()
+
+      assert_all_close(fast_out, prim_out, atol: 1.0e-5)
+    end
+
+    test "matches silu(gate) * up on Qwen3 FFN decode shape (f16)" do
+      # Qwen3-0.6B: ffn_intermediate_size = 1536 (ffn_size / 2 for gated FFN)
+      gate = Nx.iota({1, 1, 1536}, type: :f16) |> Nx.divide(1000) |> gpu()
+      up   = Nx.iota({1, 1, 1536}, type: :f16) |> Nx.divide(1000) |> gpu()
+
+      fast_out = Fast.swiglu(gate, up) |> Nx.as_type(:f32) |> Nx.backend_transfer()
+      prim_out =
+        Nx.multiply(Nx.multiply(gate, Nx.sigmoid(gate)), up)
+        |> Nx.as_type(:f32)
+        |> Nx.backend_transfer()
+
+      assert_all_close(fast_out, prim_out, atol: 1.0e-2)
+    end
+  end
+
   describe "EMLX.Fast.scaled_dot_product_attention/5 (masked)" do
     test "output shape matches q with additive mask" do
       b = 1; n_q = 4; t_q = 4; t_kv = 4; d = 32
@@ -106,6 +145,25 @@ defmodule EMLX.FastTest do
       out = Fast.scaled_dot_product_attention(q, k, v, scale, mask)
 
       assert Nx.shape(out) == {b, n_q, t_q, d}
+    end
+  end
+
+  # ── GQA SDPA (mismatched Q/KV heads) ─────────────────────────────────────────
+
+  describe "EMLX.Fast.scaled_dot_product_attention_causal_key_masked/5 (GQA)" do
+    @tag :metal
+    test "GQA: Q {1,16,1,64} × K/V {1,8,10,64} produces {1,16,1,64}" do
+      # Qwen3-0.6B: 16 query heads, 8 key/value heads (GQA groups=2).
+      q = Nx.broadcast(0.1, {1, 16, 1, 64}) |> Nx.as_type(:f16) |> gpu()
+      k = Nx.broadcast(0.1, {1, 8, 10, 64}) |> Nx.as_type(:f16) |> gpu()
+      v = Nx.broadcast(0.1, {1, 8, 10, 64}) |> Nx.as_type(:f16) |> gpu()
+      scale = 1.0 / :math.sqrt(64)
+      key_mask = Nx.broadcast(1, {1, 10}) |> gpu()
+
+      out = Fast.scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask)
+
+      assert Nx.shape(out) == {1, 16, 1, 64}
+      assert Nx.type(out) == {:f, 16}
     end
   end
 end
