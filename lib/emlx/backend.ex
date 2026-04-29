@@ -813,11 +813,15 @@ defmodule EMLX.Backend do
       # Check for NaNs in the original tensor (before any reversal)
       is_nan_mx = EMLX.is_nan(t_mx)
 
+      # Cast bool to uint8 before argmax: the sort kernel for bool_ is not compiled
+      # in libmlx's metallib, but sort_mbsort_uint8 is available.
+      is_nan_u8 = EMLX.astype(is_nan_mx, :uint8)
+
       nan_index_mx =
         if axis do
-          EMLX.argmax(is_nan_mx, axis, keep_axis)
+          EMLX.argmax(is_nan_u8, axis, keep_axis)
         else
-          EMLX.argmax(is_nan_mx, keep_axis)
+          EMLX.argmax(is_nan_u8, keep_axis)
         end
 
       # Check if any NaN exists along the axis
@@ -1168,7 +1172,7 @@ defmodule EMLX.Backend do
   #     Grouping is on the last dim (out_features) which is what EMLX.quantize produces.
   #
   # We detect the convention from `right_axes`: [last_dim] → transpose=true,
-  # [0] → transpose=false.
+  # [0] → transpose=false, unless cfg.transpose explicitly overrides this.
   defp quantized_dot(out, activation, qw_tensor, right_axes) do
     %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
 
@@ -1178,9 +1182,14 @@ defmodule EMLX.Backend do
     weight_rank = tuple_size(qw_tensor.shape)
     last_dim    = weight_rank - 1
 
-    # transpose=true when contracting on the last dim of the weight ({out, in} convention).
-    # transpose=false when contracting on axis 0 ({in, out} convention, e.g. Bumblebee kernels).
-    transpose = right_axes == [last_dim]
+    # If cfg.transpose was explicitly set (e.g. by QuantizeParams when weights are stored
+    # in {out,in} physical layout but exposed as {in,out} to Axon), use it; otherwise
+    # auto-detect from right_axes.
+    transpose =
+      case cfg.transpose do
+        nil -> right_axes == [last_dim]
+        explicit -> explicit
+      end
 
     result =
       EMLX.quantized_matmul(
@@ -1466,12 +1475,15 @@ defmodule EMLX.Backend do
     # Partition indices to place NaNs correctly (NaNs are treated as highest):
     # - For ascending: NaNs (highest) go to end: sort by is_nan (0 < 1)
     # - For descending: NaNs (highest) go to beginning: sort by !is_nan (1 < 0)
+    # Cast bool to uint8 before argsort: sort_mbsort_bool_ is not in the compiled metallib,
+    # but sort_mbsort_uint8 is. bool and uint8 have identical sort semantics (0/1).
     partition_indices_mx =
       if asc? do
-        EMLX.argsort(is_nan_mx, axis)
+        is_nan_mx |> EMLX.astype(:uint8) |> EMLX.argsort(axis)
       else
         is_nan_mx
         |> EMLX.logical_not()
+        |> EMLX.astype(:uint8)
         |> EMLX.argsort(axis)
       end
 
@@ -1505,12 +1517,14 @@ defmodule EMLX.Backend do
     # Partition indices to place NaNs correctly (NaNs are treated as highest):
     # - For ascending: NaNs (highest) go to end: sort by is_nan (0 < 1)
     # - For descending: NaNs (highest) go to beginning: sort by !is_nan (1 < 0)
+    # Cast bool to uint8 before argsort: sort_mbsort_bool_ is not in the compiled metallib.
     partition_indices_mx =
       if asc? do
-        EMLX.argsort(is_nan_mx, axis)
+        is_nan_mx |> EMLX.astype(:uint8) |> EMLX.argsort(axis)
       else
         is_nan_mx
         |> EMLX.logical_not()
+        |> EMLX.astype(:uint8)
         |> EMLX.argsort(axis)
       end
 

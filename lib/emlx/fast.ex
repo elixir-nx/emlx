@@ -123,8 +123,17 @@ defmodule EMLX.Fast do
   - Output     — `{B, N_q, T_q, D}`, same dtype as `q`
   """
   deftransform scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask) do
+    # Compute kv_offset at JIT/deftransform time: shapes are compile-time constants here.
+    #  - Decode  (T_q = 1): single query attends to all prior positions;
+    #    key_mask filters which positions are valid.  kv_offset = T_kv - 1.
+    #  - Prefill (T_q > 1): lower-triangular causal mask.  kv_offset = 0.
+    #    (T_kv - T_q would be wrong for left-padded prefill with a pre-alloc cache.)
+    t_q  = elem(Nx.shape(q), 2)
+    t_kv = elem(Nx.shape(k), 2)
+    kv_offset = if t_q == 1, do: t_kv - 1, else: 0
+
     out = Nx.template(Nx.shape(q), Nx.type(q))
-    Nx.runtime_call(out, {q, k, v, key_mask}, [scale: scale],
+    Nx.runtime_call(out, {q, k, v, key_mask}, [scale: scale, kv_offset: kv_offset],
       &__MODULE__.sdpa_causal_key_masked_callback/2)
   end
 
@@ -133,14 +142,22 @@ defmodule EMLX.Fast do
         {%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v, %Nx.Tensor{} = key_mask},
         opts
       ) do
+    # Q/K/V arrive in {B, N, T, D} layout (transposed by the outer Axon layer).
+    # kv_offset was computed at deftransform time from the static shapes.
+    # MLX's fast SDPA handles GQA natively (N_q may differ from N_kv) — no
+    # explicit head expansion needed here.
+    scale     = opts[:scale]
+    kv_offset = opts[:kv_offset]
+
     out =
       EMLX.fast_sdpa_causal_key_masked(
         EMLX.Backend.from_nx(q), EMLX.Backend.from_nx(k), EMLX.Backend.from_nx(v),
-        opts[:scale], EMLX.Backend.from_nx(key_mask)
+        scale, EMLX.Backend.from_nx(key_mask), kv_offset
       )
       |> EMLX.Backend.to_nx()
 
-    if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
+    dtype = Nx.type(q)
+    if Nx.type(out) != dtype, do: Nx.as_type(out, dtype), else: out
   end
 
   # ── RoPE ────────────────────────────────────────────────────────────────────
@@ -196,32 +213,64 @@ defmodule EMLX.Fast do
 
   Output shape and type match `a`.
 
-  > ### Sequential positions only {: .warning}
-  > This function assumes positions within each batch example are contiguous
-  > starting from `position_ids[b, 0]`. Non-sequential position_ids (e.g.
-  > from packed sequences or custom position schemes) produce incorrect results.
+  > ### Sequential positions only (fast T=1 path) {: .warning}
+  > For **decode** with `T = 1` and `base` below about `1.0e5`, the `fast_rope_ids` NIF
+  > is used; it assumes sequential positions from `position_ids[b, 0]`. For **larger**
+  > `base` (e.g. Qwen3 `rope_theta` 1M) or **prefill** (`T > 1`), the Nx per-token
+  > path is used, matching Bumblebee for arbitrary per-token `position_ids`.
   """
   deftransform rope_with_positions(a, position_ids, dims, traditional, base, scale) do
     out = Nx.template(Nx.shape(a), Nx.type(a))
 
-    Nx.runtime_call(
-      out, {a, position_ids},
-      [dims: dims, traditional: traditional, base: base, scale: scale],
-      &__MODULE__.rope_with_positions_callback/2
-    )
+    # Branch at JIT/deftransform time on T (index 1 in Bumblebee {B, T, N, D} layout).
+    # T is a compile-time constant when Bumblebee uses static sequence_length compilation.
+    #  - Decode  (T = 1): sequential positions — fast_rope_ids NIF (1 Metal dispatch).
+    #  - Prefill (T > 1): arbitrary per-token positions — fast_rope_positions NIF.
+    t = elem(Nx.shape(a), 1)
+    base = base * 1.0
+    # `fast_rope_ids` uses a scalar `base` in `mlx::fast::rope` that does not
+    # match Bumblebee's per-row `take(cos, position_ids)` table for very large
+    # `rope_theta` (Qwen2/3 use 1e6+). `fast_rope_positions` matches
+    # Bumblebee; use it for T=1 when `base` is in that regime (A13).
+    t1_use_fast? = t == 1 and base < 1.0e5
+
+    if t1_use_fast? do
+      Nx.runtime_call(out, {a, position_ids},
+        [dims: dims, traditional: traditional, base: base, scale: scale],
+        &__MODULE__.rope_with_positions_fast_callback/2)
+    else
+      Nx.runtime_call(out, {a, position_ids},
+        [dims: dims, traditional: traditional, base: base, scale: scale],
+        &__MODULE__.rope_with_positions_callback/2)
+    end
   end
 
   @doc false
-  def rope_with_positions_callback({%Nx.Tensor{} = a, %Nx.Tensor{} = position_ids}, opts) do
-    # MLX's array-offset overload takes shape {B} — one starting position per batch.
-    # Extract the first position of each batch example as the per-batch offset.
+  # Fast decode path: uses MLX fast_rope_ids NIF (1 Metal dispatch per call).
+  # position_ids = {B, 1} — take position_ids[b, 0] as the offset for each batch.
+  def rope_with_positions_fast_callback({%Nx.Tensor{} = a, %Nx.Tensor{} = position_ids}, opts) do
     batch_size = elem(Nx.shape(position_ids), 0)
     offsets = position_ids[[.., 0]] |> Nx.reshape({batch_size})
 
     EMLX.fast_rope_ids(
       EMLX.Backend.from_nx(a),
-      opts[:dims], opts[:traditional], opts[:base], opts[:scale],
+      opts[:dims], opts[:traditional], opts[:base] * 1.0, opts[:scale] * 1.0,
       EMLX.Backend.from_nx(offsets)
+    )
+    |> EMLX.Backend.to_nx()
+  end
+
+  @doc false
+  # Per-token-position RoPE fallback path, handled in native C++.
+  # Correct for arbitrary (non-sequential) position IDs and high rope_theta.
+  def rope_with_positions_callback({%Nx.Tensor{} = a, %Nx.Tensor{} = position_ids}, opts) do
+    EMLX.fast_rope_positions(
+      EMLX.Backend.from_nx(a),
+      opts[:dims],
+      opts[:traditional],
+      opts[:base] * 1.0,
+      opts[:scale] * 1.0,
+      EMLX.Backend.from_nx(position_ids)
     )
     |> EMLX.Backend.to_nx()
   end
@@ -236,7 +285,12 @@ defmodule EMLX.Fast do
   use `rope_with_positions/6` instead.
 
   - `a`            — input `{B, T, ..., D}` (Bumblebee convention: heads NOT yet transposed)
-  - `position_ids` — `{B, T}` integer tensor; positions must be sequential within each row.
+  - `position_ids` — `{B, T}` integer tensor. For **decode** (`T = 1`) the fast path uses
+    `position_ids[b,0]` as the per-batch offset into `freqs` (same contract as
+    `mlx::fast::rope` with a scalar offset per batch). For **prefill** (`T > 1`) a
+    per-token Nx path runs so arbitrary positions (e.g. left-padded
+    `[0,…,0,1,2,…]`) are correct; the NIF’s offset-only entry point cannot represent
+    that.
   - `dims`         — number of feature dims to rotate.
   - `traditional`  — `false` for split-half (Bumblebee / Qwen3); `true` for interleaved.
   - `scale`        — position scale (`1.0` for most strategies with precomputed freqs).
@@ -246,16 +300,25 @@ defmodule EMLX.Fast do
   """
   deftransform rope_with_freqs(a, position_ids, dims, traditional, scale, freqs) do
     out = Nx.template(Nx.shape(a), Nx.type(a))
+    t = elem(Nx.shape(a), 1)
 
-    Nx.runtime_call(
-      out, {a, position_ids, freqs},
-      [dims: dims, traditional: traditional, scale: scale],
-      &__MODULE__.rope_with_freqs_callback/2
-    )
+    if t == 1 do
+      Nx.runtime_call(
+        out, {a, position_ids, freqs},
+        [dims: dims, traditional: traditional, scale: scale],
+        &__MODULE__.rope_with_freqs_fast_callback/2
+      )
+    else
+      Nx.runtime_call(
+        out, {a, position_ids, freqs},
+        [dims: dims, traditional: traditional, scale: scale],
+        &__MODULE__.rope_with_freqs_callback/2
+      )
+    end
   end
 
   @doc false
-  def rope_with_freqs_callback(
+  def rope_with_freqs_fast_callback(
         {%Nx.Tensor{} = a, %Nx.Tensor{} = position_ids, %Nx.Tensor{} = freqs},
         opts
       ) do
@@ -269,6 +332,30 @@ defmodule EMLX.Fast do
       EMLX.Backend.from_nx(freqs)
     )
     |> EMLX.Backend.to_nx()
+  end
+
+  @doc false
+  # Prefill: one `fast_rope_with_freqs` call per time step (same kernel as T=1 decode) so
+  # per-token positions (e.g. left-pad zeros then real) match MLX — an element-wise Nx
+  # formula can diverge from the fused NIF. Prefill is once per generation.
+  def rope_with_freqs_callback(
+        {%Nx.Tensor{} = a, %Nx.Tensor{} = position_ids, %Nx.Tensor{} = freqs},
+        opts
+      ) do
+    t = elem(Nx.shape(a), 1)
+
+    if t == 0 do
+      a
+    else
+      parts =
+        for ti <- 0..(t - 1) do
+          a_t = a[[.., ti..ti, .., ..]]
+          pos_t = position_ids[[.., ti..ti]]
+          rope_with_freqs_fast_callback({a_t, pos_t, freqs}, opts)
+        end
+
+      Nx.concatenate(parts, axis: 1)
+    end
   end
 
   # ── SwiGLU ──────────────────────────────────────────────────────────────────

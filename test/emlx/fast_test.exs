@@ -69,6 +69,76 @@ defmodule EMLX.FastTest do
     end
   end
 
+  describe "EMLX.Fast.rope_with_freqs/6" do
+    test "T>1 prefill matches per-token T=1 stack (sequential position_ids)" do
+      dims = 8
+      half = div(dims, 2)
+      freqs =
+        Nx.iota({half}, type: :f32) |> Nx.add(0.1) |> Nx.divide(20) |> gpu()
+
+      a = Nx.iota({1, 2, 1, dims}, type: :f32) |> Nx.divide(20) |> gpu()
+      pos = Nx.tensor([[0, 1]], type: :s32) |> gpu()
+
+      out2 = Fast.rope_with_freqs(a, pos, dims, false, 1.0, freqs) |> Nx.as_type(:f32)
+
+      a0 = a[[0..0, 0..0, .., ..]]
+      a1 = a[[0..0, 1..1, .., ..]]
+      o0 = Fast.rope_with_freqs(a0, Nx.tensor([[0]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+      o1 = Fast.rope_with_freqs(a1, Nx.tensor([[1]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+      expected = Nx.concatenate([o0, o1], axis: 1) |> Nx.as_type(:f32) |> Nx.backend_transfer()
+      out2 = out2 |> Nx.backend_transfer()
+
+      assert_all_close(out2, expected, atol: 1.0e-4, rtol: 1.0e-4)
+    end
+
+    test "T>1 non-sequential position_ids: second token position is honored" do
+      dims = 8
+      half = div(dims, 2)
+      freqs =
+        Nx.iota({half}, type: :f32) |> Nx.add(0.1) |> Nx.divide(20) |> gpu()
+
+      a = Nx.iota({1, 2, 1, dims}, type: :f32) |> Nx.divide(20) |> gpu()
+      # First token 0, second 5 (not offset+1 from first)
+      pos2 = Nx.tensor([[0, 5]], type: :s32) |> gpu()
+      out2 = Fast.rope_with_freqs(a, pos2, dims, false, 1.0, freqs) |> Nx.as_type(:f32)
+
+      a0 = a[[0..0, 0..0, .., ..]]
+      a1 = a[[0..0, 1..1, .., ..]]
+      o0 = Fast.rope_with_freqs(a0, Nx.tensor([[0]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+      o1 = Fast.rope_with_freqs(a1, Nx.tensor([[5]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+      expected = Nx.concatenate([o0, o1], axis: 1) |> Nx.as_type(:f32) |> Nx.backend_transfer()
+      out2 = out2 |> Nx.backend_transfer()
+
+      assert_all_close(out2, expected, atol: 1.0e-4, rtol: 1.0e-4)
+    end
+  end
+
+  describe "EMLX.Fast.rope_with_positions/6" do
+    test "high-base decode (T=1) matches per-token RoPE formula" do
+      dims = 8
+      base = 1_000_000.0
+      a = Nx.iota({1, 1, 1, dims}, type: :f32) |> Nx.divide(50) |> gpu()
+      pos = Nx.tensor([[7]], type: :s32) |> gpu()
+
+      out = Fast.rope_with_positions(a, pos, dims, false, base, 1.0) |> Nx.backend_transfer()
+
+      half = div(dims, 2)
+      i = Nx.iota({half}, type: :f32) |> Nx.multiply(2) |> Nx.divide(dims)
+      inv = Nx.divide(1.0, Nx.pow(Nx.tensor(base, type: :f32), i))
+      angles = Nx.multiply(Nx.as_type(pos, :f32) |> Nx.new_axis(-1), inv)
+      cos = angles |> Nx.cos() |> Nx.new_axis(-2)
+      sin = angles |> Nx.sin() |> Nx.new_axis(-2)
+      cos_full = Nx.concatenate([cos, cos], axis: -1)
+      sin_full = Nx.concatenate([sin, sin], axis: -1)
+      x1 = a[[.., .., .., 0..(half - 1)//1]]
+      x2 = a[[.., .., .., half..(dims - 1)//1]]
+      rotated = Nx.concatenate([Nx.negate(x2), x1], axis: -1)
+      expected = Nx.add(Nx.multiply(a, cos_full), Nx.multiply(rotated, sin_full)) |> Nx.backend_transfer()
+
+      assert_all_close(out, expected, atol: 1.0e-4, rtol: 1.0e-4)
+    end
+  end
+
   # ── scaled_dot_product_attention ─────────────────────────────────────────────
 
   describe "EMLX.Fast.scaled_dot_product_attention/4" do

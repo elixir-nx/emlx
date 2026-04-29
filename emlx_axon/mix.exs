@@ -28,7 +28,9 @@ defmodule EMLX.Axon.MixProject do
       # Inherit emlx's Nx git pin to avoid constraint conflicts.
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
       # Bumblebee — local patched build with 8-head GQA KV cache.
-      {:bumblebee, path: Path.expand("~/coding/bumblebee"), override: true, only: [:dev, :test]}
+      {:bumblebee, path: Path.expand("~/coding/bumblebee"), override: true, only: [:dev, :test]},
+      # Native serving uses validation/ forward pass for the 28-layer generate loop.
+      {:emlx_validation, path: "../validation", only: [:dev, :test]}
     ]
   end
 

@@ -605,6 +605,42 @@ defmodule EMLX do
   end
 
   @doc """
+  Fused RoPE for arbitrary per-token `position_ids`.
+
+  Uses full `{B, T}` position IDs (not just an offset) and mirrors Bumblebee's
+  per-token cos/sin lookup, avoiding the sequential-offset assumption of
+  `fast_rope_ids`.
+
+  - `a`            — input tensor `{B, T, H, D}`.
+  - `dims`         — number of feature dims to rotate.
+  - `traditional`  — currently only `false` is supported.
+  - `base`         — angular frequency base (e.g. `1_000_000`).
+  - `scale`        — position scale.
+  - `position_ids` — `{B, T}` integer tensor.
+  """
+  @mlx_function {:fast_rope_positions, 8}
+  def fast_rope_positions(
+        {dev_a, ref_a},
+        dims,
+        traditional,
+        base,
+        scale,
+        {dev_pos, ref_pos}
+      )
+      when is_tensor(dev_a, ref_a) and is_tensor(dev_pos, ref_pos) do
+    device = merge_device(dev_a, dev_pos)
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.fast_rope_positions(
+        worker, ref_a, dims, traditional, base * 1.0, scale * 1.0, ref_pos, effective_device
+      )
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
   Fused RoPE with precomputed inv-frequency vector (`mlx::fast::rope`, freqs overload).
 
   - `a`          — input tensor; shape `{B, T, ..., D}`.
@@ -681,22 +717,23 @@ defmodule EMLX do
 
   Prefer `EMLX.Fast.scaled_dot_product_attention_causal_key_masked/5` inside `defn`.
   """
-  @mlx_function {:fast_sdpa_causal_key_masked, 7}
+  @mlx_function {:fast_sdpa_causal_key_masked, 8}
   def fast_sdpa_causal_key_masked(
         {dev_q, ref_q},
         {dev_k, ref_k},
         {dev_v, ref_v},
         scale,
-        {dev_m, ref_m}
+        {dev_m, ref_m},
+        kv_offset
       )
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
-             is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) do
+             is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) and is_integer(kv_offset) do
     device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, dev_m)))
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
       EMLX.NIF.fast_sdpa_causal_key_masked(
-        worker, ref_q, ref_k, ref_v, scale * 1.0, ref_m, effective_device
+        worker, ref_q, ref_k, ref_v, scale * 1.0, ref_m, kv_offset, effective_device
       )
       |> unwrap!()
 
@@ -724,6 +761,85 @@ defmodule EMLX do
       |> unwrap!()
 
     await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
+  Fused KV cache update + variable-length SDPA in a single Metal command buffer.
+
+  Receives tensors in Bumblebee `{B, T, N, D}` convention. Internally transposes
+  to MLX `{B, N, T, D}` for `mlx::fast::scaled_dot_product_attention`, then
+  transposes the result back. Returns a 3-tuple of EMLX `{device, ref}` pairs.
+
+  - `q`       — `{B, T_q,   N_q,  D}` post-RoPE query
+  - `new_k`   — `{B, T_new, N_kv, D}` current key projection (post-RoPE)
+  - `new_v`   — `{B, T_new, N_kv, D}` current value projection
+  - `k_cache` — `{B, T_max, N_kv, D}` preallocated key buffer
+  - `v_cache` — `{B, T_max, N_kv, D}` preallocated value buffer
+  - `offset`  — integer, number of positions already in cache
+  - `scale`   — float, `1 / sqrt(head_dim)`
+
+  Returns `{{dev, attn_ref}, {dev, k_upd_ref}, {dev, v_upd_ref}}`.
+  """
+  @mlx_function {:kv_cache_attention, 9}
+  def kv_cache_attention(
+        {dev_q, ref_q},
+        {_dev_k, ref_k},
+        {_dev_v, ref_v},
+        {_dev_kc, ref_kc},
+        {_dev_vc, ref_vc},
+        offset,
+        scale
+      )
+      when is_tensor(dev_q, ref_q) and is_integer(offset) and is_float(scale) do
+    device = dev_q
+    {worker, effective_device} = resolve_worker(device)
+
+    {attn_ref, k_upd_ref, v_upd_ref} =
+      EMLX.NIF.kv_cache_attention(
+        worker, ref_q, ref_k, ref_v, ref_kc, ref_vc, offset, scale, effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {{effective_device, attn_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
+  end
+
+  @doc """
+  Like `kv_cache_attention/7` but also applies `key_mask` to exclude padding
+  positions from attention in both prefill and decode steps.
+
+  - `key_mask` — `{B, T_kv}` integer or boolean tensor with `1` = attend,
+    `0` = skip (padding). Must cover exactly `valid_len = offset + T_new` positions.
+
+  The combined additive mask applies causal AND key_mask constraints without
+  calling `mlx::core::all()`, avoiding Metal sort-kernel compilation issues for
+  small tensor shapes.
+
+  Returns `{{dev, attn_ref}, {dev, k_upd_ref}, {dev, v_upd_ref}}`.
+  """
+  @mlx_function {:kv_cache_attention_masked, 10}
+  def kv_cache_attention_masked(
+        {dev_q, ref_q},
+        {_dev_k, ref_k},
+        {_dev_v, ref_v},
+        {_dev_kc, ref_kc},
+        {_dev_vc, ref_vc},
+        offset,
+        scale,
+        {_dev_m, ref_m}
+      )
+      when is_tensor(dev_q, ref_q) and is_integer(offset) and is_float(scale) do
+    device = dev_q
+    {worker, effective_device} = resolve_worker(device)
+
+    {attn_ref, k_upd_ref, v_upd_ref} =
+      EMLX.NIF.kv_cache_attention_masked(
+        worker, ref_q, ref_k, ref_v, ref_kc, ref_vc, offset, scale, ref_m, effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {{effective_device, attn_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
   end
 
   @doc """

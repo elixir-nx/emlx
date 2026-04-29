@@ -137,6 +137,83 @@ defmodule EMLX.Axon do
     end
   end
 
+  # ── load_quantized ───────────────────────────────────────────────────────────
+
+  @doc """
+  Loads a quantized Bumblebee model from an MLX-4bit checkpoint directory.
+
+  Combines three steps into one call:
+
+  1. Loads the Axon model structure from `config.json` via `Bumblebee.load_model/2`.
+  2. Loads the MLX-4bit safetensors weights via `EMLX.Axon.MLX4BitParams.load/1`,
+     dequantizing and transposing to Bumblebee `{in, out}` layout (BF16).
+  3. Re-quantizes all eligible weight matrices via `EMLX.Axon.QuantizeParams.quantize/1`
+     so that `Nx.dot` dispatch routes to `EMLX.quantized_matmul` at serving time.
+
+  Returns `{:ok, model_info}` compatible with `Bumblebee.Text.generation/4`.
+
+  ## Usage
+
+      {:ok, model_info} = EMLX.Axon.load_quantized({:local, "~/models/Qwen3-0.6B-MLX-4bit"})
+      {:ok, tokenizer} = Bumblebee.load_tokenizer({:local, path})
+      {:ok, gen_cfg}   = Bumblebee.load_generation_config({:local, path})
+      gen_cfg = Bumblebee.configure(gen_cfg, max_new_tokens: 100)
+
+      serving = Bumblebee.Text.generation(model_info, tokenizer, gen_cfg,
+        compile: [batch_size: 1, sequence_length: 256],
+        defn_options: [compiler: EMLX]
+      )
+
+      result = Nx.Serving.run(serving, "The capital of France is")
+
+  ## Notes
+
+  - **Do not apply `EMLX.Axon.rewrite/2` after `load_quantized`** — the rotary
+    embedding rewrite is incompatible with the standard Bumblebee `native_kv_cache: false`
+    path and produces incorrect outputs. BF16 fast ops (rms_norm, swiglu, dropout, sdpa)
+    may be added once the rotary embedding rewrite is fixed.
+
+  - Model architecture is inferred from `config.json` in the checkpoint directory. The
+    local Bumblebee build at `~/coding/bumblebee` must support the model (currently
+    validated with Qwen3-0.6B).
+
+  - Quantization metadata: QuantizeParams logs shape-mismatch warnings for tensors whose
+    physical packed dimensions differ from the Bumblebee model's expected shapes. These
+    warnings are benign — the quantized tensors are still used correctly via the EMLX
+    backend's quantized_matmul dispatch.
+  """
+  @spec load_quantized({:local, Path.t()}, keyword()) :: {:ok, map()} | {:error, term()}
+  def load_quantized(source, opts \\ [])
+
+  def load_quantized({:local, path}, opts) do
+    path = Path.expand(path)
+    load_model_opts = Keyword.merge([backend: {EMLX.Backend, device: :gpu}, type: :bf16], opts)
+
+    with {:ok, model_info} <- Bumblebee.load_model({:local, path}, load_model_opts) do
+      params = EMLX.Axon.MLX4BitParams.load(path)
+
+      bb_keys  = model_info.params.data |> Map.keys() |> MapSet.new()
+      mlx_keys = params.data            |> Map.keys() |> MapSet.new()
+      missing  = MapSet.difference(bb_keys, mlx_keys)
+      extra    = MapSet.difference(mlx_keys, bb_keys)
+
+      if MapSet.size(missing) > 0 or MapSet.size(extra) > 0 do
+        require Logger
+        Logger.warning(
+          "EMLX.Axon.load_quantized: param key mismatch — " <>
+            "#{MapSet.size(missing)} missing from checkpoint, " <>
+            "#{MapSet.size(extra)} extra in checkpoint. " <>
+            "Missing: #{inspect(Enum.take(Enum.sort(missing), 5))}. " <>
+            "This may indicate an unsupported model or mismatched checkpoint."
+        )
+      end
+
+      quant_params = EMLX.Axon.QuantizeParams.quantize(params)
+      patched = %{model_info.params | data: quant_params.data}
+      {:ok, %{model_info | params: patched}}
+    end
+  end
+
   # ── rms_norm ────────────────────────────────────────────────────────────────
 
   @doc """
@@ -720,7 +797,7 @@ defmodule EMLX.Axon.QuantizeParams do
 
   A tensor is quantized if ALL of the following hold:
   - rank is 2
-  - last dimension is divisible by `group_size` (default 64)
+  - first dimension (in_features) is divisible by `group_size` (default 64)
   - first dimension < `skip_vocab_threshold` (default 100_000) — skips embed_tokens / lm_head
   - both dimensions ≥ `2 * group_size`
   """
@@ -731,7 +808,7 @@ defmodule EMLX.Axon.QuantizeParams do
   ## Options
 
     * `:bits` — quantization bit-width, 4 (default) or 8.
-    * `:group_size` — quantization group size, must evenly divide the last dim (default 64).
+    * `:group_size` — quantization group size, must evenly divide in_features (default 64).
     * `:skip_vocab_threshold` — skip tensors whose first dim exceeds this (default 100_000).
   """
   @spec quantize(map(), keyword()) :: map()
@@ -742,18 +819,37 @@ defmodule EMLX.Axon.QuantizeParams do
 
     deep_map(params, fn tensor ->
       if eligible?(tensor, group_size, skip_vocab) do
-        EMLX.quantize(tensor, type: {:s, bits}, group_size: group_size)
+        original_type  = Nx.type(tensor)
+        original_shape = Nx.shape(tensor)
+
+        # Bumblebee uses {in_features, out_features} but MLX quantize expects
+        # {out_features, in_features} and packs along the last (in_features) dim.
+        # Transpose first, then quantize, so the physical storage is {out, in/8}.
+        # Set cfg.transpose=true so quantized_dot calls mlx::quantized_matmul with
+        # transpose=true (act @ dequant(w).T = act_{...,in} @ {in,out} = {..out}) ✓
+        qw = EMLX.quantize(Nx.transpose(tensor), type: {:s, bits}, group_size: group_size)
+
+        # Patch the config and restore the Bumblebee {in, out} logical shape + type
+        # so Axon's shape-checking and Nx.dot's right_axes=[0] remain unaware of
+        # the internal {out, in/8} physical layout.
+        new_cfg  = %{qw.data.quantization_config | transpose: true}
+        new_data = %{qw.data | quantization_config: new_cfg}
+        %Nx.Tensor{} = qw
+        %{qw | data: new_data, shape: original_shape, type: original_type}
       else
         tensor
       end
     end)
   end
 
+  # in_features is the first dim (rows) in Bumblebee {in, out} convention.
+  # After transposing to {out, in}, quantize packs along in_features (last dim),
+  # so we check rem(rows, group_size) == 0.
   defp eligible?(%Nx.Tensor{} = tensor, group_size, skip_vocab) do
     Nx.rank(tensor) == 2 and
       not EMLX.Quantization.quantized?(tensor) and
       (fn {rows, cols} ->
-        rem(cols, group_size) == 0 and
+        rem(rows, group_size) == 0 and
           rows >= 2 * group_size and
           cols >= 2 * group_size and
           rows < skip_vocab

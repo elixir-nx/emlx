@@ -31,7 +31,11 @@ defmodule EMLX.Validation.Qwen3Quantized.Generate do
   ## Options
 
   - `:max_new_tokens` — max number of tokens to generate (default 100)
-  - `:max_len`        — KV cache allocation size (default 2048)
+  - `:max_len`        — KV cache allocation size (default 2048); ignored when `:kv_cache` is given
+  - `:kv_cache`       — pre-allocated KV cache from `Model.init_kv_cache/2`; if provided,
+                        `Model.init_kv_cache/2` is skipped. The cache is used as-is — callers
+                        are responsible for ensuring it is clean (stale K/V beyond `current_len`
+                        is never read because `Model.forward/4` slices to the valid prefix).
   - `:sampler`        — `:greedy | :top_p_cpu | :top_p_gpu` (default `:greedy`)
   - `:temperature`    — float, passed to samplers that use it (default 0.95)
   - `:top_p`          — float, passed to nucleus samplers (default 0.9)
@@ -54,7 +58,11 @@ defmodule EMLX.Validation.Qwen3Quantized.Generate do
     top_p    = Keyword.get(opts, :top_p, 0.9)
     rng_key  = Keyword.get(opts, :rng_key, Nx.Random.key(42))
 
-    kv_cache = Model.init_kv_cache(state, max_len)
+    kv_cache =
+      case Keyword.fetch(opts, :kv_cache) do
+        {:ok, prealloc} -> prealloc
+        :error          -> Model.init_kv_cache(state, max_len)
+      end
 
     # Prefill: pass the full prompt in one forward
     t0 = System.monotonic_time(:millisecond)
