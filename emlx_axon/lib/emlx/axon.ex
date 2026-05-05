@@ -16,6 +16,7 @@ defmodule EMLX.Axon do
   | `:sdpa`              | Bumblebee `attention_output_impl/3`    | `EMLX.Fast.scaled_dot_product_attention_causal/4` or unmasked |
   | `:dropout`           | `op_name: :dropout` (inference)        | identity pass-through                          |
   | `:swiglu`            | `:multiply(container(up, silu(gate)))` | `EMLX.Fast.swiglu/2`                          |
+  | `:native_attention`  | Bumblebee causal self-attention        | `EMLX.kv_cache_attention_masked/8`            |
 
   ## Usage
 
@@ -75,11 +76,23 @@ defmodule EMLX.Axon do
     `%Axon.None{}`), so the else branch is dead code. Removing all 86 `:if_present` nodes
     and their ~260 `:optional` wrappers eliminates significant per-step Axon dispatch
     overhead without any functional change.
+
+  - **`:gqa_cache_fix`** rewrite fixes a shape mismatch that arises when GQA head expansion
+    (`repeat_interleave`) runs *before* `update_attention_cache`. The standard Bumblebee
+    transformer block expands keys/values from `num_key_value_heads` to `num_attention_heads`
+    before the cache update, but the cache is allocated with `num_key_value_heads`. This
+    rewrite strips the `repeat_interleave` from the key and value inputs to every
+    `update_attention_cache` Axon layer, so the cache receives the compact GQA tensors.
+    The SDPA rewriter (`maybe_strip_repeat_interleave`) already handles the expanded-head
+    removal on the SDPA side, and MLX fast SDPA handles GQA natively.
   """
 
   @bumblebee_rope_mfa {Bumblebee.Layers, :apply_rotary_embedding, 5}
   @bumblebee_attn_mfa {Bumblebee.Layers, :attention_output_impl, 3}
   @bumblebee_repeat_interleave_mfa {Bumblebee.Layers, :"-repeat_interleave/3-fun-0-", 2}
+  @bumblebee_update_attn_cache_mfa {Bumblebee.Layers.Decoder, :update_attention_cache, 5}
+  @bumblebee_put_block_cache_mfa {Bumblebee.Layers.Decoder, :"-put_block_cache/3-fun-0-", 3}
+  @kv_cache_proc_key :"$emlx_axon_native_attention_kv_cache"
 
   @doc """
   Rewrites all supported nodes in `model` to their `EMLX.Fast` equivalents.
@@ -110,8 +123,10 @@ defmodule EMLX.Axon do
           :dropout,
           :swiglu,
           :attn_weights,
-          :if_present
+          :if_present,
+          :gqa_cache_fix
         ])
+        |> expand_enabled()
 
       rewriters =
         []
@@ -123,6 +138,9 @@ defmodule EMLX.Axon do
         |> maybe_add(:swiglu, swiglu_rewriter(cache), enabled)
         |> maybe_add(:attn_weights, attn_weights_rewriter(cache), enabled)
         |> maybe_add(:if_present, if_present_rewriter(cache), enabled)
+        |> maybe_add(:gqa_cache_fix, gqa_cache_fix_rewriter(cache), enabled)
+        |> maybe_add(:native_attention, native_attention_rewriter(cache), enabled)
+        |> maybe_add(:nullify_block_cache, nullify_block_cache_rewriter(cache), enabled)
 
       Axon.rewrite_nodes(model, fn node ->
         Enum.find_value(rewriters, :skip, fn {_key, fun} ->
@@ -192,13 +210,14 @@ defmodule EMLX.Axon do
     with {:ok, model_info} <- Bumblebee.load_model({:local, path}, load_model_opts) do
       params = EMLX.Axon.MLX4BitParams.load(path)
 
-      bb_keys  = model_info.params.data |> Map.keys() |> MapSet.new()
-      mlx_keys = params.data            |> Map.keys() |> MapSet.new()
-      missing  = MapSet.difference(bb_keys, mlx_keys)
-      extra    = MapSet.difference(mlx_keys, bb_keys)
+      bb_keys = model_info.params.data |> Map.keys() |> MapSet.new()
+      mlx_keys = params.data |> Map.keys() |> MapSet.new()
+      missing = MapSet.difference(bb_keys, mlx_keys)
+      extra = MapSet.difference(mlx_keys, bb_keys)
 
       if MapSet.size(missing) > 0 or MapSet.size(extra) > 0 do
         require Logger
+
         Logger.warning(
           "EMLX.Axon.load_quantized: param key mismatch — " <>
             "#{MapSet.size(missing)} missing from checkpoint, " <>
@@ -223,9 +242,10 @@ defmodule EMLX.Axon do
   that calls `EMLX.Fast.rms_norm/3` — a single fused Metal shader.
   """
   @spec rms_norm_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def rms_norm_rewriter(cache \\ nil) do
     _ = cache
+
     fn
       %Axon.Node{op_name: :rms_norm, opts: node_opts, name: name_fn} ->
         eps = Keyword.get(node_opts, :epsilon, 1.0e-6)
@@ -236,9 +256,14 @@ defmodule EMLX.Axon do
             # Recreate the weight parameter with the same name and shape as the
             # original rms_norm weight so model_state keys match after loading.
             # Bumblebee always uses channel_index: -1 (last axis) for rms_norm.
-            weight = Axon.param("weight", fn input_shape ->
-              {elem(input_shape, Nx.rank(input_shape) - 1)}
-            end, initializer: :ones)
+            weight =
+              Axon.param(
+                "weight",
+                fn input_shape ->
+                  {elem(input_shape, Nx.rank(input_shape) - 1)}
+                end,
+                initializer: :ones
+              )
 
             Axon.layer(
               fn x, w, op_opts ->
@@ -270,9 +295,10 @@ defmodule EMLX.Axon do
   as the kernel only normalises over the last axis.
   """
   @spec layer_norm_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def layer_norm_rewriter(cache \\ nil) do
     _ = cache
+
     fn
       %Axon.Node{op_name: :layer_norm, opts: node_opts, name: name_fn} ->
         channel_index = Keyword.get(node_opts, :channel_index, -1)
@@ -328,7 +354,7 @@ defmodule EMLX.Axon do
   **Assumes sequential positions** — see `EMLX.Axon` moduledoc for the limitation.
   """
   @spec rotary_embedding_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def rotary_embedding_rewriter(cache \\ nil) do
     fn %Axon.Node{op: op, opts: node_opts, name: name_fn} ->
       if function_info(op) == @bumblebee_rope_mfa do
@@ -387,7 +413,7 @@ defmodule EMLX.Axon do
   model will be used for inference only.
   """
   @spec dropout_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def dropout_rewriter(cache \\ nil) do
     _ = cache
 
@@ -453,7 +479,7 @@ defmodule EMLX.Axon do
   KV cache and rely on the `else` branch.
   """
   @spec if_present_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def if_present_rewriter(_cache \\ nil) do
     fn
       # 3-parent :if_present: [optional(condition), optional(on_true), optional(on_false)]
@@ -478,6 +504,50 @@ defmodule EMLX.Axon do
     end
   end
 
+  # ── GQA cache fix ────────────────────────────────────────────────────────────
+
+  @doc """
+  Returns the rewriter function for GQA key/value cache shape fix.
+
+  In the standard Bumblebee transformer block, GQA head expansion via
+  `repeat_interleave` (expanding from `num_key_value_heads` to `num_attention_heads`)
+  is applied to the key and value tensors *before* `update_attention_cache`. However,
+  `init_cache` allocates the preallocated buffer with `num_key_value_heads`, causing
+  a shape mismatch at Axon compile time when `num_key_value_heads < num_attention_heads`.
+
+  This rewriter fixes the graph by stripping the `repeat_interleave` node from the
+  key and value inputs of every `update_attention_cache` layer. The cache update then
+  operates on the compact GQA tensors. The SDPA rewriter (`maybe_strip_repeat_interleave`)
+  separately handles the expanded-head removal on the SDPA path, and MLX fast SDPA
+  handles GQA natively without explicit head repetition.
+
+  Only applies when the key or value parent is a Bumblebee `repeat_interleave` node.
+  Models without GQA (or where repeat_interleave is already absent) are unaffected.
+  """
+  @spec gqa_cache_fix_rewriter(reference() | nil) ::
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
+  def gqa_cache_fix_rewriter(cache \\ nil) do
+    _ = cache
+
+    fn
+      %Axon.Node{op: op, parent: [_key_id, _value_id | _]} ->
+        if function_info(op) == @bumblebee_update_attn_cache_mfa do
+          fn [key_axon, value_axon, cache_axon, offset_axon], _placeholder ->
+            # Strip GQA head expansion from K and V so the cache update receives
+            # {B, 1, Hkv, D} tensors matching the preallocated cache shape.
+            key_raw = maybe_strip_repeat_interleave(key_axon.nodes, key_axon.output)
+            val_raw = maybe_strip_repeat_interleave(value_axon.nodes, value_axon.output)
+            Axon.layer(op, [key_raw, val_raw, cache_axon, offset_axon])
+          end
+        else
+          :skip
+        end
+
+      _ ->
+        :skip
+    end
+  end
+
   # ── SwiGLU ──────────────────────────────────────────────────────────────────
 
   @doc """
@@ -494,7 +564,7 @@ defmodule EMLX.Axon do
   `:silu` child) are reconstructed identically.
   """
   @spec swiglu_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def swiglu_rewriter(cache \\ nil) do
     _ = cache
 
@@ -581,9 +651,10 @@ defmodule EMLX.Axon do
   with `dropout_rate > 0` are skipped to preserve training-time stochastic behaviour.
   """
   @spec sdpa_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> (([Axon.t()], Axon.t()) -> Axon.t()) | :skip)
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def sdpa_rewriter(cache \\ nil) do
     _ = cache
+
     fn %Axon.Node{op: op, opts: node_opts} ->
       dropout_rate = Keyword.get(node_opts, :dropout_rate, 0.0)
 
@@ -622,6 +693,15 @@ defmodule EMLX.Axon do
               # mlx::fast::sdpa receives raw 8-head K/V and handles GQA natively.
               k_axon = maybe_strip_repeat_interleave(nodes, k_id)
               v_axon_8 = maybe_strip_repeat_interleave(nodes, v_axon.output)
+
+              if System.get_env("NATIVE_ATTN_DEBUG") in ["1", "2"] do
+                km_node = nodes[key_mask_id]
+                km_inner = maybe_unwrap_optional(nodes, key_mask_id)
+                if km_node do
+                  IO.puts("[sdpa_build] key_mask_id=#{inspect(key_mask_id)} op_name=#{km_node.op_name} inner_id=#{inspect(km_inner)}")
+                end
+              end
+
               key_mask_axon = %Axon{output: key_mask_id, nodes: nodes}
               build_sdpa_layer(q_axon, k_axon, v_axon_8, key_mask_axon, scale_opt)
 
@@ -659,14 +739,14 @@ defmodule EMLX.Axon do
     Axon.layer(
       fn q, k, v, key_mask, op_opts ->
         # Q, K, V arrive in {B, T, N, D}. SDPA expects {B, N, T, D}.
-        q = Nx.transpose(q, axes: [0, 2, 1, 3])
-        k = Nx.transpose(k, axes: [0, 2, 1, 3])
-        v = Nx.transpose(v, axes: [0, 2, 1, 3])
+        q_t = Nx.transpose(q, axes: [0, 2, 1, 3])
+        k_t = Nx.transpose(k, axes: [0, 2, 1, 3])
+        v_t = Nx.transpose(v, axes: [0, 2, 1, 3])
 
-        head_dim = elem(Nx.shape(q), 3)
+        head_dim = elem(Nx.shape(q_t), 3)
         scale = op_opts[:scale] || 1.0 / :math.sqrt(head_dim)
 
-        out = EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask)
+        out = EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, scale, key_mask)
         Nx.transpose(out, axes: [0, 2, 1, 3])
       end,
       [q_axon, k_axon, v_axon, key_mask_axon],
@@ -693,6 +773,305 @@ defmodule EMLX.Axon do
       op_name: :fast_sdpa,
       scale: if(is_number(scale_opt), do: scale_opt, else: nil)
     )
+  end
+
+  # ── Native KV attention ─────────────────────────────────────────────────────
+
+  @doc """
+  Returns the rewriter function for Bumblebee causal self-attention nodes.
+
+  This rewrite replaces the attention output with a single `Nx.runtime_call`
+  callback that updates a process-local ETS K/V cache and calls
+  `EMLX.kv_cache_attention_masked/8`. It intentionally only matches causal
+  attention without sliding-window masking; cross-attention and local attention
+  fall back to the original graph.
+  """
+  @spec native_attention_rewriter(reference() | nil) ::
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
+  def native_attention_rewriter(cache \\ nil) do
+    _ = cache
+
+    fn %Axon.Node{op: op, opts: node_opts} ->
+      dropout_rate = Keyword.get(node_opts, :dropout_rate, 0.0)
+
+      if function_info(op) == @bumblebee_attn_mfa and dropout_rate == 0.0 do
+        original_op = op
+
+        fn [weights_dropped_axon, v_axon], _placeholder ->
+          nodes = weights_dropped_axon.nodes
+          weights_dropped_id = weights_dropped_axon.output
+
+          dropout_node = nodes[weights_dropped_id]
+          [attn_weights_id] = dropout_node.parent
+          attn_weights_node = nodes[attn_weights_id]
+
+          causal = Keyword.get(attn_weights_node.opts, :causal, false)
+          window_size = Keyword.get(attn_weights_node.opts, :window_size)
+          scale_opt = Keyword.get(attn_weights_node.opts, :scale)
+
+          # parents: [q_id, k_id, key_mask_id, head_mask_id, bias_id, offset_id]
+          [q_id, k_id, key_mask_id, _head_mask_id, _bias_id, _offset_id] =
+            attn_weights_node.parent
+
+          with true <- causal,
+               true <- is_nil(window_size),
+               {:ok, k_key_id, _k_value_id, _k_cache_id, k_offset_id} <-
+                 find_update_attention_cache(nodes, k_id),
+               {:ok, _v_key_id, v_value_id, _v_cache_id, v_offset_id} <-
+                 find_update_attention_cache(nodes, v_axon.output),
+               true <- k_offset_id == v_offset_id do
+            q_axon = %Axon{output: q_id, nodes: nodes}
+            cached_k_axon = maybe_strip_repeat_interleave(nodes, k_id)
+            cached_v_axon = maybe_strip_repeat_interleave(nodes, v_axon.output)
+            new_k_axon = maybe_strip_repeat_interleave(nodes, k_key_id)
+            new_v_axon = maybe_strip_repeat_interleave(nodes, v_value_id)
+            offset_axon = %Axon{output: k_offset_id, nodes: nodes}
+
+            key_mask_axon = %Axon{output: key_mask_id, nodes: nodes}
+
+            build_native_attention_layer(
+              q_axon,
+              new_k_axon,
+              new_v_axon,
+              cached_k_axon,
+              cached_v_axon,
+              offset_axon,
+              key_mask_axon,
+              scale_opt
+            )
+          else
+            reason ->
+              IO.puts("[native_attention_rewriter] FALLTHROUGH causal=#{causal} window=#{inspect(window_size)} reason=#{inspect(reason)}")
+              Axon.layer(original_op, [weights_dropped_axon, v_axon])
+          end
+        end
+      else
+        :skip
+      end
+    end
+  end
+
+  defp build_native_attention_layer(
+         q_axon,
+         new_k_axon,
+         new_v_axon,
+         cached_k_axon,
+         cached_v_axon,
+         offset_axon,
+         key_mask_axon,
+         scale_opt
+       ) do
+    layer_key = make_ref()
+
+    Axon.layer(
+      fn q, new_k, new_v, cached_k, cached_v, offset, key_mask, op_opts ->
+        out = Nx.template(Nx.shape(q), Nx.type(q))
+        head_dim = elem(Nx.shape(q), 3)
+        scale = op_opts[:scale] || 1.0 / :math.sqrt(head_dim)
+        t_new = elem(Nx.shape(new_k), 1)
+
+        native_out =
+          Nx.runtime_call(
+            out,
+            {q, new_k, new_v, cached_k, cached_v, offset, key_mask},
+            [layer_key: op_opts[:layer_key], scale: scale],
+            &__MODULE__.native_kv_attn_callback/2
+          )
+
+        if t_new > 1 do
+          # Prefill: native_out is zeros (ETS was populated in the callback).
+          # Use SDPA for the actual prefill attention computation.
+          sdpa_out =
+            q
+            |> Nx.transpose(axes: [0, 2, 1, 3])
+            |> EMLX.Fast.scaled_dot_product_attention_causal_key_masked(
+              Nx.transpose(cached_k, axes: [0, 2, 1, 3]),
+              Nx.transpose(cached_v, axes: [0, 2, 1, 3]),
+              scale,
+              key_mask
+            )
+            |> Nx.transpose(axes: [0, 2, 1, 3])
+
+          Nx.add(sdpa_out, native_out)
+        else
+          native_out
+        end
+      end,
+      [q_axon, new_k_axon, new_v_axon, cached_k_axon, cached_v_axon, offset_axon, key_mask_axon],
+      op_name: :native_kv_attention,
+      layer_key: layer_key,
+      scale: if(is_number(scale_opt), do: scale_opt, else: nil)
+    )
+  end
+
+  @doc false
+  def native_kv_attn_callback(
+        {query, new_k, new_v, cached_k, cached_v, offset_tensor, key_mask},
+        opts
+      ) do
+    table = get_or_create_kv_table()
+    layer_key = Keyword.fetch!(opts, :layer_key)
+    offset = Nx.to_number(offset_tensor)
+    t_new = elem(Nx.shape(new_k), 1)
+
+    if offset == 0 and t_new > 1 do
+      # Prefill: store the full K/V from Bumblebee's cache (contains all prompt tokens).
+      # The attention output for prefill is computed separately by the sdpa rewriter;
+      # we return a dummy zero tensor which is discarded.
+      :ets.insert(table, {{layer_key, :key}, cached_k})
+      :ets.insert(table, {{layer_key, :value}, cached_v})
+      Nx.broadcast(Nx.tensor(0, type: Nx.type(query)), Nx.shape(query))
+    else
+      native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts)
+    end
+  end
+
+  defp native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts) do
+    t_new = elem(Nx.shape(new_k), 1)
+    valid_len = offset + t_new
+
+    if offset == 0 do
+      # No prefill ran for this layer — initialize ETS slots so ets_get_or_init works.
+      :ets.insert(table, {{layer_key, :key}, :not_initialized})
+      :ets.insert(table, {{layer_key, :value}, :not_initialized})
+    end
+
+    {batch_size, max_length, mask_axis} =
+      case Nx.shape(key_mask) do
+        {batch_size, max_length} -> {batch_size, max_length, 1}
+        {batch_size, _heads, _query_len, max_length} -> {batch_size, max_length, 3}
+      end
+
+    {_, _, kv_heads, head_dim} = Nx.shape(new_k)
+    full_shape = {batch_size, max_length, kv_heads, head_dim}
+    type = Nx.type(new_k)
+    scale = Keyword.fetch!(opts, :scale)
+
+    k_cache = ets_get_or_init(table, {layer_key, :key}, full_shape, type)
+    v_cache = ets_get_or_init(table, {layer_key, :value}, full_shape, type)
+
+    key_mask_sliced = Nx.slice_along_axis(key_mask, 0, valid_len, axis: mask_axis)
+
+    {attn_ref, k_upd_ref, v_upd_ref} =
+      EMLX.kv_cache_attention_masked(
+        EMLX.Backend.from_nx(query),
+        EMLX.Backend.from_nx(new_k),
+        EMLX.Backend.from_nx(new_v),
+        EMLX.Backend.from_nx(k_cache),
+        EMLX.Backend.from_nx(v_cache),
+        offset,
+        scale,
+        EMLX.Backend.from_nx(key_mask_sliced)
+      )
+
+    attn_out = EMLX.Backend.to_nx(attn_ref)
+    k_upd = EMLX.Backend.to_nx(k_upd_ref)
+    v_upd = EMLX.Backend.to_nx(v_upd_ref)
+
+    :ets.insert(table, {{layer_key, :key}, k_upd})
+    :ets.insert(table, {{layer_key, :value}, v_upd})
+
+    if Nx.type(attn_out) == Nx.type(query) do
+      attn_out
+    else
+      Nx.as_type(attn_out, Nx.type(query))
+    end
+  end
+
+  defp find_update_attention_cache(nodes, node_id, seen \\ MapSet.new()) do
+    cond do
+      MapSet.member?(seen, node_id) ->
+        :error
+
+      node = nodes[node_id] ->
+        if function_info(node.op) == @bumblebee_update_attn_cache_mfa do
+          [key_id, value_id, cache_id, offset_id] = node.parent
+          {:ok, key_id, value_id, cache_id, offset_id}
+        else
+          seen = MapSet.put(seen, node_id)
+
+          # For :if_present nodes, only follow parent[1] (the on_true / cache-present branch).
+          # parent[0] is optional(condition) which chains through put_block_cache to OTHER
+          # layers' UAC nodes. parent[2] is the fallback (no cache). Only parent[1] leads
+          # to the current layer's own UAC.
+          parents_to_search =
+            if node.op_name == :if_present do
+              case node.parent do
+                [_cond, on_true, _on_false] -> [on_true]
+                _ -> node.parent
+              end
+            else
+              node.parent
+            end
+
+          Enum.find_value(parents_to_search, :error, fn parent_id ->
+            case find_update_attention_cache(nodes, parent_id, seen) do
+              {:ok, _key_id, _value_id, _cache_id, _offset_id} = found -> found
+              :error -> nil
+            end
+          end)
+        end
+
+      true ->
+        :error
+    end
+  end
+
+  defp maybe_unwrap_optional(nodes, node_id) do
+    case nodes[node_id] do
+      %Axon.Node{op_name: :optional, parent: [inner_id]} -> inner_id
+      _ -> node_id
+    end
+  end
+
+  @doc """
+  Returns the rewriter function for Bumblebee block-cache update nodes.
+
+  When native attention owns K/V state in an ETS table, the Axon block-cache
+  update chain is dead. Replacing `put_block_cache` with an identity lets DCE
+  prune `get_block_cache`, `update_attention_cache`, and container plumbing.
+  """
+  @spec nullify_block_cache_rewriter(reference() | nil) ::
+          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
+  def nullify_block_cache_rewriter(cache \\ nil) do
+    _ = cache
+
+    fn %Axon.Node{op: op} ->
+      if function_info(op) == @bumblebee_put_block_cache_mfa do
+        fn [cache_axon, _block_cache_axon], _placeholder -> cache_axon end
+      else
+        :skip
+      end
+    end
+  end
+
+  defp get_or_create_kv_table do
+    case Process.get(@kv_cache_proc_key) do
+      nil ->
+        table = :ets.new(:emlx_axon_native_attention_kv_cache, [:set, :public])
+        Process.put(@kv_cache_proc_key, table)
+        table
+
+      table ->
+        table
+    end
+  end
+
+  defp ets_get_or_init(table, key, shape, type) do
+    case :ets.lookup(table, key) do
+      [{_, :not_initialized}] ->
+        zeros = Nx.broadcast(Nx.tensor(0, type: type), shape)
+        :ets.insert(table, {key, zeros})
+        zeros
+
+      [{_, cached}] ->
+        cached
+
+      [] ->
+        zeros = Nx.broadcast(Nx.tensor(0, type: type), shape)
+        :ets.insert(table, {key, zeros})
+        zeros
+    end
   end
 
   # ── RoPE frequency precomputation ────────────────────────────────────────────
@@ -774,6 +1153,14 @@ defmodule EMLX.Axon do
     end
   end
 
+  defp expand_enabled(enabled) do
+    if :native_attention in enabled do
+      Enum.uniq([:if_present, :gqa_cache_fix | enabled])
+    else
+      enabled
+    end
+  end
+
   defp maybe_add(acc, key, fun, enabled) do
     if key in enabled, do: [{key, fun} | acc], else: acc
   end
@@ -813,13 +1200,13 @@ defmodule EMLX.Axon.QuantizeParams do
   """
   @spec quantize(map(), keyword()) :: map()
   def quantize(params, opts \\ []) do
-    bits       = Keyword.get(opts, :bits, 4)
+    bits = Keyword.get(opts, :bits, 4)
     group_size = Keyword.get(opts, :group_size, 64)
     skip_vocab = Keyword.get(opts, :skip_vocab_threshold, 100_000)
 
     deep_map(params, fn tensor ->
       if eligible?(tensor, group_size, skip_vocab) do
-        original_type  = Nx.type(tensor)
+        original_type = Nx.type(tensor)
         original_shape = Nx.shape(tensor)
 
         # Bumblebee uses {in_features, out_features} but MLX quantize expects
@@ -832,7 +1219,7 @@ defmodule EMLX.Axon.QuantizeParams do
         # Patch the config and restore the Bumblebee {in, out} logical shape + type
         # so Axon's shape-checking and Nx.dot's right_axes=[0] remain unaware of
         # the internal {out, in/8} physical layout.
-        new_cfg  = %{qw.data.quantization_config | transpose: true}
+        new_cfg = %{qw.data.quantization_config | transpose: true}
         new_data = %{qw.data | quantization_config: new_cfg}
         %Nx.Tensor{} = qw
         %{qw | data: new_data, shape: original_shape, type: original_type}
@@ -849,11 +1236,11 @@ defmodule EMLX.Axon.QuantizeParams do
     Nx.rank(tensor) == 2 and
       not EMLX.Quantization.quantized?(tensor) and
       (fn {rows, cols} ->
-        rem(rows, group_size) == 0 and
-          rows >= 2 * group_size and
-          cols >= 2 * group_size and
-          rows < skip_vocab
-      end).(Nx.shape(tensor))
+         rem(rows, group_size) == 0 and
+           rows >= 2 * group_size and
+           cols >= 2 * group_size and
+           rows < skip_vocab
+       end).(Nx.shape(tensor))
   end
 
   # Recursively traverse nested maps/lists, applying fun to Nx.Tensor leaves.
