@@ -1985,36 +1985,65 @@ NIF(kv_cache_attention_masked) {
     auto k_valid_t = mlx::core::transpose(k_valid,  {0, 2, 1, 3}, device);
     auto v_valid_t = mlx::core::transpose(v_valid,  {0, 2, 1, 3}, device);
 
-    // 4. Build combined additive mask (causal AND key_mask).
-    //    kv_offset: for prefill (T_new > 1), valid_len = T_q → kv_offset = 0.
-    //               for decode  (T_new = 1), kv_offset = valid_len - 1 → Q sees all valid K.
+    // 4. Compute attention output.
+    //
+    //    For decode (T_q == 1), the causal constraint is trivially satisfied: a single
+    //    query position always sees all valid keys. We skip the arange/reshape/less_equal
+    //    construction and dispatch to the cheapest SDPA variant:
+    //      - trivial key_mask (all-ones, non-padded batch): pure causal Metal kernel.
+    //      - non-trivial key_mask (padded batch): key_mask-only additive mask.
+    //    The all().item<bool>() sync is negligible at {B, valid_len} (1–256 elements).
+    //
+    //    For prefill (T_q > 1), build the full causal + key_mask combined additive mask.
     auto mask_dtype = q->dtype();
     auto zero_val   = mlx::core::zeros({}, mask_dtype, device);
     auto neginf_val = mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, device);
 
-    int kv_offset = valid_len - T_q;
-    auto row = mlx::core::reshape(
-        mlx::core::arange(T_q, mlx::core::int32, device), {1, 1, T_q, 1}, device);
-    auto col = mlx::core::reshape(
-        mlx::core::arange(valid_len, mlx::core::int32, device), {1, 1, 1, valid_len}, device);
-    auto causal_bool = mlx::core::less_equal(
-        col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
+    mlx::core::array attn_t = [&]() -> mlx::core::array {
+      if (T_q == 1) {
+        // For single-query decode, the causal constraint is trivially satisfied
+        // (one query always attends to all preceding keys). Build a key_mask-only
+        // additive mask — 3 GPU ops vs 8 in the original full causal+mask path.
+        //
+        // We intentionally skip the all().item<bool>() trivial check here: that
+        // check forces a GPU→CPU sync on every layer call (28×/step), whose
+        // latency cost exceeds the savings from choosing "causal" mode. For
+        // non-padded inference the additive mask is all-zeros, which is
+        // functionally identical to pure causal mode.
+        auto km = mlx::core::reshape(
+            mlx::core::astype(*key_mask, mlx::core::bool_, device),
+            {key_mask->shape(0), 1, 1, key_mask->shape(1)},
+            device);
+        auto additive = mlx::core::where(km, zero_val, neginf_val, device);
+        return mlx::core::fast::scaled_dot_product_attention(
+            q_t, k_valid_t, v_valid_t, (float)scale, "array",
+            additive, std::nullopt, device);
+      } else {
+        // Prefill (T_q > 1): full causal + key_mask combined additive mask.
+        //   kv_offset: valid_len - T_q (= 0 for a fresh prefill of length T_q).
+        int kv_offset = valid_len - T_q;
+        auto row = mlx::core::reshape(
+            mlx::core::arange(T_q, mlx::core::int32, device), {1, 1, T_q, 1}, device);
+        auto col = mlx::core::reshape(
+            mlx::core::arange(valid_len, mlx::core::int32, device), {1, 1, 1, valid_len}, device);
+        auto causal_bool = mlx::core::less_equal(
+            col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
 
-    // Expand key_mask {B, T_kv} → {B, 1, 1, T_kv} for broadcasting.
-    auto km = mlx::core::reshape(
-        mlx::core::astype(*key_mask, mlx::core::bool_, device),
-        {key_mask->shape(0), 1, 1, key_mask->shape(1)},
-        device);
+        auto km = mlx::core::reshape(
+            mlx::core::astype(*key_mask, mlx::core::bool_, device),
+            {key_mask->shape(0), 1, 1, key_mask->shape(1)},
+            device);
+        auto keep = mlx::core::logical_and(km, causal_bool, device);
+        auto additive = mlx::core::where(keep, zero_val, neginf_val, device);
 
-    auto keep = mlx::core::logical_and(km, causal_bool, device);
-    auto additive = mlx::core::where(keep, zero_val, neginf_val, device);
+        return mlx::core::fast::scaled_dot_product_attention(
+            q_t, k_valid_t, v_valid_t, (float)scale, "array",
+            additive, std::nullopt, device);
+      }
+    }();
 
-    // 5. Masked SDPA.
-    auto attn_t = mlx::core::fast::scaled_dot_product_attention(
-        q_t, k_valid_t, v_valid_t, (float)scale, "array", additive, std::nullopt, device);
-
-    // 5b. Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
-    //     in Flash-Attention when seq_len >= Metal tile size, but semantically = 0).
+    // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN in
+    // Flash-Attention when seq_len >= Metal tile size, but semantically = 0).
     auto attn_safe = mlx::core::where(
         mlx::core::isnan(attn_t),
         mlx::core::zeros_like(attn_t, device),

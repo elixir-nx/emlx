@@ -33,4 +33,5 @@ emlx-*.tar
 
 # Local-only planning + measurement notes for ongoing perf investigations.
 /quantization-perf-improvements/
+/emlx-compile-plan/
 /emlx_axon/bench/

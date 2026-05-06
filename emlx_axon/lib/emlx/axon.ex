@@ -93,6 +93,9 @@ defmodule EMLX.Axon do
   @bumblebee_update_attn_cache_mfa {Bumblebee.Layers.Decoder, :update_attention_cache, 5}
   @bumblebee_put_block_cache_mfa {Bumblebee.Layers.Decoder, :"-put_block_cache/3-fun-0-", 3}
   @kv_cache_proc_key :"$emlx_axon_native_attention_kv_cache"
+  # Memoizes Nx.to_number(offset_tensor) across all 28 layers of a single forward pass.
+  # Stores {MapSet.t(layer_key), cached_integer_offset}.
+  @step_offset_proc_key :"$emlx_axon_step_offset_cache"
 
   @doc """
   Rewrites all supported nodes in `model` to their `EMLX.Fast` equivalents.
@@ -100,7 +103,9 @@ defmodule EMLX.Axon do
   ## Options
 
     * `:only` — list of atoms selecting which rewrites to apply. Defaults to
-      `[:rms_norm, :layer_norm, :rotary_embedding, :sdpa]`.
+      `[:rms_norm, :layer_norm, :rotary_embedding, :sdpa, :dropout, :swiglu,
+      :attn_weights, :if_present, :gqa_cache_fix, :native_attention,
+      :nullify_block_cache]`.
 
   ## Example
 
@@ -124,7 +129,9 @@ defmodule EMLX.Axon do
           :swiglu,
           :attn_weights,
           :if_present,
-          :gqa_cache_fix
+          :gqa_cache_fix,
+          :native_attention,
+          :nullify_block_cache
         ])
         |> expand_enabled()
 
@@ -821,8 +828,6 @@ defmodule EMLX.Axon do
                  find_update_attention_cache(nodes, v_axon.output),
                true <- k_offset_id == v_offset_id do
             q_axon = %Axon{output: q_id, nodes: nodes}
-            cached_k_axon = maybe_strip_repeat_interleave(nodes, k_id)
-            cached_v_axon = maybe_strip_repeat_interleave(nodes, v_axon.output)
             new_k_axon = maybe_strip_repeat_interleave(nodes, k_key_id)
             new_v_axon = maybe_strip_repeat_interleave(nodes, v_value_id)
             offset_axon = %Axon{output: k_offset_id, nodes: nodes}
@@ -833,8 +838,6 @@ defmodule EMLX.Axon do
               q_axon,
               new_k_axon,
               new_v_axon,
-              cached_k_axon,
-              cached_v_axon,
               offset_axon,
               key_mask_axon,
               scale_opt
@@ -855,8 +858,6 @@ defmodule EMLX.Axon do
          q_axon,
          new_k_axon,
          new_v_axon,
-         cached_k_axon,
-         cached_v_axon,
          offset_axon,
          key_mask_axon,
          scale_opt
@@ -864,40 +865,22 @@ defmodule EMLX.Axon do
     layer_key = make_ref()
 
     Axon.layer(
-      fn q, new_k, new_v, cached_k, cached_v, offset, key_mask, op_opts ->
+      fn q, new_k, new_v, offset, key_mask, op_opts ->
         out = Nx.template(Nx.shape(q), Nx.type(q))
         head_dim = elem(Nx.shape(q), 3)
         scale = op_opts[:scale] || 1.0 / :math.sqrt(head_dim)
-        t_new = elem(Nx.shape(new_k), 1)
 
-        native_out =
-          Nx.runtime_call(
-            out,
-            {q, new_k, new_v, cached_k, cached_v, offset, key_mask},
-            [layer_key: op_opts[:layer_key], scale: scale],
-            &__MODULE__.native_kv_attn_callback/2
-          )
-
-        if t_new > 1 do
-          # Prefill: native_out is zeros (ETS was populated in the callback).
-          # Use SDPA for the actual prefill attention computation.
-          sdpa_out =
-            q
-            |> Nx.transpose(axes: [0, 2, 1, 3])
-            |> EMLX.Fast.scaled_dot_product_attention_causal_key_masked(
-              Nx.transpose(cached_k, axes: [0, 2, 1, 3]),
-              Nx.transpose(cached_v, axes: [0, 2, 1, 3]),
-              scale,
-              key_mask
-            )
-            |> Nx.transpose(axes: [0, 2, 1, 3])
-
-          Nx.add(sdpa_out, native_out)
-        else
-          native_out
-        end
+        # Both prefill and decode are handled entirely inside the callback:
+        # - Prefill (t_new > 1): callback computes SDPA eagerly, stores K/V in ETS.
+        # - Decode  (t_new == 1): callback reads ETS cache, calls kv_cache_attention_masked.
+        Nx.runtime_call(
+          out,
+          {q, new_k, new_v, offset, key_mask},
+          [layer_key: op_opts[:layer_key], scale: scale],
+          &__MODULE__.native_kv_attn_callback/2
+        )
       end,
-      [q_axon, new_k_axon, new_v_axon, cached_k_axon, cached_v_axon, offset_axon, key_mask_axon],
+      [q_axon, new_k_axon, new_v_axon, offset_axon, key_mask_axon],
       op_name: :native_kv_attention,
       layer_key: layer_key,
       scale: if(is_number(scale_opt), do: scale_opt, else: nil)
@@ -906,24 +889,79 @@ defmodule EMLX.Axon do
 
   @doc false
   def native_kv_attn_callback(
-        {query, new_k, new_v, cached_k, cached_v, offset_tensor, key_mask},
+        {query, new_k, new_v, offset_tensor, key_mask},
         opts
       ) do
     table = get_or_create_kv_table()
     layer_key = Keyword.fetch!(opts, :layer_key)
-    offset = Nx.to_number(offset_tensor)
+    offset = get_step_offset(offset_tensor, layer_key)
     t_new = elem(Nx.shape(new_k), 1)
 
     if offset == 0 and t_new > 1 do
-      # Prefill: store the full K/V from Bumblebee's cache (contains all prompt tokens).
-      # The attention output for prefill is computed separately by the sdpa rewriter;
-      # we return a dummy zero tensor which is discarded.
-      :ets.insert(table, {{layer_key, :key}, cached_k})
-      :ets.insert(table, {{layer_key, :value}, cached_v})
-      Nx.broadcast(Nx.tensor(0, type: Nx.type(query)), Nx.shape(query))
+      native_kv_prefill(query, new_k, new_v, key_mask, table, layer_key, opts)
     else
       native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts)
     end
+  end
+
+  defp native_kv_prefill(query, new_k, new_v, key_mask, table, layer_key, opts) do
+    t_new = elem(Nx.shape(new_k), 1)
+    scale = Keyword.fetch!(opts, :scale)
+
+    # Bumblebee compiles with max_length = seq_length + max_new_tokens, so
+    # key_mask is {B, max_length} while new_k is {B, seq_length, N_kv, D}.
+    # Pad new_k/new_v with zeros to max_length before storing in ETS so the
+    # decode path can retrieve a buffer of the expected size.
+    max_len =
+      case Nx.shape(key_mask) do
+        {_, max} -> max
+        {_, _, _, max} -> max
+      end
+
+    pad_len = max_len - t_new
+    {b, _, nkv, d} = Nx.shape(new_k)
+    type = Nx.type(new_k)
+
+    {k_full, v_full} =
+      if pad_len > 0 do
+        zeros_k = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
+        zeros_v = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
+        {Nx.concatenate([new_k, zeros_k], axis: 1),
+         Nx.concatenate([new_v, zeros_v], axis: 1)}
+      else
+        {new_k, new_v}
+      end
+
+    :ets.insert(table, {{layer_key, :key}, k_full})
+    :ets.insert(table, {{layer_key, :value}, v_full})
+
+    # Compute prefill SDPA eagerly here in the callback (avoids splitting the
+    # computation across the Axon layer boundary and the Nx.add(sdpa, zeros) trick).
+    # Use k_full/v_full (padded to max_length) and the FULL key_mask rather than
+    # slicing both to t_new. This exactly matches the default sdpa rewriter path
+    # (T_kv = max_length), ensuring identical NaN-propagation behavior on Metal
+    # for left-padded input sequences.
+
+    # Q/K/V: {B, T, N, D} → transpose to {B, N, T, D} for the NIF.
+    q_t = Nx.transpose(query, axes: [0, 2, 1, 3])
+    k_t = Nx.transpose(k_full, axes: [0, 2, 1, 3])
+    v_t = Nx.transpose(v_full, axes: [0, 2, 1, 3])
+
+    # kv_offset = 0 for prefill (lower-triangular causal mask from position 0).
+    sdpa_t =
+      EMLX.fast_sdpa_causal_key_masked(
+        EMLX.Backend.from_nx(q_t),
+        EMLX.Backend.from_nx(k_t),
+        EMLX.Backend.from_nx(v_t),
+        scale,
+        EMLX.Backend.from_nx(key_mask),
+        0
+      )
+      |> EMLX.Backend.to_nx()
+
+    # Transpose back to {B, T, N, D} and match query dtype.
+    out = Nx.transpose(sdpa_t, axes: [0, 2, 1, 3])
+    if Nx.type(out) == Nx.type(query), do: out, else: Nx.as_type(out, Nx.type(query))
   end
 
   defp native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts) do
@@ -1054,6 +1092,33 @@ defmodule EMLX.Axon do
 
       table ->
         table
+    end
+  end
+
+  # Memoizes Nx.to_number(offset_tensor) within a single forward pass (decode step).
+  #
+  # All 28 layer callbacks within one forward pass share the same offset value. Calling
+  # Nx.to_number 28× forces 28 GPU→CPU syncs. Instead, call it once per step: detect
+  # the step boundary by tracking which layer_keys have been called in the current step.
+  # When a layer_key appears AGAIN (it was already seen in the previous step), we know
+  # a new step has begun and issue one fresh Nx.to_number; all other layers reuse the cache.
+  defp get_step_offset(offset_tensor, layer_key) do
+    case Process.get(@step_offset_proc_key) do
+      nil ->
+        offset = Nx.to_number(offset_tensor)
+        Process.put(@step_offset_proc_key, {MapSet.new([layer_key]), offset})
+        offset
+
+      {seen, cached_offset} ->
+        if MapSet.member?(seen, layer_key) do
+          # layer_key already seen in the prior step cycle → this is the start of a new step.
+          offset = Nx.to_number(offset_tensor)
+          Process.put(@step_offset_proc_key, {MapSet.new([layer_key]), offset})
+          offset
+        else
+          Process.put(@step_offset_proc_key, {MapSet.put(seen, layer_key), cached_offset})
+          cached_offset
+        end
     end
   end
 
