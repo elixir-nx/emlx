@@ -104,8 +104,10 @@ defmodule EMLX.Axon do
 
     * `:only` — list of atoms selecting which rewrites to apply. Defaults to
       `[:rms_norm, :layer_norm, :rotary_embedding, :sdpa, :dropout, :swiglu,
-      :attn_weights, :if_present, :gqa_cache_fix, :native_attention,
-      :nullify_block_cache]`.
+      :attn_weights, :if_present, :native_attention, :nullify_block_cache]`.
+      Pass `:gqa_cache_fix` explicitly when targeting a Bumblebee build whose
+      `init_cache` allocates the KV cache with `num_key_value_heads` rather than
+      `num_attention_heads` (i.e. the upstream PR branch patch).
 
   ## Example
 
@@ -129,7 +131,6 @@ defmodule EMLX.Axon do
           :swiglu,
           :attn_weights,
           :if_present,
-          :gqa_cache_fix,
           :native_attention,
           :nullify_block_cache
         ])
@@ -198,9 +199,8 @@ defmodule EMLX.Axon do
     path and produces incorrect outputs. BF16 fast ops (rms_norm, swiglu, dropout, sdpa)
     may be added once the rotary embedding rewrite is fixed.
 
-  - Model architecture is inferred from `config.json` in the checkpoint directory. The
-    local Bumblebee build at `~/coding/bumblebee` must support the model (currently
-    validated with Qwen3-0.6B).
+  - Model architecture is inferred from `config.json` in the checkpoint directory.
+    Validated with Bumblebee `~> 0.6` and Qwen3-0.6B.
 
   - Quantization metadata: QuantizeParams logs shape-mismatch warnings for tensors whose
     physical packed dimensions differ from the Bumblebee model's expected shapes. These
@@ -894,14 +894,45 @@ defmodule EMLX.Axon do
       ) do
     table = get_or_create_kv_table()
     layer_key = Keyword.fetch!(opts, :layer_key)
-    offset = get_step_offset(offset_tensor, layer_key)
     t_new = elem(Nx.shape(new_k), 1)
 
-    if offset == 0 and t_new > 1 do
-      native_kv_prefill(query, new_k, new_v, key_mask, table, layer_key, opts)
+    if t_new > 1 do
+      # Prefill path: always read the actual offset tensor.
+      #
+      # The step-offset cache may hold a stale value from a previous serving's
+      # last decode step when this layer_key is brand new (never seen before).
+      # For prefill the optimization is irrelevant (only 1 GPU→CPU sync per
+      # layer anyway since it's a single step), so bypass get_step_offset.
+      #
+      # Also accumulate this layer_key into the seen set so decode step 1 finds
+      # it already "seen" and issues a fresh read instead of using the (now
+      # correct) prefill cached_offset at the wrong decode position.
+      offset = Nx.to_number(offset_tensor)
+      register_prefill_layer(layer_key, offset)
+
+      if offset == 0 do
+        native_kv_prefill(query, new_k, new_v, key_mask, table, layer_key, opts)
+      else
+        native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts)
+      end
     else
+      offset = get_step_offset(offset_tensor, layer_key)
       native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts)
     end
+  end
+
+  # Registers a layer_key seen during the prefill step.
+  # Accumulates all 28 prefill keys into the seen set so that decode step 1
+  # will find each layer_key already "seen" and issue a fresh step-boundary read
+  # at the correct decode offset rather than reusing the prefill offset (0).
+  defp register_prefill_layer(layer_key, offset) do
+    new_state =
+      case Process.get(@step_offset_proc_key) do
+        nil -> {MapSet.new([layer_key]), offset}
+        {seen, _prev} -> {MapSet.put(seen, layer_key), offset}
+      end
+
+    Process.put(@step_offset_proc_key, new_state)
   end
 
   defp native_kv_prefill(query, new_k, new_v, key_mask, table, layer_key, opts) do
@@ -1220,7 +1251,7 @@ defmodule EMLX.Axon do
 
   defp expand_enabled(enabled) do
     if :native_attention in enabled do
-      Enum.uniq([:if_present, :gqa_cache_fix | enabled])
+      Enum.uniq([:if_present | enabled])
     else
       enabled
     end
