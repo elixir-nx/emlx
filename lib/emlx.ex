@@ -136,6 +136,10 @@ end
 defmodule EMLX do
   use EMLX.Macro
 
+  # EMLX.Profiling is compiled alongside this module; suppress the linter's
+  # undefined-module warning that arises from alphabetical scan order.
+  @compile {:no_warn_undefined, EMLX.Profiling}
+
   defguard is_tensor(device, ref) when is_reference(ref) and is_atom(device)
 
   ## Macro callbacks
@@ -554,6 +558,7 @@ defmodule EMLX do
     # operations are routed through the same worker resolution path so
     # that the contiguous fallback in `to_blob_term` runs on the same OS
     # thread that owns the tensor's stream encoder.
+    EMLX.Profiling.inc_to_blob()
     eval(tensor)
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.to_blob(worker, ref) |> unwrap!()
@@ -561,6 +566,7 @@ defmodule EMLX do
   end
 
   def to_blob({device, ref} = tensor, limit) when is_tensor(device, ref) do
+    EMLX.Profiling.inc_to_blob()
     eval(tensor)
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.to_blob(worker, ref, limit) |> unwrap!()
@@ -669,6 +675,7 @@ defmodule EMLX do
        (CPU or GPU) is used — see `EMLX.Application`.
   """
   def eval({device, ref}) when is_tensor(device, ref) do
+    EMLX.Profiling.inc_eval()
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
     await_worker(job_ref)
@@ -751,6 +758,7 @@ defmodule EMLX do
   stream encoder.
   """
   def item({device, ref}) when is_tensor(device, ref) do
+    EMLX.Profiling.inc_item()
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.item(worker, ref) |> unwrap!()
     await_worker(job_ref)

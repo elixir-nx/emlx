@@ -34,6 +34,7 @@ defmodule EMLX.Application do
 
   @doc false
   def start(_type, _args) do
+    EMLX.Profiling.init()
     ensure_default_worker!(:cpu, _gpu_optional? = false)
     ensure_default_worker!(:gpu, _gpu_optional? = true)
     Supervisor.start_link([], strategy: :one_for_one, name: __MODULE__)

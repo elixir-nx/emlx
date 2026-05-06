@@ -1,6 +1,7 @@
 #include "emlx_async.hpp"
 #include "emlx_worker.hpp"
 #include "erl_nif.h"
+#include "mlx/compile_impl.h"
 #include "mlx/mlx.h"
 #include "nx_nif_utils.hpp"
 
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <random>
 #include <optional>
+#include <unordered_set>
 #include <cstdio>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -196,6 +198,28 @@ ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
   ret = enif_make_resource(env, function_ptr);
   enif_release_resource(function_ptr);
 
+  return ret;
+}
+
+// Cached MLX graph: tape + trace-time inputs/outputs used by graph_replay.
+namespace emlx {
+struct CompiledGraph {
+  std::vector<mlx::core::array> tape;
+  std::vector<mlx::core::array> trace_inputs;
+  std::vector<mlx::core::array> trace_outputs;
+  bool shapeless;
+};
+} // namespace emlx
+
+ERL_NIF_TERM
+create_compiled_graph_resource(ErlNifEnv *env, emlx::CompiledGraph graph) {
+  auto *ptr = (emlx::CompiledGraph *)enif_alloc_resource(
+      resource_object<emlx::CompiledGraph>::type, sizeof(emlx::CompiledGraph));
+  if (ptr == NULL)
+    return enif_make_badarg(env);
+  new (ptr) emlx::CompiledGraph(std::move(graph));
+  ERL_NIF_TERM ret = enif_make_resource(env, ptr);
+  enif_release_resource(ptr);
   return ret;
 }
 
@@ -1148,6 +1172,107 @@ NIF(command_queue_synchronize) {
 // `command_queue_post_eval` / `command_queue_post_to_blob` NIFs were
 // removed in favour of that uniform dispatch.
 
+// ── Graph capture / replay NIFs ──────────────────────────────────────────
+//
+// graph_capture(inputs, outputs, shapeless) → {:ok, compiled_ref}
+//   Walks the lazy MLX DAG rooted at `outputs`, builds a replayable tape via
+//   compile_dfs + compile_simplify, and stores it as an opaque resource.
+//   Must be called after at least one evaluation pass so that the lazy graph
+//   between `inputs` and `outputs` is fully constructed.
+//
+// graph_replay(compiled_ref, new_inputs) → {:ok, [output_refs]}
+//   Substitutes `new_inputs` into the stored tape (via compile_replace) and
+//   returns new lazy output arrays — same graph topology, fresh input bindings.
+//   Returned arrays are NOT yet evaluated; pass them to the normal eval path.
+
+NIF(graph_capture) {
+  std::vector<mlx::core::array> inputs, outputs;
+  bool shapeless;
+
+  if (!nx::nif::get_list(env, argv[0], inputs))
+    return nx::nif::error(env, "graph_capture: unable to decode inputs list");
+  if (!nx::nif::get_list(env, argv[1], outputs))
+    return nx::nif::error(env, "graph_capture: unable to decode outputs list");
+  if (!nx::nif::get(env, argv[2], &shapeless))
+    return nx::nif::error(env, "graph_capture: unable to decode shapeless flag");
+
+  try {
+    // Build a topological tape from the lazy graph by DFS-walking from outputs
+    // back to inputs.  This bypasses compile_dfs which expects placeholder
+    // (tracer) arrays and throws on real input arrays.
+    //
+    // The resulting tape is used directly with compile_replace on every replay:
+    // compile_replace(tape, inputs, outputs, new_inputs, shapeless) rebuilds
+    // the graph by substituting inputs → new_inputs and replaying each tape op.
+
+    std::unordered_set<std::uintptr_t> input_ids;
+    for (auto& inp : inputs) {
+      input_ids.insert(inp.id());
+    }
+
+    std::vector<mlx::core::array> tape;
+    std::unordered_set<std::uintptr_t> visited;
+
+    std::function<void(const mlx::core::array&)> dfs =
+        [&](const mlx::core::array& a) {
+          auto id = a.id();
+          if (visited.count(id))
+            return;
+          // Stop at declared inputs — they become substitution points.
+          if (input_ids.count(id)) {
+            visited.insert(id);
+            return;
+          }
+          // Constants (evaluated, no primitive) — include in tape so that
+          // compile_replace recognises them by ID.
+          if (!a.has_primitive()) {
+            visited.insert(id);
+            tape.push_back(a);
+            for (auto& s : a.siblings())
+              visited.insert(s.id());
+            return;
+          }
+          // Recurse into all inputs first (gives post-order / topological order).
+          for (auto& in : a.inputs()) {
+            dfs(in);
+          }
+          visited.insert(id);
+          for (auto& s : a.siblings())
+            visited.insert(s.id());
+          tape.push_back(a);
+        };
+
+    for (auto& out : outputs) {
+      dfs(out);
+    }
+
+    emlx::CompiledGraph graph{std::move(tape), inputs, outputs, shapeless};
+    return nx::nif::ok(env, create_compiled_graph_resource(env, std::move(graph)));
+  }
+  CATCH()
+}
+
+NIF(graph_replay) {
+  emlx::CompiledGraph *graph;
+  if (!enif_get_resource(env, argv[0],
+                         resource_object<emlx::CompiledGraph>::type,
+                         reinterpret_cast<void **>(&graph)))
+    return nx::nif::error(env, "graph_replay: invalid compiled_ref");
+
+  std::vector<mlx::core::array> new_inputs;
+  if (!nx::nif::get_list(env, argv[1], new_inputs))
+    return nx::nif::error(env, "graph_replay: unable to decode new_inputs list");
+
+  try {
+    auto new_outputs = mlx::core::detail::compile_replace(
+        graph->tape, graph->trace_inputs, graph->trace_outputs, new_inputs,
+        graph->shapeless);
+
+    return nx::nif::ok(env, nx::nif::make_list(env, new_outputs));
+  }
+  CATCH()
+}
+
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
@@ -1162,6 +1287,12 @@ static int open_resources(ErlNifEnv *env) {
   // worker. Default destructor (~Worker) signals stop, drains pending
   // jobs, and joins the OS thread.
   if (!open_resource<emlx::Worker>(env, mod, "CommandQueue")) {
+    return -1;
+  }
+
+  // emlx::CompiledGraph — holds the tape produced by graph_capture so that
+  // graph_replay can substitute new inputs without rebuilding the MLX DAG.
+  if (!open_resource<emlx::CompiledGraph>(env, mod, "CompiledGraph")) {
     return -1;
   }
 
@@ -2040,6 +2171,10 @@ static ErlNifFunc nif_funcs[] = {
 
     {"window_scatter_max", 9, window_scatter_max_async},
     {"window_scatter_min", 9, window_scatter_min_async},
+
+    // ── Graph capture / replay (sync, CPU-bound — may DFS large graphs).
+    {"graph_capture", 3, graph_capture, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"graph_replay", 2, graph_replay, ERL_NIF_DIRTY_JOB_CPU_BOUND},
 
     // ── Sync (non-routed) NIFs.
     {"strides", 1, strides},
