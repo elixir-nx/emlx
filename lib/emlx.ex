@@ -847,6 +847,42 @@ defmodule EMLX do
   end
 
   @doc """
+  Fused KV cache update + SDPA for the native NIF loop (BNHD layout).
+
+  Accepts `q`, `new_k`, `new_v` already transposed to `{B, N, T, D}` and a
+  pre-allocated cache in `{B, N_kv, T_max, D}` layout.
+
+  Internally, the cache arrays are **move-extracted** from their ENIF resources
+  before `slice_update` so that MLX's donation optimisation fires at eval time:
+  the existing 4 MB Metal buffer is reused in-place — no new allocation.
+
+  Returns `{{dev, attn_ref}, {dev, k_upd_ref}, {dev, v_upd_ref}}`.
+  """
+  @mlx_function {:kv_cache_sdpa_update, 9}
+  def kv_cache_sdpa_update(
+        {dev_q, ref_q},
+        {_dev_k, ref_k},
+        {_dev_v, ref_v},
+        {_dev_kc, ref_kc},
+        {_dev_vc, ref_vc},
+        offset,
+        scale
+      )
+      when is_tensor(dev_q, ref_q) and is_integer(offset) and is_float(scale) do
+    device = dev_q
+    {worker, effective_device} = resolve_worker(device)
+
+    {attn_ref, k_upd_ref, v_upd_ref} =
+      EMLX.NIF.kv_cache_sdpa_update(
+        worker, ref_q, ref_k, ref_v, ref_kc, ref_vc, offset, scale, effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {{effective_device, attn_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
+  end
+
+  @doc """
   Quantize a dense 2-D `Nx.Tensor` and return an annotated quantized tensor.
 
   The returned tensor carries the original logical shape and type (e.g.

@@ -892,7 +892,6 @@ defmodule EMLX.Axon do
         {query, new_k, new_v, offset_tensor, key_mask},
         opts
       ) do
-    table = get_or_create_kv_table()
     layer_key = Keyword.fetch!(opts, :layer_key)
     t_new = elem(Nx.shape(new_k), 1)
 
@@ -911,13 +910,13 @@ defmodule EMLX.Axon do
       register_prefill_layer(layer_key, offset)
 
       if offset == 0 do
-        native_kv_prefill(query, new_k, new_v, key_mask, table, layer_key, opts)
+        native_kv_prefill(query, new_k, new_v, key_mask, layer_key, opts)
       else
-        native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts)
+        native_kv_decode(query, new_k, new_v, offset, key_mask, layer_key, opts)
       end
     else
       offset = get_step_offset(offset_tensor, layer_key)
-      native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts)
+      native_kv_decode(query, new_k, new_v, offset, key_mask, layer_key, opts)
     end
   end
 
@@ -935,13 +934,13 @@ defmodule EMLX.Axon do
     Process.put(@step_offset_proc_key, new_state)
   end
 
-  defp native_kv_prefill(query, new_k, new_v, key_mask, table, layer_key, opts) do
+  defp native_kv_prefill(query, new_k, new_v, key_mask, layer_key, opts) do
     t_new = elem(Nx.shape(new_k), 1)
     scale = Keyword.fetch!(opts, :scale)
 
     # Bumblebee compiles with max_length = seq_length + max_new_tokens, so
     # key_mask is {B, max_length} while new_k is {B, seq_length, N_kv, D}.
-    # Pad new_k/new_v with zeros to max_length before storing in ETS so the
+    # Pad new_k/new_v with zeros to max_length before storing so the
     # decode path can retrieve a buffer of the expected size.
     max_len =
       case Nx.shape(key_mask) do
@@ -963,8 +962,11 @@ defmodule EMLX.Axon do
         {new_k, new_v}
       end
 
-    :ets.insert(table, {{layer_key, :key}, k_full})
-    :ets.insert(table, {{layer_key, :value}, v_full})
+    # Store raw {dev, ref} tuples — no ETS, no to_nx overhead for k/v.
+    cache_map = Process.get(@kv_cache_proc_key, %{})
+    Process.put(@kv_cache_proc_key,
+      Map.put(cache_map, layer_key, {EMLX.Backend.from_nx(k_full), EMLX.Backend.from_nx(v_full)})
+    )
 
     # Compute prefill SDPA eagerly here in the callback (avoids splitting the
     # computation across the Axon layer boundary and the Nx.add(sdpa, zeros) trick).
@@ -995,15 +997,9 @@ defmodule EMLX.Axon do
     if Nx.type(out) == Nx.type(query), do: out, else: Nx.as_type(out, Nx.type(query))
   end
 
-  defp native_kv_decode(query, new_k, new_v, offset, key_mask, table, layer_key, opts) do
+  defp native_kv_decode(query, new_k, new_v, offset, key_mask, layer_key, opts) do
     t_new = elem(Nx.shape(new_k), 1)
     valid_len = offset + t_new
-
-    if offset == 0 do
-      # No prefill ran for this layer — initialize ETS slots so ets_get_or_init works.
-      :ets.insert(table, {{layer_key, :key}, :not_initialized})
-      :ets.insert(table, {{layer_key, :value}, :not_initialized})
-    end
 
     {batch_size, max_length, mask_axis} =
       case Nx.shape(key_mask) do
@@ -1016,8 +1012,19 @@ defmodule EMLX.Axon do
     type = Nx.type(new_k)
     scale = Keyword.fetch!(opts, :scale)
 
-    k_cache = ets_get_or_init(table, {layer_key, :key}, full_shape, type)
-    v_cache = ets_get_or_init(table, {layer_key, :value}, full_shape, type)
+    # Get cached refs directly from process dict — no ETS lookup, no term copying.
+    cache_map = Process.get(@kv_cache_proc_key, %{})
+
+    {k_cache_ref, v_cache_ref} =
+      case Map.get(cache_map, layer_key) do
+        nil ->
+          # No prefill ran — initialize zero-filled cache buffer.
+          zeros = Nx.broadcast(Nx.tensor(0, type: type), full_shape)
+          {EMLX.Backend.from_nx(zeros), EMLX.Backend.from_nx(zeros)}
+
+        refs ->
+          refs
+      end
 
     key_mask_sliced = Nx.slice_along_axis(key_mask, 0, valid_len, axis: mask_axis)
 
@@ -1026,19 +1033,17 @@ defmodule EMLX.Axon do
         EMLX.Backend.from_nx(query),
         EMLX.Backend.from_nx(new_k),
         EMLX.Backend.from_nx(new_v),
-        EMLX.Backend.from_nx(k_cache),
-        EMLX.Backend.from_nx(v_cache),
+        k_cache_ref,
+        v_cache_ref,
         offset,
         scale,
         EMLX.Backend.from_nx(key_mask_sliced)
       )
 
-    attn_out = EMLX.Backend.to_nx(attn_ref)
-    k_upd = EMLX.Backend.to_nx(k_upd_ref)
-    v_upd = EMLX.Backend.to_nx(v_upd_ref)
+    # Store raw refs directly — no to_nx for k/v, no ETS insert.
+    Process.put(@kv_cache_proc_key, Map.put(cache_map, layer_key, {k_upd_ref, v_upd_ref}))
 
-    :ets.insert(table, {{layer_key, :key}, k_upd})
-    :ets.insert(table, {{layer_key, :value}, v_upd})
+    attn_out = EMLX.Backend.to_nx(attn_ref)
 
     if Nx.type(attn_out) == Nx.type(query) do
       attn_out
@@ -1114,18 +1119,6 @@ defmodule EMLX.Axon do
     end
   end
 
-  defp get_or_create_kv_table do
-    case Process.get(@kv_cache_proc_key) do
-      nil ->
-        table = :ets.new(:emlx_axon_native_attention_kv_cache, [:set, :public])
-        Process.put(@kv_cache_proc_key, table)
-        table
-
-      table ->
-        table
-    end
-  end
-
   # Memoizes Nx.to_number(offset_tensor) within a single forward pass (decode step).
   #
   # All 28 layer callbacks within one forward pass share the same offset value. Calling
@@ -1150,23 +1143,6 @@ defmodule EMLX.Axon do
           Process.put(@step_offset_proc_key, {MapSet.put(seen, layer_key), cached_offset})
           cached_offset
         end
-    end
-  end
-
-  defp ets_get_or_init(table, key, shape, type) do
-    case :ets.lookup(table, key) do
-      [{_, :not_initialized}] ->
-        zeros = Nx.broadcast(Nx.tensor(0, type: type), shape)
-        :ets.insert(table, {key, zeros})
-        zeros
-
-      [{_, cached}] ->
-        cached
-
-      [] ->
-        zeros = Nx.broadcast(Nx.tensor(0, type: type), shape)
-        :ets.insert(table, {key, zeros})
-        zeros
     end
   end
 

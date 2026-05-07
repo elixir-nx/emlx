@@ -228,9 +228,9 @@ IO.puts("""
   native / bb base:      #{native_vs_base}×
   native / bb+rewrite:   #{native_vs_rewrite}×
 
-Reference baselines (M4 Max 64 GB, 2026-04-xx):
-  EMLX.Native.TextGeneration   ~50 tok/s
-  Bumblebee + default rewrite  39–42 tok/s
+Reference baselines (M4 Max 64 GB):
+  EMLX.Native.TextGeneration   ~48–56 tok/s  (post-H1 kv_cache_sdpa_update; thermal variance ~20%)
+  Bumblebee + default rewrite  ~36–42 tok/s  (donation on kv_cache_attention_masked; ETS removed)
   Bumblebee + :sdpa only       26–28 tok/s
   bobby_posts (Python/MLX)     69.7 tok/s
 """)

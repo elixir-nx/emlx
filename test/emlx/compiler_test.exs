@@ -149,6 +149,52 @@ defmodule EMLX.CompilerTest do
       assert_in_delta Nx.to_number(compiled.(a, b)), 7.0, 1.0e-6
     end
 
+    test "replay substitutes new inputs — successive calls with different values produce distinct correct results" do
+      defmodule ReplayInputSubstFn do
+        import Nx.Defn
+        defn double(x), do: Nx.multiply(x, 2.0)
+      end
+
+      compiled =
+        Nx.Defn.compile(&ReplayInputSubstFn.double/1, [Nx.template({}, :f32)], compiler: EMLX)
+
+      # First call triggers graph capture.
+      assert_in_delta Nx.to_number(compiled.(Nx.tensor(3.0, backend: EMLX.Backend))), 6.0, 1.0e-5
+
+      # Subsequent calls must go through replay with the new input — if replay
+      # ignored inputs and returned a cached output, these would all be 6.0.
+      assert_in_delta Nx.to_number(compiled.(Nx.tensor(5.0, backend: EMLX.Backend))), 10.0, 1.0e-5
+      assert_in_delta Nx.to_number(compiled.(Nx.tensor(1.0, backend: EMLX.Backend))), 2.0, 1.0e-5
+      assert_in_delta Nx.to_number(compiled.(Nx.tensor(0.0, backend: EMLX.Backend))), 0.0, 1.0e-5
+    end
+
+    test "concurrent first calls all return correct results and leave the cell in replay state" do
+      defmodule ConcurrentFirstCallFn do
+        import Nx.Defn
+        defn triple(x), do: Nx.multiply(x, 3.0)
+      end
+
+      compiled =
+        Nx.Defn.compile(&ConcurrentFirstCallFn.triple/1, [Nx.template({}, :f32)], compiler: EMLX)
+
+      # Race N callers on the very first invocation. Agent.update (first-writer-wins)
+      # must ensure only one compiled_ref is committed and all results are correct.
+      inputs = Enum.map(1..8, &Nx.tensor(&1 * 1.0, backend: EMLX.Backend))
+
+      results =
+        inputs
+        |> Task.async_stream(fn t -> Nx.to_number(compiled.(t)) end, timeout: 10_000)
+        |> Enum.map(fn {:ok, v} -> v end)
+
+      expected = Enum.map(1..8, &(&1 * 3.0))
+
+      Enum.zip(expected, results)
+      |> Enum.each(fn {exp, got} -> assert_in_delta got, exp, 1.0e-5 end)
+
+      # A follow-up call after the race confirms the cell settled into replay state.
+      assert_in_delta Nx.to_number(compiled.(Nx.tensor(10.0, backend: EMLX.Backend))), 30.0, 1.0e-5
+    end
+
     test "falls back to evaluator (no Logger.warning) when called without a queue" do
       # Without a command_queue, compile/5 runs the trace on the default stream.
       # The fallback path (rescue) fires when graph_capture/NIF raises; verify

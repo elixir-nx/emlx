@@ -2036,15 +2036,24 @@ NIF(kv_cache_attention) {
     int T_new = new_k->shape(1);
     int valid_len = offset + T_new;
 
+    // Donate the cache buffers so MLX can reuse them in-place.
+    // After std::move, the ENIF resource blocks hold moved-from arrays.
+    // k_cache_owned / v_cache_owned are the sole shared_ptr owners until
+    // slice_update copies them into its inputs list (count rises to 2).
+    // When this function returns, those locals destruct → count drops to 1
+    // → SliceUpdate::eval_gpu detects is_donatable() → no new 4 MB buffer.
+    auto k_cache_owned = std::move(*k_cache);
+    auto v_cache_owned = std::move(*v_cache);
+
     // 1. Insert new K/V at cache position `offset`.
     //    Output has the same shape as k_cache: {B, T_max, N_kv, D}.
     auto k_upd = mlx::core::slice_update(
-        *k_cache, *new_k,
+        k_cache_owned, *new_k,
         to_shape({0, offset, 0, 0}),
         to_shape({B, valid_len, N_kv, D}),
         device);
     auto v_upd = mlx::core::slice_update(
-        *v_cache, *new_v,
+        v_cache_owned, *new_v,
         to_shape({0, offset, 0, 0}),
         to_shape({B, valid_len, N_kv, D}),
         device);
@@ -2131,14 +2140,18 @@ NIF(kv_cache_attention_masked) {
     int T_new = new_k->shape(1);
     int valid_len = offset + T_new;
 
+    // Donate cache buffers (same pattern as kv_cache_attention).
+    auto k_cache_owned = std::move(*k_cache);
+    auto v_cache_owned = std::move(*v_cache);
+
     // 1. Insert new K/V at cache position `offset`.
     auto k_upd = mlx::core::slice_update(
-        *k_cache, *new_k,
+        k_cache_owned, *new_k,
         to_shape({0, offset, 0, 0}),
         to_shape({B, valid_len, N_kv, D}),
         device);
     auto v_upd = mlx::core::slice_update(
-        *v_cache, *new_v,
+        v_cache_owned, *new_v,
         to_shape({0, offset, 0, 0}),
         to_shape({B, valid_len, N_kv, D}),
         device);
@@ -2231,6 +2244,114 @@ NIF(kv_cache_attention_masked) {
   CATCH()
 }
 ASYNC_NIF(kv_cache_attention_masked)
+
+// kv_cache_sdpa_update — fused donation-optimised KV cache update + SDPA
+// for the native NIF loop (BNHD layout: {B, N, T, D}).
+//
+// The Bumblebee path uses {B, T, N, D} and goes through kv_cache_attention.
+// This variant accepts q / new_k / new_v already transposed to {B, N, T, D}
+// (as done by the native loop before put_slice), with the cache stored in the
+// same {B, N_kv, T_max, D} layout.
+//
+// DONATION SEMANTICS: k_cache and v_cache are move-extracted from their ENIF
+// resource blocks before slice_update.  When this function returns those
+// locals destruct, dropping their shared_ptr refs from 2 → 1.  Only
+// slice_update's inputs list retains the reference → SliceUpdate::eval_gpu
+// detects is_donatable() → the existing 4 MB Metal buffer is reused in-place,
+// no new allocation needed.
+//
+// Inputs (argv indices inside the sync NIF body, after worker is stripped):
+//   q        — {B, N_q,  T_q,   D}  post-RoPE query  (native BNHD)
+//   new_k    — {B, N_kv, T_new, D}  post-RoPE key
+//   new_v    — {B, N_kv, T_new, D}  value
+//   k_cache  — {B, N_kv, T_max, D}  pre-allocated key buffer
+//   v_cache  — {B, N_kv, T_max, D}  pre-allocated value buffer
+//   offset   — int   tokens already in cache
+//   scale    — float 1/sqrt(head_dim)
+//   device   — atom
+//
+// Returns {attn_out, k_upd, v_upd}:
+//   attn_out — {B, N_q, T_q, D}   (native BNHD, caller transposes/reshapes)
+//   k_upd    — {B, N_kv, T_max, D}  same Metal buffer as k_cache, updated
+//   v_upd    — {B, N_kv, T_max, D}  same Metal buffer as v_cache, updated
+NIF(kv_cache_sdpa_update) {
+  TENSOR_PARAM(0, q);
+  TENSOR_PARAM(1, new_k);
+  TENSOR_PARAM(2, new_v);
+  TENSOR_PARAM(3, k_cache);
+  TENSOR_PARAM(4, v_cache);
+  PARAM(5, int, offset);
+  PARAM(6, double, scale);
+  DEVICE_PARAM(7, device);
+
+  try {
+    int B       = q->shape(0);
+    int N_kv    = new_k->shape(1);
+    int T_new   = new_k->shape(2);
+    int D       = q->shape(3);
+    int valid_len = offset + T_new;
+
+    // Move-extract: after this the ENIF resource blocks hold moved-from arrays.
+    // k_cache_owned / v_cache_owned are the sole owners (use_count == 1) until
+    // slice_update copies them into its inputs (use_count rises to 2).
+    // On function return both locals destruct → use_count drops to 1 again
+    // → is_donatable() is true at eval time → no new 4 MB Metal buffer.
+    auto k_cache_owned = std::move(*k_cache);
+    auto v_cache_owned = std::move(*v_cache);
+
+    // 1. Insert new_k / new_v at cache position `offset` along axis 2 (T axis).
+    //    Layout: {B, N_kv, T_max, D} — offset along dimension 2.
+    auto k_upd = mlx::core::slice_update(
+        k_cache_owned, *new_k,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+    auto v_upd = mlx::core::slice_update(
+        v_cache_owned, *new_v,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+
+    // 2. Slice valid prefix: k_upd[0:B, 0:N_kv, 0:valid_len, 0:D].
+    auto k_valid = mlx::core::slice(
+        k_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+    auto v_valid = mlx::core::slice(
+        v_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+
+    // 3. SDPA: q / k_valid / v_valid are already in {B, N, T, D} format.
+    //    Decode (T_new == 1): no mask — single query is trivially causal.
+    //    Prefill (T_new > 1): additive causal mask in q's dtype.
+    auto build_prefill_mask = [&]() -> mlx::core::array {
+      auto mask_dtype = q->dtype();
+      auto zero_val   = mlx::core::zeros({}, mask_dtype, device);
+      auto neginf_val = mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, device);
+      int kv_offset = valid_len - T_new;
+      auto row = mlx::core::reshape(
+          mlx::core::arange(T_new,     mlx::core::int32, device), {1, 1, T_new, 1},     device);
+      auto col = mlx::core::reshape(
+          mlx::core::arange(valid_len, mlx::core::int32, device), {1, 1, 1, valid_len}, device);
+      auto causal_bool = mlx::core::less_equal(
+          col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
+      return mlx::core::where(causal_bool, zero_val, neginf_val, device);
+    };
+
+    auto attn_out = (T_new == 1)
+      ? mlx::core::fast::scaled_dot_product_attention(
+            *q, k_valid, v_valid, (float)scale, "", std::nullopt, std::nullopt, device)
+      : mlx::core::fast::scaled_dot_product_attention(
+            *q, k_valid, v_valid, (float)scale, "array", build_prefill_mask(), std::nullopt, device);
+    // k_cache_owned and v_cache_owned destruct here → use_count 2 → 1.
+
+    ERL_NIF_TERM result_tuple[3];
+    result_tuple[0] = create_tensor_resource(env, attn_out);
+    result_tuple[1] = create_tensor_resource(env, k_upd);
+    result_tuple[2] = create_tensor_resource(env, v_upd);
+
+    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+  }
+  CATCH()
+}
+ASYNC_NIF(kv_cache_sdpa_update)
 
 // fast_sdpa_causal — flash-attention SDPA with built-in causal mask
 // mask_mode="causal" lets MLX construct the upper-triangular mask internally.
@@ -2808,6 +2929,7 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
     // Metal GPU capture (synchronous — no GPU work, just starts/stops the trace)
     {"metal_start_capture", 1, metal_start_capture},
     {"metal_stop_capture", 0, metal_stop_capture}};

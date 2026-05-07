@@ -54,32 +54,27 @@ defmodule EMLX.Validation.Qwen3Quantized.Attention do
     q = EMLX.Fast.rope(q, head_dim, false, theta, 1.0, current_len)
     k = EMLX.Fast.rope(k, head_dim, false, theta, 1.0, current_len)
 
-    # Update preallocated KV cache {B, N_kv, max_len, D} via put_slice along axis 2
-    k_cache = Nx.put_slice(k_cache, [0, 0, current_len, 0], k)
-    v_cache = Nx.put_slice(v_cache, [0, 0, current_len, 0], v)
+    # Fused cache update + SDPA via kv_cache_sdpa_update.
+    #
+    # The NIF move-extracts k_cache / v_cache from their ENIF resources before
+    # slice_update, enabling MLX's donation optimisation at eval time: the
+    # existing 4 MB Metal buffer is reused in-place — no new allocation needed.
+    # The slice and SDPA are fused in the same lazy graph, so they land in one
+    # Metal command buffer submission.
+    {attn_ref, k_cache_ref, v_cache_ref} =
+      EMLX.kv_cache_sdpa_update(
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
+        EMLX.Backend.from_nx(k_cache),
+        EMLX.Backend.from_nx(v_cache),
+        current_len,
+        scale
+      )
 
-    new_len = current_len + seq_len
-
-    k_valid = k_cache[[.., .., 0..(new_len - 1)//1, ..]]
-    v_valid = v_cache[[.., .., 0..(new_len - 1)//1, ..]]
-
-    # Flash-attention SDPA — GQA-native (N_q can be a multiple of N_kv)
-    attn_out =
-      if seq_len > 1 do
-        # Prefill: additive causal mask {1, 1, T_q, T_kv}; 0 = allowed, -1e9 = masked
-        q_pos  = Nx.iota({1, 1, seq_len, 1}, type: :s32) |> Nx.add(current_len)
-        kv_pos = Nx.iota({1, 1, 1, new_len}, type: :s32)
-        mask   =
-          Nx.less_equal(kv_pos, q_pos)
-          |> Nx.select(
-            Nx.broadcast(Nx.tensor(0.0, type: :f32), {1, 1, seq_len, new_len}),
-            Nx.broadcast(Nx.tensor(-1.0e9, type: :f32), {1, 1, seq_len, new_len}))
-
-        EMLX.Fast.scaled_dot_product_attention(q, k_valid, v_valid, scale, mask)
-      else
-        # Decode: single query token has no future positions to mask
-        EMLX.Fast.scaled_dot_product_attention(q, k_valid, v_valid, scale)
-      end
+    attn_out  = EMLX.Backend.to_nx(attn_ref)
+    k_cache   = EMLX.Backend.to_nx(k_cache_ref)
+    v_cache   = EMLX.Backend.to_nx(v_cache_ref)
 
     # Reshape: {B, N_q, T_q, D} → {B, T_q, N_q, D} → {B, T, hidden}
     attn_out =
