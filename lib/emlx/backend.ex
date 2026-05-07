@@ -157,6 +157,37 @@ defmodule EMLX.Backend do
   end
 
   @impl true
+  def backend_copy(
+        %T{
+          shape: logical_shape,
+          type: logical_type,
+          names: names,
+          data: %Backend{ref: ref, shape: packed_shape, type: packed_type, quantization_config: %EMLX.Quantization.Config{} = cfg}
+        },
+        EMLX.Backend,
+        opts
+      ) do
+    # Preserve quantization_config when copying a quantized tensor to EMLX.Backend.
+    # The generic backend_copy goes through to_binary/from_binary which drops the config.
+    target_device = device_option(opts)
+    gpu_opts = {EMLX.Backend, device: target_device}
+
+    packed_size = Enum.reduce(Tuple.to_list(packed_shape), 1, &*/2)
+    packed_binary = EMLX.to_blob(ref, packed_size)
+    new_ref = EMLX.from_blob(packed_binary, packed_shape, :uint32, target_device)
+
+    new_scales = Nx.backend_transfer(cfg.scales, gpu_opts)
+    new_biases = Nx.backend_transfer(cfg.biases, gpu_opts)
+
+    %T{
+      shape: logical_shape,
+      type: logical_type,
+      names: names,
+      data: %Backend{ref: new_ref, shape: packed_shape, type: packed_type, quantization_config: %{cfg | scales: new_scales, biases: new_biases}}
+    }
+  end
+
+  @impl true
   def backend_copy(%T{type: type, shape: shape} = tensor, backend, opts) do
     Nx.from_binary(to_binary(tensor, Nx.size(tensor)), type, backend: {backend, opts})
     |> Nx.reshape(shape)
@@ -782,11 +813,15 @@ defmodule EMLX.Backend do
       # Check for NaNs in the original tensor (before any reversal)
       is_nan_mx = EMLX.is_nan(t_mx)
 
+      # Cast bool to uint8 before argmax: the sort kernel for bool_ is not compiled
+      # in libmlx's metallib, but sort_mbsort_uint8 is available.
+      is_nan_u8 = EMLX.astype(is_nan_mx, :uint8)
+
       nan_index_mx =
         if axis do
-          EMLX.argmax(is_nan_mx, axis, keep_axis)
+          EMLX.argmax(is_nan_u8, axis, keep_axis)
         else
-          EMLX.argmax(is_nan_mx, keep_axis)
+          EMLX.argmax(is_nan_u8, keep_axis)
         end
 
       # Check if any NaN exists along the axis
@@ -1107,7 +1142,7 @@ defmodule EMLX.Backend do
     end
 
     if right_quantized do
-      quantized_dot(out, left, right)
+      quantized_dot(out, left, right, right_axes)
     else
       standard_dot(
         out,
@@ -1125,13 +1160,36 @@ defmodule EMLX.Backend do
   end
 
   # Dispatch a dot where `qw_tensor` is the quantized right operand.
-  # MLX's quantized_matmul always treats w as the right operand; weights are
-  # stored in (out, in) layout so transpose=true gives x @ w.T.
-  defp quantized_dot(out, activation, qw_tensor) do
+  #
+  # MLX quantize always groups along the last (column) dimension, treating
+  # the weight as {out_features, in_features}. Two conventions exist:
+  #
+  #   - {out, in} layout (MLX / validation/ style): contracted via axis [1] (last).
+  #     quantized_matmul(act, w, ..., transpose=true) computes act @ w.T.
+  #
+  #   - {in, out} layout (Bumblebee / Jax style): contracted via axis [0] (first).
+  #     quantized_matmul(act, w, ..., transpose=false) computes act @ w directly.
+  #     Grouping is on the last dim (out_features) which is what EMLX.quantize produces.
+  #
+  # We detect the convention from `right_axes`: [last_dim] → transpose=true,
+  # [0] → transpose=false, unless cfg.transpose explicitly overrides this.
+  defp quantized_dot(out, activation, qw_tensor, right_axes) do
     %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
 
     %EMLX.Quantization.Config{scales: scales_nx, biases: biases_nx, group_size: gs, bits: bits} =
       cfg
+
+    weight_rank = tuple_size(qw_tensor.shape)
+    last_dim    = weight_rank - 1
+
+    # If cfg.transpose was explicitly set (e.g. by QuantizeParams when weights are stored
+    # in {out,in} physical layout but exposed as {in,out} to Axon), use it; otherwise
+    # auto-detect from right_axes.
+    transpose =
+      case cfg.transpose do
+        nil -> right_axes == [last_dim]
+        explicit -> explicit
+      end
 
     result =
       EMLX.quantized_matmul(
@@ -1139,7 +1197,7 @@ defmodule EMLX.Backend do
         weight_ref,
         from_nx(scales_nx),
         from_nx(biases_nx),
-        true,
+        transpose,
         gs,
         bits
       )
@@ -1417,12 +1475,15 @@ defmodule EMLX.Backend do
     # Partition indices to place NaNs correctly (NaNs are treated as highest):
     # - For ascending: NaNs (highest) go to end: sort by is_nan (0 < 1)
     # - For descending: NaNs (highest) go to beginning: sort by !is_nan (1 < 0)
+    # Cast bool to uint8 before argsort: sort_mbsort_bool_ is not in the compiled metallib,
+    # but sort_mbsort_uint8 is. bool and uint8 have identical sort semantics (0/1).
     partition_indices_mx =
       if asc? do
-        EMLX.argsort(is_nan_mx, axis)
+        is_nan_mx |> EMLX.astype(:uint8) |> EMLX.argsort(axis)
       else
         is_nan_mx
         |> EMLX.logical_not()
+        |> EMLX.astype(:uint8)
         |> EMLX.argsort(axis)
       end
 
@@ -1456,12 +1517,14 @@ defmodule EMLX.Backend do
     # Partition indices to place NaNs correctly (NaNs are treated as highest):
     # - For ascending: NaNs (highest) go to end: sort by is_nan (0 < 1)
     # - For descending: NaNs (highest) go to beginning: sort by !is_nan (1 < 0)
+    # Cast bool to uint8 before argsort: sort_mbsort_bool_ is not in the compiled metallib.
     partition_indices_mx =
       if asc? do
-        EMLX.argsort(is_nan_mx, axis)
+        is_nan_mx |> EMLX.astype(:uint8) |> EMLX.argsort(axis)
       else
         is_nan_mx
         |> EMLX.logical_not()
+        |> EMLX.astype(:uint8)
         |> EMLX.argsort(axis)
       end
 

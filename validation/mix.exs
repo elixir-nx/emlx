@@ -8,7 +8,7 @@ defmodule EMLX.Validation.MixProject do
       elixir: "~> 1.17",
       deps: deps(),
       test_paths: ["test"],
-      elixirc_paths: ["test/support"]
+      elixirc_paths: ["lib", "test/support"]
     ]
   end
 
@@ -21,8 +21,9 @@ defmodule EMLX.Validation.MixProject do
       {:emlx, path: ".."},
       # Inherit emlx's Nx git pin so axon's Hex constraint does not conflict.
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
-      {:bumblebee, "~> 0.6"},
-      {:axon, "~> 0.7"}
+      {:bumblebee, github: "elixir-nx/bumblebee", override: true},
+      {:axon, "~> 0.7"},
+      {:benchee, "~> 1.3", only: :dev}
       # exla omitted — only needed for golden regeneration, added manually when required
     ]
   end
