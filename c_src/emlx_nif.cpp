@@ -201,13 +201,23 @@ ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
   return ret;
 }
 
-// Cached MLX graph: tape + trace-time inputs/outputs used by graph_replay.
+// Cached MLX graph: tape + a detail::compile()-wrapped replay fn.
+//
+// graph_capture builds the tape from a real (already-evaluated) graph via DFS,
+// then wraps compile_replace in mlx::core::detail::compile() under a unique
+// fun_id.  On the first graph_replay call, MLX traces compile_replace with
+// tracer arrays (substituting them for the trace inputs), builds a lazy DAG,
+// applies compile_simplify + compile_fuse, and caches the fused Metal shaders.
+// On every subsequent graph_replay, MLX skips the NIF dispatch entirely and
+// reuses the cached shaders — same result as mx.compile() in Python.
 namespace emlx {
 struct CompiledGraph {
   std::vector<mlx::core::array> tape;
   std::vector<mlx::core::array> trace_inputs;
   std::vector<mlx::core::array> trace_outputs;
   bool shapeless;
+  std::uintptr_t fun_id;
+  mlx::core::detail::ArrayFnWithExtra compiled_fn;
 };
 } // namespace emlx
 
@@ -1200,10 +1210,6 @@ NIF(graph_capture) {
     // Build a topological tape from the lazy graph by DFS-walking from outputs
     // back to inputs.  This bypasses compile_dfs which expects placeholder
     // (tracer) arrays and throws on real input arrays.
-    //
-    // The resulting tape is used directly with compile_replace on every replay:
-    // compile_replace(tape, inputs, outputs, new_inputs, shapeless) rebuilds
-    // the graph by substituting inputs → new_inputs and replaying each tape op.
 
     std::unordered_set<std::uintptr_t> input_ids;
     for (auto& inp : inputs) {
@@ -1246,7 +1252,34 @@ NIF(graph_capture) {
       dfs(out);
     }
 
-    emlx::CompiledGraph graph{std::move(tape), inputs, outputs, shapeless};
+    // Assign a unique fun_id for MLX's compile cache.  Using a monotonically
+    // increasing counter avoids collisions across different captured graphs.
+    static std::atomic<std::uintptr_t> next_fun_id{0x8000'0000};
+    auto fun_id = next_fun_id.fetch_add(1, std::memory_order_relaxed);
+
+    // Wrap compile_replace inside mlx::core::detail::compile().
+    // On the first graph_replay call, MLX traces compile_replace with tracer
+    // arrays, builds a new lazy DAG, applies compile_simplify + compile_fuse
+    // (kernel fusion), and caches the resulting Metal shaders under fun_id.
+    // On every subsequent call, MLX reuses the cached fused graph — no
+    // compile_replace traversal, no NIF dispatch, no shader compilation.
+    auto compiled_fn = mlx::core::detail::compile(
+        mlx::core::detail::ArrayFnWithExtra(
+            [tape, inputs, outputs, shapeless](
+                const std::vector<mlx::core::array>& new_inputs)
+                -> mlx::core::detail::ArraysAndExtra {
+              auto outs = mlx::core::detail::compile_replace(
+                  tape, inputs, outputs, new_inputs, shapeless);
+              return {std::move(outs), nullptr};
+            }),
+        fun_id, shapeless, {});
+
+    emlx::CompiledGraph graph{std::move(tape),
+                              std::move(inputs),
+                              std::move(outputs),
+                              shapeless,
+                              fun_id,
+                              std::move(compiled_fn)};
     return nx::nif::ok(env, create_compiled_graph_resource(env, std::move(graph)));
   }
   CATCH()
@@ -1264,10 +1297,15 @@ NIF(graph_replay) {
     return nx::nif::error(env, "graph_replay: unable to decode new_inputs list");
 
   try {
-    auto new_outputs = mlx::core::detail::compile_replace(
-        graph->tape, graph->trace_inputs, graph->trace_outputs, new_inputs,
-        graph->shapeless);
+    // Ensure we're on the GPU (Metal) device so that detail::compile() traces
+    // and fuses for Metal, not for CPU JIT.  Dirty scheduler threads start on
+    // the CPU stream by default.
+    mlx::core::set_default_device(
+        mlx::core::Device(mlx::core::Device::DeviceType::gpu, 0));
 
+    // Call the MLX-compiled fn: traces+fuses on first call, then reuses the
+    // cached fused Metal shaders on all subsequent calls.
+    auto [new_outputs, _extra] = graph->compiled_fn(new_inputs);
     return nx::nif::ok(env, nx::nif::make_list(env, new_outputs));
   }
   CATCH()
