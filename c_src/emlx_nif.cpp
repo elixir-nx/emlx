@@ -1,9 +1,7 @@
 #include "emlx_async.hpp"
 #include "emlx_worker.hpp"
 #include "erl_nif.h"
-#include "mlx/compile_impl.h"
 #include "mlx/mlx.h"
-#include "mlx/backend/metal/metal.h"
 #include "nx_nif_utils.hpp"
 
 #include <iostream>
@@ -12,15 +10,16 @@
 #include <string>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <optional>
-#include <unordered_set>
 #include <cstdio>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 using namespace mlx::core;
+using namespace mlx::core::fast;
 
 std::map<const std::string, const mlx::core::Dtype> dtypes = {
     {"bool", mlx::core::bool_},         {"uint8", mlx::core::uint8},
@@ -200,38 +199,6 @@ ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
   ret = enif_make_resource(env, function_ptr);
   enif_release_resource(function_ptr);
 
-  return ret;
-}
-
-// Cached MLX graph: tape + a detail::compile()-wrapped replay fn.
-//
-// graph_capture builds the tape from a real (already-evaluated) graph via DFS,
-// then wraps compile_replace in mlx::core::detail::compile() under a unique
-// fun_id.  On the first graph_replay call, MLX traces compile_replace with
-// tracer arrays (substituting them for the trace inputs), builds a lazy DAG,
-// applies compile_simplify + compile_fuse, and caches the fused Metal shaders.
-// On every subsequent graph_replay, MLX skips the NIF dispatch entirely and
-// reuses the cached shaders — same result as mx.compile() in Python.
-namespace emlx {
-struct CompiledGraph {
-  std::vector<mlx::core::array> tape;
-  std::vector<mlx::core::array> trace_inputs;
-  std::vector<mlx::core::array> trace_outputs;
-  bool shapeless;
-  std::uintptr_t fun_id;
-  mlx::core::detail::ArrayFnWithExtra compiled_fn;
-};
-} // namespace emlx
-
-ERL_NIF_TERM
-create_compiled_graph_resource(ErlNifEnv *env, emlx::CompiledGraph graph) {
-  auto *ptr = (emlx::CompiledGraph *)enif_alloc_resource(
-      resource_object<emlx::CompiledGraph>::type, sizeof(emlx::CompiledGraph));
-  if (ptr == NULL)
-    return enif_make_badarg(env);
-  new (ptr) emlx::CompiledGraph(std::move(graph));
-  ERL_NIF_TERM ret = enif_make_resource(env, ptr);
-  enif_release_resource(ptr);
   return ret;
 }
 
@@ -1184,135 +1151,6 @@ NIF(command_queue_synchronize) {
 // `command_queue_post_eval` / `command_queue_post_to_blob` NIFs were
 // removed in favour of that uniform dispatch.
 
-// ── Graph capture / replay NIFs ──────────────────────────────────────────
-//
-// graph_capture(inputs, outputs, shapeless) → {:ok, compiled_ref}
-//   Walks the lazy MLX DAG rooted at `outputs`, builds a replayable tape via
-//   compile_dfs + compile_simplify, and stores it as an opaque resource.
-//   Must be called after at least one evaluation pass so that the lazy graph
-//   between `inputs` and `outputs` is fully constructed.
-//
-// graph_replay(compiled_ref, new_inputs) → {:ok, [output_refs]}
-//   Substitutes `new_inputs` into the stored tape (via compile_replace) and
-//   returns new lazy output arrays — same graph topology, fresh input bindings.
-//   Returned arrays are NOT yet evaluated; pass them to the normal eval path.
-
-NIF(graph_capture) {
-  std::vector<mlx::core::array> inputs, outputs;
-  bool shapeless;
-
-  if (!nx::nif::get_list(env, argv[0], inputs))
-    return nx::nif::error(env, "graph_capture: unable to decode inputs list");
-  if (!nx::nif::get_list(env, argv[1], outputs))
-    return nx::nif::error(env, "graph_capture: unable to decode outputs list");
-  if (!nx::nif::get(env, argv[2], &shapeless))
-    return nx::nif::error(env, "graph_capture: unable to decode shapeless flag");
-
-  try {
-    // Build a topological tape from the lazy graph by DFS-walking from outputs
-    // back to inputs.  This bypasses compile_dfs which expects placeholder
-    // (tracer) arrays and throws on real input arrays.
-
-    std::unordered_set<std::uintptr_t> input_ids;
-    for (auto& inp : inputs) {
-      input_ids.insert(inp.id());
-    }
-
-    std::vector<mlx::core::array> tape;
-    std::unordered_set<std::uintptr_t> visited;
-
-    std::function<void(const mlx::core::array&)> dfs =
-        [&](const mlx::core::array& a) {
-          auto id = a.id();
-          if (visited.count(id))
-            return;
-          // Stop at declared inputs — they become substitution points.
-          if (input_ids.count(id)) {
-            visited.insert(id);
-            return;
-          }
-          // Constants (evaluated, no primitive) — include in tape so that
-          // compile_replace recognises them by ID.
-          if (!a.has_primitive()) {
-            visited.insert(id);
-            tape.push_back(a);
-            for (auto& s : a.siblings())
-              visited.insert(s.id());
-            return;
-          }
-          // Recurse into all inputs first (gives post-order / topological order).
-          for (auto& in : a.inputs()) {
-            dfs(in);
-          }
-          visited.insert(id);
-          for (auto& s : a.siblings())
-            visited.insert(s.id());
-          tape.push_back(a);
-        };
-
-    for (auto& out : outputs) {
-      dfs(out);
-    }
-
-    // Assign a unique fun_id for MLX's compile cache.  Using a monotonically
-    // increasing counter avoids collisions across different captured graphs.
-    static std::atomic<std::uintptr_t> next_fun_id{0x8000'0000};
-    auto fun_id = next_fun_id.fetch_add(1, std::memory_order_relaxed);
-
-    // Wrap compile_replace inside mlx::core::detail::compile().
-    // On the first graph_replay call, MLX traces compile_replace with tracer
-    // arrays, builds a new lazy DAG, applies compile_simplify + compile_fuse
-    // (kernel fusion), and caches the resulting Metal shaders under fun_id.
-    // On every subsequent call, MLX reuses the cached fused graph — no
-    // compile_replace traversal, no NIF dispatch, no shader compilation.
-    auto compiled_fn = mlx::core::detail::compile(
-        mlx::core::detail::ArrayFnWithExtra(
-            [tape, inputs, outputs, shapeless](
-                const std::vector<mlx::core::array>& new_inputs)
-                -> mlx::core::detail::ArraysAndExtra {
-              auto outs = mlx::core::detail::compile_replace(
-                  tape, inputs, outputs, new_inputs, shapeless);
-              return {std::move(outs), nullptr};
-            }),
-        fun_id, shapeless, {});
-
-    emlx::CompiledGraph graph{std::move(tape),
-                              std::move(inputs),
-                              std::move(outputs),
-                              shapeless,
-                              fun_id,
-                              std::move(compiled_fn)};
-    return nx::nif::ok(env, create_compiled_graph_resource(env, std::move(graph)));
-  }
-  CATCH()
-}
-
-NIF(graph_replay) {
-  emlx::CompiledGraph *graph;
-  if (!enif_get_resource(env, argv[0],
-                         resource_object<emlx::CompiledGraph>::type,
-                         reinterpret_cast<void **>(&graph)))
-    return nx::nif::error(env, "graph_replay: invalid compiled_ref");
-
-  std::vector<mlx::core::array> new_inputs;
-  if (!nx::nif::get_list(env, argv[1], new_inputs))
-    return nx::nif::error(env, "graph_replay: unable to decode new_inputs list");
-
-  try {
-    // Ensure we're on the GPU (Metal) device so that detail::compile() traces
-    // and fuses for Metal, not for CPU JIT.  Dirty scheduler threads start on
-    // the CPU stream by default.
-    mlx::core::set_default_device(
-        mlx::core::Device(mlx::core::Device::DeviceType::gpu, 0));
-
-    // Call the MLX-compiled fn: traces+fuses on first call, then reuses the
-    // cached fused Metal shaders on all subsequent calls.
-    auto [new_outputs, _extra] = graph->compiled_fn(new_inputs);
-    return nx::nif::ok(env, nx::nif::make_list(env, new_outputs));
-  }
-  CATCH()
-}
-
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
@@ -1327,12 +1165,6 @@ static int open_resources(ErlNifEnv *env) {
   // worker. Default destructor (~Worker) signals stop, drains pending
   // jobs, and joins the OS thread.
   if (!open_resource<emlx::Worker>(env, mod, "CommandQueue")) {
-    return -1;
-  }
-
-  // emlx::CompiledGraph — holds the tape produced by graph_capture so that
-  // graph_replay can substitute new inputs without rebuilding the MLX DAG.
-  if (!open_resource<emlx::CompiledGraph>(env, mod, "CompiledGraph")) {
     return -1;
   }
 
@@ -1723,7 +1555,6 @@ ASYNC_NIF(quantized_matmul)
 ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
-// ============================================================================
 // mlx::fast ops — single fused Metal shaders
 // ============================================================================
 
@@ -1999,6 +1830,18 @@ NIF(fast_swiglu) {
   TENSOR(multiply(multiply(*gate, sigmoid(*gate, device), device), *up, device));
 }
 ASYNC_NIF(fast_swiglu)
+
+NIF(fast_sdpa_causal) {
+  TENSOR_PARAM(0, q);
+  TENSOR_PARAM(1, k);
+  TENSOR_PARAM(2, v);
+  PARAM(3, double, scale);
+  DEVICE_PARAM(4, device);
+
+  TENSOR(fast::scaled_dot_product_attention(
+      *q, *k, *v, (float)scale, "causal", std::nullopt, std::nullopt, device));
+}
+ASYNC_NIF(fast_sdpa_causal)
 
 // kv_cache_attention — fused KV cache update + variable-length SDPA in one Metal pass.
 //
@@ -2353,19 +2196,6 @@ NIF(kv_cache_sdpa_update) {
 }
 ASYNC_NIF(kv_cache_sdpa_update)
 
-// fast_sdpa_causal — flash-attention SDPA with built-in causal mask
-// mask_mode="causal" lets MLX construct the upper-triangular mask internally.
-NIF(fast_sdpa_causal) {
-  TENSOR_PARAM(0, q);
-  TENSOR_PARAM(1, k);
-  TENSOR_PARAM(2, v);
-  PARAM(3, double, scale);
-  DEVICE_PARAM(4, device);
-
-  TENSOR(fast::scaled_dot_product_attention(
-      *q, *k, *v, (float)scale, "causal", std::nullopt, std::nullopt, device));
-}
-ASYNC_NIF(fast_sdpa_causal)
 
 // Build a sliding window view of a padded tensor.
 // padded: [...] of ndim n; window/strides: per-axis lists of length n.
@@ -2721,38 +2551,6 @@ ASYNC_NIF(tensordot)
 ASYNC_NIF(window_scatter_max)
 ASYNC_NIF(window_scatter_min)
 
-// ── Metal GPU capture ────────────────────────────────────────────────────────
-// Writes a .gputrace file to `path` (absolute path, no default).
-// Open the result in Xcode's GPU Debugger (File → Open).
-
-static ERL_NIF_TERM metal_start_capture(ErlNifEnv *env, int argc,
-                                         const ERL_NIF_TERM argv[]) {
-  unsigned len = 0;
-  enif_get_list_length(env, argv[0], &len);
-  std::string path(len, '\0');
-  enif_get_string(env, argv[0], &path[0], len + 1, ERL_NIF_LATIN1);
-  try {
-    mlx::core::metal::start_capture(path);
-  } catch (const std::exception &e) {
-    return enif_make_tuple2(env,
-      enif_make_atom(env, "error"),
-      enif_make_string(env, e.what(), ERL_NIF_LATIN1));
-  }
-  return enif_make_atom(env, "ok");
-}
-
-static ERL_NIF_TERM metal_stop_capture(ErlNifEnv *env, int argc,
-                                        const ERL_NIF_TERM argv[]) {
-  try {
-    mlx::core::metal::stop_capture();
-  } catch (const std::exception &e) {
-    return enif_make_tuple2(env,
-      enif_make_atom(env, "error"),
-      enif_make_string(env, e.what(), ERL_NIF_LATIN1));
-  }
-  return enif_make_atom(env, "ok");
-}
-
 static ErlNifFunc nif_funcs[] = {
     {"eval", 2, eval_async},
     {"to_blob", 2, to_blob_async},
@@ -2888,10 +2686,6 @@ static ErlNifFunc nif_funcs[] = {
     {"window_scatter_max", 9, window_scatter_max_async},
     {"window_scatter_min", 9, window_scatter_min_async},
 
-    // ── Graph capture / replay (sync, CPU-bound — may DFS large graphs).
-    {"graph_capture", 3, graph_capture, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"graph_replay", 2, graph_replay, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-
     // ── Sync (non-routed) NIFs.
     {"strides", 1, strides},
     {"scalar_type", 1, scalar_type},
@@ -2914,7 +2708,8 @@ static ErlNifFunc nif_funcs[] = {
     {"quantized_matmul", 9, quantized_matmul_async},
     {"dequantize", 7, dequantize_async},
     {"quantize", 5, quantize_async},
-    // mlx::fast ops (arity = params + 1 for the worker queue arg)
+
+    // mlx::fast ops (worker arity includes queue ref as argv[0])
     {"fast_rms_norm", 5, fast_rms_norm_async},
     {"fast_rope", 8, fast_rope_async},
     {"fast_sdpa", 6, fast_sdpa_async},
@@ -2929,10 +2724,7 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
-    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
-    // Metal GPU capture (synchronous — no GPU work, just starts/stops the trace)
-    {"metal_start_capture", 1, metal_start_capture},
-    {"metal_stop_capture", 0, metal_stop_capture}};
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 

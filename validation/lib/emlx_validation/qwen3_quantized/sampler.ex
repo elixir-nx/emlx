@@ -14,7 +14,8 @@ defmodule EMLX.Validation.Qwen3Quantized.Sampler do
 
   @doc "Greedy decoding: return the token with the highest logit as a scalar tensor."
   def greedy(logits) do
-    logits |> Nx.argmax(axis: -1) |> Nx.squeeze()
+    # {1, vocab} → 1-D logits → argmax without trailing squeeze on a {1} intermediate.
+    logits |> Nx.squeeze(axes: [0]) |> Nx.argmax(axis: 0)
   end
 
   @doc """
@@ -24,7 +25,8 @@ defmodule EMLX.Validation.Qwen3Quantized.Sampler do
   This matches the A0 baseline timing (expected ~42 ms overhead per token).
   """
   def top_p_cpu(logits, temperature \\ 0.95, top_p \\ 0.9) do
-    vocab_size = elem(Nx.shape(logits), tuple_size(Nx.shape(logits)) - 1)
+    shape = Nx.shape(logits)
+    vocab_size = elem(shape, tuple_size(shape) - 1)
 
     # Scale by temperature then softmax on the host
     scaled = Nx.divide(logits, temperature) |> Nx.to_flat_list()

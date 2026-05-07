@@ -17,6 +17,7 @@
 #   VQ_BENCH_RUNS          — number of timed runs (default: 5)
 #   VQ_WARMUP_RUNS         — number of warmup runs before timing (default: 2)
 #   VQ_SEQUENCE_LENGTH     — sequence_length for Bumblebee compile (default: 1024)
+#   VQ_NATIVE_PROFILE_TIMING — set to "0" to disable per-token monotonic_time in native decode (default: on)
 
 Nx.default_backend({EMLX.Backend, device: :gpu})
 
@@ -36,6 +37,8 @@ max_new      = String.to_integer(System.get_env("VQ_MAX_NEW",         "60"))
 bench_runs   = String.to_integer(System.get_env("VQ_BENCH_RUNS",      "5"))
 warmup_runs  = String.to_integer(System.get_env("VQ_WARMUP_RUNS",     "2"))
 seq_len      = String.to_integer(System.get_env("VQ_SEQUENCE_LENGTH", "1024"))
+
+native_profile_timing? = System.get_env("VQ_NATIVE_PROFILE_TIMING") != "0"
 
 # Qwen3 instruct chat template — long enough that EOS won't hit within max_new tokens.
 prompt =
@@ -179,18 +182,23 @@ native_serving =
     Path.expand(model_path_raw),
     tokenizer,
     max_new_tokens: max_new,
-    sampler: :greedy
+    sampler: :greedy,
+    profile_timing: native_profile_timing?
   )
 IO.puts("    loaded in #{System.monotonic_time(:millisecond) - t_native} ms")
 
-# EMLX.Native.TextGeneration returns %{results: [%{generated_text: ...}]}
-# No token_summary — re-tokenize to count output tokens.
-native_extract = fn %{results: [%{generated_text: text}]} ->
-  %{"input_ids" => ids} =
-    Nx.with_default_backend(Nx.BinaryBackend, fn ->
-      Bumblebee.apply_tokenizer(tokenizer, text)
-    end)
-  {text, elem(Nx.shape(ids), 1)}
+# Native serving includes :num_tokens (tensor seq dim); avoids tokenizer round-trip for bench throughput.
+native_extract = fn
+  %{results: [%{generated_text: text, num_tokens: n}]} ->
+    {text, n}
+
+  %{results: [%{generated_text: text}]} ->
+    %{"input_ids" => ids} =
+      Nx.with_default_backend(Nx.BinaryBackend, fn ->
+        Bumblebee.apply_tokenizer(tokenizer, text)
+      end)
+
+    {text, elem(Nx.shape(ids), 1)}
 end
 
 Bench.warmup("native", native_serving, prompt, native_extract, warmup_runs)

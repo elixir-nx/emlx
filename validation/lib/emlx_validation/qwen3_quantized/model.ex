@@ -81,23 +81,42 @@ defmodule EMLX.Validation.Qwen3Quantized.Model do
     %State{embed_tokens: embed_tokens, layers: layers, norm: norm, lm_head: lm_head, config: cfg} = state
 
     # Embed input tokens: {1, seq_len} → {1, seq_len, hidden_size}
-    hidden = Nx.take(embed_tokens, input_ids[[0, ..]]) |> Nx.new_axis(0)
+    ids_shape = Nx.shape(input_ids)
 
-    # Run through each transformer layer (RoPE is applied inside Attention.forward)
-    {hidden, kv_cache_updated} =
-      Enum.reduce(Enum.zip(layers, kv_cache), {hidden, []}, fn
-        {layer_weights, {k_cache, v_cache}}, {h, acc_cache} ->
-          {h_new, k_new, v_new} =
-            transformer_layer(h, k_cache, v_cache, current_len, layer_weights, cfg)
-          {h_new, acc_cache ++ [{k_new, v_new}]}
-      end)
+    hidden =
+      if elem(ids_shape, 1) == 1 do
+        # Decode hot path (single token): avoid full-row slice graph when T==1.
+        Nx.take(embed_tokens, Nx.reshape(input_ids[[0, 0]], {1})) |> Nx.new_axis(0)
+      else
+        Nx.take(embed_tokens, input_ids[[0, ..]]) |> Nx.new_axis(0)
+      end
+
+    # Walk layers + KV pairs without Enum.zip (saves a ~28-cell list alloc per forward).
+    {hidden, kv_cache_rev} =
+      forward_layers(layers, kv_cache, hidden, [], current_len, cfg)
+
+    kv_cache_updated = :lists.reverse(kv_cache_rev)
 
     # Final norm + lm_head on the last token position only
-    last_hidden = hidden[[.., -1, ..]]
+    last_hidden =
+      if elem(ids_shape, 1) == 1 do
+        Nx.squeeze(hidden, axes: [1])
+      else
+        hidden[[.., -1, ..]]
+      end
     normed      = EMLX.Fast.rms_norm(last_hidden, norm, cfg.rms_norm_eps)
     logits      = Nx.dot(normed, [1], lm_head, [1])
 
     {logits, kv_cache_updated}
+  end
+
+  defp forward_layers([], [], hidden, acc, _cur_len, _cfg), do: {hidden, acc}
+
+  defp forward_layers([layer_weights | layers_rest], [{k_cache, v_cache} | kv_rest], hidden, acc, cur_len, cfg) do
+    {h_new, k_new, v_new} =
+      transformer_layer(hidden, k_cache, v_cache, cur_len, layer_weights, cfg)
+
+    forward_layers(layers_rest, kv_rest, h_new, [{k_new, v_new} | acc], cur_len, cfg)
   end
 
   @doc false
@@ -122,7 +141,7 @@ defmodule EMLX.Validation.Qwen3Quantized.Model do
     xn2  = Layers.rms_norm(hidden, norm2, cfg.rms_norm_eps)
     gate = Nx.dot(xn2, [2], gate_proj, [1])
     up   = Nx.dot(xn2, [2], up_proj,   [1])
-    mlp  = Layers.swiglu(gate, up)
+    mlp  = EMLX.Fast.swiglu(gate, up)
     out  = Nx.dot(mlp, [2], down_proj, [1])
 
     hidden = Nx.add(hidden, out)

@@ -34,7 +34,9 @@ defmodule EMLX.Validation.Qwen3Quantized.Attention do
     scale        = 1.0 / :math.sqrt(head_dim)
     theta        = cfg.rope_theta
 
-    [batch, seq_len, _hidden] = Nx.shape(hidden) |> Tuple.to_list()
+    hidden_shape = Nx.shape(hidden)
+    batch = elem(hidden_shape, 0)
+    seq_len = elem(hidden_shape, 1)
 
     # Quantized projections — EMLX dispatches to quantized_matmul via backend
     q = Nx.dot(hidden, [2], q_proj, [1]) |> Nx.reshape({batch, seq_len, num_heads, head_dim})

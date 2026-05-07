@@ -26,29 +26,34 @@ defmodule EMLX.Native.TextGeneration do
 
   alias EMLX.Validation.Qwen3Quantized.{Model, Generate, Loader}
 
+  @cpu_backend Nx.BinaryBackend
+
   @doc """
   Builds an `Nx.Serving` wrapping the native Qwen3 quantized model.
 
   Accepts the same text-string input format as `Bumblebee.Text.generation/4`:
-  a plain binary or `%{text: binary()}`. Returns `%{results: [%{generated_text: binary()}]}`
-  for a single input and a list of those maps for a batch input.
+  a plain binary or `%{text: binary()}`. Returns `%{results: [%{generated_text: binary(),
+  num_tokens: pos_integer()}]}` for a single input and a list of those maps for a batch input.
 
   ## Options
 
   - `:max_new_tokens` — max tokens to generate per request (default 100)
   - `:max_len`        — KV cache preallocated token budget (default 2048)
   - `:sampler`        — `:greedy | :top_p_cpu | :top_p_gpu` (default `:greedy`)
+  - `:profile_timing` — forwarded to `Generate.generate/3`; when `false`, skips per-token
+                        `System.monotonic_time` in the decode loop (default `true`)
   """
   @spec serving(Bumblebee.Tokenizer.t(), Model.State.t(), keyword()) :: Nx.Serving.t()
   def serving(tokenizer, state, opts \\ []) do
     max_new = Keyword.get(opts, :max_new_tokens, 100)
     max_len = Keyword.get(opts, :max_len, 2048)
     sampler = Keyword.get(opts, :sampler, :greedy)
+    profile_timing = Keyword.get(opts, :profile_timing, true)
 
     Nx.Serving.new(fn _init_opts ->
       fn batch ->
-        # Nx.Serving passes a lazy Nx.Batch.t() to non-defn serving functions.
-        # Materialize it so we get the concrete %{"input_ids" => tensor} map.
+        # `Nx.Batch` stays lazy until a defn/jit entry; `jit_apply(identity)` is the
+        # supported way to concatenate stacked entries into concrete tensors.
         %{"input_ids" => input_ids} = Nx.Defn.jit_apply(&Function.identity/1, [batch])
 
         # Pre-alloc KV cache per call. The cache is safe to reuse because
@@ -60,12 +65,13 @@ defmodule EMLX.Native.TextGeneration do
           Generate.generate(input_ids, state,
             kv_cache: kv_cache,
             max_new_tokens: max_new,
-            sampler: sampler
+            sampler: sampler,
+            profile_timing: profile_timing
           )
 
         # Return as 2-D tensor {1, num_tokens} matching the shape that
         # Bumblebee.Tokenizer.decode/2 expects for batch input.
-        Nx.tensor([tokens], type: :s64, backend: Nx.BinaryBackend)
+        tokens_to_batch_tensor(tokens)
       end
     end)
     |> Nx.Serving.client_preprocessing(fn input ->
@@ -87,12 +93,18 @@ defmodule EMLX.Native.TextGeneration do
     end)
     |> Nx.Serving.client_postprocessing(fn {token_ids, _metadata}, multi? ->
       # token_ids: {1, num_generated_tokens} on Nx.BinaryBackend
+      num_tokens = elem(Nx.shape(token_ids), 1)
       decoded = Bumblebee.Tokenizer.decode(tokenizer, token_ids)
 
-      decoded
-      |> List.wrap()
-      |> Enum.map(&%{results: [%{generated_text: &1}]})
-      |> normalize_output(multi?)
+      case {List.wrap(decoded), multi?} do
+        {[text], false} ->
+          %{results: [%{generated_text: text, num_tokens: num_tokens}]}
+
+        {texts, _} ->
+          texts
+          |> Enum.map(&%{results: [%{generated_text: &1, num_tokens: num_tokens}]})
+          |> normalize_output(multi?)
+      end
     end)
   end
 
@@ -122,4 +134,10 @@ defmodule EMLX.Native.TextGeneration do
 
   defp normalize_output([result], false), do: result
   defp normalize_output(results, _multi?), do: results
+
+  defp tokens_to_batch_tensor(tokens) when is_list(tokens) and tokens != [] do
+    tokens
+    |> Nx.tensor(type: :s64, backend: @cpu_backend)
+    |> Nx.reshape({1, :auto})
+  end
 end

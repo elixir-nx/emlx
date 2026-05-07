@@ -136,10 +136,6 @@ end
 defmodule EMLX do
   use EMLX.Macro
 
-  # EMLX.Profiling is compiled alongside this module; suppress the linter's
-  # undefined-module warning that arises from alphabetical scan order.
-  @compile {:no_warn_undefined, EMLX.Profiling}
-
   defguard is_tensor(device, ref) when is_reference(ref) and is_atom(device)
 
   ## Macro callbacks
@@ -854,7 +850,7 @@ defmodule EMLX do
 
   Internally, the cache arrays are **move-extracted** from their ENIF resources
   before `slice_update` so that MLX's donation optimisation fires at eval time:
-  the existing 4 MB Metal buffer is reused in-place — no new allocation.
+  the existing Metal buffer is reused in-place — no new allocation.
 
   Returns `{{dev, attn_ref}, {dev, k_upd_ref}, {dev, v_upd_ref}}`.
   """
@@ -1003,7 +999,6 @@ defmodule EMLX do
     # operations are routed through the same worker resolution path so
     # that the contiguous fallback in `to_blob_term` runs on the same OS
     # thread that owns the tensor's stream encoder.
-    EMLX.Profiling.inc_to_blob()
     eval(tensor)
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.to_blob(worker, ref) |> unwrap!()
@@ -1011,7 +1006,6 @@ defmodule EMLX do
   end
 
   def to_blob({device, ref} = tensor, limit) when is_tensor(device, ref) do
-    EMLX.Profiling.inc_to_blob()
     eval(tensor)
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.to_blob(worker, ref, limit) |> unwrap!()
@@ -1120,7 +1114,6 @@ defmodule EMLX do
        (CPU or GPU) is used — see `EMLX.Application`.
   """
   def eval({device, ref}) when is_tensor(device, ref) do
-    EMLX.Profiling.inc_eval()
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
     await_worker(job_ref)
@@ -1203,7 +1196,6 @@ defmodule EMLX do
   stream encoder.
   """
   def item({device, ref}) when is_tensor(device, ref) do
-    EMLX.Profiling.inc_item()
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.item(worker, ref) |> unwrap!()
     await_worker(job_ref)
@@ -1227,13 +1219,22 @@ defmodule EMLX do
     {compiler_opts, rest_opts} = split_compiler_opts(opts)
     queue = Keyword.get(compiler_opts, :command_queue)
 
-    EMLX.Compiler.compile(
-      key,
-      vars,
-      fun,
-      Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator),
-      queue
-    )
+    inner =
+      Nx.Defn.Evaluator.__compile__(
+        key,
+        vars,
+        fun,
+        Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
+      )
+
+    if queue do
+      # Capture the queue ref in a closure so each invocation of the compiled
+      # function routes through the correct CommandQueue. The queue lives as
+      # long as the Nx.Serving module_state that holds this compiled function.
+      fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> inner.(inputs) end) end
+    else
+      inner
+    end
   end
 
   @impl Nx.Defn.Compiler
@@ -1342,32 +1343,5 @@ defmodule EMLX do
   """
   def set_cache_limit(limit) when is_integer(limit) and limit >= 0 do
     EMLX.NIF.set_cache_limit(limit) |> unwrap!()
-  end
-
-  @doc """
-  Start a Metal GPU capture, writing a `.gputrace` to the given absolute path.
-
-  The file can be opened in Xcode's GPU Debugger (File → Open) to inspect
-  per-kernel timing, command counts, and pipeline occupancy.
-
-  Warm the model up first so JIT compilation is complete before capture begins.
-
-  ## Example
-
-      EMLX.metal_start_capture(Path.expand("~/Desktop/native_decode.gputrace"))
-      # ... run decode steps ...
-      EMLX.metal_stop_capture()
-  """
-  @spec metal_start_capture(String.t()) :: :ok
-  def metal_start_capture(path) when is_binary(path) do
-    EMLX.NIF.metal_start_capture(String.to_charlist(path)) |> unwrap!()
-  end
-
-  @doc """
-  Stop the active Metal GPU capture started with `metal_start_capture/1`.
-  """
-  @spec metal_stop_capture() :: :ok
-  def metal_stop_capture do
-    EMLX.NIF.metal_stop_capture() |> unwrap!()
   end
 end
