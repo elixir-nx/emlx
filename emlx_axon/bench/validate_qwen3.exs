@@ -1,8 +1,10 @@
 # emlx_axon/bench/validate_qwen3.exs
 #
 # Throughput benchmark for EMLX.Axon.rewrite/2 on Qwen3-0.6B-MLX-4bit.
-# Measures e2e tok/s for the best-performing rewrite path (default: all rewrites
-# enabled, including :native_attention + :nullify_block_cache).
+# Measures e2e tok/s for:
+#   - Bumblebee + stock Axon graph (no EMLX.Axon.rewrite)
+#   - Bumblebee + full rewrite (default: all rewrites, including :native_attention)
+#   - EMLX.Native.TextGeneration (native bypass)
 #
 # Run from the emlx_axon directory:
 #
@@ -79,16 +81,28 @@ generation_config = Bumblebee.configure(generation_config,
 
 # ── Rewrite ───────────────────────────────────────────────────────────────────
 
+model_base = model_info.model
+
 IO.puts("==> Applying EMLX.Axon.rewrite/2 (all rewrites — best performing path) ...")
 t3 = System.monotonic_time(:millisecond)
-model_rewritten = EMLX.Axon.rewrite(model_info.model)
+model_rewritten = EMLX.Axon.rewrite(model_base)
 t4 = System.monotonic_time(:millisecond)
 IO.puts("    rewrite done in #{t4 - t3} ms")
 
 # ── Build serving ─────────────────────────────────────────────────────────────
 
-IO.puts("==> Building Bumblebee.Text.generation serving ...")
-serving =
+IO.puts("==> Building Bumblebee.Text.generation serving (base — no rewrite) ...")
+serving_base =
+  Bumblebee.Text.generation(
+    %{model_info | model: model_base},
+    tokenizer,
+    generation_config,
+    compile: [batch_size: 1, sequence_length: seq_len],
+    defn_options: [compiler: EMLX]
+  )
+
+IO.puts("==> Building Bumblebee.Text.generation serving (rewritten) ...")
+serving_rewrite =
   Bumblebee.Text.generation(
     %{model_info | model: model_rewritten},
     tokenizer,
@@ -143,15 +157,18 @@ defmodule Bench do
   end
 end
 
-# ── Bumblebee rewrite path ────────────────────────────────────────────────────
+# ── Bumblebee paths (base vs rewrite) ───────────────────────────────────────
 
 # Bumblebee.Text.generation returns %{results: [%{text: ..., token_summary: ...}]}
 bb_extract = fn %{results: [%{text: text, token_summary: summary}]} ->
   {text, summary.output}
 end
 
-Bench.warmup("bb+rewrite", serving, prompt, bb_extract, warmup_runs)
-bb_results = Bench.bench("bb+rewrite", serving, prompt, bb_extract, bench_runs)
+Bench.warmup("bb base", serving_base, prompt, bb_extract, warmup_runs)
+base_bb_results = Bench.bench("bb base", serving_base, prompt, bb_extract, bench_runs)
+
+Bench.warmup("bb+rewrite", serving_rewrite, prompt, bb_extract, warmup_runs)
+bb_results = Bench.bench("bb+rewrite", serving_rewrite, prompt, bb_extract, bench_runs)
 
 # ── Native TextGeneration path ────────────────────────────────────────────────
 
@@ -186,16 +203,30 @@ IO.puts("""
 === Summary (#{bench_runs} runs, #{max_new} max_new_tokens, Qwen3-0.6B-MLX-4bit) ===
 """)
 
-bb_stats     = Bench.stats("bb+rewrite (Bumblebee + EMLX.Axon.rewrite)", bb_results)
-native_stats = Bench.stats("native     (EMLX.Native.TextGeneration)     ", native_results)
+base_stats   = Bench.stats("bb base    (Bumblebee, no rewrite)           ", base_bb_results)
+bb_stats     = Bench.stats("bb+rewrite (Bumblebee + EMLX.Axon.rewrite)   ", bb_results)
+native_stats = Bench.stats("native     (EMLX.Native.TextGeneration)      ", native_results)
 
-speedup = if bb_stats.median > 0,
-  do: Float.round(native_stats.median / bb_stats.median, 2),
-  else: :n_a
+rewrite_vs_base =
+  if base_stats.median > 0,
+    do: Float.round(bb_stats.median / base_stats.median, 2),
+    else: :n_a
+
+native_vs_base =
+  if base_stats.median > 0,
+    do: Float.round(native_stats.median / base_stats.median, 2),
+    else: :n_a
+
+native_vs_rewrite =
+  if bb_stats.median > 0,
+    do: Float.round(native_stats.median / bb_stats.median, 2),
+    else: :n_a
 
 IO.puts("""
 
-  native / bb+rewrite speedup: #{speedup}×
+  bb+rewrite / bb base:  #{rewrite_vs_base}×
+  native / bb base:      #{native_vs_base}×
+  native / bb+rewrite:   #{native_vs_rewrite}×
 
 Reference baselines (M4 Max 64 GB, 2026-04-xx):
   EMLX.Native.TextGeneration   ~50 tok/s
