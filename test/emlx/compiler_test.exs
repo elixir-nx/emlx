@@ -128,6 +128,53 @@ defmodule EMLX.CompilerTest do
     end
   end
 
+  describe "__compile__/4 graph_capture compiler" do
+    import ExUnit.CaptureLog
+
+    test "produces correct result for a simple add defn (compiler path)" do
+      defmodule CompilePathFn do
+        import Nx.Defn
+        defn add(a, b), do: Nx.add(a, b)
+      end
+
+      compiled =
+        Nx.Defn.compile(&CompilePathFn.add/2, [Nx.template({}, :f32), Nx.template({}, :f32)],
+          compiler: EMLX
+        )
+
+      a = Nx.tensor(3.0, backend: EMLX.Backend)
+      b = Nx.tensor(4.0, backend: EMLX.Backend)
+      assert_in_delta Nx.to_number(compiled.(a, b)), 7.0, 1.0e-6
+      # Second call exercises the replay closure (not just the trace)
+      assert_in_delta Nx.to_number(compiled.(a, b)), 7.0, 1.0e-6
+    end
+
+    test "falls back to evaluator (no Logger.warning) when called without a queue" do
+      # Without a command_queue, compile/5 runs the trace on the default stream.
+      # The fallback path (rescue) fires when graph_capture/NIF raises; verify
+      # no warning is emitted for the happy path.
+      defmodule FallbackCheckFn do
+        import Nx.Defn
+        defn mul(a, b), do: Nx.multiply(a, b)
+      end
+
+      log =
+        capture_log(fn ->
+          compiled =
+            Nx.Defn.compile(&FallbackCheckFn.mul/2, [Nx.template({}, :f32), Nx.template({}, :f32)],
+              compiler: EMLX
+            )
+
+          a = Nx.tensor(2.0, backend: EMLX.Backend)
+          b = Nx.tensor(5.0, backend: EMLX.Backend)
+          assert_in_delta Nx.to_number(compiled.(a, b)), 10.0, 1.0e-6
+        end)
+
+      # Happy path should not log a warning
+      refute log =~ "graph_capture failed"
+    end
+  end
+
   describe "__compile__/4 queue wrapping" do
     test "without :command_queue, the compiled closure is returned as-is" do
       # Compile a minimal defn function and verify the closure can be called.

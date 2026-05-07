@@ -1191,22 +1191,13 @@ defmodule EMLX do
     {compiler_opts, rest_opts} = split_compiler_opts(opts)
     queue = Keyword.get(compiler_opts, :command_queue)
 
-    inner =
-      Nx.Defn.Evaluator.__compile__(
-        key,
-        vars,
-        fun,
-        Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
-      )
-
-    if queue do
-      # Capture the queue ref in a closure so each invocation of the compiled
-      # function routes through the correct CommandQueue. The queue lives as
-      # long as the Nx.Serving module_state that holds this compiled function.
-      fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> inner.(inputs) end) end
-    else
-      inner
-    end
+    EMLX.Compiler.compile(
+      key,
+      vars,
+      fun,
+      Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator),
+      queue
+    )
   end
 
   @impl Nx.Defn.Compiler
