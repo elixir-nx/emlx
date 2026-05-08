@@ -56,8 +56,8 @@ defmodule EMLX.Axon do
 
   - **`:dropout`** rewrite replaces `op_name: :dropout` nodes with an identity
     pass-through. Dropout at inference time is always a no-op regardless of rate;
-    this eliminates 56 NIF-boundary crossings per decode step in Qwen3-0.6B without
-    any functional change. Not appropriate for training graphs.
+    eliminating the NIF-boundary crossings per decode step without any functional
+    change. Not appropriate for training graphs.
 
   - **`:swiglu`** rewrite matches `:multiply` nodes backed by a `:container` node whose
     two parents include one `:silu` node (the Bumblebee SwiGLU pattern:
@@ -73,9 +73,9 @@ defmodule EMLX.Axon do
 
   - **`:if_present`** rewrite replaces Bumblebee's KV-cache conditional nodes with their
     "cache present" branch. In compiled serving the KV cache is always initialized (never
-    `%Axon.None{}`), so the else branch is dead code. Removing all 86 `:if_present` nodes
-    and their ~260 `:optional` wrappers eliminates significant per-step Axon dispatch
-    overhead without any functional change.
+    `%Axon.None{}`), so the else branch is dead code. Removing the `:if_present` nodes
+    and their `:optional` wrappers eliminates per-step Axon dispatch overhead without any
+    functional change.
 
   - **`:gqa_cache_fix`** rewrite fixes a shape mismatch that arises when GQA head expansion
     (`repeat_interleave`) runs *before* `update_attention_cache`. The standard Bumblebee
@@ -93,7 +93,7 @@ defmodule EMLX.Axon do
   @bumblebee_update_attn_cache_mfa {Bumblebee.Layers.Decoder, :update_attention_cache, 5}
   @bumblebee_put_block_cache_mfa {Bumblebee.Layers.Decoder, :"-put_block_cache/3-fun-0-", 3}
   @kv_cache_proc_key :"$emlx_axon_native_attention_kv_cache"
-  # Memoizes Nx.to_number(offset_tensor) across all 28 layers of a single forward pass.
+  # Memoizes Nx.to_number(offset_tensor) across all layers of a single forward pass.
   # Stores {MapSet.t(layer_key), cached_integer_offset}.
   @step_offset_proc_key :"$emlx_axon_step_offset_cache"
 
@@ -117,7 +117,7 @@ defmodule EMLX.Axon do
   """
   @spec rewrite(Axon.t(), keyword()) :: Axon.t()
   def rewrite(%Axon{} = model, opts \\ []) do
-    # Anonymous ETS table (no :named_table) so concurrent rewrite/2 calls don't collide.
+    opts = Keyword.validate(opts, [:only])
     cache = :ets.new(:emlx_axon_rewrite_cache, [:set, :public])
 
     try do
@@ -138,17 +138,17 @@ defmodule EMLX.Axon do
 
       rewriters =
         []
-        |> maybe_add(:rms_norm, rms_norm_rewriter(cache), enabled)
-        |> maybe_add(:layer_norm, layer_norm_rewriter(cache), enabled)
+        |> maybe_add(:rms_norm, rms_norm_rewriter(), enabled)
+        |> maybe_add(:layer_norm, layer_norm_rewriter(), enabled)
         |> maybe_add(:rotary_embedding, rotary_embedding_rewriter(cache), enabled)
-        |> maybe_add(:sdpa, sdpa_rewriter(cache), enabled)
-        |> maybe_add(:dropout, dropout_rewriter(cache), enabled)
-        |> maybe_add(:swiglu, swiglu_rewriter(cache), enabled)
-        |> maybe_add(:attn_weights, attn_weights_rewriter(cache), enabled)
-        |> maybe_add(:if_present, if_present_rewriter(cache), enabled)
-        |> maybe_add(:gqa_cache_fix, gqa_cache_fix_rewriter(cache), enabled)
-        |> maybe_add(:native_attention, native_attention_rewriter(cache), enabled)
-        |> maybe_add(:nullify_block_cache, nullify_block_cache_rewriter(cache), enabled)
+        |> maybe_add(:sdpa, sdpa_rewriter(), enabled)
+        |> maybe_add(:dropout, dropout_rewriter(), enabled)
+        |> maybe_add(:swiglu, swiglu_rewriter(), enabled)
+        |> maybe_add(:attn_weights, attn_weights_rewriter(), enabled)
+        |> maybe_add(:if_present, if_present_rewriter(), enabled)
+        |> maybe_add(:gqa_cache_fix, gqa_cache_fix_rewriter(), enabled)
+        |> maybe_add(:native_attention, native_attention_rewriter(), enabled)
+        |> maybe_add(:nullify_block_cache, nullify_block_cache_rewriter(), enabled)
 
       Axon.rewrite_nodes(model, fn node ->
         Enum.find_value(rewriters, :skip, fn {_key, fun} ->
@@ -200,7 +200,7 @@ defmodule EMLX.Axon do
     may be added once the rotary embedding rewrite is fixed.
 
   - Model architecture is inferred from `config.json` in the checkpoint directory.
-    Validated with Bumblebee `~> 0.6` and Qwen3-0.6B.
+    Validated with Bumblebee and Qwen3-0.6B.
 
   - Quantization metadata: QuantizeParams logs shape-mismatch warnings for tensors whose
     physical packed dimensions differ from the Bumblebee model's expected shapes. These
@@ -248,11 +248,9 @@ defmodule EMLX.Axon do
   Replaces `op_name: :rms_norm` nodes with `shift: 0.0` with an Axon layer
   that calls `EMLX.Fast.rms_norm/3` — a single fused Metal shader.
   """
-  @spec rms_norm_rewriter(reference() | nil) ::
+  @spec rms_norm_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def rms_norm_rewriter(cache \\ nil) do
-    _ = cache
-
+  def rms_norm_rewriter do
     fn
       %Axon.Node{op_name: :rms_norm, opts: node_opts, name: name_fn} ->
         eps = Keyword.get(node_opts, :epsilon, 1.0e-6)
@@ -301,11 +299,9 @@ defmodule EMLX.Axon do
   Metal shader. Skips nodes where `channel_index` is not `-1` (last axis),
   as the kernel only normalises over the last axis.
   """
-  @spec layer_norm_rewriter(reference() | nil) ::
+  @spec layer_norm_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def layer_norm_rewriter(cache \\ nil) do
-    _ = cache
-
+  def layer_norm_rewriter do
     fn
       %Axon.Node{op_name: :layer_norm, opts: node_opts, name: name_fn} ->
         channel_index = Keyword.get(node_opts, :channel_index, -1)
@@ -419,11 +415,9 @@ defmodule EMLX.Axon do
   **Not appropriate for training graphs** — only enable this rewriter when the
   model will be used for inference only.
   """
-  @spec dropout_rewriter(reference() | nil) ::
+  @spec dropout_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def dropout_rewriter(cache \\ nil) do
-    _ = cache
-
+  def dropout_rewriter do
     fn
       %Axon.Node{op_name: :dropout, name: name_fn} ->
         fn [x], _placeholder ->
@@ -447,11 +441,9 @@ defmodule EMLX.Axon do
   consumes) becomes unreachable. Inference-only: attention weight tensors are
   never used for token generation.
   """
-  @spec attn_weights_rewriter(reference() | nil) ::
+  @spec attn_weights_rewriter() ::
           (Axon.Node.t() -> :skip | ([Axon.t(), ...], Axon.t() -> Axon.t()))
-  def attn_weights_rewriter(cache \\ nil) do
-    _ = cache
-
+  def attn_weights_rewriter do
     fn
       %Axon.Node{op_name: :bb_attn_weights} ->
         fn [weights_axon], _placeholder ->
@@ -485,9 +477,9 @@ defmodule EMLX.Axon do
   **Do not enable for training graphs** — training models typically run without a
   KV cache and rely on the `else` branch.
   """
-  @spec if_present_rewriter(reference() | nil) ::
+  @spec if_present_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def if_present_rewriter(_cache \\ nil) do
+  def if_present_rewriter do
     fn
       # 3-parent :if_present: [optional(condition), optional(on_true), optional(on_false)]
       %Axon.Node{op_name: :if_present, parent: [_, _, _]} ->
@@ -531,11 +523,9 @@ defmodule EMLX.Axon do
   Only applies when the key or value parent is a Bumblebee `repeat_interleave` node.
   Models without GQA (or where repeat_interleave is already absent) are unaffected.
   """
-  @spec gqa_cache_fix_rewriter(reference() | nil) ::
+  @spec gqa_cache_fix_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def gqa_cache_fix_rewriter(cache \\ nil) do
-    _ = cache
-
+  def gqa_cache_fix_rewriter do
     fn
       %Axon.Node{op: op, parent: [_key_id, _value_id | _]} ->
         if function_info(op) == @bumblebee_update_attn_cache_mfa do
@@ -570,11 +560,9 @@ defmodule EMLX.Axon do
   Generic `:multiply` nodes (no `:container` parent, or container without a
   `:silu` child) are reconstructed identically.
   """
-  @spec swiglu_rewriter(reference() | nil) ::
+  @spec swiglu_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def swiglu_rewriter(cache \\ nil) do
-    _ = cache
-
+  def swiglu_rewriter do
     fn
       # Bumblebee's SwiGLU: multiply(container(up_proj, silu(gate))).
       # The :multiply node has ONE parent (the container), and the container
@@ -657,11 +645,9 @@ defmodule EMLX.Axon do
   **Inference-only**: attention dropout is elided (a no-op at inference time). Nodes
   with `dropout_rate > 0` are skipped to preserve training-time stochastic behaviour.
   """
-  @spec sdpa_rewriter(reference() | nil) ::
+  @spec sdpa_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def sdpa_rewriter(cache \\ nil) do
-    _ = cache
-
+  def sdpa_rewriter do
     fn %Axon.Node{op: op, opts: node_opts} ->
       dropout_rate = Keyword.get(node_opts, :dropout_rate, 0.0)
 
@@ -793,11 +779,9 @@ defmodule EMLX.Axon do
   attention without sliding-window masking; cross-attention and local attention
   fall back to the original graph.
   """
-  @spec native_attention_rewriter(reference() | nil) ::
+  @spec native_attention_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def native_attention_rewriter(cache \\ nil) do
-    _ = cache
-
+  def native_attention_rewriter do
     fn %Axon.Node{op: op, opts: node_opts} ->
       dropout_rate = Keyword.get(node_opts, :dropout_rate, 0.0)
 
@@ -921,7 +905,7 @@ defmodule EMLX.Axon do
   end
 
   # Registers a layer_key seen during the prefill step.
-  # Accumulates all 28 prefill keys into the seen set so that decode step 1
+  # Accumulates all prefill keys into the seen set so that decode step 1
   # will find each layer_key already "seen" and issue a fresh step-boundary read
   # at the correct decode offset rather than reusing the prefill offset (0).
   defp register_prefill_layer(layer_key, offset) do
@@ -1105,11 +1089,9 @@ defmodule EMLX.Axon do
   update chain is dead. Replacing `put_block_cache` with an identity lets DCE
   prune `get_block_cache`, `update_attention_cache`, and container plumbing.
   """
-  @spec nullify_block_cache_rewriter(reference() | nil) ::
+  @spec nullify_block_cache_rewriter() ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def nullify_block_cache_rewriter(cache \\ nil) do
-    _ = cache
-
+  def nullify_block_cache_rewriter do
     fn %Axon.Node{op: op} ->
       if function_info(op) == @bumblebee_put_block_cache_mfa do
         fn [cache_axon, _block_cache_axon], _placeholder -> cache_axon end
@@ -1121,11 +1103,12 @@ defmodule EMLX.Axon do
 
   # Memoizes Nx.to_number(offset_tensor) within a single forward pass (decode step).
   #
-  # All 28 layer callbacks within one forward pass share the same offset value. Calling
-  # Nx.to_number 28× forces 28 GPU→CPU syncs. Instead, call it once per step: detect
-  # the step boundary by tracking which layer_keys have been called in the current step.
-  # When a layer_key appears AGAIN (it was already seen in the previous step), we know
-  # a new step has begun and issue one fresh Nx.to_number; all other layers reuse the cache.
+  # All layer callbacks within one forward pass share the same offset value. Calling
+  # Nx.to_number once per layer forces one GPU→CPU sync per layer. Instead, call it
+  # once per step: detect the step boundary by tracking which layer_keys have been
+  # called in the current step. When a layer_key appears AGAIN (it was already seen in
+  # the previous step), we know a new step has begun and issue one fresh Nx.to_number;
+  # all other layers reuse the cache.
   defp get_step_offset(offset_tensor, layer_key) do
     case Process.get(@step_offset_proc_key) do
       nil ->
