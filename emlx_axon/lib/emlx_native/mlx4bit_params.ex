@@ -47,10 +47,14 @@ defmodule EMLX.Axon.MLX4BitParams do
 
     params =
       %{}
-      |> put_t(["embedder", "token_embedding", "kernel"],
-               load_embed(tensors, "model.embed_tokens"))
-      |> put_t(["output_norm", "weight"],
-               to_bf16_gpu(tensors["model.norm.weight"]))
+      |> put_t(
+        ["embedder", "token_embedding", "kernel"],
+        load_embed(tensors, "model.embed_tokens")
+      )
+      |> put_t(
+        ["output_norm", "weight"],
+        to_bf16_gpu(tensors["model.norm.weight"])
+      )
       |> load_lm_head(tensors, config)
       |> load_layers(tensors, num_layers)
 
@@ -77,34 +81,56 @@ defmodule EMLX.Axon.MLX4BitParams do
   defp load_layers(params, tensors, num_layers) do
     Enum.reduce(0..(num_layers - 1), params, fn n, acc ->
       mlx = "model.layers.#{n}"
-      bb  = ["decoder", "blocks", "#{n}"]
+      bb = ["decoder", "blocks", "#{n}"]
 
       acc
       # Dense norms — shape {hidden}, same in both conventions.
       # Bumblebee's RMSNorm Axon layers use "weight" as the parameter name.
-      |> put_t(bb ++ ["self_attention_norm", "weight"],
-               to_bf16_gpu(tensors["#{mlx}.input_layernorm.weight"]))
-      |> put_t(bb ++ ["output_norm", "weight"],
-               to_bf16_gpu(tensors["#{mlx}.post_attention_layernorm.weight"]))
-      |> put_t(bb ++ ["self_attention", "query_norm", "weight"],
-               to_bf16_gpu(tensors["#{mlx}.self_attn.q_norm.weight"]))
-      |> put_t(bb ++ ["self_attention", "key_norm", "weight"],
-               to_bf16_gpu(tensors["#{mlx}.self_attn.k_norm.weight"]))
+      |> put_t(
+        bb ++ ["self_attention_norm", "weight"],
+        to_bf16_gpu(tensors["#{mlx}.input_layernorm.weight"])
+      )
+      |> put_t(
+        bb ++ ["output_norm", "weight"],
+        to_bf16_gpu(tensors["#{mlx}.post_attention_layernorm.weight"])
+      )
+      |> put_t(
+        bb ++ ["self_attention", "query_norm", "weight"],
+        to_bf16_gpu(tensors["#{mlx}.self_attn.q_norm.weight"])
+      )
+      |> put_t(
+        bb ++ ["self_attention", "key_norm", "weight"],
+        to_bf16_gpu(tensors["#{mlx}.self_attn.k_norm.weight"])
+      )
       # Quantized linear projections — dequantize → transpose {out, in} → {in, out}.
-      |> put_t(bb ++ ["self_attention", "query", "kernel"],
-               load_linear(tensors, "#{mlx}.self_attn.q_proj"))
-      |> put_t(bb ++ ["self_attention", "key", "kernel"],
-               load_linear(tensors, "#{mlx}.self_attn.k_proj"))
-      |> put_t(bb ++ ["self_attention", "value", "kernel"],
-               load_linear(tensors, "#{mlx}.self_attn.v_proj"))
-      |> put_t(bb ++ ["self_attention", "output", "kernel"],
-               load_linear(tensors, "#{mlx}.self_attn.o_proj"))
-      |> put_t(bb ++ ["ffn", "gate", "kernel"],
-               load_linear(tensors, "#{mlx}.mlp.gate_proj"))
-      |> put_t(bb ++ ["ffn", "intermediate", "kernel"],
-               load_linear(tensors, "#{mlx}.mlp.up_proj"))
-      |> put_t(bb ++ ["ffn", "output", "kernel"],
-               load_linear(tensors, "#{mlx}.mlp.down_proj"))
+      |> put_t(
+        bb ++ ["self_attention", "query", "kernel"],
+        load_linear(tensors, "#{mlx}.self_attn.q_proj")
+      )
+      |> put_t(
+        bb ++ ["self_attention", "key", "kernel"],
+        load_linear(tensors, "#{mlx}.self_attn.k_proj")
+      )
+      |> put_t(
+        bb ++ ["self_attention", "value", "kernel"],
+        load_linear(tensors, "#{mlx}.self_attn.v_proj")
+      )
+      |> put_t(
+        bb ++ ["self_attention", "output", "kernel"],
+        load_linear(tensors, "#{mlx}.self_attn.o_proj")
+      )
+      |> put_t(
+        bb ++ ["ffn", "gate", "kernel"],
+        load_linear(tensors, "#{mlx}.mlp.gate_proj")
+      )
+      |> put_t(
+        bb ++ ["ffn", "intermediate", "kernel"],
+        load_linear(tensors, "#{mlx}.mlp.up_proj")
+      )
+      |> put_t(
+        bb ++ ["ffn", "output", "kernel"],
+        load_linear(tensors, "#{mlx}.mlp.down_proj")
+      )
     end)
   end
 
@@ -118,11 +144,17 @@ defmodule EMLX.Axon.MLX4BitParams do
     biases = tensors["#{name}.biases"]
     {out_f, num_groups} = Nx.shape(scales)
     original_shape = {out_f, num_groups * @group_size}
+
     qt =
       Quantization.quantized_tensor(
-        tensors_to_ref(weight), tensors_to_ref(scales), tensors_to_ref(biases),
-        original_shape, type: {:s, 4}, group_size: @group_size
+        tensors_to_ref(weight),
+        tensors_to_ref(scales),
+        tensors_to_ref(biases),
+        original_shape,
+        type: {:s, 4},
+        group_size: @group_size
       )
+
     Quantization.dequantize(qt)
   end
 
@@ -198,7 +230,7 @@ defmodule EMLX.Axon.MLX4BitParams do
 
   defp put_t(params, path, tensor) do
     {layer_parts, [param_name]} = Enum.split(path, length(path) - 1)
-    layer_name  = Enum.join(layer_parts, ".")
+    layer_name = Enum.join(layer_parts, ".")
     layer_entry = Map.get(params, layer_name, %{})
     Map.put(params, layer_name, Map.put(layer_entry, param_name, tensor))
   end
