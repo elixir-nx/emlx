@@ -111,8 +111,6 @@ defmodule EMLX.Axon do
     :nullify_block_cache
   ]
 
-  @supported_rewrites [:gqa_cache_fix | @default_rewrites]
-
   @doc """
   Rewrites all supported nodes in `model` to their `EMLX.Fast` equivalents.
 
@@ -137,39 +135,24 @@ defmodule EMLX.Axon do
     cache = :ets.new(:emlx_axon_rewrite_cache, [:set, :public])
 
     try do
-      enabled =
-        if :native_attention in opts[:only] do
-          [:if_present | opts[:only]]
-        else
-          opts[:only]
-        end
-
-      enabled = Enum.uniq(enabled)
+      enabled = expand_enabled(opts[:only])
 
       rewriters =
-        for rewrite <- @supported_rewrites, rewrite in enabled, into: %{} do
-          fun =
-            case rewrite do
-              :rms_norm -> rms_norm_rewriter()
-              :layer_norm -> layer_norm_rewriter()
-              :rotary_embedding -> rotary_embedding_rewriter(cache)
-              :sdpa -> sdpa_rewriter()
-              :dropout -> dropout_rewriter()
-              :swiglu -> swiglu_rewriter()
-              :attn_weights -> attn_weights_rewriter()
-              :if_present -> if_present_rewriter()
-              :gqa_cache_fix -> gqa_cache_fix_rewriter()
-              :native_attention -> native_attention_rewriter()
-              :nullify_block_cache -> nullify_block_cache_rewriter()
-            end
-
-          {rewrite, fun}
-        end
-
-      rewriters = rewriters |> Map.delete(nil) |> Map.values()
+        []
+        |> maybe_add(:rms_norm, rms_norm_rewriter(), enabled)
+        |> maybe_add(:layer_norm, layer_norm_rewriter(), enabled)
+        |> maybe_add(:rotary_embedding, rotary_embedding_rewriter(cache), enabled)
+        |> maybe_add(:sdpa, sdpa_rewriter(), enabled)
+        |> maybe_add(:dropout, dropout_rewriter(), enabled)
+        |> maybe_add(:swiglu, swiglu_rewriter(), enabled)
+        |> maybe_add(:attn_weights, attn_weights_rewriter(), enabled)
+        |> maybe_add(:if_present, if_present_rewriter(), enabled)
+        |> maybe_add(:gqa_cache_fix, gqa_cache_fix_rewriter(), enabled)
+        |> maybe_add(:native_attention, native_attention_rewriter(), enabled)
+        |> maybe_add(:nullify_block_cache, nullify_block_cache_rewriter(), enabled)
 
       Axon.rewrite_nodes(model, fn node ->
-        Enum.find_value(rewriters, :skip, fn fun ->
+        Enum.find_value(rewriters, :skip, fn {_key, fun} ->
           case fun.(node) do
             :skip -> nil
             rewriter -> rewriter
@@ -708,11 +691,8 @@ defmodule EMLX.Axon do
               if System.get_env("NATIVE_ATTN_DEBUG") in ["1", "2"] do
                 km_node = nodes[key_mask_id]
                 km_inner = maybe_unwrap_optional(nodes, key_mask_id)
-
                 if km_node do
-                  IO.puts(
-                    "[sdpa_build] key_mask_id=#{inspect(key_mask_id)} op_name=#{km_node.op_name} inner_id=#{inspect(km_inner)}"
-                  )
+                  IO.puts("[sdpa_build] key_mask_id=#{inspect(key_mask_id)} op_name=#{km_node.op_name} inner_id=#{inspect(km_inner)}")
                 end
               end
 
@@ -760,9 +740,7 @@ defmodule EMLX.Axon do
         head_dim = elem(Nx.shape(q_t), 3)
         scale = op_opts[:scale] || 1.0 / :math.sqrt(head_dim)
 
-        out =
-          EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, scale, key_mask)
-
+        out = EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, scale, key_mask)
         Nx.transpose(out, axes: [0, 2, 1, 3])
       end,
       [q_axon, k_axon, v_axon, key_mask_axon],
@@ -851,10 +829,7 @@ defmodule EMLX.Axon do
             )
           else
             reason ->
-              IO.puts(
-                "[native_attention_rewriter] FALLTHROUGH causal=#{causal} window=#{inspect(window_size)} reason=#{inspect(reason)}"
-              )
-
+              IO.puts("[native_attention_rewriter] FALLTHROUGH causal=#{causal} window=#{inspect(window_size)} reason=#{inspect(reason)}")
               Axon.layer(original_op, [weights_dropped_axon, v_axon])
           end
         end
@@ -966,16 +941,15 @@ defmodule EMLX.Axon do
       if pad_len > 0 do
         zeros_k = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
         zeros_v = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
-        {Nx.concatenate([new_k, zeros_k], axis: 1), Nx.concatenate([new_v, zeros_v], axis: 1)}
+        {Nx.concatenate([new_k, zeros_k], axis: 1),
+         Nx.concatenate([new_v, zeros_v], axis: 1)}
       else
         {new_k, new_v}
       end
 
     # Store raw {dev, ref} tuples — no ETS, no to_nx overhead for k/v.
     cache_map = Process.get(@kv_cache_proc_key, %{})
-
-    Process.put(
-      @kv_cache_proc_key,
+    Process.put(@kv_cache_proc_key,
       Map.put(cache_map, layer_key, {EMLX.Backend.from_nx(k_full), EMLX.Backend.from_nx(v_full)})
     )
 
@@ -1233,6 +1207,18 @@ defmodule EMLX.Axon do
         :ets.insert(cache, {key, value})
         value
     end
+  end
+
+  defp expand_enabled(enabled) do
+    if :native_attention in enabled do
+      Enum.uniq([:if_present | enabled])
+    else
+      enabled
+    end
+  end
+
+  defp maybe_add(acc, key, fun, enabled) do
+    if key in enabled, do: [{key, fun} | acc], else: acc
   end
 end
 
