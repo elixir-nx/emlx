@@ -3,7 +3,8 @@ defmodule EMLX.Profiling do
 
   # Lightweight atomic counters for profiling the MLX eval-dispatch path.
   #
-  # Enabled at runtime by setting EMLX_PROFILE_EVAL=1 before starting the VM.
+  # Enabled via `config :emlx, :profile_eval, true` in `config/runtime.exs`
+  # (or by setting EMLX_PROFILE_EVAL=1, which runtime.exs maps to that key).
   # The counters module guarantees atomic increments with ~10ns overhead per
   # call, which is negligible compared to NIF entry/exit cost (~1–5 µs).
   #
@@ -17,10 +18,10 @@ defmodule EMLX.Profiling do
 
   @doc """
   Called once from `EMLX.Application.start/2` to allocate the counter slab
-  when `EMLX_PROFILE_EVAL=1` is set. No-op otherwise.
+  when `config :emlx, :profile_eval, true` is set. No-op otherwise.
   """
   def init do
-    if System.get_env("EMLX_PROFILE_EVAL") == "1" do
+    if Application.get_env(:emlx, :profile_eval, false) do
       ref = :counters.new(@num_counters, [:atomics])
       :persistent_term.put(@pt_key, ref)
       ref
@@ -102,7 +103,7 @@ defmodule EMLX.Profiling do
         )
 
       {:error, :not_initialized} ->
-        IO.puts("[EMLX.Profiling] counters not initialized — set EMLX_PROFILE_EVAL=1")
+        IO.puts("[EMLX.Profiling] counters not initialized — set `config :emlx, :profile_eval, true` in runtime.exs")
     end
   end
 end
