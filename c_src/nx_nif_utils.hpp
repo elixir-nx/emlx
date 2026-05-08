@@ -3,8 +3,8 @@
 #include "erl_nif.h"
 #include "mlx/mlx.h"
 
-ErlNifResourceType *TENSOR_TYPE;
-ErlNifResourceType *FUNCTION_TYPE;
+inline ErlNifResourceType *TENSOR_TYPE;
+inline ErlNifResourceType *FUNCTION_TYPE;
 
 namespace emlx {
 typedef std::function<std::vector<mlx::core::array>(

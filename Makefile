@@ -40,8 +40,8 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
 
 # Main targets
