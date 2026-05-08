@@ -13,11 +13,11 @@
 #
 # Environment variables (all optional):
 #   EMLX_QWEN3_MODEL_PATH  — local model dir or HF repo id (default: ~/models/Qwen3-0.6B-MLX-4bit)
-#   VQ_MAX_NEW             — max new tokens per run (default: 60)
-#   VQ_BENCH_RUNS          — number of timed runs (default: 5)
-#   VQ_WARMUP_RUNS         — number of warmup runs before timing (default: 2)
-#   VQ_SEQUENCE_LENGTH     — sequence_length for Bumblebee compile (default: 1024)
-#   VQ_NATIVE_PROFILE_TIMING — set to "0" to disable per-token monotonic_time in native decode (default: on)
+#   EMLX_QWEN3_MAX_NEW             — max new tokens per run (default: 60)
+#   EMLX_QWEN3_BENCH_RUNS          — number of timed runs (default: 5)
+#   EMLX_QWEN3_WARMUP_RUNS         — number of warmup runs before timing (default: 2)
+#   EMLX_QWEN3_SEQUENCE_LENGTH     — sequence_length for Bumblebee compile (default: 1024)
+#   EMLX_QWEN3_NATIVE_PROFILE_TIMING — set to "0" to disable per-token monotonic_time in native decode (default: on)
 
 Nx.default_backend({EMLX.Backend, device: :gpu})
 
@@ -33,12 +33,12 @@ model_source =
     {:hf, model_path_raw}
   end
 
-max_new      = String.to_integer(System.get_env("VQ_MAX_NEW",         "60"))
-bench_runs   = String.to_integer(System.get_env("VQ_BENCH_RUNS",      "5"))
-warmup_runs  = String.to_integer(System.get_env("VQ_WARMUP_RUNS",     "2"))
-seq_len      = String.to_integer(System.get_env("VQ_SEQUENCE_LENGTH", "1024"))
+max_new      = String.to_integer(System.get_env("EMLX_QWEN3_MAX_NEW",         "60"))
+bench_runs   = String.to_integer(System.get_env("EMLX_QWEN3_BENCH_RUNS",      "5"))
+warmup_runs  = String.to_integer(System.get_env("EMLX_QWEN3_WARMUP_RUNS",     "2"))
+seq_len      = String.to_integer(System.get_env("EMLX_QWEN3_SEQUENCE_LENGTH", "1024"))
 
-native_profile_timing? = System.get_env("VQ_NATIVE_PROFILE_TIMING") != "0"
+native_profile_timing? = System.get_env("EMLX_QWEN3_NATIVE_PROFILE_TIMING") != "0"
 
 # Qwen3 instruct chat template — long enough that EOS won't hit within max_new tokens.
 prompt =
@@ -231,14 +231,7 @@ native_vs_rewrite =
     else: :n_a
 
 IO.puts("""
-
   bb+rewrite / bb base:  #{rewrite_vs_base}×
   native / bb base:      #{native_vs_base}×
   native / bb+rewrite:   #{native_vs_rewrite}×
-
-Reference baselines (M4 Max 64 GB):
-  EMLX.Native.TextGeneration   ~48–56 tok/s  (post-H1 kv_cache_sdpa_update; thermal variance ~20%)
-  Bumblebee + default rewrite  ~36–42 tok/s  (donation on kv_cache_attention_masked; ETS removed)
-  Bumblebee + :sdpa only       26–28 tok/s
-  bobby_posts (Python/MLX)     69.7 tok/s
 """)
