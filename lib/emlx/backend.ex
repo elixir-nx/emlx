@@ -162,7 +162,12 @@ defmodule EMLX.Backend do
           shape: logical_shape,
           type: logical_type,
           names: names,
-          data: %Backend{ref: ref, shape: packed_shape, type: packed_type, quantization_config: %EMLX.Quantization.Config{} = cfg}
+          data: %Backend{
+            ref: ref,
+            shape: packed_shape,
+            type: packed_type,
+            quantization_config: %EMLX.Quantization.Config{} = cfg
+          }
         },
         EMLX.Backend,
         opts
@@ -183,7 +188,12 @@ defmodule EMLX.Backend do
       shape: logical_shape,
       type: logical_type,
       names: names,
-      data: %Backend{ref: new_ref, shape: packed_shape, type: packed_type, quantization_config: %{cfg | scales: new_scales, biases: new_biases}}
+      data: %Backend{
+        ref: new_ref,
+        shape: packed_shape,
+        type: packed_type,
+        quantization_config: %{cfg | scales: new_scales, biases: new_biases}
+      }
     }
   end
 
@@ -1180,7 +1190,7 @@ defmodule EMLX.Backend do
       cfg
 
     weight_rank = tuple_size(qw_tensor.shape)
-    last_dim    = weight_rank - 1
+    last_dim = weight_rank - 1
 
     # If cfg.transpose was explicitly set (e.g. by QuantizeParams when weights are stored
     # in {out,in} physical layout but exposed as {in,out} to Axon), use it; otherwise

@@ -73,6 +73,7 @@ defmodule EMLX.FastTest do
     test "T>1 prefill matches per-token T=1 stack (sequential position_ids)" do
       dims = 8
       half = div(dims, 2)
+
       freqs =
         Nx.iota({half}, type: :f32) |> Nx.add(0.1) |> Nx.divide(20) |> gpu()
 
@@ -83,8 +84,13 @@ defmodule EMLX.FastTest do
 
       a0 = a[[0..0, 0..0, .., ..]]
       a1 = a[[0..0, 1..1, .., ..]]
-      o0 = Fast.rope_with_freqs(a0, Nx.tensor([[0]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
-      o1 = Fast.rope_with_freqs(a1, Nx.tensor([[1]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+
+      o0 =
+        Fast.rope_with_freqs(a0, Nx.tensor([[0]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+
+      o1 =
+        Fast.rope_with_freqs(a1, Nx.tensor([[1]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+
       expected = Nx.concatenate([o0, o1], axis: 1) |> Nx.as_type(:f32) |> Nx.backend_transfer()
       out2 = out2 |> Nx.backend_transfer()
 
@@ -94,6 +100,7 @@ defmodule EMLX.FastTest do
     test "T>1 non-sequential position_ids: second token position is honored" do
       dims = 8
       half = div(dims, 2)
+
       freqs =
         Nx.iota({half}, type: :f32) |> Nx.add(0.1) |> Nx.divide(20) |> gpu()
 
@@ -104,8 +111,13 @@ defmodule EMLX.FastTest do
 
       a0 = a[[0..0, 0..0, .., ..]]
       a1 = a[[0..0, 1..1, .., ..]]
-      o0 = Fast.rope_with_freqs(a0, Nx.tensor([[0]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
-      o1 = Fast.rope_with_freqs(a1, Nx.tensor([[5]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+
+      o0 =
+        Fast.rope_with_freqs(a0, Nx.tensor([[0]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+
+      o1 =
+        Fast.rope_with_freqs(a1, Nx.tensor([[5]], type: :s32) |> gpu(), dims, false, 1.0, freqs)
+
       expected = Nx.concatenate([o0, o1], axis: 1) |> Nx.as_type(:f32) |> Nx.backend_transfer()
       out2 = out2 |> Nx.backend_transfer()
 
@@ -133,7 +145,9 @@ defmodule EMLX.FastTest do
       x1 = a[[.., .., .., 0..(half - 1)//1]]
       x2 = a[[.., .., .., half..(dims - 1)//1]]
       rotated = Nx.concatenate([Nx.negate(x2), x1], axis: -1)
-      expected = Nx.add(Nx.multiply(a, cos_full), Nx.multiply(rotated, sin_full)) |> Nx.backend_transfer()
+
+      expected =
+        Nx.add(Nx.multiply(a, cos_full), Nx.multiply(rotated, sin_full)) |> Nx.backend_transfer()
 
       assert_all_close(out, expected, atol: 1.0e-4, rtol: 1.0e-4)
     end
@@ -143,7 +157,12 @@ defmodule EMLX.FastTest do
 
   describe "EMLX.Fast.scaled_dot_product_attention/4" do
     test "output shape: {B, N_q, T_q, D}" do
-      b = 1; n_q = 8; n_kv = 4; t_q = 1; t_kv = 32; d = 64
+      b = 1
+      n_q = 8
+      n_kv = 4
+      t_q = 1
+      t_kv = 32
+      d = 64
       scale = 1.0 / :math.sqrt(d)
 
       q = Nx.broadcast(0.1, {b, n_q, t_q, d}) |> Nx.as_type(:f16) |> gpu()
@@ -162,7 +181,7 @@ defmodule EMLX.FastTest do
   describe "EMLX.Fast.swiglu/2" do
     test "output shape and type match gate input" do
       gate = Nx.iota({1, 1, 64}, type: :f16) |> Nx.divide(100) |> gpu()
-      up   = Nx.iota({1, 1, 64}, type: :f16) |> Nx.divide(100) |> gpu()
+      up = Nx.iota({1, 1, 64}, type: :f16) |> Nx.divide(100) |> gpu()
 
       out = Fast.swiglu(gate, up)
 
@@ -172,7 +191,7 @@ defmodule EMLX.FastTest do
 
     test "matches silu(gate) * up on f32 inputs" do
       gate = Nx.tensor([[[1.0, -1.0, 2.0, 0.5]]], type: :f32) |> gpu()
-      up   = Nx.tensor([[[2.0,  3.0, 1.0, 4.0]]], type: :f32) |> gpu()
+      up = Nx.tensor([[[2.0, 3.0, 1.0, 4.0]]], type: :f32) |> gpu()
 
       fast_out = Fast.swiglu(gate, up) |> Nx.backend_transfer()
       # silu(x) = x * sigmoid(x)
@@ -184,9 +203,10 @@ defmodule EMLX.FastTest do
     test "matches silu(gate) * up on Qwen3 FFN decode shape (f16)" do
       # Qwen3-0.6B: ffn_intermediate_size = 1536 (ffn_size / 2 for gated FFN)
       gate = Nx.iota({1, 1, 1536}, type: :f16) |> Nx.divide(1000) |> gpu()
-      up   = Nx.iota({1, 1, 1536}, type: :f16) |> Nx.divide(1000) |> gpu()
+      up = Nx.iota({1, 1, 1536}, type: :f16) |> Nx.divide(1000) |> gpu()
 
       fast_out = Fast.swiglu(gate, up) |> Nx.as_type(:f32) |> Nx.backend_transfer()
+
       prim_out =
         Nx.multiply(Nx.multiply(gate, Nx.sigmoid(gate)), up)
         |> Nx.as_type(:f32)
@@ -198,7 +218,11 @@ defmodule EMLX.FastTest do
 
   describe "EMLX.Fast.scaled_dot_product_attention/5 (masked)" do
     test "output shape matches q with additive mask" do
-      b = 1; n_q = 4; t_q = 4; t_kv = 4; d = 32
+      b = 1
+      n_q = 4
+      t_q = 4
+      t_kv = 4
+      d = 32
       scale = 1.0 / :math.sqrt(d)
 
       q = Nx.broadcast(0.1, {b, n_q, t_q, d}) |> Nx.as_type(:f32) |> gpu()

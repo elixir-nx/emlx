@@ -691,8 +691,11 @@ defmodule EMLXAxon do
               if System.get_env("NATIVE_ATTN_DEBUG") in ["1", "2"] do
                 km_node = nodes[key_mask_id]
                 km_inner = maybe_unwrap_optional(nodes, key_mask_id)
+
                 if km_node do
-                  IO.puts("[sdpa_build] key_mask_id=#{inspect(key_mask_id)} op_name=#{km_node.op_name} inner_id=#{inspect(km_inner)}")
+                  IO.puts(
+                    "[sdpa_build] key_mask_id=#{inspect(key_mask_id)} op_name=#{km_node.op_name} inner_id=#{inspect(km_inner)}"
+                  )
                 end
               end
 
@@ -740,7 +743,9 @@ defmodule EMLXAxon do
         head_dim = elem(Nx.shape(q_t), 3)
         scale = op_opts[:scale] || 1.0 / :math.sqrt(head_dim)
 
-        out = EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, scale, key_mask)
+        out =
+          EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, scale, key_mask)
+
         Nx.transpose(out, axes: [0, 2, 1, 3])
       end,
       [q_axon, k_axon, v_axon, key_mask_axon],
@@ -829,7 +834,10 @@ defmodule EMLXAxon do
             )
           else
             reason ->
-              IO.puts("[native_attention_rewriter] FALLTHROUGH causal=#{causal} window=#{inspect(window_size)} reason=#{inspect(reason)}")
+              IO.puts(
+                "[native_attention_rewriter] FALLTHROUGH causal=#{causal} window=#{inspect(window_size)} reason=#{inspect(reason)}"
+              )
+
               Axon.layer(original_op, [weights_dropped_axon, v_axon])
           end
         end
@@ -941,15 +949,16 @@ defmodule EMLXAxon do
       if pad_len > 0 do
         zeros_k = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
         zeros_v = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
-        {Nx.concatenate([new_k, zeros_k], axis: 1),
-         Nx.concatenate([new_v, zeros_v], axis: 1)}
+        {Nx.concatenate([new_k, zeros_k], axis: 1), Nx.concatenate([new_v, zeros_v], axis: 1)}
       else
         {new_k, new_v}
       end
 
     # Store raw {dev, ref} tuples — no ETS, no to_nx overhead for k/v.
     cache_map = Process.get(@kv_cache_proc_key, %{})
-    Process.put(@kv_cache_proc_key,
+
+    Process.put(
+      @kv_cache_proc_key,
       Map.put(cache_map, layer_key, {EMLX.Backend.from_nx(k_full), EMLX.Backend.from_nx(v_full)})
     )
 

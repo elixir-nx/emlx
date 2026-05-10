@@ -27,12 +27,24 @@ defmodule EMLXAxon.Qwen3.Attention do
 
   Returns `{attn_out, k_cache_updated, v_cache_updated}`.
   """
-  def forward(hidden, k_cache, v_cache, current_len, q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, cfg) do
-    num_heads    = cfg.num_attention_heads
+  def forward(
+        hidden,
+        k_cache,
+        v_cache,
+        current_len,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        cfg
+      ) do
+    num_heads = cfg.num_attention_heads
     num_kv_heads = cfg.num_key_value_heads
-    head_dim     = cfg.head_dim
-    scale        = 1.0 / :math.sqrt(head_dim)
-    theta        = cfg.rope_theta
+    head_dim = cfg.head_dim
+    scale = 1.0 / :math.sqrt(head_dim)
+    theta = cfg.rope_theta
 
     hidden_shape = Nx.shape(hidden)
     batch = elem(hidden_shape, 0)
@@ -74,9 +86,9 @@ defmodule EMLXAxon.Qwen3.Attention do
         scale
       )
 
-    attn_out  = EMLX.Backend.to_nx(attn_ref)
-    k_cache   = EMLX.Backend.to_nx(k_cache_ref)
-    v_cache   = EMLX.Backend.to_nx(v_cache_ref)
+    attn_out = EMLX.Backend.to_nx(attn_ref)
+    k_cache = EMLX.Backend.to_nx(k_cache_ref)
+    v_cache = EMLX.Backend.to_nx(v_cache_ref)
 
     # Reshape: {B, N_q, T_q, D} → {B, T_q, N_q, D} → {B, T, hidden}
     attn_out =

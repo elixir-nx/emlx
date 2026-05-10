@@ -26,7 +26,7 @@ defmodule EMLXAxon.Qwen3QuantizedTest do
       """)
     end
 
-    {:ok, state}     = Loader.load(path)
+    {:ok, state} = Loader.load(path)
     {:ok, tokenizer} = Bumblebee.load_tokenizer({:local, path})
 
     {:ok, %{state: state, tokenizer: tokenizer}}
@@ -56,7 +56,28 @@ defmodule EMLXAxon.Qwen3QuantizedTest do
     #
     # Captured on M4 Max, 64 GB, macOS 26.3, EMLX 0.2.0 / MLX 0.31.2, A4 fast-ops.
     # To regenerate: run `mix test --only quantized_inference` and copy `left:`.
-    assert tokens1 == [481, 2585, 1558, 468, 97772, 3705, 279, 990, 315, 5746, 304, 264, 15473, 4128, 30, 481, 3555, 374, 279, 7428]
+    assert tokens1 == [
+             481,
+             2585,
+             1558,
+             468,
+             97772,
+             3705,
+             279,
+             990,
+             315,
+             5746,
+             304,
+             264,
+             15473,
+             4128,
+             30,
+             481,
+             3555,
+             374,
+             279,
+             7428
+           ]
   end
 
   test "greedy decode is faster than top_p_cpu", %{state: state, tokenizer: tok} do
@@ -69,14 +90,15 @@ defmodule EMLXAxon.Qwen3QuantizedTest do
       Generate.generate(input_ids, state, max_new_tokens: 10, sampler: :top_p_cpu)
 
     greedy_median = median(t_greedy.per_token_ms)
-    cpu_median    = median(t_cpu.per_token_ms)
+    cpu_median = median(t_cpu.per_token_ms)
 
     # CPU sampler must add measurable overhead vs greedy (A0 showed ~42 ms)
     assert cpu_median > greedy_median,
-      "Expected top_p_cpu (#{cpu_median} ms) > greedy (#{greedy_median} ms)"
+           "Expected top_p_cpu (#{cpu_median} ms) > greedy (#{greedy_median} ms)"
   end
 
   defp median([]), do: 0
+
   defp median(list) do
     sorted = Enum.sort(list)
     n = length(sorted)

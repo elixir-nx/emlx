@@ -32,18 +32,19 @@ defmodule EMLXAxon.Qwen3.Sampler do
     scaled = Nx.divide(logits, temperature) |> Nx.to_flat_list()
 
     max_l = Enum.max(scaled)
-    exps  = Enum.map(scaled, fn l -> :math.exp(l - max_l) end)
+    exps = Enum.map(scaled, fn l -> :math.exp(l - max_l) end)
     sum_e = Enum.sum(exps)
     probs = Enum.map(exps, &(&1 / sum_e))
 
     # Sort descending by probability
     indexed = Enum.zip(0..(vocab_size - 1), probs)
-    sorted  = Enum.sort_by(indexed, fn {_i, p} -> p end, :desc)
+    sorted = Enum.sort_by(indexed, fn {_i, p} -> p end, :desc)
 
     # Nucleus cutoff
     {chosen, _cum} =
       Enum.reduce_while(sorted, {[], 0.0}, fn {idx, p}, {acc, cum} ->
         new_cum = cum + p
+
         if new_cum - p >= top_p do
           {:halt, {acc, cum}}
         else
@@ -57,7 +58,7 @@ defmodule EMLXAxon.Qwen3.Sampler do
     total = Enum.sum(Enum.map(candidates, fn {_i, p} -> p end))
     normed = Enum.map(candidates, fn {i, p} -> {i, p / total} end)
 
-    u     = :rand.uniform()
+    u = :rand.uniform()
     token = sample_from_probs(normed, u, 0.0)
 
     Nx.tensor(token, type: :s64)
@@ -96,7 +97,7 @@ defmodule EMLXAxon.Qwen3.Sampler do
 
     # Gumbel noise: G = -log(-log(U)) where U ~ Uniform(0, 1)
     {u, _key} = Nx.Random.uniform(key, shape: Nx.shape(logits_1d), type: :f32)
-    gumbel    = Nx.negate(Nx.log(Nx.negate(Nx.log(u + 1.0e-10)) + 1.0e-10))
+    gumbel = Nx.negate(Nx.log(Nx.negate(Nx.log(u + 1.0e-10)) + 1.0e-10))
 
     # argmax(logits/temp + Gumbel) ~ Categorical(softmax(logits/temp))
     Nx.argmax(logits_1d / opts[:temperature] + gumbel, axis: 0)

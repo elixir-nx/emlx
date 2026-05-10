@@ -34,10 +34,10 @@ defmodule EMLXAxon.Qwen3.Model do
 
     @type t :: %__MODULE__{
             embed_tokens: Nx.Tensor.t(),
-            layers:       [map()],
-            norm:         Nx.Tensor.t(),
-            lm_head:      Nx.Tensor.t(),
-            config:       map()
+            layers: [map()],
+            norm: Nx.Tensor.t(),
+            lm_head: Nx.Tensor.t(),
+            config: map()
           }
   end
 
@@ -50,16 +50,20 @@ defmodule EMLXAxon.Qwen3.Model do
   @spec init_kv_cache(State.t(), pos_integer()) :: [{Nx.Tensor.t(), Nx.Tensor.t()}]
   def init_kv_cache(%State{config: cfg, layers: layers}, max_len) do
     num_kv_heads = cfg.num_key_value_heads
-    head_dim     = cfg.head_dim
-    gpu          = {EMLX.Backend, device: :gpu}
+    head_dim = cfg.head_dim
+    gpu = {EMLX.Backend, device: :gpu}
 
     # Cache layout: {B, N_kv, max_len, D} — heads-before-sequence so that
     # tensors transposed to {B, N, T, D} for RoPE/SDPA slot in without copies.
     for _layer <- layers do
-      k = Nx.broadcast(Nx.tensor(0.0, type: :f16), {1, num_kv_heads, max_len, head_dim})
-          |> Nx.backend_transfer(gpu)
-      v = Nx.broadcast(Nx.tensor(0.0, type: :f16), {1, num_kv_heads, max_len, head_dim})
-          |> Nx.backend_transfer(gpu)
+      k =
+        Nx.broadcast(Nx.tensor(0.0, type: :f16), {1, num_kv_heads, max_len, head_dim})
+        |> Nx.backend_transfer(gpu)
+
+      v =
+        Nx.broadcast(Nx.tensor(0.0, type: :f16), {1, num_kv_heads, max_len, head_dim})
+        |> Nx.backend_transfer(gpu)
+
       {k, v}
     end
   end
@@ -78,7 +82,8 @@ defmodule EMLXAxon.Qwen3.Model do
   @spec forward(Nx.Tensor.t(), [{Nx.Tensor.t(), Nx.Tensor.t()}], non_neg_integer(), State.t()) ::
           {Nx.Tensor.t(), [{Nx.Tensor.t(), Nx.Tensor.t()}]}
   def forward(input_ids, kv_cache, current_len, %State{} = state) do
-    %State{embed_tokens: embed_tokens, layers: layers, norm: norm, lm_head: lm_head, config: cfg} = state
+    %State{embed_tokens: embed_tokens, layers: layers, norm: norm, lm_head: lm_head, config: cfg} =
+      state
 
     # Embed input tokens: {1, seq_len} → {1, seq_len, hidden_size}
     ids_shape = Nx.shape(input_ids)
@@ -104,15 +109,23 @@ defmodule EMLXAxon.Qwen3.Model do
       else
         hidden[[.., -1, ..]]
       end
-    normed      = EMLX.Fast.rms_norm(last_hidden, norm, cfg.rms_norm_eps)
-    logits      = Nx.dot(normed, [1], lm_head, [1])
+
+    normed = EMLX.Fast.rms_norm(last_hidden, norm, cfg.rms_norm_eps)
+    logits = Nx.dot(normed, [1], lm_head, [1])
 
     {logits, kv_cache_updated}
   end
 
   defp forward_layers([], [], hidden, acc, _cur_len, _cfg), do: {hidden, acc}
 
-  defp forward_layers([layer_weights | layers_rest], [{k_cache, v_cache} | kv_rest], hidden, acc, cur_len, cfg) do
+  defp forward_layers(
+         [layer_weights | layers_rest],
+         [{k_cache, v_cache} | kv_rest],
+         hidden,
+         acc,
+         cur_len,
+         cfg
+       ) do
     {h_new, k_new, v_new} =
       transformer_layer(hidden, k_cache, v_cache, cur_len, layer_weights, cfg)
 
@@ -122,27 +135,45 @@ defmodule EMLXAxon.Qwen3.Model do
   @doc false
   def transformer_layer(hidden, k_cache, v_cache, current_len, weights, cfg) do
     %{
-      input_layernorm:          norm1,
+      input_layernorm: norm1,
       post_attention_layernorm: norm2,
-      q_norm: q_norm, k_norm: k_norm,
-      q_proj: q_proj, k_proj: k_proj, v_proj: v_proj, o_proj: o_proj,
-      gate_proj: gate_proj, up_proj: up_proj, down_proj: down_proj
+      q_norm: q_norm,
+      k_norm: k_norm,
+      q_proj: q_proj,
+      k_proj: k_proj,
+      v_proj: v_proj,
+      o_proj: o_proj,
+      gate_proj: gate_proj,
+      up_proj: up_proj,
+      down_proj: down_proj
     } = weights
 
     # Self-attention with pre-norm
     xn = Layers.rms_norm(hidden, norm1, cfg.rms_norm_eps)
+
     {attn_out, k_new, v_new} =
-      Attention.forward(xn, k_cache, v_cache, current_len,
-        q_proj, k_proj, v_proj, o_proj, q_norm, k_norm, cfg)
+      Attention.forward(
+        xn,
+        k_cache,
+        v_cache,
+        current_len,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        cfg
+      )
 
     hidden = Nx.add(hidden, attn_out)
 
     # MLP with post-norm
-    xn2  = Layers.rms_norm(hidden, norm2, cfg.rms_norm_eps)
+    xn2 = Layers.rms_norm(hidden, norm2, cfg.rms_norm_eps)
     gate = Nx.dot(xn2, [2], gate_proj, [1])
-    up   = Nx.dot(xn2, [2], up_proj,   [1])
-    mlp  = EMLX.Fast.swiglu(gate, up)
-    out  = Nx.dot(mlp, [2], down_proj, [1])
+    up = Nx.dot(xn2, [2], up_proj, [1])
+    mlp = EMLX.Fast.swiglu(gate, up)
+    out = Nx.dot(mlp, [2], down_proj, [1])
 
     hidden = Nx.add(hidden, out)
 

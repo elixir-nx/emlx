@@ -57,18 +57,18 @@ defmodule EMLXAxon.Qwen3.Generate do
   @spec generate(Nx.Tensor.t(), Model.State.t(), keyword()) ::
           {[non_neg_integer()], map()}
   def generate(input_ids, %Model.State{} = state, opts \\ []) do
-    max_new  = Keyword.get(opts, :max_new_tokens, @default_max_new_tokens)
-    max_len  = Keyword.get(opts, :max_len, @default_max_len)
-    sampler  = Keyword.get(opts, :sampler, :greedy)
-    temp     = Keyword.get(opts, :temperature, 0.95)
-    top_p    = Keyword.get(opts, :top_p, 0.9)
-    rng_key         = Keyword.get(opts, :rng_key, Nx.Random.key(42))
+    max_new = Keyword.get(opts, :max_new_tokens, @default_max_new_tokens)
+    max_len = Keyword.get(opts, :max_len, @default_max_len)
+    sampler = Keyword.get(opts, :sampler, :greedy)
+    temp = Keyword.get(opts, :temperature, 0.95)
+    top_p = Keyword.get(opts, :top_p, 0.9)
+    rng_key = Keyword.get(opts, :rng_key, Nx.Random.key(42))
     profile_timing? = Keyword.get(opts, :profile_timing, true)
 
     kv_cache =
       case Keyword.fetch(opts, :kv_cache) do
         {:ok, prealloc} -> prealloc
-        :error          -> Model.init_kv_cache(state, max_len)
+        :error -> Model.init_kv_cache(state, max_len)
       end
 
     gpu = {EMLX.Backend, device: :gpu}
@@ -88,7 +88,7 @@ defmodule EMLXAxon.Qwen3.Generate do
     {rng_key, first_gpu_key} = advance_rng_for_gpu(sampler, rng_key)
 
     {logits, kv_cache} = Model.forward(input_ids, kv_cache, 0, state)
-    first_token        = sample(logits, sampler, temp, top_p, first_gpu_key)
+    first_token = sample(logits, sampler, temp, top_p, first_gpu_key)
     # Sync to GPU here (once per token)
     EMLX.eval(EMLX.Backend.from_nx(first_token))
 
@@ -119,9 +119,9 @@ defmodule EMLXAxon.Qwen3.Generate do
     t_end = System.monotonic_time(:millisecond)
 
     timing = %{
-      prefill_ms:    prefill_ms,
-      per_token_ms:  :lists.reverse(per_token_ms),
-      total_ms:      t_end - t0
+      prefill_ms: prefill_ms,
+      per_token_ms: :lists.reverse(per_token_ms),
+      total_ms: t_end - t0
     }
 
     {:lists.reverse(tokens), %{timing: timing}}

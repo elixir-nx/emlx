@@ -44,7 +44,7 @@ defmodule EMLXAxon.Qwen3.Loader do
   def load(path) do
     path = Path.expand(path)
 
-    with {:ok, config}  <- read_config(path),
+    with {:ok, config} <- read_config(path),
          {:ok, tensors} <- read_safetensors(path) do
       build_state(tensors, config)
     end
@@ -56,21 +56,22 @@ defmodule EMLXAxon.Qwen3.Loader do
     config_path = Path.join(path, "config.json")
 
     with {:ok, json} <- File.read(config_path),
-         {:ok, raw}  <- Jason.decode(json) do
+         {:ok, raw} <- Jason.decode(json) do
       config = %{
-        hidden_size:          raw["hidden_size"],
-        intermediate_size:    raw["intermediate_size"],
-        num_attention_heads:  raw["num_attention_heads"],
-        num_key_value_heads:  raw["num_key_value_heads"],
-        head_dim:             raw["head_dim"] || div(raw["hidden_size"], raw["num_attention_heads"]),
-        num_hidden_layers:    raw["num_hidden_layers"],
-        vocab_size:           raw["vocab_size"],
-        rms_norm_eps:         raw["rms_norm_eps"] || 1.0e-6,
-        rope_theta:           raw["rope_theta"] || 10_000.0,
-        tie_word_embeddings:  raw["tie_word_embeddings"] || false,
-        eos_token_id:         raw["eos_token_id"] || 2,
-        bos_token_id:         raw["bos_token_id"] || 1
+        hidden_size: raw["hidden_size"],
+        intermediate_size: raw["intermediate_size"],
+        num_attention_heads: raw["num_attention_heads"],
+        num_key_value_heads: raw["num_key_value_heads"],
+        head_dim: raw["head_dim"] || div(raw["hidden_size"], raw["num_attention_heads"]),
+        num_hidden_layers: raw["num_hidden_layers"],
+        vocab_size: raw["vocab_size"],
+        rms_norm_eps: raw["rms_norm_eps"] || 1.0e-6,
+        rope_theta: raw["rope_theta"] || 10_000.0,
+        tie_word_embeddings: raw["tie_word_embeddings"] || false,
+        eos_token_id: raw["eos_token_id"] || 2,
+        bos_token_id: raw["bos_token_id"] || 1
       }
+
       {:ok, config}
     end
   end
@@ -92,6 +93,7 @@ defmodule EMLXAxon.Qwen3.Loader do
           full = Path.join(path, shard)
           Map.merge(acc, Safetensors.read!(full))
         end)
+
       {:ok, tensors}
     end
   end
@@ -144,8 +146,7 @@ defmodule EMLXAxon.Qwen3.Loader do
         prefix = "model.layers.#{i}"
 
         %{
-          input_layernorm:
-            tensors["#{prefix}.input_layernorm.weight"] |> to_gpu.(),
+          input_layernorm: tensors["#{prefix}.input_layernorm.weight"] |> to_gpu.(),
           post_attention_layernorm:
             tensors["#{prefix}.post_attention_layernorm.weight"] |> to_gpu.(),
           # Qwen3 has per-head RMSNorm on q and k after projection
@@ -156,17 +157,17 @@ defmodule EMLXAxon.Qwen3.Loader do
           v_proj: quantized_linear(tensors, "#{prefix}.self_attn.v_proj", config),
           o_proj: quantized_linear(tensors, "#{prefix}.self_attn.o_proj", config),
           gate_proj: quantized_linear(tensors, "#{prefix}.mlp.gate_proj", config),
-          up_proj:   quantized_linear(tensors, "#{prefix}.mlp.up_proj", config),
+          up_proj: quantized_linear(tensors, "#{prefix}.mlp.up_proj", config),
           down_proj: quantized_linear(tensors, "#{prefix}.mlp.down_proj", config)
         }
       end
 
     state = %State{
       embed_tokens: embed_tokens,
-      layers:       layers,
-      norm:         final_norm,
-      lm_head:      lm_head,
-      config:       config
+      layers: layers,
+      norm: final_norm,
+      lm_head: lm_head,
+      config: config
     }
 
     {:ok, state}
@@ -183,15 +184,19 @@ defmodule EMLXAxon.Qwen3.Loader do
     # The original (logical) shape is inferred from scales: {out, num_groups * group_size}.
     group_size = 64
     {out_f, num_groups} = Nx.shape(scales)
-    original_shape      = {out_f, num_groups * group_size}
+    original_shape = {out_f, num_groups * group_size}
 
     weight_ref = EMLX.Backend.from_nx(Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu}))
     scales_ref = EMLX.Backend.from_nx(Nx.backend_transfer(scales, {EMLX.Backend, device: :gpu}))
     biases_ref = EMLX.Backend.from_nx(Nx.backend_transfer(biases, {EMLX.Backend, device: :gpu}))
 
     EMLX.Quantization.quantized_tensor(
-      weight_ref, scales_ref, biases_ref, original_shape,
-      type: {:s, 4}, group_size: group_size
+      weight_ref,
+      scales_ref,
+      biases_ref,
+      original_shape,
+      type: {:s, 4},
+      group_size: group_size
     )
   end
 end

@@ -488,7 +488,16 @@ defmodule EMLX do
     {worker, effective_device} = resolve_worker(dev_a)
 
     job_ref =
-      EMLX.NIF.fast_rope(worker, ref_a, dims, traditional, base * 1.0, scale * 1.0, offset, effective_device)
+      EMLX.NIF.fast_rope(
+        worker,
+        ref_a,
+        dims,
+        traditional,
+        base * 1.0,
+        scale * 1.0,
+        offset,
+        effective_device
+      )
       |> unwrap!()
 
     await_worker(job_ref) |> wrap_tensor(effective_device)
@@ -608,7 +617,14 @@ defmodule EMLX do
 
     job_ref =
       EMLX.NIF.fast_rope_ids(
-        worker, ref_a, dims, traditional, base * 1.0, scale * 1.0, ref_off, effective_device
+        worker,
+        ref_a,
+        dims,
+        traditional,
+        base * 1.0,
+        scale * 1.0,
+        ref_off,
+        effective_device
       )
       |> unwrap!()
 
@@ -644,7 +660,14 @@ defmodule EMLX do
 
     job_ref =
       EMLX.NIF.fast_rope_positions(
-        worker, ref_a, dims, traditional, base * 1.0, scale * 1.0, ref_pos, effective_device
+        worker,
+        ref_a,
+        dims,
+        traditional,
+        base * 1.0,
+        scale * 1.0,
+        ref_pos,
+        effective_device
       )
       |> unwrap!()
 
@@ -678,7 +701,14 @@ defmodule EMLX do
 
     job_ref =
       EMLX.NIF.fast_rope_with_freqs(
-        worker, ref_a, dims, traditional, scale * 1.0, ref_off, ref_f, effective_device
+        worker,
+        ref_a,
+        dims,
+        traditional,
+        scale * 1.0,
+        ref_off,
+        ref_f,
+        effective_device
       )
       |> unwrap!()
 
@@ -744,7 +774,14 @@ defmodule EMLX do
 
     job_ref =
       EMLX.NIF.fast_sdpa_causal_key_masked(
-        worker, ref_q, ref_k, ref_v, scale * 1.0, ref_m, kv_offset, effective_device
+        worker,
+        ref_q,
+        ref_k,
+        ref_v,
+        scale * 1.0,
+        ref_m,
+        kv_offset,
+        effective_device
       )
       |> unwrap!()
 
@@ -807,7 +844,15 @@ defmodule EMLX do
 
     {attn_ref, k_upd_ref, v_upd_ref} =
       EMLX.NIF.kv_cache_attention(
-        worker, ref_q, ref_k, ref_v, ref_kc, ref_vc, offset, scale, effective_device
+        worker,
+        ref_q,
+        ref_k,
+        ref_v,
+        ref_kc,
+        ref_vc,
+        offset,
+        scale,
+        effective_device
       )
       |> unwrap!()
       |> await_worker()
@@ -845,7 +890,16 @@ defmodule EMLX do
 
     {attn_ref, k_upd_ref, v_upd_ref} =
       EMLX.NIF.kv_cache_attention_masked(
-        worker, ref_q, ref_k, ref_v, ref_kc, ref_vc, offset, scale, ref_m, effective_device
+        worker,
+        ref_q,
+        ref_k,
+        ref_v,
+        ref_kc,
+        ref_vc,
+        offset,
+        scale,
+        ref_m,
+        effective_device
       )
       |> unwrap!()
       |> await_worker()
@@ -881,7 +935,15 @@ defmodule EMLX do
 
     {attn_ref, k_upd_ref, v_upd_ref} =
       EMLX.NIF.kv_cache_sdpa_update(
-        worker, ref_q, ref_k, ref_v, ref_kc, ref_vc, offset, scale, effective_device
+        worker,
+        ref_q,
+        ref_k,
+        ref_v,
+        ref_kc,
+        ref_vc,
+        offset,
+        scale,
+        effective_device
       )
       |> unwrap!()
       |> await_worker()

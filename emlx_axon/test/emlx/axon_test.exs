@@ -21,7 +21,9 @@ defmodule EMLXAxonTest do
         "weight",
         fn input_shape ->
           {elem(input_shape, Nx.rank(input_shape) - 1)}
-        end, initializer: :ones)
+        end,
+        initializer: :ones
+      )
 
     Axon.layer(
       fn x, w, opts ->

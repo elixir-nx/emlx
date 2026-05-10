@@ -103,7 +103,9 @@ defmodule EMLX.Profiling do
         )
 
       {:error, :not_initialized} ->
-        IO.puts("[EMLX.Profiling] counters not initialized — set `config :emlx, :profile_eval, true` in runtime.exs")
+        IO.puts(
+          "[EMLX.Profiling] counters not initialized — set `config :emlx, :profile_eval, true` in runtime.exs"
+        )
     end
   end
 end

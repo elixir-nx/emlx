@@ -73,7 +73,9 @@ defmodule EMLX.Fast do
   @doc false
   def layer_norm_callback({%Nx.Tensor{} = x, %Nx.Tensor{} = weight, %Nx.Tensor{} = bias}, opts) do
     EMLX.fast_layer_norm(
-      EMLX.Backend.from_nx(x), EMLX.Backend.from_nx(weight), EMLX.Backend.from_nx(bias),
+      EMLX.Backend.from_nx(x),
+      EMLX.Backend.from_nx(weight),
+      EMLX.Backend.from_nx(bias),
       opts[:eps]
     )
     |> EMLX.Backend.to_nx()
@@ -96,7 +98,8 @@ defmodule EMLX.Fast do
   @doc false
   def layer_norm_no_bias_callback({%Nx.Tensor{} = x, %Nx.Tensor{} = weight}, opts) do
     EMLX.fast_layer_norm_no_bias(
-      EMLX.Backend.from_nx(x), EMLX.Backend.from_nx(weight),
+      EMLX.Backend.from_nx(x),
+      EMLX.Backend.from_nx(weight),
       opts[:eps]
     )
     |> EMLX.Backend.to_nx()
@@ -128,13 +131,18 @@ defmodule EMLX.Fast do
     #    key_mask filters which positions are valid.  kv_offset = T_kv - 1.
     #  - Prefill (T_q > 1): lower-triangular causal mask.  kv_offset = 0.
     #    (T_kv - T_q would be wrong for left-padded prefill with a pre-alloc cache.)
-    t_q  = elem(Nx.shape(q), 2)
+    t_q = elem(Nx.shape(q), 2)
     t_kv = elem(Nx.shape(k), 2)
     kv_offset = if t_q == 1, do: t_kv - 1, else: 0
 
     out = Nx.template(Nx.shape(q), Nx.type(q))
-    Nx.runtime_call(out, {q, k, v, key_mask}, [scale: scale, kv_offset: kv_offset],
-      &__MODULE__.sdpa_causal_key_masked_callback/2)
+
+    Nx.runtime_call(
+      out,
+      {q, k, v, key_mask},
+      [scale: scale, kv_offset: kv_offset],
+      &__MODULE__.sdpa_causal_key_masked_callback/2
+    )
   end
 
   @doc false
@@ -146,13 +154,17 @@ defmodule EMLX.Fast do
     # kv_offset was computed at deftransform time from the static shapes.
     # MLX's fast SDPA handles GQA natively (N_q may differ from N_kv) — no
     # explicit head expansion needed here.
-    scale     = opts[:scale]
+    scale = opts[:scale]
     kv_offset = opts[:kv_offset]
 
     out =
       EMLX.fast_sdpa_causal_key_masked(
-        EMLX.Backend.from_nx(q), EMLX.Backend.from_nx(k), EMLX.Backend.from_nx(v),
-        scale, EMLX.Backend.from_nx(key_mask), kv_offset
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
+        scale,
+        EMLX.Backend.from_nx(key_mask),
+        kv_offset
       )
       |> EMLX.Backend.to_nx()
 
@@ -180,16 +192,23 @@ defmodule EMLX.Fast do
   deftransform rope(a, dims, traditional, base, scale, offset) do
     out = Nx.template(Nx.shape(a), Nx.type(a))
 
-    Nx.runtime_call(out, a,
+    Nx.runtime_call(
+      out,
+      a,
       [dims: dims, traditional: traditional, base: base, scale: scale, offset: offset],
-      &__MODULE__.rope_callback/2)
+      &__MODULE__.rope_callback/2
+    )
   end
 
   @doc false
   def rope_callback(%Nx.Tensor{} = a, opts) do
     EMLX.fast_rope(
       EMLX.Backend.from_nx(a),
-      opts[:dims], opts[:traditional], opts[:base], opts[:scale], opts[:offset]
+      opts[:dims],
+      opts[:traditional],
+      opts[:base],
+      opts[:scale],
+      opts[:offset]
     )
     |> EMLX.Backend.to_nx()
   end
@@ -235,13 +254,19 @@ defmodule EMLX.Fast do
     t1_use_fast? = t == 1 and base < 1.0e5
 
     if t1_use_fast? do
-      Nx.runtime_call(out, {a, position_ids},
+      Nx.runtime_call(
+        out,
+        {a, position_ids},
         [dims: dims, traditional: traditional, base: base, scale: scale],
-        &__MODULE__.rope_with_positions_fast_callback/2)
+        &__MODULE__.rope_with_positions_fast_callback/2
+      )
     else
-      Nx.runtime_call(out, {a, position_ids},
+      Nx.runtime_call(
+        out,
+        {a, position_ids},
         [dims: dims, traditional: traditional, base: base, scale: scale],
-        &__MODULE__.rope_with_positions_callback/2)
+        &__MODULE__.rope_with_positions_callback/2
+      )
     end
   end
 
@@ -254,7 +279,10 @@ defmodule EMLX.Fast do
 
     EMLX.fast_rope_ids(
       EMLX.Backend.from_nx(a),
-      opts[:dims], opts[:traditional], opts[:base] * 1.0, opts[:scale] * 1.0,
+      opts[:dims],
+      opts[:traditional],
+      opts[:base] * 1.0,
+      opts[:scale] * 1.0,
       EMLX.Backend.from_nx(offsets)
     )
     |> EMLX.Backend.to_nx()
@@ -304,13 +332,15 @@ defmodule EMLX.Fast do
 
     if t == 1 do
       Nx.runtime_call(
-        out, {a, position_ids, freqs},
+        out,
+        {a, position_ids, freqs},
         [dims: dims, traditional: traditional, scale: scale],
         &__MODULE__.rope_with_freqs_fast_callback/2
       )
     else
       Nx.runtime_call(
-        out, {a, position_ids, freqs},
+        out,
+        {a, position_ids, freqs},
         [dims: dims, traditional: traditional, scale: scale],
         &__MODULE__.rope_with_freqs_callback/2
       )
@@ -327,7 +357,9 @@ defmodule EMLX.Fast do
 
     EMLX.fast_rope_with_freqs(
       EMLX.Backend.from_nx(a),
-      opts[:dims], opts[:traditional], opts[:scale],
+      opts[:dims],
+      opts[:traditional],
+      opts[:scale],
       EMLX.Backend.from_nx(offsets),
       EMLX.Backend.from_nx(freqs)
     )
@@ -406,7 +438,9 @@ defmodule EMLX.Fast do
   def sdpa_callback({%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v}, opts) do
     out =
       EMLX.fast_sdpa(
-        EMLX.Backend.from_nx(q), EMLX.Backend.from_nx(k), EMLX.Backend.from_nx(v),
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
         opts[:scale]
       )
       |> EMLX.Backend.to_nx()
@@ -437,8 +471,11 @@ defmodule EMLX.Fast do
       ) do
     out =
       EMLX.fast_sdpa_masked(
-        EMLX.Backend.from_nx(q), EMLX.Backend.from_nx(k), EMLX.Backend.from_nx(v),
-        EMLX.Backend.from_nx(mask), opts[:scale]
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
+        EMLX.Backend.from_nx(mask),
+        opts[:scale]
       )
       |> EMLX.Backend.to_nx()
 
@@ -471,7 +508,9 @@ defmodule EMLX.Fast do
   def sdpa_causal_callback({%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v}, opts) do
     out =
       EMLX.fast_sdpa_causal(
-        EMLX.Backend.from_nx(q), EMLX.Backend.from_nx(k), EMLX.Backend.from_nx(v),
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
         opts[:scale]
       )
       |> EMLX.Backend.to_nx()
