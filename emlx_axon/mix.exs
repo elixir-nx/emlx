@@ -24,7 +24,7 @@ defmodule EMLXAxon.MixProject do
 
   defp deps do
     [
-      {:emlx, path: ".."},
+      {:emlx, path: "../emlx"},
       {:axon, "~> 0.7"},
       # Inherit emlx's Nx git pin to avoid constraint conflicts.
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
