@@ -47,6 +47,7 @@ jobs:
         run: sudo apt-get install -y libopenblas0
 
       - name: Compile and check warnings
+        working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
 
@@ -62,6 +63,7 @@ jobs:
           epmd -daemon
 
       - name: Run tests
+        working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           if [ "${{ matrix.job.build }}" = "true" ]; then
@@ -102,6 +104,7 @@ jobs:
           echo "${ELIXIR_PATH}" >> $GITHUB_PATH
 
       - name: Setup Mix
+        working-directory: emlx
         run: |
           mix local.hex --force
           mix local.rebar --force
@@ -112,16 +115,18 @@ jobs:
         uses: actions/cache@v4
         id: mix-cache # id to use in retrieve action
         with:
-          path: ${{ github.workspace }}/deps
-          key: ${{ runner.os }}-Elixir-v${{ matrix.job.elixir }}-OTP-${{ matrix.job.otp }}-${{ hashFiles(format('{0}/mix.lock', github.workspace)) }}-v1
+          path: ${{ github.workspace }}/emlx/deps
+          key: ${{ runner.os }}-Elixir-v${{ matrix.job.elixir }}-OTP-${{ matrix.job.otp }}-${{ hashFiles(format('{0}/emlx/mix.lock', github.workspace)) }}-v1
 
       - name: Install dependencies
         if: ${{ steps.mix-cache.outputs.cache-hit != 'true' }}
+        working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           mix deps.get
 
       - name: Compile and check warnings
+        working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           if [ "${{ matrix.job.build }}" = "true" ]; then
@@ -131,6 +136,7 @@ jobs:
 
       - name: Check formatting
         if: ${{ matrix.job.lint }}
+        working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           if [ "${{ matrix.job.build }}" = "true" ]; then
@@ -144,6 +150,7 @@ jobs:
           epmd -daemon
 
       - name: Run tests
+        working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           export EMLX_TEST_DEFAULT_GPU="${{ matrix.job.gpu }}"
