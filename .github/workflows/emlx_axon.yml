@@ -1,24 +1,27 @@
-name: Validation
+name: EMLXAxon
 
 on:
   push:
     branches:
       - main
     paths:
-      - 'lib/**'
-      - 'c_src/**'
-      - 'validation/**'
-      - 'mix.exs'
-      - 'mix.lock'
+      - 'emlx/lib/**'
+      - 'emlx/c_src/**'
+      - 'emlx/mix.exs'
+      - 'emlx/mix.lock'
+      - 'emlx_axon/lib/**'
+      - 'emlx_axon/test/**'
+      - 'emlx_axon/mix.exs'
+      - 'emlx_axon/mix.lock'
   workflow_dispatch:
 
 concurrency:
-  group: validation-${{ github.ref }}
+  group: emlx-axon-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  validation:
-    name: Validation suite (macOS arm64)
+  emlx_axon:
+    name: EMLXAxon suite (macOS arm64)
     runs-on: macos-26
     env:
       MIX_ENV: test
@@ -45,38 +48,45 @@ jobs:
           mix local.hex --force
           mix local.rebar --force
 
-      - name: Cache root deps and build
+      - name: Cache emlx deps and build
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/deps
-            ${{ github.workspace }}/_build
-          key: ${{ runner.os }}-validation-root-${{ hashFiles('mix.lock', 'mix.exs', 'c_src/**') }}-v1
+            ${{ github.workspace }}/emlx/deps
+            ${{ github.workspace }}/emlx/_build
+          key: ${{ runner.os }}-emlx-axon-emlx-${{ hashFiles('emlx/mix.lock', 'emlx/mix.exs', 'emlx/c_src/**') }}-v1
 
-      - name: Cache validation deps
+      - name: Cache emlx_axon deps and build
         uses: actions/cache@v4
         with:
           path: |
-            ${{ github.workspace }}/validation/deps
-            ${{ github.workspace }}/validation/_build
-          key: ${{ runner.os }}-validation-deps-${{ hashFiles('validation/mix.lock') }}-v1
+            ${{ github.workspace }}/emlx_axon/deps
+            ${{ github.workspace }}/emlx_axon/_build
+          key: ${{ runner.os }}-emlx-axon-${{ hashFiles('emlx_axon/mix.lock', 'emlx_axon/mix.exs') }}-v1
 
-      - name: Build EMLX (root project)
+      - name: Build EMLX
+        working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           mix deps.get
           mix compile
 
-      - name: Install validation dependencies
-        working-directory: validation
+      - name: Install emlx_axon dependencies
+        working-directory: emlx_axon
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           mix deps.get
 
-      - name: Run validation suite
-        working-directory: validation
+      - name: Check formatting
+        working-directory: emlx_axon
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          mix format --check-formatted
+
+      - name: Run emlx_axon tests
+        working-directory: emlx_axon
         env:
           EMLX_TEST_DEFAULT_GPU: "true"
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
-          mix test --only validation
+          mix test --exclude quantized_inference --warnings-as-errors

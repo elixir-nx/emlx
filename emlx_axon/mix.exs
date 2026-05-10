@@ -11,6 +11,7 @@ defmodule EMLXAxon.MixProject do
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+      docs: docs(),
       aliases: aliases(),
       description: "Axon model rewrites to swap supported nodes for EMLX.Fast Metal shaders",
       package: package()
@@ -23,11 +24,25 @@ defmodule EMLXAxon.MixProject do
 
   defp deps do
     [
-      {:emlx, path: ".."},
+      {:emlx, path: "../emlx"},
       {:axon, "~> 0.7"},
       # Inherit emlx's Nx git pin to avoid constraint conflicts.
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
-      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: [:dev, :test]}
+      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: [:dev, :test]},
+      {:ex_doc, "~> 0.34", only: :docs}
+    ]
+  end
+
+  def cli do
+    [preferred_envs: [docs: :docs, "hex.publish": :docs]]
+  end
+
+  defp docs do
+    [
+      main: "EMLXAxon",
+      source_url: @source_url,
+      source_url_pattern: "#{@source_url}/blob/v#{@version}/emlx_axon/%{path}#L%{line}",
+      extras: ["README.md"]
     ]
   end
 
@@ -40,7 +55,8 @@ defmodule EMLXAxon.MixProject do
   defp package do
     [
       links: %{"GitHub" => @source_url},
-      licenses: ["Apache-2.0"]
+      licenses: ["Apache-2.0"],
+      maintainers: ["Paulo Valente"]
     ]
   end
 end
