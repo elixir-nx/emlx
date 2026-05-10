@@ -27,5 +27,5 @@ emlx-*.tar
 /cache
 
 # Validation subproject build artifacts (not the mix.lock — that is committed).
-/validation/_build/
-/validation/deps/
+/**/_build/
+/**/deps/

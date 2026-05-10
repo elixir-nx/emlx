@@ -57,6 +57,14 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
+  def metal_start_capture(_path) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def metal_stop_capture do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
   def tensor_data_ptr(_tensor) do
     :erlang.nif_error(:nif_not_loaded)
   end
@@ -87,6 +95,22 @@ defmodule EMLX.NIF do
   end
 
   def command_queue_synchronize(_queue_ref) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  # ── Graph capture / replay ─────────────────────────────────────────────────
+  # graph_capture/3 — walks the lazy MLX DAG from `outputs` back to `inputs`,
+  # builds and simplifies a replayable tape, and returns an opaque compiled_ref.
+  # Must be called while the arrays are still lazy (before eval).
+  #
+  # graph_replay/2 — substitutes `new_inputs` into the stored tape and returns
+  # new lazy output arrays without re-dispatching any Nx ops.
+
+  def graph_capture(_inputs, _outputs, _shapeless) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def graph_replay(_compiled_ref, _new_inputs) do
     :erlang.nif_error(:nif_not_loaded)
   end
 end

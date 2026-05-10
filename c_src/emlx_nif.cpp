@@ -1,22 +1,13 @@
-#include "emlx_async.hpp"
-#include "emlx_worker.hpp"
-#include "erl_nif.h"
-#include "mlx/mlx.h"
-#include "nx_nif_utils.hpp"
+#include "emlx_nif_shared.hpp"
 
 #include <iostream>
 #include <map>
 #include <numeric>
-#include <string>
-#include <cstring>
 #include <random>
-#include <optional>
 #include <cstdio>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-
-using namespace mlx::core;
 
 std::map<const std::string, const mlx::core::Dtype> dtypes = {
     {"bool", mlx::core::bool_},         {"uint8", mlx::core::uint8},
@@ -59,100 +50,6 @@ inline const std::string *dtype2string(const mlx::core::Dtype dtype) {
   return nullptr;
 }
 
-inline const mlx::core::Device string2device(const std::string &atom) {
-  if (atom == "cpu") {
-    return mlx::core::Device(mlx::core::Device::DeviceType::cpu, 0);
-  } else if (atom == "gpu") {
-    return mlx::core::Device(mlx::core::Device::DeviceType::gpu, 0);
-  }
-  throw std::runtime_error("Unknown device: " + atom);
-}
-
-// MLX 0.31+ uses Shape = SmallVector<int> and Strides = SmallVector<long long>
-// which no longer accept implicit construction from std::vector.
-static inline mlx::core::Shape to_shape(const std::vector<int> &v) {
-  return mlx::core::Shape(v.begin(), v.end());
-}
-static inline mlx::core::Strides to_strides(const std::vector<int64_t> &v) {
-  return mlx::core::Strides(v.begin(), v.end());
-}
-
-// Class to manage the refcount of MLX tensors
-class TensorP {
-public:
-  TensorP(ErlNifEnv *env, const ERL_NIF_TERM arg) : ptr(nullptr) {
-    // setup
-    if (!enif_get_resource(env, arg, resource_object<mlx::core::array>::type,
-                           (void **)&ptr)) {
-      err = nx::nif::error(env, "Unable to get tensor param in NIF");
-      return;
-    }
-
-    refcount = (std::atomic<int> *)(ptr + 1);
-    deleted = (std::atomic_flag *)(refcount + 1);
-
-    if (refcount->load() == 0) {
-      // already deallocated
-      ptr = nullptr;
-      err = nx::nif::error(env, "Tensor has been deallocated");
-      return;
-    }
-
-    if (is_valid()) {
-      // increase reference count
-      ++(*refcount);
-    }
-  }
-
-  ~TensorP() {
-    if (is_valid()) {
-      // decrease reference count
-      if (refcount->fetch_sub(1) == 0) {
-        ptr->~array(); // Call MLX tensor destructor
-      }
-    }
-  }
-
-  bool deallocate() {
-    if (is_valid() && atomic_flag_test_and_set(deleted) == false) {
-      --(*refcount);
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  mlx::core::array *data() const { return ptr; }
-
-  // Raw ERTS resource pointer for use with enif_make_resource_binary.
-  void *resource_ptr() const { return static_cast<void *>(ptr); }
-
-  bool is_valid() const { return ptr != nullptr; }
-
-  ERL_NIF_TERM error() { return err; }
-
-private:
-  mlx::core::array *ptr;
-  std::atomic<int> *refcount;
-  std::atomic_flag *deleted;
-  ERL_NIF_TERM err;
-};
-
-#define CATCH()                                                                \
-  catch (const std::exception &e) {                                            \
-    std::ostringstream msg;                                                    \
-    msg << e.what() << " in NIF." << __func__ << "/" << argc;                  \
-    return nx::nif::error(env, msg.str().c_str());                             \
-  }                                                                            \
-  catch (...) {                                                                \
-    return nx::nif::error(env, "Unknown error occurred");                      \
-  }
-
-#define TENSOR(A)                                                              \
-  try {                                                                        \
-    return nx::nif::ok(env, create_tensor_resource(env, A));                   \
-  }                                                                            \
-  CATCH()
 
 ERL_NIF_TERM
 create_tensor_resource(ErlNifEnv *env, mlx::core::array tensor) {
@@ -199,35 +96,6 @@ ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
   return ret;
 }
 
-#define NIF(NAME)                                                              \
-  ERL_NIF_TERM NAME(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[])
-
-// One-line async wrapper: declare `NIF(OP) { ... }` then `ASYNC_NIF(OP)`.
-// Register in `nif_funcs[]` at `original_arity + 1` (command queue is argv[0]).
-// Example: {"add", 4, add_async}  // was {"add", 3, add}
-#define ASYNC_NIF(OP)                                                          \
-  ERL_NIF_TERM OP##_async(ErlNifEnv *env, int argc,                            \
-                          const ERL_NIF_TERM argv[]) {                         \
-    return emlx::async_dispatch<OP>(env, argc, argv);                          \
-  }
-
-#define PARAM(ARGN, TYPE, VAR)                                                 \
-  TYPE VAR;                                                                    \
-  GET(ARGN, VAR)
-
-#define TENSOR_PARAM(ARGN, VAR)                                                \
-  TensorP VAR##_tp(env, argv[ARGN]);                                           \
-  mlx::core::array *VAR;                                                       \
-  if (!VAR##_tp.is_valid()) {                                                  \
-    return VAR##_tp.error();                                                   \
-  } else {                                                                     \
-    VAR = VAR##_tp.data();                                                     \
-  }
-
-#define LIST_PARAM(ARGN, TYPE, VAR)                                            \
-  TYPE VAR;                                                                    \
-  if (!nx::nif::get_list(env, argv[ARGN], VAR))                                \
-    return nx::nif::error(env, "Unable to get " #VAR " list param.");
 
 NIF(deallocate) {
   TensorP t(env, argv[0]);
@@ -1552,6 +1420,27 @@ ASYNC_NIF(quantized_matmul)
 ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
+// fast_* and kv_cache_* NIFs are defined in emlx_fast.cpp.
+
+// Forward declarations for the async wrappers defined in emlx_fast.cpp.
+ERL_NIF_TERM fast_rms_norm_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_rope_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_sdpa_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_sdpa_masked_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_layer_norm_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_layer_norm_no_bias_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_rope_ids_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_rope_with_freqs_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_rope_positions_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_sdpa_causal_key_masked_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_sdpa_causal_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM fast_swiglu_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM kv_cache_attention_masked_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM kv_cache_sdpa_update_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+
+// ─── Async wrappers ────────────────────────────────────────────────────────
+
 // Build a sliding window view of a padded tensor.
 // padded: [...] of ndim n; window/strides: per-axis lists of length n.
 // Returns a view of shape [o0,...,on-1, w0,...,wn-1] where
@@ -2062,7 +1951,24 @@ static ErlNifFunc nif_funcs[] = {
     // Quantization operations (async — must run on a worker thread)
     {"quantized_matmul", 9, quantized_matmul_async},
     {"dequantize", 7, dequantize_async},
-    {"quantize", 5, quantize_async}};
+    {"quantize", 5, quantize_async},
+
+    // mlx::fast ops (worker arity includes queue ref as argv[0])
+    {"fast_rms_norm", 5, fast_rms_norm_async},
+    {"fast_rope", 8, fast_rope_async},
+    {"fast_sdpa", 6, fast_sdpa_async},
+    {"fast_sdpa_masked", 7, fast_sdpa_masked_async},
+    {"fast_rope_ids", 8, fast_rope_ids_async},
+    {"fast_rope_with_freqs", 8, fast_rope_with_freqs_async},
+    {"fast_rope_positions", 8, fast_rope_positions_async},
+    {"fast_sdpa_causal_key_masked", 8, fast_sdpa_causal_key_masked_async},
+    {"fast_sdpa_causal", 6, fast_sdpa_causal_async},
+    {"fast_layer_norm", 6, fast_layer_norm_async},
+    {"fast_layer_norm_no_bias", 5, fast_layer_norm_no_bias_async},
+    {"fast_swiglu", 4, fast_swiglu_async},
+    {"kv_cache_attention", 9, kv_cache_attention_async},
+    {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
 

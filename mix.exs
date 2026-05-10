@@ -20,10 +20,6 @@ defmodule EMLX.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       docs: docs(),
-      preferred_cli_env: [
-        docs: :docs,
-        "hex.publish": :docs
-      ],
       # elixir_make
       make_env: %{
         "MLX_DIR" => libmlx_config.dir,
@@ -59,13 +55,16 @@ defmodule EMLX.MixProject do
     ]
   end
 
+  def cli do
+    [preferred_envs: [docs: :docs, "hex.publish": :docs]]
+  end
+
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      # temporary; revert to version pin once Nx.runtime_call/4 is in a release
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
