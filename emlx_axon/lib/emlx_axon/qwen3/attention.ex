@@ -1,4 +1,4 @@
-defmodule EMLX.Validation.Qwen3Quantized.Attention do
+defmodule EMLXAxon.Qwen3.Attention do
   @moduledoc """
   Grouped-query attention (GQA) for Qwen3, with a preallocated KV cache.
 
@@ -11,7 +11,7 @@ defmodule EMLX.Validation.Qwen3Quantized.Attention do
   cos/sin needed). The `offset` is the current cache fill length.
   """
 
-  alias EMLX.Validation.Qwen3Quantized.Layers
+  alias EMLXAxon.Qwen3.Layers
 
   @doc """
   GQA forward.

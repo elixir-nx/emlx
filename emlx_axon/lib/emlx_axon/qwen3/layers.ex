@@ -1,4 +1,4 @@
-defmodule EMLX.Validation.Qwen3Quantized.Layers do
+defmodule EMLXAxon.Qwen3.Layers do
   @moduledoc """
   Stateless layer primitives: RMSNorm, SwiGLU.
 

@@ -1,10 +1,10 @@
-# validation/bench/qwen3_e2e_bench.exs
+# bench/qwen3_e2e_bench.exs
 #
 # End-to-end throughput benchmark for the emlx-native Qwen3 quantized inference.
 # Stage A3 of the emlx#108 quantization perf investigation.
 #
 # Run with:
-#   cd validation
+#   cd emlx_axon
 #   mix run bench/qwen3_e2e_bench.exs
 #
 # For 8B:
@@ -12,7 +12,7 @@
 
 Nx.default_backend({EMLX.Backend, device: :gpu})
 
-alias EMLX.Validation.Qwen3Quantized.{Loader, Generate}
+alias EMLXAxon.Qwen3.{Loader, Generate}
 
 model_path =
   System.get_env("EMLX_QWEN3_MODEL_PATH") ||

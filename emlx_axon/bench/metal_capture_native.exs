@@ -1,11 +1,11 @@
-# validation/bench/metal_capture_native.exs
+# bench/metal_capture_native.exs
 #
 # Captures a Metal GPU trace of the native emlx-validation Qwen3 decode path.
 # The resulting .gputrace file can be opened in Xcode's GPU Debugger
 # (File → Open) to inspect per-kernel timing and Metal command counts.
 #
 # Run:
-#   cd validation
+#   cd emlx_axon
 #   mix run bench/metal_capture_native.exs
 #
 # Optional env vars:
@@ -16,7 +16,7 @@
 
 Nx.default_backend({EMLX.Backend, device: :gpu})
 
-alias EMLX.Validation.Qwen3Quantized.{Loader, Model, Sampler}
+alias EMLXAxon.Qwen3.{Loader, Model, Sampler}
 
 model_path =
   System.get_env("EMLX_QWEN3_MODEL_PATH") ||

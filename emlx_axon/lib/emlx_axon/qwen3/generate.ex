@@ -1,4 +1,4 @@
-defmodule EMLX.Validation.Qwen3Quantized.Generate do
+defmodule EMLXAxon.Qwen3.Generate do
   @moduledoc """
   Autoregressive token generation loop.
 
@@ -20,7 +20,7 @@ defmodule EMLX.Validation.Qwen3Quantized.Generate do
       )
   """
 
-  alias EMLX.Validation.Qwen3Quantized.{Model, Sampler}
+  alias EMLXAxon.Qwen3.{Model, Sampler}
 
   @cpu_backend Nx.BinaryBackend
 

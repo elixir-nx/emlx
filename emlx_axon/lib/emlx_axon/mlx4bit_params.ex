@@ -1,4 +1,4 @@
-defmodule EMLX.Axon.MLX4BitParams do
+defmodule EMLXAxon.MLX4BitParams do
   @moduledoc """
   Loads Qwen3 weights from an MLX-4bit safetensors checkpoint into Bumblebee
   Axon params format (BF16, Bumblebee `{in, out}` key convention).
@@ -14,15 +14,15 @@ defmodule EMLX.Axon.MLX4BitParams do
      contracts the weight's first axis (in-features).
 
   After calling `load/1`, pass the result through
-  `EMLX.Axon.QuantizeParams.quantize/1` to re-apply 4-bit quantization in
+  `EMLXAxon.QuantizeParams.quantize/1` to re-apply 4-bit quantization in
   Bumblebee's convention so `quantized_matmul` dispatch is active at serving
   time.
 
   ## Usage
 
       {:ok, model_info} = Bumblebee.load_model({:local, mlx_path})
-      params = EMLX.Axon.MLX4BitParams.load(mlx_path)
-      params = EMLX.Axon.QuantizeParams.quantize(params)
+      params = EMLXAxon.MLX4BitParams.load(mlx_path)
+      params = EMLXAxon.QuantizeParams.quantize(params)
       serving = Bumblebee.Text.generation(
         %{model_info | params: params}, tokenizer, gen_cfg, ...
       )

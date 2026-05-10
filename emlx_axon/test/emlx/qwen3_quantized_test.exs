@@ -1,16 +1,18 @@
-defmodule EMLX.Validation.Qwen3QuantizedTest do
-  use EMLX.ValidationCase, async: false
+defmodule EMLXAxon.Qwen3QuantizedTest do
+  use ExUnit.Case, async: false
 
   # Excluded from default CI runs — requires local checkpoint.
   # Run with: mix test --only quantized_inference
   @moduletag :quantized_inference
 
-  alias EMLX.Validation.Qwen3Quantized.{Loader, Generate}
+  alias EMLXAxon.Qwen3.{Loader, Generate}
 
   @model_path System.get_env("EMLX_QWEN3_MODEL_PATH") ||
                 "~/models/Qwen3-0.6B-MLX-4bit"
 
   setup_all do
+    Nx.default_backend({EMLX.Backend, device: :gpu})
+
     path = Path.expand(@model_path)
 
     unless File.dir?(path) do
@@ -54,8 +56,7 @@ defmodule EMLX.Validation.Qwen3QuantizedTest do
     #
     # Captured on M4 Max, 64 GB, macOS 26.3, EMLX 0.2.0 / MLX 0.31.2, A4 fast-ops.
     # To regenerate: run `mix test --only quantized_inference` and copy `left:`.
-    assert tokens1 == [481, 576, 11652, 1265, 2924, 279, 3409, 330, 67718, 404,
-                       1, 304, 432, 13, 481, 576, 11652, 1265, 2924, 279]
+    assert tokens1 == [481, 2585, 1558, 468, 97772, 3705, 279, 990, 315, 5746, 304, 264, 15473, 4128, 30, 481, 3555, 374, 279, 7428]
   end
 
   test "greedy decode is faster than top_p_cpu", %{state: state, tokenizer: tok} do

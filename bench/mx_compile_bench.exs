@@ -13,8 +13,8 @@
 #   K5 — SVD 1024×1024      : 1 Nx op, larger SVD (more internal GPU kernels)
 #
 # Run:
-#   mix run validation/bench/mx_compile_bench.exs
-#   EMLX_BENCH_ITERS=200 mix run validation/bench/mx_compile_bench.exs
+#   mix run bench/mx_compile_bench.exs
+#   EMLX_BENCH_ITERS=200 mix run bench/mx_compile_bench.exs
 
 defmodule MxCompileBench do
   @iters String.to_integer(System.get_env("EMLX_BENCH_ITERS", "200"))

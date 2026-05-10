@@ -1,4 +1,4 @@
-# validation/bench/profile_eval.exs
+# bench/profile_eval.exs
 #
 # C01 measurement script — EMLX eval-dispatch profiling.
 #
@@ -7,8 +7,8 @@
 # compute graph structure as a production Llama/Qwen3 — all the same NIF
 # call patterns, just smaller. The counter measurements transfer directly.
 #
-# Run (from the validation/ directory):
-#   cd validation
+# Run (from the emlx_axon/ directory):
+#   cd emlx_axon
 #   EMLX_PROFILE_EVAL=1 VQ_MAX_NEW=20 mix run bench/profile_eval.exs
 #
 # Scriptable Metal capture (no Xcode GUI):

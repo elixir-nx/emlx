@@ -1,7 +1,7 @@
-defmodule EMLX.Validation.Qwen3Quantized.Loader do
+defmodule EMLXAxon.Qwen3.Loader do
   @moduledoc """
   Loads a `lmstudio-community/Qwen3-*-MLX-4bit` checkpoint from disk into
-  an `%EMLX.Validation.Qwen3Quantized.Model.State{}` struct.
+  an `%EMLXAxon.Qwen3.Model.State{}` struct.
 
   Each linear weight is stored as a triplet in the safetensors file:
     - `<name>.weight`  — `:u32`, packed int4 data
@@ -17,7 +17,7 @@ defmodule EMLX.Validation.Qwen3Quantized.Loader do
       {:ok, state} = Loader.load("~/models/Qwen3-0.6B-MLX-4bit")
   """
 
-  alias EMLX.Validation.Qwen3Quantized.Model.State
+  alias EMLXAxon.Qwen3.Model.State
 
   @type config :: %{
           hidden_size: pos_integer(),

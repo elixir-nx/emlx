@@ -1,9 +1,9 @@
-defmodule EMLX.Native.TextGeneration do
+defmodule EMLXAxon.TextGeneration do
   @moduledoc """
   A `Nx.Serving`-compatible wrapper around the native Qwen3 quantized model.
 
   Bypasses the Axon graph entirely — the 28-layer forward pass runs as a single
-  `mlx::eval` per token (via `EMLX.Validation.Qwen3Quantized.Generate`), avoiding
+  `mlx::eval` per token (via `EMLXAxon.Qwen3.Generate`), avoiding
   the 28 separate Metal command buffer submissions that the Bumblebee + Axon path
   incurs.
 
@@ -13,7 +13,7 @@ defmodule EMLX.Native.TextGeneration do
   ## Usage
 
       {:ok, tokenizer} = Bumblebee.load_tokenizer({:local, "~/models/Qwen3-0.6B-MLX-4bit"})
-      serving = EMLX.Native.TextGeneration.from_mlx4bit(
+      serving = EMLXAxon.TextGeneration.from_mlx4bit(
         "~/models/Qwen3-0.6B-MLX-4bit",
         tokenizer,
         max_new_tokens: 100,
@@ -24,7 +24,7 @@ defmodule EMLX.Native.TextGeneration do
       IO.puts(result.results |> hd() |> Map.fetch!(:generated_text))
   """
 
-  alias EMLX.Validation.Qwen3Quantized.{Model, Generate, Loader}
+  alias EMLXAxon.Qwen3.{Model, Generate, Loader}
 
   @cpu_backend Nx.BinaryBackend
 

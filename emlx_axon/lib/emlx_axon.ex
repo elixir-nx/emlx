@@ -1,4 +1,4 @@
-defmodule EMLX.Axon do
+defmodule EMLXAxon do
   @moduledoc """
   Axon model rewrites that swap supported nodes to `EMLX.Fast` Metal shaders.
 
@@ -21,7 +21,7 @@ defmodule EMLX.Axon do
   ## Usage
 
       {:ok, %{model: model, params: params}} = Bumblebee.load_model({:hf, "Qwen/Qwen3-0.6B"})
-      model = EMLX.Axon.rewrite(model)
+      model = EMLXAxon.rewrite(model)
       serving = Bumblebee.Text.generation(
         %{model: model, params: params, spec: spec},
         tokenizer, generation_config,
@@ -125,8 +125,8 @@ defmodule EMLX.Axon do
 
   ## Example
 
-      model = EMLX.Axon.rewrite(model)
-      model = EMLX.Axon.rewrite(model, only: [:rms_norm, :layer_norm])
+      model = EMLXAxon.rewrite(model)
+      model = EMLXAxon.rewrite(model, only: [:rms_norm, :layer_norm])
 
   """
   @spec rewrite(Axon.t(), keyword()) :: Axon.t()
@@ -172,16 +172,16 @@ defmodule EMLX.Axon do
   Combines three steps into one call:
 
   1. Loads the Axon model structure from `config.json` via `Bumblebee.load_model/2`.
-  2. Loads the MLX-4bit safetensors weights via `EMLX.Axon.MLX4BitParams.load/1`,
+  2. Loads the MLX-4bit safetensors weights via `EMLXAxon.MLX4BitParams.load/1`,
      dequantizing and transposing to Bumblebee `{in, out}` layout (BF16).
-  3. Re-quantizes all eligible weight matrices via `EMLX.Axon.QuantizeParams.quantize/1`
+  3. Re-quantizes all eligible weight matrices via `EMLXAxon.QuantizeParams.quantize/1`
      so that `Nx.dot` dispatch routes to `EMLX.quantized_matmul` at serving time.
 
   Returns `{:ok, model_info}` compatible with `Bumblebee.Text.generation/4`.
 
   ## Usage
 
-      {:ok, model_info} = EMLX.Axon.load_quantized({:local, "~/models/Qwen3-0.6B-MLX-4bit"})
+      {:ok, model_info} = EMLXAxon.load_quantized({:local, "~/models/Qwen3-0.6B-MLX-4bit"})
       {:ok, tokenizer} = Bumblebee.load_tokenizer({:local, path})
       {:ok, gen_cfg}   = Bumblebee.load_generation_config({:local, path})
       gen_cfg = Bumblebee.configure(gen_cfg, max_new_tokens: 100)
@@ -195,7 +195,7 @@ defmodule EMLX.Axon do
 
   ## Notes
 
-  - **Do not apply `EMLX.Axon.rewrite/2` after `load_quantized`** — the rotary
+  - **Do not apply `EMLXAxon.rewrite/2` after `load_quantized`** — the rotary
     embedding rewrite is incompatible with the standard Bumblebee `native_kv_cache: false`
     path and produces incorrect outputs. BF16 fast ops (rms_norm, swiglu, dropout, sdpa)
     may be added once the rotary embedding rewrite is fixed.
@@ -216,7 +216,7 @@ defmodule EMLX.Axon do
     load_model_opts = Keyword.merge([backend: {EMLX.Backend, device: :gpu}, type: :bf16], opts)
 
     with {:ok, model_info} <- Bumblebee.load_model({:local, path}, load_model_opts) do
-      params = EMLX.Axon.MLX4BitParams.load(path)
+      params = EMLXAxon.MLX4BitParams.load(path)
 
       bb_keys = model_info.params.data |> Map.keys() |> MapSet.new()
       mlx_keys = params.data |> Map.keys() |> MapSet.new()
@@ -227,7 +227,7 @@ defmodule EMLX.Axon do
         require Logger
 
         Logger.warning(
-          "EMLX.Axon.load_quantized: param key mismatch — " <>
+          "EMLXAxon.load_quantized: param key mismatch — " <>
             "#{MapSet.size(missing)} missing from checkpoint, " <>
             "#{MapSet.size(extra)} extra in checkpoint. " <>
             "Missing: #{inspect(Enum.take(Enum.sort(missing), 5))}. " <>
@@ -235,7 +235,7 @@ defmodule EMLX.Axon do
         )
       end
 
-      quant_params = EMLX.Axon.QuantizeParams.quantize(params)
+      quant_params = EMLXAxon.QuantizeParams.quantize(params)
       patched = %{model_info.params | data: quant_params.data}
       {:ok, %{model_info | params: patched}}
     end
@@ -355,7 +355,7 @@ defmodule EMLX.Axon do
   call on both Q and K. The replacement node returns `{q_rotated, k_rotated}` —
   downstream `Axon.nx(_, &elem(&1, i))` unwrap nodes continue to work unchanged.
 
-  **Assumes sequential positions** — see `EMLX.Axon` moduledoc for the limitation.
+  **Assumes sequential positions** — see `EMLXAxon` moduledoc for the limitation.
   """
   @spec rotary_embedding_rewriter(reference() | nil) ::
           (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
@@ -1222,7 +1222,7 @@ defmodule EMLX.Axon do
   end
 end
 
-defmodule EMLX.Axon.QuantizeParams do
+defmodule EMLXAxon.QuantizeParams do
   @moduledoc """
   Post-load param quantization for Bumblebee models.
 
@@ -1233,8 +1233,8 @@ defmodule EMLX.Axon.QuantizeParams do
   ## Usage
 
       {:ok, model_info} = Bumblebee.load_model(source, backend: {EMLX.Backend, device: :gpu})
-      model_info = %{model_info | params: EMLX.Axon.QuantizeParams.quantize(model_info.params)}
-      model_info = %{model_info | model: EMLX.Axon.rewrite(model_info.model)}
+      model_info = %{model_info | params: EMLXAxon.QuantizeParams.quantize(model_info.params)}
+      model_info = %{model_info | model: EMLXAxon.rewrite(model_info.model)}
 
   ## Eligibility
 

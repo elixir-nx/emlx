@@ -1,6 +1,6 @@
-defmodule EMLX.AxonTest do
+defmodule EMLXAxonTest do
   @moduledoc """
-  Tests for `EMLX.Axon.rewrite/1`.
+  Tests for `EMLXAxon.rewrite/1`.
 
   ## Tag guide
   - no tag   — pure graph-structure tests; no GPU, no model load needed
@@ -42,7 +42,7 @@ defmodule EMLX.AxonTest do
   describe "rewrite/1 – graph structure" do
     test "rewrites rms_norm node to fast_rms_norm" do
       model = rms_norm_axon()
-      rewritten = EMLX.Axon.rewrite(model)
+      rewritten = EMLXAxon.rewrite(model)
 
       # Traverse nodes and confirm at least one :fast_rms_norm op_name exists
       %Axon{nodes: nodes} = rewritten
@@ -54,7 +54,7 @@ defmodule EMLX.AxonTest do
 
     test "does NOT rewrite rms_norm with non-zero shift" do
       model = rms_norm_axon(1.0e-6, 0.5)
-      rewritten = EMLX.Axon.rewrite(model)
+      rewritten = EMLXAxon.rewrite(model)
 
       %Axon{nodes: nodes} = rewritten
       op_names = nodes |> Map.values() |> Enum.map(& &1.op_name)
@@ -66,7 +66,7 @@ defmodule EMLX.AxonTest do
 
     test "rewrite/2 with only: [] skips all rewrites" do
       model = rms_norm_axon()
-      rewritten = EMLX.Axon.rewrite(model, only: [])
+      rewritten = EMLXAxon.rewrite(model, only: [])
 
       %Axon{nodes: nodes} = rewritten
       op_names = nodes |> Map.values() |> Enum.map(& &1.op_name)
@@ -77,8 +77,8 @@ defmodule EMLX.AxonTest do
 
     test "rewrite/2 with only: [:rms_norm] is equivalent to rewrite/1" do
       model = rms_norm_axon()
-      default_result = EMLX.Axon.rewrite(model)
-      explicit_result = EMLX.Axon.rewrite(model, only: [:rms_norm])
+      default_result = EMLXAxon.rewrite(model)
+      explicit_result = EMLXAxon.rewrite(model, only: [:rms_norm])
 
       %Axon{nodes: n1} = default_result
       %Axon{nodes: n2} = explicit_result
@@ -92,10 +92,10 @@ defmodule EMLX.AxonTest do
 
     test "model with no rms_norm nodes is returned unchanged" do
       model = Axon.input("x", shape: {nil, 8}) |> Axon.dense(4)
-      rewritten = EMLX.Axon.rewrite(model)
+      rewritten = EMLXAxon.rewrite(model)
 
       %Axon{nodes: orig_nodes} = model
-      %Axon{nodes: new_nodes} = rewritten 
+      %Axon{nodes: new_nodes} = rewritten
 
       orig_op_names = orig_nodes |> Map.values() |> Enum.map(& &1.op_name) |> Enum.sort()
       new_op_names = new_nodes |> Map.values() |> Enum.map(& &1.op_name) |> Enum.sort()
@@ -135,7 +135,7 @@ defmodule EMLX.AxonTest do
 
       # Rewritten model (EMLX.Fast.rms_norm) — same :ones initialiser
       {fast_predict, fast_params} =
-        build_and_init(EMLX.Axon.rewrite(rms_norm_axon(eps)), input_template)
+        build_and_init(EMLXAxon.rewrite(rms_norm_axon(eps)), input_template)
 
       fast_out = fast_predict.(fast_params, %{"x" => x_val})
 
@@ -152,7 +152,7 @@ defmodule EMLX.AxonTest do
       x_val = Nx.iota({2, 6, 16}) |> Nx.divide(100) |> Nx.as_type(:f32)
 
       {fast_predict, fast_params} =
-        build_and_init(EMLX.Axon.rewrite(rms_norm_axon(1.0e-6)), input_template)
+        build_and_init(EMLXAxon.rewrite(rms_norm_axon(1.0e-6)), input_template)
 
       fast_out = fast_predict.(fast_params, %{"x" => x_val})
 

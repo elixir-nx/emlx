@@ -1,4 +1,4 @@
-defmodule EMLX.Axon.MixProject do
+defmodule EMLXAxon.MixProject do
   use Mix.Project
 
   @version "0.1.0"
@@ -27,9 +27,7 @@ defmodule EMLX.Axon.MixProject do
       {:axon, "~> 0.7"},
       # Inherit emlx's Nx git pin to avoid constraint conflicts.
       {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
-      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: [:dev, :test]},
-      # Native serving uses validation/ forward pass for the 28-layer generate loop.
-      {:emlx_validation, path: "../validation", only: [:dev, :test]}
+      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: [:dev, :test]}
     ]
   end
 

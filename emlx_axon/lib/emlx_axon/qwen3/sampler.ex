@@ -1,4 +1,4 @@
-defmodule EMLX.Validation.Qwen3Quantized.Sampler do
+defmodule EMLXAxon.Qwen3.Sampler do
   @moduledoc """
   Three sampling strategies for autoregressive token generation.
 

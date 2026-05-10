@@ -1,4 +1,4 @@
-defmodule EMLX.Validation.Qwen3Quantized.Model do
+defmodule EMLXAxon.Qwen3.Model do
   @moduledoc """
   Qwen3 quantized model state struct and forward pass.
 
@@ -24,7 +24,7 @@ defmodule EMLX.Validation.Qwen3Quantized.Model do
   the full lazy MLX graph spans all 28 layers before any CPU sync.
   """
 
-  alias EMLX.Validation.Qwen3Quantized.{Layers, Attention}
+  alias EMLXAxon.Qwen3.{Layers, Attention}
 
   defmodule State do
     @moduledoc "Loaded model weights and config."
