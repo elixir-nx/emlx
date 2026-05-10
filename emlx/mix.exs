@@ -73,7 +73,7 @@ defmodule EMLX.MixProject do
   defp docs do
     [
       main: "EMLX",
-      source_url_pattern: "#{@source_url}/blob/v#{@version}/%{path}#L%{line}",
+      source_url_pattern: "#{@source_url}/blob/v#{@version}/emlx/%{path}#L%{line}",
       extras: [
         "README.md"
       ]
