@@ -55,7 +55,8 @@ defmodule EMLXAxon.MixProject do
   defp package do
     [
       links: %{"GitHub" => @source_url},
-      licenses: ["Apache-2.0"]
+      licenses: ["Apache-2.0"],
+      maintainers: ["Paulo Valente"]
     ]
   end
 end
