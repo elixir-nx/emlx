@@ -136,6 +136,17 @@ end
 defmodule EMLX do
   use EMLX.Macro
 
+  @profile_eval Application.compile_env(:emlx, :profile_eval, false)
+  # Emits the profiling call only when `config :emlx, :profile_eval, true` is
+  # set at compile time; otherwise expands to `:ok` with zero runtime cost.
+  defmacrop maybe_profile(call) do
+    if @profile_eval do
+      call
+    else
+      :ok
+    end
+  end
+
   defguard is_tensor(device, ref) when is_reference(ref) and is_atom(device)
 
   ## Macro callbacks
@@ -994,6 +1005,7 @@ defmodule EMLX do
   end
 
   def to_blob({device, ref} = tensor) when is_tensor(device, ref) do
+    maybe_profile(EMLX.Profiling.inc_to_blob())
     # Eval first so the underlying MLX array is materialised; then ask the
     # worker for the contiguous-copy + zero-copy resource binary. Both
     # operations are routed through the same worker resolution path so
@@ -1006,6 +1018,7 @@ defmodule EMLX do
   end
 
   def to_blob({device, ref} = tensor, limit) when is_tensor(device, ref) do
+    maybe_profile(EMLX.Profiling.inc_to_blob())
     eval(tensor)
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.to_blob(worker, ref, limit) |> unwrap!()
@@ -1114,6 +1127,7 @@ defmodule EMLX do
        (CPU or GPU) is used — see `EMLX.Application`.
   """
   def eval({device, ref}) when is_tensor(device, ref) do
+    maybe_profile(EMLX.Profiling.inc_eval())
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
     await_worker(job_ref)
@@ -1196,6 +1210,7 @@ defmodule EMLX do
   stream encoder.
   """
   def item({device, ref}) when is_tensor(device, ref) do
+    maybe_profile(EMLX.Profiling.inc_item())
     {worker, _effective_device} = resolve_worker(device)
     job_ref = EMLX.NIF.item(worker, ref) |> unwrap!()
     await_worker(job_ref)
