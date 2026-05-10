@@ -77,6 +77,12 @@ jobs:
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           mix deps.get
 
+      - name: Check formatting
+        working-directory: emlx_axon
+        run: |
+          export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          mix format --check-formatted
+
       - name: Run emlx_axon tests
         working-directory: emlx_axon
         env:
