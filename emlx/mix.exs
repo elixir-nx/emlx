@@ -2,7 +2,7 @@ defmodule EMLX.MixProject do
   use Mix.Project
 
   @app :emlx
-  @version "0.2.0"
+  @version "0.3.0"
   @mlx_version "0.31.2"
   @source_url "https://github.com/elixir-nx/emlx"
 
@@ -65,7 +65,7 @@ defmodule EMLX.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
+      {:nx, "~> 0.12"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
   end
