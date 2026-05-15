@@ -2140,24 +2140,10 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def block(%Nx.Block.LinAlg.SVD{full_matrices?: full?}, {out_u, out_s, out_v}, [tensor], _fun) do
+  def block(%Nx.Block.LinAlg.SVD{full_matrices?: true}, {out_u, out_s, out_v}, [tensor], _fun) do
     t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
     [u, s, vt] = EMLX.linalg_svd(t, true)
-
-    # MLX always returns full matrices; truncate for full_matrices?: false
-    {u_final, vt_final} =
-      if full? do
-        {u, vt}
-      else
-        # Truncate U to {m, k} and Vt to {k, n} where k = min(m, n)
-        {_m, k} = out_u.shape
-        u_sliced = EMLX.slice(u, [0, 0], [elem(EMLX.shape(u), 0), k], [1, 1])
-        {_k2, n} = out_v.shape
-        vt_sliced = EMLX.slice(vt, [0, 0], [k, n], [1, 1])
-        {u_sliced, vt_sliced}
-      end
-
-    {to_nx(u_final, out_u), to_nx(s, out_s), to_nx(vt_final, out_v)}
+    {to_nx(u, out_u), to_nx(s, out_s), to_nx(vt, out_v)}
   end
 
   @impl true
