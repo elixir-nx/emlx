@@ -33,6 +33,10 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
+  def to_device(_worker, _tensor, _device) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
   def item(_worker, _tensor_ref) do
     :erlang.nif_error(:nif_not_loaded)
   end

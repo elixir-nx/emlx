@@ -1,7 +1,7 @@
 defmodule EMLXAxon.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.3.0"
   @source_url "https://github.com/elixir-nx/emlx"
 
   def project do
@@ -24,11 +24,10 @@ defmodule EMLXAxon.MixProject do
 
   defp deps do
     [
-      {:emlx, path: "../emlx"},
+      # {:emlx, path: "../emlx"},
+      {:emlx, "~> 0.3"},
       {:axon, "~> 0.7"},
-      # Inherit emlx's Nx git pin to avoid constraint conflicts.
-      {:nx, github: "elixir-nx/nx", sparse: "nx", override: true},
-      {:bumblebee, github: "elixir-nx/bumblebee", override: true, only: [:dev, :test]},
+      {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
   end

@@ -175,14 +175,14 @@ defmodule EMLX.Backend do
     # Preserve quantization_config when copying a quantized tensor to EMLX.Backend.
     # The generic backend_copy goes through to_binary/from_binary which drops the config.
     target_device = device_option(opts)
-    gpu_opts = {EMLX.Backend, device: target_device}
+    device_opts = {EMLX.Backend, device: target_device}
 
     packed_size = Enum.reduce(Tuple.to_list(packed_shape), 1, &*/2)
     packed_binary = EMLX.to_blob(ref, packed_size)
     new_ref = EMLX.from_blob(packed_binary, packed_shape, :uint32, target_device)
 
-    new_scales = Nx.backend_transfer(cfg.scales, gpu_opts)
-    new_biases = Nx.backend_transfer(cfg.biases, gpu_opts)
+    new_scales = Nx.backend_copy(cfg.scales, device_opts)
+    new_biases = Nx.backend_copy(cfg.biases, device_opts)
 
     %T{
       shape: logical_shape,
@@ -1984,8 +1984,10 @@ defmodule EMLX.Backend do
       raise ArgumentError, "can't solve for singular matrix"
     end
 
-    a_typed = to_typed_ref(from_nx(a), a.type, {:f, 32})
-    b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32})
+    {device, _} = from_nx(a)
+
+    a_typed = to_typed_ref(from_nx(a), a.type, {:f, 32}) |> EMLX.to_device(:cpu)
+    b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32}) |> EMLX.to_device(:cpu)
 
     upper = !opts[:lower]
 
@@ -2018,6 +2020,7 @@ defmodule EMLX.Backend do
 
     out_mx
     |> EMLX.astype(to_mlx_type(out.type))
+    |> EMLX.to_device(device)
     |> to_nx(out)
   end
 
@@ -2103,11 +2106,18 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def block(%Nx.Block.LinAlg.Cholesky{}, out, [tensor], _fun) do
-    from_nx(tensor)
-    |> to_typed_ref(tensor.type, {:f, 32})
-    |> EMLX.linalg_cholesky(false)
-    |> to_nx(out)
+  def block(%Nx.Block.LinAlg.Cholesky{} = struct, out, [tensor], fun) do
+    {device, _ref} = t_mx = from_nx(tensor)
+
+    case device do
+      :cpu ->
+        t = to_typed_ref(t_mx, tensor.type, {:f, 32})
+        cholesky = EMLX.linalg_cholesky(t, false)
+        to_nx(cholesky, out)
+
+      :gpu ->
+        fun.(struct, tensor)
+    end
   end
 
   @impl true
@@ -2120,10 +2130,18 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def block(%Nx.Block.LinAlg.QR{mode: :reduced}, {out_q, out_r}, [tensor], _fun) do
-    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
-    {q, r} = EMLX.linalg_qr(t)
-    {to_nx(q, out_q), to_nx(r, out_r)}
+  def block(%Nx.Block.LinAlg.QR{mode: :reduced} = struct, {out_q, out_r}, [tensor], fun) do
+    {device, _ref} = t_mx = from_nx(tensor)
+
+    case device do
+      :cpu ->
+        t = to_typed_ref(t_mx, tensor.type, {:f, 32})
+        {q, r} = EMLX.linalg_qr(t)
+        {to_nx(q, out_q), to_nx(r, out_r)}
+
+      :gpu ->
+        fun.(struct, tensor)
+    end
   end
 
   @impl true
@@ -2133,17 +2151,38 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def block(%Nx.Block.LinAlg.Eigh{}, {out_eigenvals, out_eigenvecs}, [tensor], _fun) do
-    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
-    {eigenvalues, eigenvectors} = EMLX.linalg_eigh(t, :L)
-    {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
+  def block(%Nx.Block.LinAlg.Eigh{} = struct, {out_eigenvals, out_eigenvecs}, [tensor], fun) do
+    {device, _ref} = t_mx = from_nx(tensor)
+
+    case device do
+      :cpu ->
+        t = to_typed_ref(t_mx, tensor.type, {:f, 32})
+        {eigenvalues, eigenvectors} = EMLX.linalg_eigh(t, :L)
+        {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
+
+      :gpu ->
+        fun.(struct, tensor)
+    end
   end
 
   @impl true
-  def block(%Nx.Block.LinAlg.SVD{full_matrices?: true}, {out_u, out_s, out_v}, [tensor], _fun) do
-    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
-    [u, s, vt] = EMLX.linalg_svd(t, true)
-    {to_nx(u, out_u), to_nx(s, out_s), to_nx(vt, out_v)}
+  def block(
+        %Nx.Block.LinAlg.SVD{full_matrices?: true} = struct,
+        {out_u, out_s, out_v},
+        [tensor],
+        fun
+      ) do
+    {device, _ref} = t_mx = from_nx(tensor)
+
+    case device do
+      :cpu ->
+        t = to_typed_ref(t_mx, tensor.type, {:f, 32})
+        [u, s, vt] = EMLX.linalg_svd(t, true)
+        {to_nx(u, out_u), to_nx(s, out_s), to_nx(vt, out_v)}
+
+      :gpu ->
+        fun.(struct, tensor)
+    end
   end
 
   @impl true

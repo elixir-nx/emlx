@@ -495,6 +495,13 @@ NIF(eval) {
   return nx::nif::ok(env);
 }
 
+NIF(to_device) {
+  TENSOR_PARAM(0, t);
+  DEVICE_PARAM(1, device);
+  TENSOR(mlx::core::contiguous(*t, false, device));
+}
+ASYNC_NIF(to_device)
+
 NIF(stack) {
   LIST_PARAM(0, std::vector<mlx::core::array>, arrays);
   PARAM(1, int, axis);
@@ -1797,6 +1804,7 @@ ASYNC_NIF(window_scatter_min)
 
 static ErlNifFunc nif_funcs[] = {
     {"eval", 2, eval_async},
+    {"to_device", 3, to_device_async},
     {"to_blob", 2, to_blob_async},
     {"to_blob", 3, to_blob_async},
     {"tensor_to_shm", 3, tensor_to_shm_async},
