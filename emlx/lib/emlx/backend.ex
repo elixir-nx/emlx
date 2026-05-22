@@ -175,14 +175,14 @@ defmodule EMLX.Backend do
     # Preserve quantization_config when copying a quantized tensor to EMLX.Backend.
     # The generic backend_copy goes through to_binary/from_binary which drops the config.
     target_device = device_option(opts)
-    gpu_opts = {EMLX.Backend, device: target_device}
+    device_opts = {EMLX.Backend, device: target_device}
 
     packed_size = Enum.reduce(Tuple.to_list(packed_shape), 1, &*/2)
     packed_binary = EMLX.to_blob(ref, packed_size)
     new_ref = EMLX.from_blob(packed_binary, packed_shape, :uint32, target_device)
 
-    new_scales = Nx.backend_copy(cfg.scales, gpu_opts)
-    new_biases = Nx.backend_copy(cfg.biases, gpu_opts)
+    new_scales = Nx.backend_copy(cfg.scales, device_opts)
+    new_biases = Nx.backend_copy(cfg.biases, device_opts)
 
     %T{
       shape: logical_shape,
