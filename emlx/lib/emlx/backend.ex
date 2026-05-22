@@ -1987,7 +1987,7 @@ defmodule EMLX.Backend do
     {device, _} = from_nx(a)
 
     a_typed = to_typed_ref(from_nx(a), a.type, {:f, 32}) |> EMLX.to_device(:cpu)
-    b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32})  |> EMLX.to_device(:cpu)
+    b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32}) |> EMLX.to_device(:cpu)
 
     upper = !opts[:lower]
 
@@ -2166,7 +2166,12 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def block(%Nx.Block.LinAlg.SVD{full_matrices?: true} = struct, {out_u, out_s, out_v}, [tensor], fun) do
+  def block(
+        %Nx.Block.LinAlg.SVD{full_matrices?: true} = struct,
+        {out_u, out_s, out_v},
+        [tensor],
+        fun
+      ) do
     {device, _ref} = t_mx = from_nx(tensor)
 
     case device do

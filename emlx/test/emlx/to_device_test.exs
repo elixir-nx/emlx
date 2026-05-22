@@ -5,6 +5,7 @@ defmodule EMLX.ToDeviceTest do
     test "preserves values" do
       t = Nx.iota({3, 4}, type: :f32, backend: {EMLX.Backend, device: :cpu})
       result_ref = EMLX.to_device(EMLX.Backend.from_nx(t), :cpu)
+
       assert EMLX.to_blob(result_ref) ==
                Nx.to_binary(Nx.iota({3, 4}, type: :f32, backend: Nx.BinaryBackend))
     end
