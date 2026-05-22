@@ -1195,6 +1195,23 @@ defmodule EMLX do
     await_worker(job_ref)
   end
 
+  @doc """
+  Moves a tensor to `target_device` (`:cpu` or `:gpu`) without deallocating
+  the source.
+
+  Unlike `Nx.backend_transfer/2`, this does not round-trip through a binary
+  and does not call `backend_deallocate` on the original tensor. Internally
+  it schedules `mlx::core::contiguous(arr, target_device)` on the target
+  device's worker thread, which on Apple Silicon (unified memory) avoids any
+  physical data copy.
+  """
+  def to_device({old_device, ref}, target_device)
+      when is_tensor(old_device, ref) and target_device in [:cpu, :gpu] do
+    {worker, effective_device} = resolve_worker(target_device)
+    job_ref = EMLX.NIF.to_device(worker, ref, effective_device) |> unwrap!()
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
   # ── Worker resolution ──────────────────────────────────────────────────────
   #
   # `Process.get(:emlx_command_queue)` is set by EMLX.CommandQueue.with_queue/2.
