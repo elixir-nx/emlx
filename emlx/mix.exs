@@ -2,7 +2,7 @@ defmodule EMLX.MixProject do
   use Mix.Project
 
   @app :emlx
-  @version "0.3.0"
+  @version "0.3.1"
   @mlx_version "0.31.2"
   @source_url "https://github.com/elixir-nx/emlx"
 
