@@ -1,3 +1,10 @@
+# Helper to escape spaces so that paths work as Make targets/prerequisites
+# and survive expansion into shell recipes (backslash-escaped spaces are
+# treated as literal spaces by both Make and the shell).
+empty :=
+space := $(empty) $(empty)
+esc = $(subst $(space),\$(space),$(1))
+
 # Private configuration
 PRIV_DIR = $(MIX_APP_PATH)/priv
 BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)/objs
@@ -13,7 +20,7 @@ MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
 
 $(info LIBMLX_ENABLE_DEBUG=$(LIBMLX_ENABLE_DEBUG))
 # Build flags
-CFLAGS = -fPIC -I$(ERTS_INCLUDE_DIR) -I$(MLX_INCLUDE_DIR) -Wall \
+CFLAGS = -fPIC -I$(call esc,$(ERTS_INCLUDE_DIR)) -I$(call esc,$(MLX_INCLUDE_DIR)) -Wall \
          -std=c++20
 ifeq ($(LIBMLX_ENABLE_DEBUG),true)
 		CFLAGS += -g
@@ -23,7 +30,7 @@ else
 		CMAKE_BUILD_TYPE = Release
 endif
 
-LDFLAGS = -L$(MLX_LIB_DIR) -lmlx -shared
+LDFLAGS = -L$(call esc,$(MLX_LIB_DIR)) -lmlx -shared
 
 # Platform-specific settings
 UNAME_S := $(shell uname -s)
@@ -42,32 +49,32 @@ MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 # Source files
 SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp
 HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp
-OBJECTS = $(patsubst c_src/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
+OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 
 # Main targets
-all: $(MLX_SO) $(EMLX_SO)
+all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_SO))
 	@ echo > /dev/null
 
-$(PRIV_DIR):
-	@ mkdir -p $(PRIV_DIR)
+$(call esc,$(PRIV_DIR)):
+	@ mkdir -p "$(PRIV_DIR)"
 
-$(BUILD_DIR)/%.o: c_src/%.cpp $(HEADERS)
-	@ mkdir -p $(BUILD_DIR)
-	$(CXX) $(CFLAGS) -c $< -o $@
+$(call esc,$(BUILD_DIR))/%.o: c_src/%.cpp $(HEADERS)
+	@ mkdir -p "$(BUILD_DIR)"
+	$(CXX) $(CFLAGS) -c "$<" -o "$@"
 
-$(MLX_SRC_ARCHIVE):
+$(call esc,$(MLX_SRC_ARCHIVE)):
 	@ if [ "$(MLX_BUILD)" = "true" ]; then \
 		mkdir -p "$(EMLX_CACHE_DIR)/mlx" && \
 		curl -fSL "https://github.com/ml-explore/mlx/archive/refs/tags/v$(MLX_VERSION).tar.gz" -o "$(MLX_SRC_ARCHIVE)" ; \
 	fi
 
-$(MLX_SRC_DIR): $(MLX_SRC_ARCHIVE)
+$(call esc,$(MLX_SRC_DIR)): $(call esc,$(MLX_SRC_ARCHIVE))
 	@ if [ "$(MLX_BUILD)" = "true" ]; then \
 		mkdir -p "$(MLX_SRC_DIR)" && \
 		tar -xzf "$(MLX_SRC_ARCHIVE)" -C "$(MLX_SRC_DIR)" --strip-components=1 ; \
 	fi
 
-$(MLX_SO): $(MLX_SRC_DIR)
+$(call esc,$(MLX_SO)): $(call esc,$(MLX_SRC_DIR))
 	@ if [ "$(MLX_BUILD)" = "true" ]; then \
 		cd "$(MLX_SRC_DIR)" && \
 		export DESTDIR="$(MLX_INSTALL_DIR)" && \
@@ -89,14 +96,14 @@ $(MLX_SO): $(MLX_SRC_DIR)
 		fi ; \
 	fi
 
-$(EMLX_SO): $(PRIV_DIR) $(MLX_SO) $(OBJECTS)
+$(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(OBJECTS)
 	@ echo "Copying MLX library to $(EMLX_LIB_DIR)"
-	@ mkdir -p $(EMLX_LIB_DIR)
-	@ cp -a $(MLX_LIB_DIR)/* $(EMLX_LIB_DIR)
-	$(CXX) $(OBJECTS) -o $(EMLX_SO) $(LDFLAGS)
+	@ mkdir -p "$(EMLX_LIB_DIR)"
+	@ cp -a "$(MLX_LIB_DIR)"/* "$(EMLX_LIB_DIR)"
+	$(CXX) $(OBJECTS) -o "$(EMLX_SO)" $(LDFLAGS)
 
 clean:
-	rm -rf $(PRIV_DIR)
-	rm -rf $(BUILD_DIR)
+	rm -rf "$(PRIV_DIR)"
+	rm -rf "$(BUILD_DIR)"
 
 .PHONY: all clean
