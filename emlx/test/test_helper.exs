@@ -51,8 +51,8 @@ distributed_exclude =
 
 gpu_exclude =
   case EMLX.NIF.command_queue_new(:gpu) do
-    {:ok, _} -> []
+    {:ok, _} -> [:large_memory]
     {:error, _} -> [:metal]
   end
 
-ExUnit.start(exclude: distributed_exclude ++ gpu_exclude)
+ExUnit.start(exclude: distributed_exclude ++ gpu_exclude ++ large_memory_exclude)

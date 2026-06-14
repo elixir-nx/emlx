@@ -173,6 +173,7 @@ defmodule EMLXTest do
 
   # Regression: elem_count overflowed int32 for shapes whose element count
   # exceeds INT32_MAX, causing "Binary size is too small" on valid binaries.
+  @tag :large_memory
   test "from_binary accepts shape whose element count exceeds INT32_MAX" do
     # Reshape on BinaryBackend first — Nx.from_binary creates a flat 1D tensor
     # whose single dimension would also exceed INT32_MAX.
