@@ -171,22 +171,19 @@ defmodule EMLXTest do
     end
   end
 
-  describe "large tensors (element count > INT32_MAX)" do
-    # Regression: elem_count overflowed int32 for shapes whose element count
-    # exceeds INT32_MAX, causing "Binary size is too small" on valid binaries.
-    @tag :large_tensor
-    test "from_binary accepts shape whose element count exceeds INT32_MAX" do
-      # Reshape on BinaryBackend first — Nx.from_binary creates a flat 1D tensor
-      # whose single dimension would also exceed INT32_MAX.
-      binary = :binary.copy(<<7>>, 2_147_483_648)
+  # Regression: elem_count overflowed int32 for shapes whose element count
+  # exceeds INT32_MAX, causing "Binary size is too small" on valid binaries.
+  test "from_binary accepts shape whose element count exceeds INT32_MAX" do
+    # Reshape on BinaryBackend first — Nx.from_binary creates a flat 1D tensor
+    # whose single dimension would also exceed INT32_MAX.
+    int_32_max = 2 ** 31
+    binary = String.duplicate(<<7>>, int_32_max)
+    shape = {2, div(int_32_max, 2)}
 
-      t =
-        Nx.from_binary(binary, :u8, backend: Nx.BinaryBackend)
-        |> Nx.reshape({2, 1_073_741_824})
-        |> Nx.backend_transfer(EMLX.Backend)
+    out = Nx.template(shape, :u8)
+    t = EMLX.Backend.from_binary(out, binary, backend: EMLX.Backend)
 
-      assert Nx.shape(t) == {2, 1_073_741_824}
-      assert Nx.to_number(t[0][0]) == 7
-    end
+    assert Nx.shape(t) == shape
+    assert_equal(Nx.all(Nx.equal(t, 7)), 1)
   end
 end
