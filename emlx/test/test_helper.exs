@@ -55,4 +55,4 @@ gpu_exclude =
     {:error, _} -> [:metal]
   end
 
-ExUnit.start(exclude: distributed_exclude ++ gpu_exclude ++ large_memory_exclude)
+ExUnit.start(exclude: distributed_exclude ++ gpu_exclude)
