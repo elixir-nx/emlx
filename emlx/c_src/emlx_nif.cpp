@@ -218,7 +218,7 @@ NIF(to_blob) {
 }
 
 uint64_t elem_count(std::vector<int> shape) {
-  return std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<>{});
+  return std::accumulate(shape.begin(), shape.end(), uint64_t{1}, std::multiplies<uint64_t>{});
 }
 
 NIF(from_blob) {
