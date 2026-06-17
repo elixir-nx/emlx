@@ -159,27 +159,86 @@ defmodule EMLX.Backend do
   @impl true
   def backend_copy(
         %T{
-          shape: logical_shape,
-          type: logical_type,
-          names: names,
           data: %Backend{
-            ref: ref,
-            shape: packed_shape,
-            type: packed_type,
-            quantization_config: %EMLX.Quantization.Config{} = cfg
+            quantization_config: nil
           }
-        },
+        } = tensor,
         EMLX.Backend,
         opts
       ) do
+    copy_to_device(tensor, device_option(opts))
+  end
+
+  @impl true
+  def backend_copy(
+        %T{
+          data: %Backend{
+            quantization_config: %EMLX.Quantization.Config{}
+          }
+        } = tensor,
+        EMLX.Backend,
+        opts
+      ) do
+    copy_quantized_to_device(tensor, opts)
+  end
+
+  @impl true
+  def backend_copy(
+        %T{data: %Nx.BinaryBackend{state: binary}, type: type, shape: shape} = tensor,
+        EMLX.Backend,
+        opts
+      ) do
+    binary
+    |> maybe_modify_binary(type, to_nx_type(to_mlx_type(type)))
+    |> EMLX.from_blob(shape, to_mlx_type(type), device_option(opts))
+    |> to_nx(tensor)
+  end
+
+  @impl true
+  def backend_copy(%T{type: type, shape: shape} = tensor, backend, opts) do
+    Nx.from_binary(to_binary(tensor, Nx.size(tensor)), type, backend: {backend, opts})
+    |> Nx.reshape(shape)
+  end
+
+  defp copy_to_device(%T{data: %Backend{ref: {device, _ref}}} = tensor, device) do
+    tensor
+    |> from_nx()
+    |> EMLX.copy()
+    |> to_nx(tensor)
+  end
+
+  defp copy_to_device(%T{data: %Backend{ref: ref}} = tensor, target_device) do
+    ref
+    |> EMLX.to_device(target_device)
+    |> to_nx(tensor)
+  end
+
+  defp copy_quantized_to_device(
+         %T{
+           shape: logical_shape,
+           type: logical_type,
+           names: names,
+           data: %Backend{
+             ref: ref,
+             shape: packed_shape,
+             type: packed_type,
+             quantization_config: %EMLX.Quantization.Config{} = cfg
+           }
+         },
+         opts
+       ) do
     # Preserve quantization_config when copying a quantized tensor to EMLX.Backend.
     # The generic backend_copy goes through to_binary/from_binary which drops the config.
     target_device = device_option(opts)
     device_opts = {EMLX.Backend, device: target_device}
 
-    packed_size = Enum.reduce(Tuple.to_list(packed_shape), 1, &*/2)
-    packed_binary = EMLX.to_blob(ref, packed_size)
-    new_ref = EMLX.from_blob(packed_binary, packed_shape, :uint32, target_device)
+    new_ref =
+      if elem(ref, 0) == target_device do
+        ref
+        |> EMLX.copy()
+      else
+        EMLX.to_device(ref, target_device)
+      end
 
     new_scales = Nx.backend_copy(cfg.scales, device_opts)
     new_biases = Nx.backend_copy(cfg.biases, device_opts)
@@ -198,9 +257,14 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def backend_copy(%T{type: type, shape: shape} = tensor, backend, opts) do
-    Nx.from_binary(to_binary(tensor, Nx.size(tensor)), type, backend: {backend, opts})
-    |> Nx.reshape(shape)
+  def backend_transfer(%T{data: %Backend{ref: {device, _ref}}} = tensor, EMLX.Backend, opts) do
+    if device == device_option(opts) do
+      tensor
+    else
+      new_tensor = backend_copy(tensor, EMLX.Backend, opts)
+      backend_deallocate(tensor)
+      new_tensor
+    end
   end
 
   @impl true

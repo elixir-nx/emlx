@@ -179,6 +179,7 @@ defmodule EMLX do
   ## Manipulation
   deftensor reshape(tensor, shape)
   deftensor broadcast_to(tensor, shape)
+  deftensor copy(tensor)
   deftensor astype(tensor, type)
   deftensor as_strided(tensor, shape, strides, offset)
   deftensor view(tensor, type)

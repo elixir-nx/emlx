@@ -160,6 +160,13 @@ NIF(astype) {
   TENSOR(mlx::core::astype(*t, type, device));
 }
 
+NIF(copy) {
+  TENSOR_PARAM(0, t);
+  DEVICE_PARAM(1, device);
+
+  TENSOR(mlx::core::copy(*t, device));
+}
+
 // Builds the resource binary for `to_blob` in `out_env`. Used by both the
 // legacy direct-call NIF and `command_queue_post_to_blob` (which builds the
 // term inside the worker thread for delivery via enif_send). May throw
@@ -1683,6 +1690,7 @@ ASYNC_NIF(full)
 ASYNC_NIF(arange)
 ASYNC_NIF(eye)
 ASYNC_NIF(reshape)
+ASYNC_NIF(copy)
 ASYNC_NIF(astype)
 ASYNC_NIF(view)
 ASYNC_NIF(broadcast_to)
@@ -1817,6 +1825,7 @@ static ErlNifFunc nif_funcs[] = {
     {"arange", 6, arange_async},
     {"eye", 5, eye_async},
     {"reshape", 4, reshape_async},
+    {"copy", 3, copy_async},
     {"astype", 4, astype_async},
     {"view", 4, view_async},
     {"broadcast_to", 4, broadcast_to_async},
@@ -1979,4 +1988,3 @@ static ErlNifFunc nif_funcs[] = {
     {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
-
