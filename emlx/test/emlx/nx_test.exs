@@ -27,6 +27,79 @@ defmodule EMLX.NxTest do
   ]
   @unary_ops [:abs, :bitwise_not, :ceil, :floor, :negate, :round, :sign, :argmax, :argmin]
 
+  test "backend_transfer to the same EMLX device is a no-op" do
+    tensor = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: {EB, device: :cpu})
+
+    assert Nx.backend_transfer(tensor, {EB, device: :cpu}) |> EB.from_nx() == EB.from_nx(tensor)
+  end
+
+  test "EMLX.copy creates an independent tensor ref" do
+    tensor = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: {EB, device: :cpu})
+    ref = EB.from_nx(tensor)
+
+    copied_ref = EMLX.copy(ref)
+
+    assert copied_ref != ref
+
+    Nx.backend_deallocate(tensor)
+    assert Nx.to_flat_list(EB.to_nx(copied_ref, tensor)) == [1.0, 2.0, 3.0]
+  end
+
+  test "backend_copy to the same EMLX device creates an independent tensor ref" do
+    tensor = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: {EB, device: :cpu})
+
+    copied = Nx.backend_copy(tensor, {EB, device: :cpu})
+
+    assert EB.from_nx(copied) != EB.from_nx(tensor)
+
+    Nx.backend_deallocate(tensor)
+    assert Nx.to_flat_list(copied) == [1.0, 2.0, 3.0]
+  end
+
+  @tag :metal
+  test "backend_copy to the same GPU device creates an independent tensor ref" do
+    tensor = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: {EB, device: :gpu})
+
+    copied = Nx.backend_copy(tensor, {EB, device: :gpu})
+
+    assert EB.from_nx(copied) != EB.from_nx(tensor)
+
+    Nx.backend_deallocate(tensor)
+    assert Nx.to_flat_list(copied) == [1.0, 2.0, 3.0]
+  end
+
+  test "backend_copy to the same EMLX device creates independent quantized refs" do
+    tensor = Nx.iota({2, 32}, type: :f32, backend: {EB, device: :cpu})
+    quantized = EMLX.quantize(tensor, group_size: 32, type: {:s, 4})
+
+    expected = EMLX.dequantize(quantized)
+    copied = Nx.backend_copy(quantized, {EB, device: :cpu})
+
+    assert EB.from_nx(copied) != EB.from_nx(quantized)
+
+    assert EB.from_nx(copied.data.quantization_config.scales) !=
+             EB.from_nx(quantized.data.quantization_config.scales)
+
+    assert EB.from_nx(copied.data.quantization_config.biases) !=
+             EB.from_nx(quantized.data.quantization_config.biases)
+
+    Nx.backend_deallocate(quantized)
+    Nx.backend_deallocate(quantized.data.quantization_config.scales)
+    Nx.backend_deallocate(quantized.data.quantization_config.biases)
+
+    assert_all_close(EMLX.dequantize(copied), expected)
+  end
+
+  @tag :metal
+  test "backend_copy between EMLX devices preserves values" do
+    tensor = Nx.iota({3, 4}, type: :f32, backend: {EB, device: :cpu})
+
+    copied = Nx.backend_copy(tensor, {EB, device: :gpu})
+
+    assert elem(EB.from_nx(copied), 0) == :gpu
+    assert Nx.to_binary(copied) == Nx.to_binary(tensor)
+  end
+
   defp test_binary_op(op, data_a \\ [[5, 6], [7, 8]], data_b \\ [[4, 3], [2, 1]], type_a, type_b) do
     a = Nx.tensor(data_a, type: type_a)
     b = Nx.tensor(data_b, type: type_b)
