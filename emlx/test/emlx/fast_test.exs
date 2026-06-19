@@ -871,6 +871,69 @@ defmodule EMLX.FastTest do
       )
     end
 
+    test "qwen3_layer matches pure Nx reference for batched GQA" do
+      fixtures = qwen3_batched_dense_attention_fixtures()
+      scale = 1.0 / :math.sqrt(fixtures.head_dim)
+
+      {out_ref, k_ref, v_ref} =
+        EMLX.qwen3_layer(
+          EMLX.Backend.from_nx(gpu(fixtures.hidden)),
+          EMLX.Backend.from_nx(gpu(fixtures.norm1)),
+          EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
+          EMLX.Backend.from_nx(gpu(fixtures.k_proj)),
+          EMLX.Backend.from_nx(gpu(fixtures.v_proj)),
+          EMLX.Backend.from_nx(gpu(fixtures.o_proj)),
+          EMLX.Backend.from_nx(gpu(fixtures.q_norm)),
+          EMLX.Backend.from_nx(gpu(fixtures.k_norm)),
+          EMLX.Backend.from_nx(gpu(fixtures.k_cache)),
+          EMLX.Backend.from_nx(gpu(fixtures.v_cache)),
+          EMLX.Backend.from_nx(gpu(fixtures.norm2)),
+          EMLX.Backend.from_nx(gpu(fixtures.gate_proj)),
+          EMLX.Backend.from_nx(gpu(fixtures.up_proj)),
+          EMLX.Backend.from_nx(gpu(fixtures.down_proj)),
+          fixtures.offset,
+          scale,
+          fixtures.head_dim,
+          fixtures.theta,
+          fixtures.eps
+        )
+
+      {attn_expected, expected_k, expected_v} = qwen3_attention_block_reference(fixtures)
+
+      expected =
+        qwen3_mlp_reference(
+          attn_expected,
+          fixtures.norm2,
+          fixtures.gate_proj,
+          fixtures.up_proj,
+          fixtures.down_proj,
+          fixtures.eps
+        )
+
+      assert Nx.shape(expected) == {2, 2, 4}
+
+      assert_all_close(
+        out_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected,
+        atol: 1.0e-5,
+        rtol: 1.0e-5
+      )
+
+      assert_all_close(
+        k_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected_k,
+        atol: 1.0e-5,
+        rtol: 1.0e-5
+      )
+
+      assert_all_close(
+        v_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected_v,
+        atol: 1.0e-5,
+        rtol: 1.0e-5
+      )
+    end
+
     test "qwen3_attention_residual matches pure Nx reference" do
       {hidden, attn_out, o_proj} =
         Nx.with_default_backend(Nx.BinaryBackend, fn ->
@@ -1049,12 +1112,16 @@ defmodule EMLX.FastTest do
       %{
         hidden: Nx.iota({2, 2, 4}, type: :f32) |> Nx.add(1) |> Nx.divide(20),
         norm1: Nx.tensor([1.0, 1.1, 0.9, 1.2], type: :f32),
+        norm2: Nx.tensor([1.2, 0.8, 1.1, 0.95], type: :f32),
         q_norm: Nx.tensor([1.0, 1.1], type: :f32),
         k_norm: Nx.tensor([0.9, 1.2], type: :f32),
         q_proj: Nx.iota({4, 8}, type: :f32) |> Nx.add(1) |> Nx.divide(80),
         k_proj: Nx.iota({4, 4}, type: :f32) |> Nx.add(3) |> Nx.divide(90),
         v_proj: Nx.iota({4, 4}, type: :f32) |> Nx.add(5) |> Nx.divide(100),
         o_proj: Nx.iota({8, 4}, type: :f32) |> Nx.add(7) |> Nx.divide(110),
+        gate_proj: Nx.iota({4, 6}, type: :f32) |> Nx.add(13) |> Nx.divide(120),
+        up_proj: Nx.iota({4, 6}, type: :f32) |> Nx.add(29) |> Nx.divide(130),
+        down_proj: Nx.iota({6, 4}, type: :f32) |> Nx.add(41) |> Nx.divide(140),
         k_cache: Nx.iota({2, 2, 6, 2}, type: :f32) |> Nx.add(11) |> Nx.divide(1_000),
         v_cache: Nx.iota({2, 2, 6, 2}, type: :f32) |> Nx.add(101) |> Nx.divide(1_000),
         offset: 2,
