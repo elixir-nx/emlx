@@ -640,3 +640,796 @@ NIF(kv_cache_sdpa_update) {
   CATCH()
 }
 ASYNC_NIF(kv_cache_sdpa_update)
+
+static ERL_NIF_TERM qwen3_error(ErlNifEnv *env, const std::string &message) {
+  return nx::nif::error(env, message.c_str());
+}
+
+static bool qwen3_check_rank(
+    const mlx::core::array &tensor,
+    int expected,
+    const char *name,
+    std::string &error) {
+  if (tensor.ndim() != expected) {
+    std::ostringstream msg;
+    msg << name << " expects rank " << expected << ", got rank " << tensor.ndim();
+    error = msg.str();
+    return false;
+  }
+
+  return true;
+}
+
+static bool qwen3_check_positive(int value, const char *name, std::string &error) {
+  if (value <= 0) {
+    std::ostringstream msg;
+    msg << name << " must be positive";
+    error = msg.str();
+    return false;
+  }
+
+  return true;
+}
+
+static bool qwen3_check_non_negative(int value, const char *name, std::string &error) {
+  if (value < 0) {
+    std::ostringstream msg;
+    msg << name << " must be non-negative";
+    error = msg.str();
+    return false;
+  }
+
+  return true;
+}
+
+static bool qwen3_check_dim(
+    const mlx::core::array &tensor,
+    int axis,
+    int expected,
+    const char *name,
+    const char *dim_name,
+    std::string &error) {
+  if (tensor.shape(axis) != expected) {
+    std::ostringstream msg;
+    msg << name << " " << dim_name << " must be " << expected
+        << ", got " << tensor.shape(axis);
+    error = msg.str();
+    return false;
+  }
+
+  return true;
+}
+
+static bool qwen3_check_rank4_positive(
+    const mlx::core::array &tensor,
+    const char *name,
+    std::string &error) {
+  if (!qwen3_check_rank(tensor, 4, name, error)) {
+    return false;
+  }
+
+  for (int axis = 0; axis < 4; ++axis) {
+    if (tensor.shape(axis) <= 0) {
+      std::ostringstream msg;
+      msg << name << " dimensions must be positive";
+      error = msg.str();
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool qwen3_check_rank3_positive(
+    const mlx::core::array &tensor,
+    const char *name,
+    std::string &error) {
+  if (!qwen3_check_rank(tensor, 3, name, error)) {
+    return false;
+  }
+
+  for (int axis = 0; axis < 3; ++axis) {
+    if (tensor.shape(axis) <= 0) {
+      std::ostringstream msg;
+      msg << name << " dimensions must be positive";
+      error = msg.str();
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool qwen3_check_rank2_positive(
+    const mlx::core::array &tensor,
+    const char *name,
+    std::string &error) {
+  if (!qwen3_check_rank(tensor, 2, name, error)) {
+    return false;
+  }
+
+  for (int axis = 0; axis < 2; ++axis) {
+    if (tensor.shape(axis) <= 0) {
+      std::ostringstream msg;
+      msg << name << " dimensions must be positive";
+      error = msg.str();
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool qwen3_check_rank1_dim(
+    const mlx::core::array &tensor,
+    int expected,
+    const char *name,
+    std::string &error) {
+  if (!qwen3_check_rank(tensor, 1, name, error)) {
+    return false;
+  }
+
+  return qwen3_check_dim(tensor, 0, expected, name, "size", error);
+}
+
+static bool qwen3_validate_projection_width(
+    const mlx::core::array &projection,
+    int input_width,
+    int head_dim,
+    const char *name,
+    std::string &error) {
+  if (!qwen3_check_rank2_positive(projection, name, error)) {
+    return false;
+  }
+  if (!qwen3_check_dim(projection, 0, input_width, name, "input width", error)) {
+    return false;
+  }
+  if ((projection.shape(1) % head_dim) != 0) {
+    std::ostringstream msg;
+    msg << name << " output width must be divisible by head_dim";
+    error = msg.str();
+    return false;
+  }
+
+  return true;
+}
+
+static bool qwen3_validate_kv_cache_bn(
+    const mlx::core::array &k_cache,
+    const mlx::core::array &v_cache,
+    int batch,
+    int num_kv_heads,
+    int offset,
+    int token_count,
+    int head_dim,
+    std::string &error) {
+  if (!qwen3_check_rank4_positive(k_cache, "k_cache", error) ||
+      !qwen3_check_rank4_positive(v_cache, "v_cache", error)) {
+    return false;
+  }
+
+  if (!qwen3_check_dim(k_cache, 0, batch, "k_cache", "batch", error) ||
+      !qwen3_check_dim(v_cache, 0, batch, "v_cache", "batch", error) ||
+      !qwen3_check_dim(k_cache, 1, num_kv_heads, "k_cache", "heads", error) ||
+      !qwen3_check_dim(v_cache, 1, num_kv_heads, "v_cache", "heads", error) ||
+      !qwen3_check_dim(k_cache, 3, head_dim, "k_cache", "head_dim", error) ||
+      !qwen3_check_dim(v_cache, 3, head_dim, "v_cache", "head_dim", error)) {
+    return false;
+  }
+
+  if (v_cache.shape(2) != k_cache.shape(2)) {
+    error = "k_cache and v_cache capacity must match";
+    return false;
+  }
+
+  int64_t required_len = static_cast<int64_t>(offset) + static_cast<int64_t>(token_count);
+  int capacity = k_cache.shape(2);
+
+  if (required_len > capacity) {
+    std::ostringstream msg;
+    msg << "KV cache capacity " << capacity
+        << " is smaller than required length " << required_len;
+    error = msg.str();
+    return false;
+  }
+
+  return true;
+}
+
+static bool qwen3_validate_qkv_cache_attention(
+    const mlx::core::array &q,
+    const mlx::core::array &new_k,
+    const mlx::core::array &new_v,
+    const mlx::core::array &k_cache,
+    const mlx::core::array &v_cache,
+    int offset,
+    int head_dim,
+    std::string &error) {
+  if (!qwen3_check_rank4_positive(q, "q", error) ||
+      !qwen3_check_rank4_positive(new_k, "new_k", error) ||
+      !qwen3_check_rank4_positive(new_v, "new_v", error) ||
+      !qwen3_check_non_negative(offset, "offset", error) ||
+      !qwen3_check_positive(head_dim, "head_dim", error)) {
+    return false;
+  }
+
+  int B = q.shape(0);
+  int T_new = q.shape(1);
+  int N_q = q.shape(2);
+  int D = q.shape(3);
+  int N_kv = new_k.shape(2);
+
+  if (D != head_dim) {
+    error = "q last dimension must match head_dim";
+    return false;
+  }
+  if ((N_q % N_kv) != 0) {
+    error = "query heads must be divisible by key/value heads";
+    return false;
+  }
+  if (!qwen3_check_dim(new_k, 0, B, "new_k", "batch", error) ||
+      !qwen3_check_dim(new_v, 0, B, "new_v", "batch", error) ||
+      !qwen3_check_dim(new_k, 1, T_new, "new_k", "sequence length", error) ||
+      !qwen3_check_dim(new_v, 1, T_new, "new_v", "sequence length", error) ||
+      !qwen3_check_dim(new_v, 2, N_kv, "new_v", "heads", error) ||
+      !qwen3_check_dim(new_k, 3, D, "new_k", "head_dim", error) ||
+      !qwen3_check_dim(new_v, 3, D, "new_v", "head_dim", error)) {
+    return false;
+  }
+
+  return qwen3_validate_kv_cache_bn(k_cache, v_cache, B, N_kv, offset, T_new, D, error);
+}
+
+// qwen3_kv_cache_attention — Qwen3-specific fused RoPE + KV update + SDPA.
+//
+// Inputs:
+//   q        — {B, T_new, N_q,  D}  Q projection after Q norm
+//   new_k    — {B, T_new, N_kv, D}  K projection after K norm
+//   new_v    — {B, T_new, N_kv, D}  V projection
+//   k_cache  — {B, N_kv, T_max, D}  pre-allocated key buffer
+//   v_cache  — {B, N_kv, T_max, D}  pre-allocated value buffer
+//   offset   — int                  tokens already in cache
+//   scale    — float                1/sqrt(head_dim)
+//   head_dim — int                  RoPE dimensions
+//   theta    — float                RoPE base
+//   device   — atom
+//
+// Returns {attn_out, k_upd, v_upd}:
+//   attn_out — {B, T_new, N_q * D}  projection-ready BTH layout
+//   k_upd    — {B, N_kv, T_max, D}
+//   v_upd    — {B, N_kv, T_max, D}
+NIF(qwen3_kv_cache_attention) {
+  TENSOR_PARAM(0, q);
+  TENSOR_PARAM(1, new_k);
+  TENSOR_PARAM(2, new_v);
+  TENSOR_PARAM(3, k_cache);
+  TENSOR_PARAM(4, v_cache);
+  PARAM(5, int, offset);
+  PARAM(6, double, scale);
+  PARAM(7, int, head_dim);
+  PARAM(8, double, theta);
+  DEVICE_PARAM(9, device);
+
+  try {
+    std::string error;
+    if (!qwen3_validate_qkv_cache_attention(
+            *q, *new_k, *new_v, *k_cache, *v_cache, offset, head_dim, error)) {
+      return qwen3_error(env, error);
+    }
+
+    int B       = q->shape(0);
+    int T_new   = q->shape(1);
+    int N_q     = q->shape(2);
+    int D       = q->shape(3);
+    int N_kv    = new_k->shape(2);
+    int valid_len = offset + T_new;
+
+    auto q_bn = mlx::core::transpose(*q, {0, 2, 1, 3}, device);
+    auto k_bn = mlx::core::transpose(*new_k, {0, 2, 1, 3}, device);
+    auto v_bn = mlx::core::transpose(*new_v, {0, 2, 1, 3}, device);
+
+    auto q_rope = mlx::core::fast::rope(
+        q_bn, head_dim, false, (float)theta, 1.0f, offset, std::nullopt, device);
+    auto k_rope = mlx::core::fast::rope(
+        k_bn, head_dim, false, (float)theta, 1.0f, offset, std::nullopt, device);
+
+    auto k_cache_owned = std::move(*k_cache);
+    auto v_cache_owned = std::move(*v_cache);
+
+    auto k_upd = mlx::core::slice_update(
+        k_cache_owned, k_rope,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+    auto v_upd = mlx::core::slice_update(
+        v_cache_owned, v_bn,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+
+    auto k_valid = mlx::core::slice(
+        k_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+    auto v_valid = mlx::core::slice(
+        v_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+
+    auto build_prefill_mask = [&]() -> mlx::core::array {
+      auto mask_dtype = q->dtype();
+      auto zero_val   = mlx::core::zeros({}, mask_dtype, device);
+      auto neginf_val = mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, device);
+      int kv_offset = valid_len - T_new;
+      auto row = mlx::core::reshape(
+          mlx::core::arange(T_new,     mlx::core::int32, device), {1, 1, T_new, 1},     device);
+      auto col = mlx::core::reshape(
+          mlx::core::arange(valid_len, mlx::core::int32, device), {1, 1, 1, valid_len}, device);
+      auto causal_bool = mlx::core::less_equal(
+          col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
+      return mlx::core::where(causal_bool, zero_val, neginf_val, device);
+    };
+
+    auto attn_out_bn = (T_new == 1)
+      ? mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, (float)scale, "", std::nullopt, std::nullopt, device)
+      : mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, (float)scale, "array", build_prefill_mask(), std::nullopt, device);
+    auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
+    auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, N_q * D}, device);
+
+    ERL_NIF_TERM result_tuple[3];
+    result_tuple[0] = create_tensor_resource(env, attn_out);
+    result_tuple[1] = create_tensor_resource(env, k_upd);
+    result_tuple[2] = create_tensor_resource(env, v_upd);
+
+    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+  }
+  CATCH()
+}
+ASYNC_NIF(qwen3_kv_cache_attention)
+
+static mlx::core::array qwen3_linear_in_out(
+    const mlx::core::array &x,
+    const mlx::core::array &weight,
+    const mlx::core::Device &device) {
+  if (x.ndim() == 3 && x.shape(1) == 1) {
+    auto x_2d = mlx::core::reshape(x, {x.shape(0), x.shape(2)}, device);
+    auto out = mlx::core::matmul(x_2d, weight, device);
+    return mlx::core::reshape(out, {x.shape(0), 1, weight.shape(1)}, device);
+  }
+
+  return mlx::core::matmul(x, weight, device);
+}
+
+// qwen3_mlp — dense Qwen3 MLP block: RMSNorm + gate/up + SwiGLU + down + residual.
+//
+// Inputs:
+//   hidden    — {B, T, H}
+//   norm      — {H}
+//   gate_proj — {H, I}
+//   up_proj   — {H, I}
+//   down_proj — {I, H}
+//   eps       — RMSNorm epsilon
+//
+// Returns hidden + out {B, T, H}.
+NIF(qwen3_mlp) {
+  TENSOR_PARAM(0, hidden);
+  TENSOR_PARAM(1, norm);
+  TENSOR_PARAM(2, gate_proj);
+  TENSOR_PARAM(3, up_proj);
+  TENSOR_PARAM(4, down_proj);
+  PARAM(5, double, eps);
+  DEVICE_PARAM(6, device);
+
+  try {
+    std::string error;
+    if (!qwen3_check_rank3_positive(*hidden, "hidden", error)) {
+      return qwen3_error(env, error);
+    }
+
+    int H = hidden->shape(2);
+    if (!qwen3_check_rank1_dim(*norm, H, "norm", error) ||
+        !qwen3_check_rank2_positive(*gate_proj, "gate_proj", error) ||
+        !qwen3_check_rank2_positive(*up_proj, "up_proj", error) ||
+        !qwen3_check_rank2_positive(*down_proj, "down_proj", error) ||
+        !qwen3_check_dim(*gate_proj, 0, H, "gate_proj", "input width", error) ||
+        !qwen3_check_dim(*up_proj, 0, H, "up_proj", "input width", error) ||
+        !qwen3_check_dim(*up_proj, 1, gate_proj->shape(1), "up_proj", "output width", error) ||
+        !qwen3_check_dim(*down_proj, 0, gate_proj->shape(1), "down_proj", "input width", error) ||
+        !qwen3_check_dim(*down_proj, 1, H, "down_proj", "output width", error)) {
+      return qwen3_error(env, error);
+    }
+
+    auto xn = mlx::core::fast::rms_norm(*hidden, *norm, (float)eps, device);
+    auto gate = qwen3_linear_in_out(xn, *gate_proj, device);
+    auto up = qwen3_linear_in_out(xn, *up_proj, device);
+    auto mlp = mlx::core::multiply(
+        mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device),
+        up,
+        device);
+    auto out = qwen3_linear_in_out(mlp, *down_proj, device);
+    auto residual = mlx::core::add(*hidden, out, device);
+
+    TENSOR(residual);
+  }
+  CATCH()
+}
+ASYNC_NIF(qwen3_mlp)
+
+// qwen3_layer — dense Qwen3 transformer layer:
+// attention input RMSNorm + dense attention block + post-attention RMSNorm
+// + dense MLP + residual add.
+//
+// Inputs:
+//   hidden    — {B, T_new, H}
+//   norm1     — {H}
+//   q_proj    — {H, N_q * D}
+//   k_proj    — {H, N_kv * D}
+//   v_proj    — {H, N_kv * D}
+//   o_proj    — {N_q * D, H}
+//   q_norm    — {D}
+//   k_norm    — {D}
+//   k_cache   — {B, N_kv, T_max, D}
+//   v_cache   — {B, N_kv, T_max, D}
+//   norm2     — {H}
+//   gate_proj — {H, I}
+//   up_proj   — {H, I}
+//   down_proj — {I, H}
+//   offset    — int
+//   scale     — float
+//   head_dim  — int
+//   theta     — float
+//   eps       — RMSNorm epsilon
+//
+// Returns {hidden_out, k_upd, v_upd}.
+NIF(qwen3_layer) {
+  TENSOR_PARAM(0, hidden);
+  TENSOR_PARAM(1, norm1);
+  TENSOR_PARAM(2, q_proj);
+  TENSOR_PARAM(3, k_proj);
+  TENSOR_PARAM(4, v_proj);
+  TENSOR_PARAM(5, o_proj);
+  TENSOR_PARAM(6, q_norm);
+  TENSOR_PARAM(7, k_norm);
+  TENSOR_PARAM(8, k_cache);
+  TENSOR_PARAM(9, v_cache);
+  TENSOR_PARAM(10, norm2);
+  TENSOR_PARAM(11, gate_proj);
+  TENSOR_PARAM(12, up_proj);
+  TENSOR_PARAM(13, down_proj);
+  PARAM(14, int, offset);
+  PARAM(15, double, scale);
+  PARAM(16, int, head_dim);
+  PARAM(17, double, theta);
+  PARAM(18, double, eps);
+  DEVICE_PARAM(19, device);
+
+  try {
+    std::string error;
+    if (!qwen3_check_rank3_positive(*hidden, "hidden", error) ||
+        !qwen3_check_non_negative(offset, "offset", error) ||
+        !qwen3_check_positive(head_dim, "head_dim", error)) {
+      return qwen3_error(env, error);
+    }
+
+    int B       = hidden->shape(0);
+    int T_new   = hidden->shape(1);
+    int H       = hidden->shape(2);
+    int D       = head_dim;
+    if (!qwen3_check_rank1_dim(*norm1, H, "norm1", error) ||
+        !qwen3_check_rank1_dim(*norm2, H, "norm2", error) ||
+        !qwen3_validate_projection_width(*q_proj, H, D, "q_proj", error) ||
+        !qwen3_validate_projection_width(*k_proj, H, D, "k_proj", error) ||
+        !qwen3_validate_projection_width(*v_proj, H, D, "v_proj", error) ||
+        !qwen3_check_dim(*v_proj, 1, k_proj->shape(1), "v_proj", "output width", error) ||
+        !qwen3_check_rank1_dim(*q_norm, D, "q_norm", error) ||
+        !qwen3_check_rank1_dim(*k_norm, D, "k_norm", error)) {
+      return qwen3_error(env, error);
+    }
+
+    int N_q     = q_proj->shape(1) / D;
+    int N_kv    = k_proj->shape(1) / D;
+    int attn_width = N_q * D;
+
+    if ((N_q % N_kv) != 0) {
+      return qwen3_error(env, "query heads must be divisible by key/value heads");
+    }
+    if (!qwen3_check_rank2_positive(*o_proj, "o_proj", error) ||
+        !qwen3_check_dim(*o_proj, 0, attn_width, "o_proj", "input width", error) ||
+        !qwen3_check_dim(*o_proj, 1, H, "o_proj", "output width", error) ||
+        !qwen3_validate_kv_cache_bn(*k_cache, *v_cache, B, N_kv, offset, T_new, D, error) ||
+        !qwen3_check_rank2_positive(*gate_proj, "gate_proj", error) ||
+        !qwen3_check_rank2_positive(*up_proj, "up_proj", error) ||
+        !qwen3_check_rank2_positive(*down_proj, "down_proj", error) ||
+        !qwen3_check_dim(*gate_proj, 0, H, "gate_proj", "input width", error) ||
+        !qwen3_check_dim(*up_proj, 0, H, "up_proj", "input width", error) ||
+        !qwen3_check_dim(*up_proj, 1, gate_proj->shape(1), "up_proj", "output width", error) ||
+        !qwen3_check_dim(*down_proj, 0, gate_proj->shape(1), "down_proj", "input width", error) ||
+        !qwen3_check_dim(*down_proj, 1, H, "down_proj", "output width", error)) {
+      return qwen3_error(env, error);
+    }
+    int valid_len = offset + T_new;
+
+    auto xn = mlx::core::fast::rms_norm(*hidden, *norm1, (float)eps, device);
+    auto q_flat = qwen3_linear_in_out(xn, *q_proj, device);
+    auto k_flat = qwen3_linear_in_out(xn, *k_proj, device);
+    auto v_flat = qwen3_linear_in_out(xn, *v_proj, device);
+
+    auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, device);
+    auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, device);
+    auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, device);
+
+    q = mlx::core::fast::rms_norm(q, *q_norm, (float)eps, device);
+    k = mlx::core::fast::rms_norm(k, *k_norm, (float)eps, device);
+
+    auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, device);
+    auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, device);
+    auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, device);
+
+    auto q_rope = mlx::core::fast::rope(
+        q_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, device);
+    auto k_rope = mlx::core::fast::rope(
+        k_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, device);
+
+    auto k_cache_owned = std::move(*k_cache);
+    auto v_cache_owned = std::move(*v_cache);
+
+    auto k_upd = mlx::core::slice_update(
+        k_cache_owned, k_rope,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+    auto v_upd = mlx::core::slice_update(
+        v_cache_owned, v_bn,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+
+    auto k_valid = mlx::core::slice(
+        k_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+    auto v_valid = mlx::core::slice(
+        v_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+
+    auto build_prefill_mask = [&]() -> mlx::core::array {
+      auto mask_dtype = q.dtype();
+      auto zero_val   = mlx::core::zeros({}, mask_dtype, device);
+      auto neginf_val = mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, device);
+      int kv_offset = valid_len - T_new;
+      auto row = mlx::core::reshape(
+          mlx::core::arange(T_new,     mlx::core::int32, device), {1, 1, T_new, 1},     device);
+      auto col = mlx::core::reshape(
+          mlx::core::arange(valid_len, mlx::core::int32, device), {1, 1, 1, valid_len}, device);
+      auto causal_bool = mlx::core::less_equal(
+          col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
+      return mlx::core::where(causal_bool, zero_val, neginf_val, device);
+    };
+
+    auto attn_out_bn = (T_new == 1)
+      ? mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, (float)scale, "", std::nullopt, std::nullopt, device)
+      : mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, (float)scale, "array", build_prefill_mask(), std::nullopt, device);
+    auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
+    auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, device);
+    auto attn_projected = qwen3_linear_in_out(attn_out, *o_proj, device);
+    auto attn_hidden = mlx::core::add(*hidden, attn_projected, device);
+
+    auto xn2 = mlx::core::fast::rms_norm(attn_hidden, *norm2, (float)eps, device);
+    auto gate = qwen3_linear_in_out(xn2, *gate_proj, device);
+    auto up = qwen3_linear_in_out(xn2, *up_proj, device);
+    auto mlp = mlx::core::multiply(
+        mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device),
+        up,
+        device);
+    auto mlp_out = qwen3_linear_in_out(mlp, *down_proj, device);
+    auto out = mlx::core::add(attn_hidden, mlp_out, device);
+
+    ERL_NIF_TERM result_tuple[3];
+    result_tuple[0] = create_tensor_resource(env, out);
+    result_tuple[1] = create_tensor_resource(env, k_upd);
+    result_tuple[2] = create_tensor_resource(env, v_upd);
+
+    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+  }
+  CATCH()
+}
+ASYNC_NIF(qwen3_layer)
+
+// qwen3_attention_residual — dense attention output projection + residual add.
+//
+// Inputs:
+//   hidden   — {B, T, H}
+//   attn_out — {B, T, I}
+//   o_proj   — {I, H}
+//
+// Returns hidden + attn_out @ o_proj as {B, T, H}.
+NIF(qwen3_attention_residual) {
+  TENSOR_PARAM(0, hidden);
+  TENSOR_PARAM(1, attn_out);
+  TENSOR_PARAM(2, o_proj);
+  DEVICE_PARAM(3, device);
+
+  try {
+    std::string error;
+    if (!qwen3_check_rank3_positive(*hidden, "hidden", error) ||
+        !qwen3_check_rank3_positive(*attn_out, "attn_out", error)) {
+      return qwen3_error(env, error);
+    }
+
+    int B = hidden->shape(0);
+    int T = hidden->shape(1);
+    int H = hidden->shape(2);
+    if (!qwen3_check_dim(*attn_out, 0, B, "attn_out", "batch", error) ||
+        !qwen3_check_dim(*attn_out, 1, T, "attn_out", "sequence length", error) ||
+        !qwen3_check_rank2_positive(*o_proj, "o_proj", error) ||
+        !qwen3_check_dim(*o_proj, 0, attn_out->shape(2), "o_proj", "input width", error) ||
+        !qwen3_check_dim(*o_proj, 1, H, "o_proj", "output width", error)) {
+      return qwen3_error(env, error);
+    }
+
+    auto projected = qwen3_linear_in_out(*attn_out, *o_proj, device);
+    auto residual = mlx::core::add(*hidden, projected, device);
+
+    TENSOR(residual);
+  }
+  CATCH()
+}
+ASYNC_NIF(qwen3_attention_residual)
+
+// qwen3_attention_block — dense Qwen3 attention block:
+// input RMSNorm + Q/K/V projections + Q/K RMSNorm + RoPE + KV update + SDPA
+// + output projection + residual add.
+//
+// Inputs:
+//   hidden   — {B, T_new, H}       pre-attention residual hidden state
+//   norm     — {H}                 input RMSNorm weight
+//   q_proj   — {H, N_q * D}
+//   k_proj   — {H, N_kv * D}
+//   v_proj   — {H, N_kv * D}
+//   o_proj   — {N_q * D, H}
+//   q_norm   — {D}
+//   k_norm   — {D}
+//   k_cache  — {B, N_kv, T_max, D}
+//   v_cache  — {B, N_kv, T_max, D}
+//   offset   — int
+//   scale    — float
+//   head_dim — int
+//   theta    — float
+//   eps      — RMSNorm epsilon
+//
+// Returns {hidden_out, k_upd, v_upd}.
+NIF(qwen3_attention_block) {
+  TENSOR_PARAM(0, hidden);
+  TENSOR_PARAM(1, norm);
+  TENSOR_PARAM(2, q_proj);
+  TENSOR_PARAM(3, k_proj);
+  TENSOR_PARAM(4, v_proj);
+  TENSOR_PARAM(5, o_proj);
+  TENSOR_PARAM(6, q_norm);
+  TENSOR_PARAM(7, k_norm);
+  TENSOR_PARAM(8, k_cache);
+  TENSOR_PARAM(9, v_cache);
+  PARAM(10, int, offset);
+  PARAM(11, double, scale);
+  PARAM(12, int, head_dim);
+  PARAM(13, double, theta);
+  PARAM(14, double, eps);
+  DEVICE_PARAM(15, device);
+
+  try {
+    std::string error;
+    if (!qwen3_check_rank3_positive(*hidden, "hidden", error) ||
+        !qwen3_check_non_negative(offset, "offset", error) ||
+        !qwen3_check_positive(head_dim, "head_dim", error)) {
+      return qwen3_error(env, error);
+    }
+
+    int B       = hidden->shape(0);
+    int T_new   = hidden->shape(1);
+    int H       = hidden->shape(2);
+    int D       = head_dim;
+    if (!qwen3_check_rank1_dim(*norm, H, "norm", error) ||
+        !qwen3_check_rank1_dim(*q_norm, D, "q_norm", error) ||
+        !qwen3_check_rank1_dim(*k_norm, D, "k_norm", error) ||
+        !qwen3_check_rank2_positive(*q_proj, "q_proj", error) ||
+        !qwen3_check_rank2_positive(*k_proj, "k_proj", error) ||
+        !qwen3_check_rank2_positive(*v_proj, "v_proj", error) ||
+        !qwen3_check_dim(*q_proj, 0, H, "q_proj", "input width", error) ||
+        !qwen3_check_dim(*k_proj, 0, H, "k_proj", "input width", error) ||
+        !qwen3_check_dim(*v_proj, 0, H, "v_proj", "input width", error)) {
+      return qwen3_error(env, error);
+    }
+
+    if ((q_proj->shape(1) % D) != 0 || (k_proj->shape(1) % D) != 0) {
+      return qwen3_error(env, "projection output widths must be divisible by head_dim");
+    }
+    if (v_proj->shape(1) != k_proj->shape(1)) {
+      return qwen3_error(env, "v_proj output width must match k_proj output width");
+    }
+
+    int N_q     = q_proj->shape(1) / D;
+    int N_kv    = k_proj->shape(1) / D;
+    int attn_width = N_q * D;
+
+    if ((N_q % N_kv) != 0) {
+      return qwen3_error(env, "query heads must be divisible by key/value heads");
+    }
+    if (!qwen3_check_rank2_positive(*o_proj, "o_proj", error) ||
+        !qwen3_check_dim(*o_proj, 0, attn_width, "o_proj", "input width", error) ||
+        !qwen3_check_dim(*o_proj, 1, H, "o_proj", "output width", error) ||
+        !qwen3_validate_kv_cache_bn(*k_cache, *v_cache, B, N_kv, offset, T_new, D, error)) {
+      return qwen3_error(env, error);
+    }
+    int valid_len = offset + T_new;
+
+    auto xn = mlx::core::fast::rms_norm(*hidden, *norm, (float)eps, device);
+    auto q_flat = qwen3_linear_in_out(xn, *q_proj, device);
+    auto k_flat = qwen3_linear_in_out(xn, *k_proj, device);
+    auto v_flat = qwen3_linear_in_out(xn, *v_proj, device);
+
+    auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, device);
+    auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, device);
+    auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, device);
+
+    q = mlx::core::fast::rms_norm(q, *q_norm, (float)eps, device);
+    k = mlx::core::fast::rms_norm(k, *k_norm, (float)eps, device);
+
+    auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, device);
+    auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, device);
+    auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, device);
+
+    auto q_rope = mlx::core::fast::rope(
+        q_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, device);
+    auto k_rope = mlx::core::fast::rope(
+        k_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, device);
+
+    auto k_cache_owned = std::move(*k_cache);
+    auto v_cache_owned = std::move(*v_cache);
+
+    auto k_upd = mlx::core::slice_update(
+        k_cache_owned, k_rope,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+    auto v_upd = mlx::core::slice_update(
+        v_cache_owned, v_bn,
+        to_shape({0, 0, offset, 0}),
+        to_shape({B, N_kv, valid_len, D}),
+        device);
+
+    auto k_valid = mlx::core::slice(
+        k_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+    auto v_valid = mlx::core::slice(
+        v_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+
+    auto build_prefill_mask = [&]() -> mlx::core::array {
+      auto mask_dtype = q.dtype();
+      auto zero_val   = mlx::core::zeros({}, mask_dtype, device);
+      auto neginf_val = mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, device);
+      int kv_offset = valid_len - T_new;
+      auto row = mlx::core::reshape(
+          mlx::core::arange(T_new,     mlx::core::int32, device), {1, 1, T_new, 1},     device);
+      auto col = mlx::core::reshape(
+          mlx::core::arange(valid_len, mlx::core::int32, device), {1, 1, 1, valid_len}, device);
+      auto causal_bool = mlx::core::less_equal(
+          col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
+      return mlx::core::where(causal_bool, zero_val, neginf_val, device);
+    };
+
+    auto attn_out_bn = (T_new == 1)
+      ? mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, (float)scale, "", std::nullopt, std::nullopt, device)
+      : mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, (float)scale, "array", build_prefill_mask(), std::nullopt, device);
+    auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
+    auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, device);
+    auto projected = qwen3_linear_in_out(attn_out, *o_proj, device);
+    auto out = mlx::core::add(*hidden, projected, device);
+
+    ERL_NIF_TERM result_tuple[3];
+    result_tuple[0] = create_tensor_resource(env, out);
+    result_tuple[1] = create_tensor_resource(env, k_upd);
+    result_tuple[2] = create_tensor_resource(env, v_upd);
+
+    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+  }
+  CATCH()
+}
+ASYNC_NIF(qwen3_attention_block)

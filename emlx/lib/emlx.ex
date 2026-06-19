@@ -148,6 +148,7 @@ defmodule EMLX do
   end
 
   defguard is_tensor(device, ref) when is_reference(ref) and is_atom(device)
+  @type tensor_ref :: {atom(), reference()}
 
   ## Macro callbacks
 
@@ -950,6 +951,297 @@ defmodule EMLX do
       |> await_worker()
 
     {{effective_device, attn_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
+  end
+
+  @doc """
+  Qwen3-specific fused RoPE + KV cache update + SDPA for the native decode path.
+
+  Accepts `query`, `new_key`, and `new_value` in projection layout
+  `{B, T, N, D}`. The NIF transposes Q/K/V, applies Qwen3 RoPE to Q/K, updates
+  the owned KV cache, runs SDPA, and returns flattened projection-ready
+  attention output `{B, T, N * D}` plus updated cache refs.
+  """
+  @mlx_function {:qwen3_kv_cache_attention, 11}
+  def qwen3_kv_cache_attention(
+        {dev_q, ref_q},
+        {_dev_k, ref_k},
+        {_dev_v, ref_v},
+        {_dev_kc, ref_kc},
+        {_dev_vc, ref_vc},
+        offset,
+        scale,
+        head_dim,
+        theta
+      )
+      when is_tensor(dev_q, ref_q) and is_integer(offset) and is_float(scale) and
+             is_integer(head_dim) and is_number(theta) do
+    device = dev_q
+    {worker, effective_device} = resolve_worker(device)
+
+    {attn_ref, k_upd_ref, v_upd_ref} =
+      EMLX.NIF.qwen3_kv_cache_attention(
+        worker,
+        ref_q,
+        ref_k,
+        ref_v,
+        ref_kc,
+        ref_vc,
+        offset,
+        scale,
+        head_dim,
+        theta * 1.0,
+        effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {{effective_device, attn_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
+  end
+
+  @doc """
+  Qwen3-specific dense MLP helper.
+
+  Accepts hidden states `{B, T, H}`, post-attention RMSNorm weight `{H}`,
+  dense gate/up projections `{H, I}`, dense down projection `{I, H}`, and RMSNorm
+  epsilon. Returns `hidden + mlp_output` as `{B, T, H}`.
+  """
+  @mlx_function {:qwen3_mlp, 8}
+  def qwen3_mlp(
+        {dev_h, ref_h},
+        {_dev_norm, ref_norm},
+        {_dev_gate, ref_gate},
+        {_dev_up, ref_up},
+        {_dev_down, ref_down},
+        eps
+      )
+      when is_tensor(dev_h, ref_h) and is_float(eps) do
+    device = dev_h
+    {worker, effective_device} = resolve_worker(device)
+
+    out_ref =
+      EMLX.NIF.qwen3_mlp(
+        worker,
+        ref_h,
+        ref_norm,
+        ref_gate,
+        ref_up,
+        ref_down,
+        eps,
+        effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {effective_device, out_ref}
+  end
+
+  @doc """
+  Qwen3-specific dense attention output projection plus residual add.
+
+  Accepts residual hidden state `{B, T, H}`, flattened attention output
+  `{B, T, I}`, and dense output projection `{I, H}`. Returns
+  `hidden + projected_attention`.
+  """
+  @mlx_function {:qwen3_attention_residual, 5}
+  def qwen3_attention_residual(
+        {dev_h, ref_h},
+        {_dev_attn, ref_attn},
+        {_dev_o, ref_o}
+      )
+      when is_tensor(dev_h, ref_h) do
+    device = dev_h
+    {worker, effective_device} = resolve_worker(device)
+
+    out_ref =
+      EMLX.NIF.qwen3_attention_residual(
+        worker,
+        ref_h,
+        ref_attn,
+        ref_o,
+        effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {effective_device, out_ref}
+  end
+
+  @doc """
+  Qwen3-specific dense transformer layer helper.
+
+  Accepts hidden states `{B, T, H}`, input/post-attention RMSNorm weights,
+  dense attention projections, Q/K RMSNorm weights, owned KV cache refs, dense
+  MLP projections, offset, scale, RoPE parameters, and RMSNorm epsilon. Returns
+  `{hidden_out, k_cache, v_cache}`.
+  """
+  @mlx_function {:qwen3_layer, 21}
+  def qwen3_layer(
+        {dev_h, ref_h},
+        {_dev_norm1, ref_norm1},
+        {_dev_q, ref_q},
+        {_dev_k, ref_k},
+        {_dev_v, ref_v},
+        {_dev_o, ref_o},
+        {_dev_qn, ref_qn},
+        {_dev_kn, ref_kn},
+        {_dev_kc, ref_kc},
+        {_dev_vc, ref_vc},
+        {_dev_norm2, ref_norm2},
+        {_dev_gate, ref_gate},
+        {_dev_up, ref_up},
+        {_dev_down, ref_down},
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      )
+      when is_tensor(dev_h, ref_h) and is_integer(offset) and is_float(scale) and
+             is_integer(head_dim) and is_number(theta) and is_float(eps) do
+    device = dev_h
+    {worker, effective_device} = resolve_worker(device)
+
+    {out_ref, k_upd_ref, v_upd_ref} =
+      EMLX.NIF.qwen3_layer(
+        worker,
+        ref_h,
+        ref_norm1,
+        ref_q,
+        ref_k,
+        ref_v,
+        ref_o,
+        ref_qn,
+        ref_kn,
+        ref_kc,
+        ref_vc,
+        ref_norm2,
+        ref_gate,
+        ref_up,
+        ref_down,
+        offset,
+        scale,
+        head_dim,
+        theta * 1.0,
+        eps,
+        effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {{effective_device, out_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
+  end
+
+  @doc """
+  Qwen3-specific dense attention block helper.
+
+  Accepts pre-attention residual hidden state `{B, T, H}`, input RMSNorm weight
+  `{H}`, dense Q/K/V/O projections, Q/K RMSNorm weights, owned KV cache refs,
+  offset, scale, RoPE parameters, and RMSNorm epsilon. Returns
+  `{hidden_out, k_cache, v_cache}`.
+  """
+  @mlx_function {:qwen3_attention_block, 17}
+  def qwen3_attention_block(
+        {dev_h, ref_h},
+        {_dev_norm, ref_norm},
+        {_dev_q, ref_q},
+        {_dev_k, ref_k},
+        {_dev_v, ref_v},
+        {_dev_o, ref_o},
+        {_dev_qn, ref_qn},
+        {_dev_kn, ref_kn},
+        {_dev_kc, ref_kc},
+        {_dev_vc, ref_vc},
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      )
+      when is_tensor(dev_h, ref_h) and is_integer(offset) and is_float(scale) and
+             is_integer(head_dim) and is_number(theta) and is_float(eps) do
+    device = dev_h
+    {worker, effective_device} = resolve_worker(device)
+
+    {out_ref, k_upd_ref, v_upd_ref} =
+      EMLX.NIF.qwen3_attention_block(
+        worker,
+        ref_h,
+        ref_norm,
+        ref_q,
+        ref_k,
+        ref_v,
+        ref_o,
+        ref_qn,
+        ref_kn,
+        ref_kc,
+        ref_vc,
+        offset,
+        scale,
+        head_dim,
+        theta * 1.0,
+        eps,
+        effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {{effective_device, out_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
+  end
+
+  @doc """
+  Stable wrapper for causal self-attention with an owned KV cache.
+
+  This is the public semantic API for Qwen/Llama-style decode paths that need
+  compact GQA KV heads, fused cache update, valid-prefix slicing, and causal
+  SDPA through EMLX's native MLX kernels.
+
+  Inputs use Bumblebee convention:
+
+  - `query` — `{B, T_q, N_q, D}`
+  - `new_key` / `new_value` — `{B, T_new, N_kv, D}`
+  - `key_cache` / `value_cache` — `{B, T_max, N_kv, D}`
+  - `offset` — integer count of positions already present in the cache
+
+  Options:
+
+  - `:scale` — required float, usually `1 / sqrt(head_dim)`
+  - `:key_mask` — optional `{B, offset + T_new}` mask with `1` = attend and
+    `0` = skip padding
+
+  Returns `{attention, updated_key_cache, updated_value_cache}` as raw EMLX
+  `{device, ref}` pairs. Keeping the caches in this representation lets callers
+  store and reuse device-resident cache buffers without converting them back to
+  `Nx.Tensor` between decode steps.
+  """
+  @spec causal_kv_attention(
+          tensor_ref(),
+          tensor_ref(),
+          tensor_ref(),
+          tensor_ref(),
+          tensor_ref(),
+          non_neg_integer(),
+          keyword()
+        ) :: {tensor_ref(), tensor_ref(), tensor_ref()}
+  def causal_kv_attention(query, new_key, new_value, key_cache, value_cache, offset, opts)
+      when is_integer(offset) and offset >= 0 and is_list(opts) do
+    scale = Keyword.fetch!(opts, :scale)
+
+    case Keyword.get(opts, :key_mask) do
+      nil ->
+        kv_cache_attention(query, new_key, new_value, key_cache, value_cache, offset, scale)
+
+      key_mask ->
+        kv_cache_attention_masked(
+          query,
+          new_key,
+          new_value,
+          key_cache,
+          value_cache,
+          offset,
+          scale,
+          key_mask
+        )
+    end
   end
 
   @doc """

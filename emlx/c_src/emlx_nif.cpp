@@ -1452,6 +1452,11 @@ ERL_NIF_TERM fast_swiglu_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_masked_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_sdpa_update_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM qwen3_kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM qwen3_mlp_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM qwen3_layer_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM qwen3_attention_residual_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM qwen3_attention_block_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 
 // ─── Async wrappers ────────────────────────────────────────────────────────
 
@@ -1985,6 +1990,11 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
-    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
+    {"qwen3_kv_cache_attention", 11, qwen3_kv_cache_attention_async},
+    {"qwen3_mlp", 8, qwen3_mlp_async},
+    {"qwen3_layer", 21, qwen3_layer_async},
+    {"qwen3_attention_residual", 5, qwen3_attention_residual_async},
+    {"qwen3_attention_block", 17, qwen3_attention_block_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
