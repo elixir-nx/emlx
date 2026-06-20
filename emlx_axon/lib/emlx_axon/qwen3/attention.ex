@@ -17,7 +17,8 @@ defmodule EMLXAxon.Qwen3.Attention do
   GQA forward.
 
   Inputs:
-  - `hidden`      — `{1, seq_len, hidden_size}` (post-norm)
+  - `hidden`      — `{1, seq_len, hidden_size}` pre-norm residual input
+  - `norm`        — `{hidden_size}` input RMSNorm weight
   - `k_cache`     — `{1, num_kv_heads, max_len, head_dim}` preallocated
   - `v_cache`     — `{1, num_kv_heads, max_len, head_dim}` preallocated
   - `current_len` — number of valid positions already in the cache
@@ -29,6 +30,7 @@ defmodule EMLXAxon.Qwen3.Attention do
   """
   def forward(
         hidden,
+        norm,
         k_cache,
         v_cache,
         current_len,
@@ -40,35 +42,80 @@ defmodule EMLXAxon.Qwen3.Attention do
         k_norm,
         cfg
       ) do
+    if Enum.any?([q_proj, k_proj, v_proj, o_proj], &EMLX.Quantization.quantized?/1) do
+      forward_generic(
+        hidden,
+        norm,
+        k_cache,
+        v_cache,
+        current_len,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        cfg
+      )
+    else
+      forward_dense(
+        hidden,
+        norm,
+        k_cache,
+        v_cache,
+        current_len,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        cfg
+      )
+    end
+  end
+
+  defp forward_generic(
+         hidden,
+         norm,
+         k_cache,
+         v_cache,
+         current_len,
+         q_proj,
+         k_proj,
+         v_proj,
+         o_proj,
+         q_norm,
+         k_norm,
+         cfg
+       ) do
     num_heads = cfg.num_attention_heads
     num_kv_heads = cfg.num_key_value_heads
     head_dim = cfg.head_dim
     scale = 1.0 / :math.sqrt(head_dim)
     theta = cfg.rope_theta
 
+    hidden_norm = Layers.rms_norm(hidden, norm, cfg.rms_norm_eps)
     hidden_shape = Nx.shape(hidden)
     batch = elem(hidden_shape, 0)
     seq_len = elem(hidden_shape, 1)
 
     # Quantized projections — EMLX dispatches to quantized_matmul via backend
-    q = Nx.dot(hidden, [2], q_proj, [1]) |> Nx.reshape({batch, seq_len, num_heads, head_dim})
-    k = Nx.dot(hidden, [2], k_proj, [1]) |> Nx.reshape({batch, seq_len, num_kv_heads, head_dim})
-    v = Nx.dot(hidden, [2], v_proj, [1]) |> Nx.reshape({batch, seq_len, num_kv_heads, head_dim})
+    q = Nx.dot(hidden_norm, [2], q_proj, [1]) |> Nx.reshape({batch, seq_len, num_heads, head_dim})
+
+    k =
+      Nx.dot(hidden_norm, [2], k_proj, [1])
+      |> Nx.reshape({batch, seq_len, num_kv_heads, head_dim})
+
+    v =
+      Nx.dot(hidden_norm, [2], v_proj, [1])
+      |> Nx.reshape({batch, seq_len, num_kv_heads, head_dim})
 
     # Qwen3 per-head QK RMSNorm before RoPE (normalises over last axis = head_dim)
     q = Layers.rms_norm(q, q_norm, cfg.rms_norm_eps)
     k = Layers.rms_norm(k, k_norm, cfg.rms_norm_eps)
 
-    # Transpose to {B, N, T, D} — required by mlx::fast::rope and sdpa
-    q = Nx.transpose(q, axes: [0, 2, 1, 3])
-    k = Nx.transpose(k, axes: [0, 2, 1, 3])
-    v = Nx.transpose(v, axes: [0, 2, 1, 3])
-
-    # Fused RoPE: computes cos/sin internally; offset = tokens already in cache
-    q = EMLX.Fast.rope(q, head_dim, false, theta, 1.0, current_len)
-    k = EMLX.Fast.rope(k, head_dim, false, theta, 1.0, current_len)
-
-    # Fused cache update + SDPA via kv_cache_sdpa_update.
+    # Fused Q/K transpose + RoPE + cache update + SDPA.
     #
     # The NIF move-extracts k_cache / v_cache from their ENIF resources before
     # slice_update, enabling MLX's donation optimisation at eval time: the
@@ -76,28 +123,78 @@ defmodule EMLXAxon.Qwen3.Attention do
     # The slice and SDPA are fused in the same lazy graph, so they land in one
     # Metal command buffer submission.
     {attn_ref, k_cache_ref, v_cache_ref} =
-      EMLX.kv_cache_sdpa_update(
+      EMLX.qwen3_kv_cache_attention(
         EMLX.Backend.from_nx(q),
         EMLX.Backend.from_nx(k),
         EMLX.Backend.from_nx(v),
         EMLX.Backend.from_nx(k_cache),
         EMLX.Backend.from_nx(v_cache),
         current_len,
-        scale
+        scale,
+        head_dim,
+        theta
       )
 
-    attn_out = EMLX.Backend.to_nx(attn_ref)
+    attn_out = attention_residual(hidden, attn_ref, o_proj)
     k_cache = EMLX.Backend.to_nx(k_cache_ref)
     v_cache = EMLX.Backend.to_nx(v_cache_ref)
 
-    # Reshape: {B, N_q, T_q, D} → {B, T_q, N_q, D} → {B, T, hidden}
-    attn_out =
-      attn_out
-      |> Nx.transpose(axes: [0, 2, 1, 3])
-      |> Nx.reshape({batch, seq_len, num_heads * head_dim})
+    {attn_out, k_cache, v_cache}
+  end
 
-    out = Nx.dot(attn_out, [2], o_proj, [1])
+  defp forward_dense(
+         hidden,
+         norm,
+         k_cache,
+         v_cache,
+         current_len,
+         q_proj,
+         k_proj,
+         v_proj,
+         o_proj,
+         q_norm,
+         k_norm,
+         cfg
+       ) do
+    head_dim = cfg.head_dim
+    scale = 1.0 / :math.sqrt(head_dim)
+    theta = cfg.rope_theta
 
-    {out, k_cache, v_cache}
+    {out_ref, k_cache_ref, v_cache_ref} =
+      EMLX.qwen3_attention_block(
+        EMLX.Backend.from_nx(hidden),
+        EMLX.Backend.from_nx(norm),
+        EMLX.Backend.from_nx(q_proj),
+        EMLX.Backend.from_nx(k_proj),
+        EMLX.Backend.from_nx(v_proj),
+        EMLX.Backend.from_nx(o_proj),
+        EMLX.Backend.from_nx(q_norm),
+        EMLX.Backend.from_nx(k_norm),
+        EMLX.Backend.from_nx(k_cache),
+        EMLX.Backend.from_nx(v_cache),
+        current_len,
+        scale,
+        head_dim,
+        theta,
+        cfg.rms_norm_eps
+      )
+
+    {
+      EMLX.Backend.to_nx(out_ref),
+      EMLX.Backend.to_nx(k_cache_ref),
+      EMLX.Backend.to_nx(v_cache_ref)
+    }
+  end
+
+  defp attention_residual(residual_hidden, attn_ref, o_proj) do
+    if EMLX.Quantization.quantized?(o_proj) do
+      attn_out = EMLX.Backend.to_nx(attn_ref)
+      Nx.add(residual_hidden, Nx.dot(attn_out, [2], o_proj, [1]))
+    else
+      residual_hidden
+      |> EMLX.Backend.from_nx()
+      |> EMLX.qwen3_attention_residual(attn_ref, EMLX.Backend.from_nx(o_proj))
+      |> EMLX.Backend.to_nx()
+    end
   end
 end

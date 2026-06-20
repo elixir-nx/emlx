@@ -43,9 +43,30 @@ defmodule EMLXAxon.Qwen3.Generate do
   - `:top_p`          — float, passed to nucleus samplers (default 0.9)
   - `:rng_key`        — `Nx.Random.key/1`, used by `:top_p_gpu` (split each step via
                         `Nx.Random.split/2`; avoids host time + transfer per token)
-  - `:profile_timing` — when `true` (default), record `per_token_ms` decode samples via
-                        `System.monotonic_time/1` each step; set `false` to skip that overhead
+  - `:profile_timing` — when `true`, record `per_token_ms` decode samples via
+                        `System.monotonic_time/1` each step; defaults to `false`
+                        to keep the generation hot path free of timing for each token
+                        overhead
                         (prefill/total wall time is still measured)
+  - `:token_callback` — optional function of arity 1 called with each generated token id
+                        after the token has been evaluated and copied to the host
+  - `:chunk_callback` — optional function of arity 1 called with a list of generated
+                        token ids whenever a deferred host sync chunk is copied to
+                        the host. This is only used with `host_sync: {:chunk, n}`.
+  - `:chunk_callback_first_token` — when `true`, emit the prefill token through
+                        `:chunk_callback` immediately and then chunk the remaining
+                        decode tokens. Defaults to `false` to preserve generic
+                        chunk callback semantics.
+  - `:return_kv_cache` — when `true`, include the final KV cache in the returned
+                         metadata so serving layers can reuse the owned cache on
+                         the next request
+  - `:host_sync`      — `:per_token | :end | {:chunk, pos_integer()}` (default
+                        `:per_token`). `:end` keeps greedy/top-p GPU sampled tokens
+                        on the EMLX backend until generation finishes, then copies
+                        token ids to the host once as a stacked tensor. `{:chunk, n}`
+                        copies stacked token chunks every `n` generated tokens so it
+                        can stop soon after EOS. Deferred host sync modes cannot be
+                        used with `:token_callback`.
 
   ## Returns
 
@@ -57,64 +78,104 @@ defmodule EMLXAxon.Qwen3.Generate do
   @spec generate(Nx.Tensor.t(), Model.State.t(), keyword()) ::
           {[non_neg_integer()], map()}
   def generate(input_ids, %Model.State{} = state, opts \\ []) do
-    max_new = Keyword.get(opts, :max_new_tokens, @default_max_new_tokens)
-    max_len = Keyword.get(opts, :max_len, @default_max_len)
+    ensure_single_batch!(input_ids)
+
+    requested_max_new =
+      opts
+      |> Keyword.get(:max_new_tokens, @default_max_new_tokens)
+      |> validate_max_new_tokens!()
+
+    configured_max_len = Keyword.get(opts, :max_len, @default_max_len)
     sampler = Keyword.get(opts, :sampler, :greedy)
     temp = Keyword.get(opts, :temperature, 0.95)
     top_p = Keyword.get(opts, :top_p, 0.9)
-    rng_key = Keyword.get(opts, :rng_key, Nx.Random.key(42))
-    profile_timing? = Keyword.get(opts, :profile_timing, true)
+    input_length = elem(Nx.shape(input_ids), 1)
 
     kv_cache =
       case Keyword.fetch(opts, :kv_cache) do
         {:ok, prealloc} -> prealloc
-        :error -> Model.init_kv_cache(state, max_len)
+        :error -> Model.init_kv_cache(state, configured_max_len)
       end
 
-    gpu = {EMLX.Backend, device: :gpu}
+    max_len = effective_max_len(configured_max_len, kv_cache)
+    max_new = safe_max_new_tokens!(requested_max_new, max_len, input_length)
 
-    # Reused {1,1} token buffer for decode steps (avoids reallocating the slot each token).
-    decode_slot =
-      if max_new > 1 do
-        Nx.broadcast(Nx.tensor(0, type: :s64, backend: @cpu_backend), {1, 1})
-        |> Nx.backend_transfer(gpu)
+    rng_key =
+      if sampler == :top_p_gpu do
+        Keyword.get(opts, :rng_key, Nx.Random.key(42))
       else
         nil
       end
+
+    profile_timing? = Keyword.get(opts, :profile_timing, false)
+    token_callback = Keyword.get(opts, :token_callback)
+    chunk_callback = Keyword.get(opts, :chunk_callback)
+    chunk_callback_first_token? = Keyword.get(opts, :chunk_callback_first_token, false)
+    return_kv_cache? = Keyword.get(opts, :return_kv_cache, false)
+
+    host_sync =
+      host_sync_mode(Keyword.get(opts, :host_sync, :per_token), sampler, token_callback)
 
     # Prefill: pass the full prompt in one forward
     t0 = System.monotonic_time(:millisecond)
 
     {rng_key, first_gpu_key} = advance_rng_for_gpu(sampler, rng_key)
 
-    {logits, kv_cache} = Model.forward(input_ids, kv_cache, 0, state)
-    first_token = sample(logits, sampler, temp, top_p, first_gpu_key)
-    # Sync to GPU here (once per token)
-    EMLX.eval(EMLX.Backend.from_nx(first_token))
+    {first_token, kv_cache} =
+      forward_sample(input_ids, kv_cache, 0, sampler, temp, top_p, first_gpu_key, state)
 
     t1 = System.monotonic_time(:millisecond)
     prefill_ms = t1 - t0
 
     # Native path uses `{1, prompt_len}`; KV length tracks sequence dimension.
-    current_len = elem(Nx.shape(input_ids), 1)
+    current_len = input_length
     eos_id = eos_token_id(state)
 
-    decode_ctx = {eos_id, sampler, temp, top_p, state, profile_timing?}
+    decode_ctx =
+      {eos_id, sampler, temp, top_p, state, profile_timing?, token_callback, chunk_callback}
 
     # Tail-recursive decode: max_new - 1 steps after prefill (no Enum range / closure).
     remaining_decode = max(max_new - 1, 0)
 
-    {tokens, per_token_ms, _kv, _cur, _rng, _decode_slot} =
-      decode_tokens(
-        remaining_decode,
-        [Nx.to_number(first_token)],
-        [],
-        kv_cache,
-        current_len,
-        rng_key,
-        decode_slot,
-        decode_ctx
-      )
+    {tokens, per_token_ms, kv_cache, _cur, _rng} =
+      case host_sync do
+        :per_token ->
+          first_token_id = Nx.to_number(first_token)
+          emit_token(token_callback, first_token_id)
+
+          decode_tokens(
+            remaining_decode,
+            [first_token_id],
+            [],
+            kv_cache,
+            current_len,
+            rng_key,
+            decode_ctx
+          )
+
+        :end ->
+          decode_tensors(
+            remaining_decode,
+            [first_token],
+            [],
+            kv_cache,
+            current_len,
+            rng_key,
+            decode_ctx
+          )
+
+        {:chunk, chunk_size} ->
+          decode_tensor_chunks_start(
+            remaining_decode,
+            first_token,
+            kv_cache,
+            current_len,
+            rng_key,
+            decode_ctx,
+            chunk_size,
+            chunk_callback_first_token?
+          )
+      end
 
     t_end = System.monotonic_time(:millisecond)
 
@@ -124,42 +185,128 @@ defmodule EMLXAxon.Qwen3.Generate do
       total_ms: t_end - t0
     }
 
-    {:lists.reverse(tokens), %{timing: timing}}
+    metadata =
+      %{timing: timing}
+      |> Map.put(:finish_reason, finish_reason(tokens, eos_id, requested_max_new, max_new))
+      |> maybe_put_kv_cache(return_kv_cache?, kv_cache)
+
+    {:lists.reverse(tokens), metadata}
   end
 
   # ── Helpers ───────────────────────────────────────────────────────────────
 
-  defp decode_tokens(0, acc_tokens, acc_times, kv, cur, rng_key, decode_slot, _ctx) do
-    {acc_tokens, acc_times, kv, cur, rng_key, decode_slot}
+  defp validate_max_new_tokens!(max_new) when is_integer(max_new) and max_new > 0,
+    do: max_new
+
+  defp validate_max_new_tokens!(max_new) do
+    raise ArgumentError,
+          "expected :max_new_tokens to be a positive integer, got: #{inspect(max_new)}"
   end
 
-  defp decode_tokens(n, acc_tokens, acc_times, kv, cur, rng_key, decode_slot, ctx)
-       when is_integer(n) and n > 0 do
-    {eos_id, _, _, _, _, _} = ctx
-    [last_id | _] = acc_tokens
+  defp safe_max_new_tokens!(requested_max_new, max_len, input_length) do
+    safe_max_new = max_len - input_length + 1
 
-    if last_id == eos_id do
-      {acc_tokens, acc_times, kv, cur, rng_key, decode_slot}
-    else
-      decode_step_timed(n, acc_tokens, acc_times, kv, cur, rng_key, decode_slot, ctx, last_id)
+    cond do
+      input_length > max_len ->
+        raise ArgumentError,
+              "expected :max_len to be greater than or equal to input length, " <>
+                "got max_len=#{inspect(max_len)} and input_length=#{inspect(input_length)}"
+
+      safe_max_new < requested_max_new ->
+        safe_max_new
+
+      true ->
+        requested_max_new
     end
   end
 
-  defp decode_step_timed(n, acc_tokens, acc_times, kv, cur, rng_key, decode_slot, ctx, last_id) do
-    {_eos_id, sampler, temp, top_p, state, profile_timing?} = ctx
+  defp finish_reason(tokens, eos_id, _requested_max_new, _max_new) do
+    if Enum.any?(tokens, &eos_token?(&1, eos_id)), do: :stop, else: :length
+  end
+
+  defp maybe_put_kv_cache(metadata, true, kv_cache), do: Map.put(metadata, :kv_cache, kv_cache)
+  defp maybe_put_kv_cache(metadata, false, _kv_cache), do: metadata
+
+  defp effective_max_len(configured_max_len, kv_cache) do
+    case kv_cache_capacity(kv_cache) do
+      nil -> configured_max_len
+      capacity -> min(configured_max_len, capacity)
+    end
+  end
+
+  defp kv_cache_capacity([{k_cache, _v_cache} | _rest]) do
+    case cache_shape(k_cache) do
+      {_batch, _heads, max_len, _head_dim} -> max_len
+      _other -> nil
+    end
+  end
+
+  defp kv_cache_capacity(_kv_cache), do: nil
+
+  defp cache_shape(%Nx.Tensor{} = tensor), do: Nx.shape(tensor)
+
+  defp cache_shape({device, ref}) when is_atom(device) and is_reference(ref),
+    do: EMLX.shape({device, ref})
+
+  defp cache_shape(_cache), do: nil
+
+  defp host_sync_mode(:per_token, _sampler, _token_callback), do: :per_token
+
+  defp host_sync_mode(:end, sampler, nil) when sampler in [:greedy, :top_p_gpu], do: :end
+
+  defp host_sync_mode({:chunk, chunk_size}, sampler, nil)
+       when sampler in [:greedy, :top_p_gpu] and is_integer(chunk_size) and chunk_size > 0,
+       do: {:chunk, chunk_size}
+
+  defp host_sync_mode({:chunk, chunk_size}, _sampler, _token_callback)
+       when not is_integer(chunk_size) or chunk_size <= 0 do
+    raise ArgumentError,
+          "expected :host_sync chunk size to be a positive integer, got: #{inspect(chunk_size)}"
+  end
+
+  defp host_sync_mode(:end, _sampler, token_callback) when is_function(token_callback, 1),
+    do: :per_token
+
+  defp host_sync_mode({:chunk, _chunk_size}, _sampler, token_callback)
+       when is_function(token_callback, 1),
+       do: :per_token
+
+  defp host_sync_mode(:end, _sampler, _token_callback), do: :per_token
+  defp host_sync_mode({:chunk, _chunk_size}, _sampler, _token_callback), do: :per_token
+
+  defp host_sync_mode(other, _sampler, _token_callback) do
+    raise ArgumentError,
+          "expected :host_sync to be :per_token, :end, or {:chunk, positive_integer}, got: #{inspect(other)}"
+  end
+
+  defp decode_tokens(0, acc_tokens, acc_times, kv, cur, rng_key, _ctx) do
+    {acc_tokens, acc_times, kv, cur, rng_key}
+  end
+
+  defp decode_tokens(n, acc_tokens, acc_times, kv, cur, rng_key, ctx)
+       when is_integer(n) and n > 0 do
+    {eos_id, _, _, _, _, _, _, _} = ctx
+    [last_id | _] = acc_tokens
+
+    if eos_token?(last_id, eos_id) do
+      {acc_tokens, acc_times, kv, cur, rng_key}
+    else
+      decode_step_timed(n, acc_tokens, acc_times, kv, cur, rng_key, ctx, last_id)
+    end
+  end
+
+  defp decode_step_timed(n, acc_tokens, acc_times, kv, cur, rng_key, ctx, last_id) do
+    {_eos_id, sampler, temp, top_p, state, profile_timing?, token_callback, _chunk_callback} =
+      ctx
 
     ts = if profile_timing?, do: System.monotonic_time(:millisecond)
 
-    # Host {1,1} slice; put_slice uploads into the GPU decode_slot (no separate transfer).
-    id_patch = Nx.tensor([[last_id]], type: :s64, backend: @cpu_backend)
-
-    decode_slot = Nx.put_slice(decode_slot, [0, 0], id_patch)
-
-    {logits, kv_new} = Model.forward(decode_slot, kv, cur, state)
-
     {rng_key, gpu_key} = advance_rng_for_gpu(sampler, rng_key)
-    next_token = sample(logits, sampler, temp, top_p, gpu_key)
-    EMLX.eval(EMLX.Backend.from_nx(next_token))
+
+    {next_token_id, kv_new} =
+      forward_sample_token_id(last_id, kv, cur, sampler, temp, top_p, gpu_key, state)
+
+    emit_token(token_callback, next_token_id)
 
     acc_times =
       if profile_timing? do
@@ -171,23 +318,397 @@ defmodule EMLXAxon.Qwen3.Generate do
 
     decode_tokens(
       n - 1,
-      [Nx.to_number(next_token) | acc_tokens],
+      [next_token_id | acc_tokens],
       acc_times,
       kv_new,
       cur + 1,
       rng_key,
-      decode_slot,
       ctx
     )
   end
 
-  defp sample(logits, :greedy, _temp, _top_p, _key), do: Sampler.greedy(logits)
+  defp decode_tensors(0, acc_tokens, acc_times, kv, cur, rng_key, ctx) do
+    {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback, _chunk_callback} =
+      ctx
+
+    tokens =
+      acc_tokens
+      |> :lists.reverse()
+      |> tokens_to_host()
+      |> truncate_at_eos(eos_id)
+
+    {:lists.reverse(tokens), :lists.reverse(acc_times), kv, cur, rng_key}
+  end
+
+  defp decode_tensors(n, acc_tokens, acc_times, kv, cur, rng_key, ctx)
+       when is_integer(n) and n > 0 do
+    {_eos_id, sampler, temp, top_p, state, profile_timing?, _token_callback, _chunk_callback} =
+      ctx
+
+    [last_token | _] = acc_tokens
+
+    ts = if profile_timing?, do: System.monotonic_time(:millisecond)
+    decode_input = Nx.reshape(last_token, {1, 1})
+
+    {rng_key, gpu_key} = advance_rng_for_gpu(sampler, rng_key)
+
+    {next_token, kv_new} =
+      forward_sample(decode_input, kv, cur, sampler, temp, top_p, gpu_key, state)
+
+    acc_times =
+      if profile_timing? do
+        te = System.monotonic_time(:millisecond)
+        [te - ts | acc_times]
+      else
+        acc_times
+      end
+
+    decode_tensors(
+      n - 1,
+      [next_token | acc_tokens],
+      acc_times,
+      kv_new,
+      cur + 1,
+      rng_key,
+      ctx
+    )
+  end
+
+  defp decode_tensor_chunks_start(
+         remaining_decode,
+         first_token,
+         kv_cache,
+         current_len,
+         rng_key,
+         ctx,
+         chunk_size,
+         false
+       ) do
+    decode_tensor_chunks(
+      remaining_decode,
+      first_token,
+      [first_token],
+      1,
+      [],
+      [],
+      kv_cache,
+      current_len,
+      rng_key,
+      ctx,
+      chunk_size
+    )
+  end
+
+  defp decode_tensor_chunks_start(
+         remaining_decode,
+         first_token,
+         kv_cache,
+         current_len,
+         rng_key,
+         {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback,
+          chunk_callback} = ctx,
+         chunk_size,
+         true
+       )
+       when is_function(chunk_callback, 1) do
+    first_token_id = Nx.to_number(first_token)
+    emit_chunk(chunk_callback, [first_token_id])
+
+    if eos_token?(first_token_id, eos_id) do
+      {[first_token_id], [], kv_cache, current_len, rng_key}
+    else
+      decode_tensor_chunks(
+        remaining_decode,
+        first_token,
+        [],
+        0,
+        [first_token_id],
+        [],
+        kv_cache,
+        current_len,
+        rng_key,
+        ctx,
+        chunk_size
+      )
+    end
+  end
+
+  defp decode_tensor_chunks(
+         0,
+         _last_token,
+         pending_tokens,
+         _pending_count,
+         host_tokens,
+         acc_times,
+         kv,
+         cur,
+         rng_key,
+         ctx,
+         _chunk_size
+       ) do
+    {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback, chunk_callback} =
+      ctx
+
+    tokens = flush_chunk(host_tokens, pending_tokens, eos_id, chunk_callback)
+    {:lists.reverse(tokens), :lists.reverse(acc_times), kv, cur, rng_key}
+  end
+
+  defp decode_tensor_chunks(
+         n,
+         last_token,
+         pending_tokens,
+         pending_count,
+         host_tokens,
+         acc_times,
+         kv,
+         cur,
+         rng_key,
+         ctx,
+         chunk_size
+       )
+       when is_integer(n) and n > 0 do
+    {eos_id, sampler, _temp, _top_p, state, profile_timing?, _token_callback, chunk_callback} =
+      ctx
+
+    case maybe_flush_chunk(
+           host_tokens,
+           pending_tokens,
+           pending_count,
+           eos_id,
+           chunk_size,
+           chunk_callback
+         ) do
+      {:halt, tokens} ->
+        {:lists.reverse(tokens), :lists.reverse(acc_times), kv, cur, rng_key}
+
+      {:cont, host_tokens, pending_tokens, pending_count} ->
+        ts = if profile_timing?, do: System.monotonic_time(:millisecond)
+        decode_input = Nx.reshape(last_token, {1, 1})
+
+        if sampler == :greedy and not profile_timing? do
+          chunk_count = min(n, chunk_size - pending_count)
+
+          case Model.forward_greedy_chunk(decode_input, kv, cur, chunk_count, state) do
+            {next_tokens, kv_new} ->
+              {last_token, pending_tokens} =
+                append_reversed_with_last(next_tokens, pending_tokens)
+
+              decode_tensor_chunks(
+                n - chunk_count,
+                last_token,
+                pending_tokens,
+                pending_count + chunk_count,
+                host_tokens,
+                acc_times,
+                kv_new,
+                cur + chunk_count,
+                rng_key,
+                ctx,
+                chunk_size
+              )
+
+            :fallback ->
+              decode_tensor_chunk_step(
+                n,
+                decode_input,
+                pending_tokens,
+                pending_count,
+                host_tokens,
+                acc_times,
+                kv,
+                cur,
+                rng_key,
+                ctx,
+                ts,
+                chunk_size
+              )
+          end
+        else
+          decode_tensor_chunk_step(
+            n,
+            decode_input,
+            pending_tokens,
+            pending_count,
+            host_tokens,
+            acc_times,
+            kv,
+            cur,
+            rng_key,
+            ctx,
+            ts,
+            chunk_size
+          )
+        end
+    end
+  end
+
+  defp append_reversed_with_last([token | rest], pending_tokens) do
+    append_reversed_with_last(rest, token, [token | pending_tokens])
+  end
+
+  defp append_reversed_with_last([], _pending_tokens) do
+    raise ArgumentError, "expected at least one generated token in a greedy chunk"
+  end
+
+  defp append_reversed_with_last([token | rest], _last_token, pending_tokens) do
+    append_reversed_with_last(rest, token, [token | pending_tokens])
+  end
+
+  defp append_reversed_with_last([], last_token, pending_tokens), do: {last_token, pending_tokens}
+
+  defp decode_tensor_chunk_step(
+         n,
+         decode_input,
+         pending_tokens,
+         pending_count,
+         host_tokens,
+         acc_times,
+         kv,
+         cur,
+         rng_key,
+         ctx,
+         ts,
+         chunk_size
+       ) do
+    {_eos_id, sampler, temp, top_p, state, profile_timing?, _token_callback, _chunk_callback} =
+      ctx
+
+    {rng_key, gpu_key} = advance_rng_for_gpu(sampler, rng_key)
+
+    {next_token, kv_new} =
+      forward_sample(decode_input, kv, cur, sampler, temp, top_p, gpu_key, state)
+
+    acc_times =
+      if profile_timing? do
+        te = System.monotonic_time(:millisecond)
+        [te - ts | acc_times]
+      else
+        acc_times
+      end
+
+    decode_tensor_chunks(
+      n - 1,
+      next_token,
+      [next_token | pending_tokens],
+      pending_count + 1,
+      host_tokens,
+      acc_times,
+      kv_new,
+      cur + 1,
+      rng_key,
+      ctx,
+      chunk_size
+    )
+  end
+
+  defp forward_sample(input_ids, kv, cur, :greedy, _temp, _top_p, _key, state) do
+    Model.forward_greedy(input_ids, kv, cur, state)
+  end
+
+  defp forward_sample(input_ids, kv, cur, sampler, temp, top_p, key, state) do
+    {logits, kv_new} = Model.forward(input_ids, kv, cur, state)
+    {sample(logits, sampler, temp, top_p, key), kv_new}
+  end
+
+  defp forward_sample_token_id(token_id, kv, cur, :greedy, _temp, _top_p, _key, state)
+       when is_integer(token_id) do
+    Model.forward_greedy_decode_token_id(token_id, kv, cur, state)
+  end
+
+  defp forward_sample_token_id(token_id, kv, cur, sampler, temp, top_p, key, state)
+       when is_integer(token_id) do
+    input_ids = Nx.tensor([[token_id]], type: :s64, backend: @cpu_backend)
+    {next_token, kv_new} = forward_sample(input_ids, kv, cur, sampler, temp, top_p, key, state)
+    {Nx.to_number(next_token), kv_new}
+  end
 
   defp sample(logits, :top_p_cpu, temp, top_p, _key),
     do: Sampler.top_p_cpu(logits, temp, top_p)
 
   defp sample(logits, :top_p_gpu, temp, _top_p, gpu_key) do
     Sampler.top_p_gpu(logits, gpu_key, temperature: temp)
+  end
+
+  defp emit_token(nil, _token_id), do: :ok
+
+  defp emit_token(callback, token_id) when is_function(callback, 1) do
+    callback.(token_id)
+    :ok
+  end
+
+  defp ensure_single_batch!(input_ids) do
+    case Nx.shape(input_ids) do
+      {1, _seq_len} ->
+        :ok
+
+      {batch_size, _seq_len} ->
+        raise ArgumentError,
+              "native Qwen3 generation currently supports batch size 1, got batch size #{batch_size}"
+
+      shape ->
+        raise ArgumentError,
+              "expected input_ids to have shape {1, sequence_length}, got: #{inspect(shape)}"
+    end
+  end
+
+  defp emit_chunk(nil, _token_ids), do: :ok
+  defp emit_chunk(_callback, []), do: :ok
+
+  defp emit_chunk(callback, token_ids) when is_function(callback, 1) do
+    callback.(token_ids)
+    :ok
+  end
+
+  defp truncate_at_eos(tokens, eos_id) do
+    case Enum.split_while(tokens, &(not eos_token?(&1, eos_id))) do
+      {prefix, []} -> prefix
+      {prefix, [eos_token | _rest]} -> prefix ++ [eos_token]
+    end
+  end
+
+  defp maybe_flush_chunk(host_tokens, pending_tokens, pending_count, eos_id, chunk_size, callback)
+       when pending_count >= chunk_size do
+    tokens = flush_chunk(host_tokens, pending_tokens, eos_id, callback)
+
+    if eos_seen?(tokens, eos_id) do
+      {:halt, tokens}
+    else
+      {:cont, tokens, [], 0}
+    end
+  end
+
+  defp maybe_flush_chunk(
+         host_tokens,
+         pending_tokens,
+         pending_count,
+         _eos_id,
+         _chunk_size,
+         _callback
+       ),
+       do: {:cont, host_tokens, pending_tokens, pending_count}
+
+  defp flush_chunk(host_tokens, [] = _pending_tokens, _eos_id, _callback), do: host_tokens
+
+  defp flush_chunk(host_tokens, pending_tokens, eos_id, callback) do
+    emitted =
+      pending_tokens
+      |> :lists.reverse()
+      |> tokens_to_host()
+      |> truncate_at_eos(eos_id)
+
+    emit_chunk(callback, emitted)
+    host_tokens ++ emitted
+  end
+
+  defp eos_seen?(tokens, eos_id), do: Enum.any?(tokens, &eos_token?(&1, eos_id))
+
+  defp eos_token?(token_id, eos_ids) when is_list(eos_ids), do: token_id in eos_ids
+  defp eos_token?(token_id, eos_id), do: token_id == eos_id
+
+  defp tokens_to_host(tokens) do
+    tokens
+    |> Nx.stack()
+    |> Nx.to_flat_list()
   end
 
   defp advance_rng_for_gpu(:top_p_gpu, key) do

@@ -17,6 +17,7 @@ defmodule EMLXAxon.Qwen3.Loader do
       {:ok, state} = Loader.load("~/models/Qwen3-0.6B-MLX-4bit")
   """
 
+  alias EMLXAxon.Qwen3.Model
   alias EMLXAxon.Qwen3.Model.State
 
   @type config :: %{
@@ -145,21 +146,20 @@ defmodule EMLXAxon.Qwen3.Loader do
       for i <- 0..(config.num_hidden_layers - 1) do
         prefix = "model.layers.#{i}"
 
-        %{
-          input_layernorm: tensors["#{prefix}.input_layernorm.weight"] |> to_gpu.(),
-          post_attention_layernorm:
-            tensors["#{prefix}.post_attention_layernorm.weight"] |> to_gpu.(),
-          # Qwen3 has per-head RMSNorm on q and k after projection
-          q_norm: tensors["#{prefix}.self_attn.q_norm.weight"] |> to_gpu.(),
-          k_norm: tensors["#{prefix}.self_attn.k_norm.weight"] |> to_gpu.(),
-          q_proj: quantized_linear(tensors, "#{prefix}.self_attn.q_proj", config),
-          k_proj: quantized_linear(tensors, "#{prefix}.self_attn.k_proj", config),
-          v_proj: quantized_linear(tensors, "#{prefix}.self_attn.v_proj", config),
-          o_proj: quantized_linear(tensors, "#{prefix}.self_attn.o_proj", config),
-          gate_proj: quantized_linear(tensors, "#{prefix}.mlp.gate_proj", config),
-          up_proj: quantized_linear(tensors, "#{prefix}.mlp.up_proj", config),
-          down_proj: quantized_linear(tensors, "#{prefix}.mlp.down_proj", config)
-        }
+        # Qwen3 has per-head RMSNorm on q and k after projection.
+        Model.layer(
+          tensors["#{prefix}.input_layernorm.weight"] |> to_gpu.(),
+          tensors["#{prefix}.post_attention_layernorm.weight"] |> to_gpu.(),
+          tensors["#{prefix}.self_attn.q_norm.weight"] |> to_gpu.(),
+          tensors["#{prefix}.self_attn.k_norm.weight"] |> to_gpu.(),
+          quantized_linear(tensors, "#{prefix}.self_attn.q_proj", config),
+          quantized_linear(tensors, "#{prefix}.self_attn.k_proj", config),
+          quantized_linear(tensors, "#{prefix}.self_attn.v_proj", config),
+          quantized_linear(tensors, "#{prefix}.self_attn.o_proj", config),
+          quantized_linear(tensors, "#{prefix}.mlp.gate_proj", config),
+          quantized_linear(tensors, "#{prefix}.mlp.up_proj", config),
+          quantized_linear(tensors, "#{prefix}.mlp.down_proj", config)
+        )
       end
 
     state = %State{
