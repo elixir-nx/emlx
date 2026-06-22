@@ -333,7 +333,7 @@ defmodule EMLXAxon.Qwen3.Generate do
 
     tokens =
       acc_tokens
-      |> :lists.reverse()
+      |> Enum.reverse()
       |> tokens_to_host()
       |> truncate_at_eos(eos_id)
 
