@@ -706,9 +706,7 @@ defmodule EMLXAxon.Qwen3.Generate do
   defp eos_token?(token_id, eos_id), do: token_id == eos_id
 
   defp tokens_to_host(tokens) do
-    tokens
-    |> Nx.stack()
-    |> Nx.to_flat_list()
+    Enum.flat_map(tokens, &Nx.to_flat_list/1)
   end
 
   defp advance_rng_for_gpu(:top_p_gpu, key) do
