@@ -337,7 +337,7 @@ defmodule EMLXAxon.Qwen3.Generate do
       |> tokens_to_host()
       |> truncate_at_eos(eos_id)
 
-    {:lists.reverse(tokens), :lists.reverse(acc_times), kv, cur, rng_key}
+    {Enum.reverse(tokens), Enum.reverse(acc_times), kv, cur, rng_key}
   end
 
   defp decode_tensors(n, acc_tokens, acc_times, kv, cur, rng_key, ctx)
