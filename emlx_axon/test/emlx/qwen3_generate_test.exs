@@ -172,6 +172,34 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     assert first_token == hd(tokens)
   end
 
+  test "profile timing reports microsecond-resolution millisecond values" do
+    {:ok, state} =
+      DenseLoader.from_model_info(%{
+        params: %Axon.ModelState{data: params()},
+        spec: spec()
+      })
+
+    input_ids =
+      Nx.tensor([[1, 2]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    for host_sync <- [:per_token, :end, {:chunk, 2}] do
+      {_tokens, %{timing: timing}} =
+        Generate.generate(input_ids, state,
+          max_new_tokens: 3,
+          max_len: 8,
+          sampler: :greedy,
+          host_sync: host_sync,
+          profile_timing: true
+        )
+
+      assert is_float(timing.prefill_ms)
+      assert is_float(timing.total_ms)
+      assert length(timing.per_token_ms) == 2
+      assert Enum.all?(timing.per_token_ms, &is_float/1)
+    end
+  end
+
   test "chunked host sync returns the same greedy token ids as sync after each token" do
     {:ok, state} =
       DenseLoader.from_model_info(%{
