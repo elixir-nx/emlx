@@ -82,9 +82,7 @@ defmodule EMLXAxon.TextGeneration do
         Bumblebee.apply_tokenizer(tokenizer, [text])
       end)
 
-    input_ids =
-      encoded["input_ids"]
-      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+    input_ids = Nx.backend_transfer(encoded["input_ids"], {EMLX.Backend, device: :gpu})
 
     input_length = Nx.axis_size(input_ids, 1)
 
