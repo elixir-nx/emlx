@@ -479,7 +479,7 @@ defmodule EMLXAxon.Qwen3.Generate do
            chunk_callback
          ) do
       {:halt, tokens} ->
-        {:lists.reverse(tokens), :lists.reverse(acc_times), kv, cur, rng_key}
+        {Enum.reverse(tokens), Enum.reverse(acc_times), kv, cur, rng_key}
 
       {:cont, host_tokens, pending_tokens, pending_count} ->
         ts = if profile_timing?, do: System.monotonic_time(:millisecond)
