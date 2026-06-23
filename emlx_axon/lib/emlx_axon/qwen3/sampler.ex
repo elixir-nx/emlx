@@ -14,11 +14,7 @@ defmodule EMLXAxon.Qwen3.Sampler do
 
   @doc "Greedy decoding: return the token with the highest logit as a scalar tensor."
   def greedy(logits) do
-    logits
-    |> EMLX.Backend.from_nx()
-    |> EMLX.argmax(1, false)
-    |> EMLX.Backend.to_nx()
-    |> Nx.squeeze(axes: [0])
+    logits |> Nx.squeeze(axes: [0]) |> Nx.argmax(axis: 0)
   end
 
   @doc """
