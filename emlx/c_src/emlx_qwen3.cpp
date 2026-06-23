@@ -5,10 +5,6 @@
 // translation unit so the model native code has a clear boundary from the
 // generic EMLX fast operations and can be extracted later.
 
-static ERL_NIF_TERM qwen3_error(ErlNifEnv *env, const std::string &message) {
-  return nx::nif::error(env, message.c_str());
-}
-
 static bool qwen3_check_rank(
     const mlx::core::array &tensor,
     int expected,
@@ -278,7 +274,7 @@ NIF(qwen3_kv_cache_attention) {
     std::string error;
     if (!qwen3_validate_qkv_cache_attention(
             *q, *new_k, *new_v, *k_cache, *v_cache, offset, head_dim, error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int B       = q->shape(0);
@@ -416,7 +412,7 @@ NIF(qwen3_mlp) {
   try {
     std::string error;
     if (!qwen3_check_rank3_positive(*hidden, "hidden", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int H = hidden->shape(2);
@@ -429,7 +425,7 @@ NIF(qwen3_mlp) {
         !qwen3_check_dim(*up_proj, 1, gate_proj->shape(1), "up_proj", "output width", error) ||
         !qwen3_check_dim(*down_proj, 0, gate_proj->shape(1), "down_proj", "input width", error) ||
         !qwen3_check_dim(*down_proj, 1, H, "down_proj", "output width", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     auto xn = mlx::core::fast::rms_norm(*hidden, *norm, (float)eps, device);
@@ -501,7 +497,7 @@ NIF(qwen3_layer) {
     if (!qwen3_check_rank3_positive(*hidden, "hidden", error) ||
         !qwen3_check_non_negative(offset, "offset", error) ||
         !qwen3_check_positive(head_dim, "head_dim", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int B       = hidden->shape(0);
@@ -516,7 +512,7 @@ NIF(qwen3_layer) {
         !qwen3_check_dim(*v_proj, 1, k_proj->shape(1), "v_proj", "output width", error) ||
         !qwen3_check_rank1_dim(*q_norm, D, "q_norm", error) ||
         !qwen3_check_rank1_dim(*k_norm, D, "k_norm", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int N_q     = q_proj->shape(1) / D;
@@ -524,7 +520,7 @@ NIF(qwen3_layer) {
     int attn_width = N_q * D;
 
     if ((N_q % N_kv) != 0) {
-      return qwen3_error(env, "query heads must be divisible by key/value heads");
+      return nx::nif::error(env, "query heads must be divisible by key/value heads");
     }
     if (!qwen3_check_rank2_positive(*o_proj, "o_proj", error) ||
         !qwen3_check_dim(*o_proj, 0, attn_width, "o_proj", "input width", error) ||
@@ -538,7 +534,7 @@ NIF(qwen3_layer) {
         !qwen3_check_dim(*up_proj, 1, gate_proj->shape(1), "up_proj", "output width", error) ||
         !qwen3_check_dim(*down_proj, 0, gate_proj->shape(1), "down_proj", "input width", error) ||
         !qwen3_check_dim(*down_proj, 1, H, "down_proj", "output width", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
     int valid_len = offset + T_new;
 
@@ -972,7 +968,7 @@ static ERL_NIF_TERM qwen3_forward_greedy_from_hidden(
   if (!qwen3_check_rank3_positive(hidden, "hidden", input_error) ||
       !qwen3_check_non_negative(offset, "offset", input_error) ||
       !qwen3_check_positive(head_dim, "head_dim", input_error)) {
-    return qwen3_error(env, input_error);
+    return nx::nif::error(env, input_error.c_str());
   }
 
   auto current = hidden;
@@ -1001,7 +997,7 @@ static ERL_NIF_TERM qwen3_forward_greedy_from_hidden(
     }
     std::string error;
     if (!qwen3_validate_dense_layer(current, layer, kv, offset, head_dim, error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     auto k_new = *kv.k;
@@ -1027,13 +1023,13 @@ static ERL_NIF_TERM qwen3_forward_greedy_from_hidden(
   int T = current.shape(1);
   int H = current.shape(2);
   if (return_token_id && B != 1) {
-    return qwen3_error(env, "token_id return paths require batch size 1");
+    return nx::nif::error(env, "token_id return paths require batch size 1");
   }
   std::string final_error;
   if (!qwen3_check_rank1_dim(*norm, H, "norm", final_error) ||
       !qwen3_check_rank2_positive(*lm_head, "lm_head", final_error) ||
       !qwen3_check_dim(*lm_head, 1, H, "lm_head", "hidden width", final_error)) {
-    return qwen3_error(env, final_error);
+    return nx::nif::error(env, final_error.c_str());
   }
 
   auto last = (T == 1)
@@ -1091,7 +1087,7 @@ NIF(qwen3_forward_greedy_ids) {
         !qwen3_check_rank2_positive(*embed_tokens, "embed_tokens", error) ||
         !qwen3_check_non_negative(offset, "offset", error) ||
         !qwen3_check_positive(head_dim, "head_dim", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int B = input_ids->shape(0);
@@ -1194,13 +1190,13 @@ NIF(qwen3_forward_greedy_ids_chunk) {
         !qwen3_check_rank1_dim(*norm, embed_tokens->shape(1), "norm", error) ||
         !qwen3_check_rank2_positive(*lm_head, "lm_head", error) ||
         !qwen3_check_dim(*lm_head, 1, embed_tokens->shape(1), "lm_head", "hidden width", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
     if (input_ids->shape(0) != 1) {
-      return qwen3_error(env, "qwen3_forward_greedy_ids_chunk requires batch size 1");
+      return nx::nif::error(env, "qwen3_forward_greedy_ids_chunk requires batch size 1");
     }
     if (input_ids->shape(1) != 1) {
-      return qwen3_error(env, "qwen3_forward_greedy_ids_chunk requires sequence length 1");
+      return nx::nif::error(env, "qwen3_forward_greedy_ids_chunk requires sequence length 1");
     }
 
     std::vector<mlx::core::array> k_cache;
@@ -1241,7 +1237,7 @@ NIF(qwen3_forward_greedy_ids_chunk) {
         std::string layer_error;
         if (!qwen3_validate_dense_layer(
                 current, layers[layer_idx], kv, current_offset, head_dim, layer_error)) {
-          return qwen3_error(env, layer_error);
+          return nx::nif::error(env, layer_error.c_str());
         }
 
         ERL_NIF_TERM unused_k_term;
@@ -1363,7 +1359,7 @@ NIF(qwen3_forward_greedy_ids_token_id) {
         !qwen3_check_rank2_positive(*embed_tokens, "embed_tokens", error) ||
         !qwen3_check_non_negative(offset, "offset", error) ||
         !qwen3_check_positive(head_dim, "head_dim", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int B = input_ids->shape(0);
@@ -1414,10 +1410,10 @@ NIF(qwen3_forward_greedy_token_id) {
     if (!qwen3_check_rank2_positive(*embed_tokens, "embed_tokens", error) ||
         !qwen3_check_non_negative(offset, "offset", error) ||
         !qwen3_check_positive(head_dim, "head_dim", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
     if (token_id < 0 || token_id >= embed_tokens->shape(0)) {
-      return qwen3_error(env, "token_id is outside the embedding vocabulary");
+      return nx::nif::error(env, "token_id is outside the embedding vocabulary");
     }
 
     auto ids = mlx::core::array(token_id, mlx::core::int64);
@@ -1453,7 +1449,7 @@ NIF(qwen3_final_greedy) {
   try {
     std::string error;
     if (!qwen3_check_rank3_positive(*hidden, "hidden", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int B = hidden->shape(0);
@@ -1462,7 +1458,7 @@ NIF(qwen3_final_greedy) {
     if (!qwen3_check_rank1_dim(*norm, H, "norm", error) ||
         !qwen3_check_rank2_positive(*lm_head, "lm_head", error) ||
         !qwen3_check_dim(*lm_head, 1, H, "lm_head", "hidden width", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     auto last = (T == 1)
@@ -1499,7 +1495,7 @@ NIF(qwen3_attention_residual) {
     std::string error;
     if (!qwen3_check_rank3_positive(*hidden, "hidden", error) ||
         !qwen3_check_rank3_positive(*attn_out, "attn_out", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int B = hidden->shape(0);
@@ -1510,7 +1506,7 @@ NIF(qwen3_attention_residual) {
         !qwen3_check_rank2_positive(*o_proj, "o_proj", error) ||
         !qwen3_check_dim(*o_proj, 0, attn_out->shape(2), "o_proj", "input width", error) ||
         !qwen3_check_dim(*o_proj, 1, H, "o_proj", "output width", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     auto projected = qwen3_linear_in_out(*attn_out, *o_proj, device);
@@ -1567,7 +1563,7 @@ NIF(qwen3_attention_block) {
     if (!qwen3_check_rank3_positive(*hidden, "hidden", error) ||
         !qwen3_check_non_negative(offset, "offset", error) ||
         !qwen3_check_positive(head_dim, "head_dim", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     int B       = hidden->shape(0);
@@ -1583,14 +1579,14 @@ NIF(qwen3_attention_block) {
         !qwen3_check_dim(*q_proj, 0, H, "q_proj", "input width", error) ||
         !qwen3_check_dim(*k_proj, 0, H, "k_proj", "input width", error) ||
         !qwen3_check_dim(*v_proj, 0, H, "v_proj", "input width", error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
 
     if ((q_proj->shape(1) % D) != 0 || (k_proj->shape(1) % D) != 0) {
-      return qwen3_error(env, "projection output widths must be divisible by head_dim");
+      return nx::nif::error(env, "projection output widths must be divisible by head_dim");
     }
     if (v_proj->shape(1) != k_proj->shape(1)) {
-      return qwen3_error(env, "v_proj output width must match k_proj output width");
+      return nx::nif::error(env, "v_proj output width must match k_proj output width");
     }
 
     int N_q     = q_proj->shape(1) / D;
@@ -1598,13 +1594,13 @@ NIF(qwen3_attention_block) {
     int attn_width = N_q * D;
 
     if ((N_q % N_kv) != 0) {
-      return qwen3_error(env, "query heads must be divisible by key/value heads");
+      return nx::nif::error(env, "query heads must be divisible by key/value heads");
     }
     if (!qwen3_check_rank2_positive(*o_proj, "o_proj", error) ||
         !qwen3_check_dim(*o_proj, 0, attn_width, "o_proj", "input width", error) ||
         !qwen3_check_dim(*o_proj, 1, H, "o_proj", "output width", error) ||
         !qwen3_validate_kv_cache_bn(*k_cache, *v_cache, B, N_kv, offset, T_new, D, error)) {
-      return qwen3_error(env, error);
+      return nx::nif::error(env, error.c_str());
     }
     int valid_len = offset + T_new;
 
