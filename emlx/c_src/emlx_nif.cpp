@@ -1,5 +1,5 @@
 #include "emlx_nif_shared.hpp"
-#include "emlx_qwen3.hpp"
+#include "emlx_fast/qwen3.hpp"
 
 #include <iostream>
 #include <map>
@@ -1436,7 +1436,7 @@ ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
 // fast_* and kv_cache_* NIFs are defined in emlx_fast.cpp.
-// Qwen3 model accelerators are defined in emlx_qwen3.cpp. They are still
+// Qwen3 model accelerators are defined in emlx_fast/qwen3.cpp. They are still
 // registered by emlx for now, but kept isolated because the user facing
 // loading and generation path lives in emlx_axon.
 
