@@ -104,7 +104,6 @@ defmodule EMLXAxon.Qwen3.DenseLoader do
         Nx.with_default_backend(backend, fn ->
           build_safetensors_state(tensors, config, type)
         end)
-        |> eval_state()
 
       {:ok, state}
     end
@@ -258,26 +257,5 @@ defmodule EMLXAxon.Qwen3.DenseLoader do
       _missing ->
         raise ArgumentError, "missing Bumblebee parameter #{scope}.#{name}"
     end
-  end
-
-  defp eval_state(%State{} = state) do
-    state
-    |> state_tensors()
-    |> Enum.each(fn tensor ->
-      tensor
-      |> EMLX.Backend.from_nx()
-      |> EMLX.eval()
-    end)
-
-    state
-  end
-
-  defp state_tensors(%State{
-         embed_tokens: embed_tokens,
-         layers: layers,
-         norm: norm,
-         lm_head: lm_head
-       }) do
-    [embed_tokens, norm, lm_head | Enum.flat_map(layers, &Tuple.to_list/1)]
   end
 end
