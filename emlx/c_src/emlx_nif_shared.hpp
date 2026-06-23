@@ -12,7 +12,6 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
-#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>

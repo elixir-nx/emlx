@@ -1,6 +1,8 @@
 #include "qwen3.hpp"
 #include "../emlx_nif_shared.hpp"
 
+#include <memory>
+
 // Qwen3 model accelerators used by emlx_axon. These live in a separate
 // translation unit so the model native code has a clear boundary from the
 // generic EMLX fast operations and can be extracted later.
