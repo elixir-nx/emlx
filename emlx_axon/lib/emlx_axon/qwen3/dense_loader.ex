@@ -253,14 +253,10 @@ defmodule EMLXAxon.Qwen3.DenseLoader do
   defp tensor!(params, scope, name) do
     case params do
       %{^scope => %{^name => tensor}} ->
-        tensor
+        Nx.backend_transfer(tensor, @gpu)
 
       _missing ->
-        nil
-    end
-    |> case do
-      %Nx.Tensor{} = tensor -> Nx.backend_transfer(tensor, @gpu)
-      nil -> raise ArgumentError, "missing Bumblebee parameter #{scope}.#{name}"
+        raise ArgumentError, "missing Bumblebee parameter #{scope}.#{name}"
     end
   end
 
