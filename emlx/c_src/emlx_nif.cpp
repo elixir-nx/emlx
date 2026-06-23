@@ -1,4 +1,5 @@
 #include "emlx_nif_shared.hpp"
+#include "emlx_qwen3.hpp"
 
 #include <iostream>
 #include <map>
@@ -1435,6 +1436,9 @@ ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
 // fast_* and kv_cache_* NIFs are defined in emlx_fast.cpp.
+// Qwen3 model accelerators are defined in emlx_qwen3.cpp. They are still
+// registered by emlx for now, but kept isolated because the user facing
+// loading and generation path lives in emlx_axon.
 
 // Forward declarations for the async wrappers defined in emlx_fast.cpp.
 ERL_NIF_TERM fast_rms_norm_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
@@ -1452,17 +1456,6 @@ ERL_NIF_TERM fast_swiglu_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_masked_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_sdpa_update_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_mlp_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_layer_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_forward_greedy_ids_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_forward_greedy_ids_chunk_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_forward_greedy_ids_token_id_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_forward_greedy_token_id_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_final_greedy_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_attention_residual_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-ERL_NIF_TERM qwen3_attention_block_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-
 // ─── Async wrappers ────────────────────────────────────────────────────────
 
 // Build a sliding window view of a padded tensor.
