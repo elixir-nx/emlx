@@ -43,7 +43,7 @@ defmodule EMLXAxon.Qwen3.Attention do
         cfg
       ) do
     if Enum.any?([q_proj, k_proj, v_proj, o_proj], &EMLX.Quantization.quantized?/1) do
-      forward_generic(
+      forward_quantized(
         hidden,
         norm,
         k_cache,
@@ -75,7 +75,7 @@ defmodule EMLXAxon.Qwen3.Attention do
     end
   end
 
-  defp forward_generic(
+  defp forward_quantized(
          hidden,
          norm,
          k_cache,
