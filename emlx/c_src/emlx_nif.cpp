@@ -1,4 +1,5 @@
 #include "emlx_nif_shared.hpp"
+#include "emlx_compiler.hpp"
 
 #include <iostream>
 #include <map>
@@ -8,15 +9,6 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-
-std::map<const std::string, const mlx::core::Dtype> dtypes = {
-    {"bool", mlx::core::bool_},         {"uint8", mlx::core::uint8},
-    {"uint16", mlx::core::uint16},      {"uint32", mlx::core::uint32},
-    {"uint64", mlx::core::uint64},      {"int8", mlx::core::int8},
-    {"int16", mlx::core::int16},        {"int32", mlx::core::int32},
-    {"int64", mlx::core::int64},        {"float16", mlx::core::float16},
-    {"float32", mlx::core::float32},    {"bfloat16", mlx::core::bfloat16},
-    {"complex64", mlx::core::complex64}};
 
 std::map<const std::string, const uint8_t> dtype_sizes = {
     {"bool", mlx::core::bool_.size()},
@@ -32,23 +24,6 @@ std::map<const std::string, const uint8_t> dtype_sizes = {
     {"float32", mlx::core::float32.size()},
     {"bfloat16", mlx::core::bfloat16.size()},
     {"complex64", mlx::core::complex64.size()}};
-
-inline mlx::core::Dtype string2dtype(const std::string &atom) {
-  auto it = dtypes.find(atom);
-  if (it != dtypes.end()) {
-    return it->second;
-  }
-  throw std::runtime_error("Unknown dtype: " + atom);
-}
-
-inline const std::string *dtype2string(const mlx::core::Dtype dtype) {
-  for (const auto &pair : dtypes) {
-    if (pair.second == dtype) {
-      return &pair.first;
-    }
-  }
-  return nullptr;
-}
 
 
 ERL_NIF_TERM
@@ -1047,6 +1022,11 @@ static int open_resources(ErlNifEnv *env) {
     return -1;
   }
 
+  // emlx::native::Expr — opaque compiled program resource for the defn compiler.
+  if (!open_resource<emlx::native::Expr>(env, mod, "NativeProgram")) {
+    return -1;
+  }
+
   return 0;
 }
 
@@ -1810,6 +1790,16 @@ ASYNC_NIF(tensordot)
 ASYNC_NIF(window_scatter_max)
 ASYNC_NIF(window_scatter_min)
 
+// ── Native compiler NIFs (thin wrappers — logic lives in emlx_compiler.cpp) ──
+
+NIF(compile_program) { return emlx::native::compile_program_impl(env, argc, argv); }
+ASYNC_NIF(compile_program)
+
+NIF(eval_program) { return emlx::native::eval_program_impl(env, argc, argv); }
+ASYNC_NIF(eval_program)
+
+NIF(native_expr_opcode_table) { return emlx::native::opcode_table_impl(env, argc, argv); }
+
 static ErlNifFunc nif_funcs[] = {
     {"eval", 2, eval_async},
     {"to_device", 3, to_device_async},
@@ -1985,6 +1975,14 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
-    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
+
+    // ── NativeExpr compiler NIFs ──────────────────────────────────────────
+    // compile_program: 1 (worker) + 8 args = 9 registered.
+    {"compile_program", 9, compile_program_async},
+    // eval_program: 1 (worker) + 2 args = 3 registered.
+    {"eval_program", 3, eval_program_async},
+    // native_expr_opcode_table: 0 args, non-worker-routed.
+    {"native_expr_opcode_table", 0, native_expr_opcode_table}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

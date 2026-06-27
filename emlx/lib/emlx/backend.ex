@@ -705,26 +705,7 @@ defmodule EMLX.Backend do
   defp needs_type_conversion?({:u, 8}, :bool), do: true
   defp needs_type_conversion?(_, _), do: false
 
-  defp to_mlx_type({:u, 2}), do: :uint8
-  defp to_mlx_type({:u, 4}), do: :uint8
-  defp to_mlx_type({:u, 8}), do: :uint8
-  defp to_mlx_type({:u, 16}), do: :uint16
-  defp to_mlx_type({:u, 32}), do: :uint32
-  defp to_mlx_type({:u, 64}), do: :uint64
-  defp to_mlx_type({:s, 2}), do: :int8
-  defp to_mlx_type({:s, 4}), do: :int8
-  defp to_mlx_type({:s, 8}), do: :int8
-  defp to_mlx_type({:s, 16}), do: :int16
-  defp to_mlx_type({:s, 32}), do: :int32
-  defp to_mlx_type({:s, 64}), do: :int64
-  defp to_mlx_type({:f, 8}), do: :float16
-  defp to_mlx_type({:f, 16}), do: :float16
-  defp to_mlx_type({:f, 32}), do: :float32
-  defp to_mlx_type({:f, 64}), do: :float32
-  defp to_mlx_type({:bf, 16}), do: :bfloat16
-  defp to_mlx_type({:c, 64}), do: :complex64
-  defp to_mlx_type({:c, 128}), do: :complex64
-  defp to_mlx_type(:bool), do: :bool
+  defp to_mlx_type(type), do: EMLX.Native.to_mlx_type(type)
 
   defp to_nx_type(:uint8), do: {:u, 8}
   defp to_nx_type(:uint16), do: {:u, 16}

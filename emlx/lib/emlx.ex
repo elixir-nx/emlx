@@ -1321,22 +1321,113 @@ defmodule EMLX do
     Keyword.validate!(opts, @valid_compiler_keys)
     {compiler_opts, rest_opts} = split_compiler_opts(opts)
     queue = Keyword.get(compiler_opts, :command_queue)
+    device = Keyword.get(compiler_opts, :device, default_device())
 
-    inner =
-      Nx.Defn.Evaluator.__compile__(
-        key,
-        vars,
-        fun,
-        Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
+    case try_native_compile(vars, fun, device) do
+      {:ok, eval_fn} ->
+        # Native path: wrap with queue if provided.
+        if queue do
+          fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> eval_fn.(inputs) end) end
+        else
+          eval_fn
+        end
+
+      :not_supported ->
+        # Fallback: delegate to Nx.Defn.Evaluator for ops not yet lowered.
+        inner =
+          Nx.Defn.Evaluator.__compile__(
+            key,
+            vars,
+            fun,
+            Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
+          )
+
+        if queue do
+          # Capture the queue ref in a closure so each invocation of the
+          # compiled function routes through the correct CommandQueue.
+          fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> inner.(inputs) end) end
+        else
+          inner
+        end
+    end
+  end
+
+  # Attempts to lower `fun.(vars)` to an `EMLX.Native.Expr` program and build a compiled
+  # program resource. Returns `{:ok, eval_fn}` on success, or `:not_supported`
+  # if `lower/1` encounters an op not yet implemented (fires the Evaluator
+  # fallback). Any other error is re-raised.
+  #
+  # This is intentionally a separate function so the rescue clause does not
+  # accidentally swallow unrelated errors from the outer __compile__ body.
+  defp try_native_compile(vars, fun, device) do
+    output_expr = fun.(vars)
+    program = EMLX.Native.Expr.lower(output_expr)
+
+    # Resolve the compile-time worker for compile_program.
+    {worker, effective_device} = resolve_worker(device)
+
+    {num_inputs, capture_nif_refs, constant_values, constant_types, opcodes, operands, iattrs, wire_outputs} =
+      EMLX.Native.Expr.to_wire(program)
+
+    job_ref =
+      EMLX.NIF.compile_program(
+        worker,
+        num_inputs,
+        capture_nif_refs,
+        constant_values,
+        constant_types,
+        opcodes,
+        operands,
+        iattrs,
+        wire_outputs
       )
+      |> unwrap!()
 
-    if queue do
-      # Capture the queue ref in a closure so each invocation of the compiled
-      # function routes through the correct CommandQueue. The queue lives as
-      # long as the Nx.Serving module_state that holds this compiled function.
-      fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> inner.(inputs) end) end
-    else
-      inner
+    program_resource = await_worker(job_ref)
+
+    eval_fn = build_native_eval_fn(program_resource, output_expr, effective_device)
+
+    {:ok, eval_fn}
+  rescue
+    e in ArgumentError ->
+      if String.starts_with?(Exception.message(e), "does not yet lower op") do
+        :not_supported
+      else
+        reraise e, __STACKTRACE__
+      end
+  end
+
+  # Builds the per-call eval closure for the native path.
+  # `output_expr` is the traced expression (used as a type/shape template for
+  # reconstructing output tensors after the NIF returns raw resource refs).
+  defp build_native_eval_fn(program_resource, output_expr, effective_device) do
+    fn [params] ->
+      {worker, dev} = resolve_worker(effective_device)
+
+      # Each element of `params` is a zero-arity function (lazy container).
+      # Call it to materialise the actual %Nx.Tensor{} with EMLX.Backend data.
+      input_refs =
+        Enum.map(params, fn lazy ->
+          %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, ref}}} = lazy.()
+          ref
+        end)
+
+      job_ref =
+        EMLX.NIF.eval_program(worker, program_resource, input_refs)
+        |> unwrap!()
+
+      out_refs = await_worker(job_ref)
+
+      # Reconstruct output tensors: traverse the output expression template
+      # (provides type/shape/names) and attach each returned resource ref as
+      # a proper EMLX.Backend data value.
+      {output_container, []} =
+        Nx.Defn.Composite.traverse(output_expr, out_refs, fn leaf, [ref | rest] ->
+          emlx_tensor = EMLX.Backend.to_nx({dev, ref}, leaf)
+          {emlx_tensor, rest}
+        end)
+
+      [output_container]
     end
   end
 

@@ -1,6 +1,6 @@
 # Nx.Defn.Expr node taxonomy & coverage checklist
 
-The complete set of node types the native lowerer (`EMLX.NativeExpr`) must
+The complete set of node types the native lowerer (`EMLX.Native.Expr`) must
 eventually handle, split into **syntax/control-flow nodes** (compiler-level —
 the lowerer must handle these itself; `Nx.Defn.Evaluator` does today) and
 **backend-callback ops** (EMLX.Backend already implements eager semantics —

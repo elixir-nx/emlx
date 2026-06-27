@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -136,5 +137,36 @@ private:
     VAR = VAR##_tp.data();                                                     \
   }
 
-// Forward declaration — defined in emlx_nif.cpp, used in emlx_fast.cpp.
+// Forward declaration — defined in emlx_nif.cpp, used in emlx_fast.cpp and
+// emlx_compiler.cpp.
 ERL_NIF_TERM create_tensor_resource(ErlNifEnv *env, mlx::core::array tensor);
+
+// Dtype name ↔ mlx::core::Dtype mapping — shared across emlx_nif.cpp and
+// emlx_compiler.cpp.
+inline const std::map<std::string, mlx::core::Dtype> &dtype_map() {
+  static const std::map<std::string, mlx::core::Dtype> table = {
+      {"bool", mlx::core::bool_},         {"uint8", mlx::core::uint8},
+      {"uint16", mlx::core::uint16},      {"uint32", mlx::core::uint32},
+      {"uint64", mlx::core::uint64},      {"int8", mlx::core::int8},
+      {"int16", mlx::core::int16},        {"int32", mlx::core::int32},
+      {"int64", mlx::core::int64},        {"float16", mlx::core::float16},
+      {"float32", mlx::core::float32},    {"bfloat16", mlx::core::bfloat16},
+      {"complex64", mlx::core::complex64}};
+  return table;
+}
+
+inline mlx::core::Dtype string2dtype(const std::string &atom) {
+  const auto &table = dtype_map();
+  auto it = table.find(atom);
+  if (it != table.end())
+    return it->second;
+  throw std::runtime_error("Unknown dtype: " + atom);
+}
+
+inline const std::string *dtype2string(const mlx::core::Dtype dtype) {
+  for (const auto &pair : dtype_map()) {
+    if (pair.second == dtype)
+      return &pair.first;
+  }
+  return nullptr;
+}

@@ -129,7 +129,9 @@ defmodule EMLX.Defn.TreeTest do
 
       # Inner-body ops (:less, :add at inner scope and hoisted :constant) must NOT appear
       not_while = Enum.map(not_while, & &1.data.op)
-      assert [:parameter] == not_while, "inner-scope nodes leaked into parent ordering: #{inspect(not_while)}"
+
+      assert [:parameter] == not_while,
+             "inner-scope nodes leaked into parent ordering: #{inspect(not_while)}"
 
       assert_post_order(order)
 
@@ -158,7 +160,8 @@ defmodule EMLX.Defn.TreeTest do
       order = Tree.post_order(expr)
 
       # :multiply and :subtract could appear in different others, this doesn't really impact the test
-      assert [:parameter, :parameter, :add, :multiply, :subtract, :add] == Enum.map(order, & &1.data.op)
+      assert [:parameter, :parameter, :add, :multiply, :subtract, :add] ==
+               Enum.map(order, & &1.data.op)
 
       # Every operand must precede its consumer
       assert_post_order(order)

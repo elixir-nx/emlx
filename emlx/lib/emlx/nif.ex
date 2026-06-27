@@ -117,4 +117,35 @@ defmodule EMLX.NIF do
   def graph_replay(_compiled_ref, _new_inputs) do
     :erlang.nif_error(:nif_not_loaded)
   end
+
+  # ── Native.Expr compiler NIFs ─────────────────────────────────────────────
+  # compile_program — builds an opaque ProgramResource from the Native.Expr IR
+  # and a set of captured arrays. Worker-routed (argv[0] = worker).
+  # Arity = 1 (worker) + 9 = 10 registered.
+  def compile_program(
+        _worker,
+        _num_inputs,
+        _capture_refs,
+        _const_values,
+        _const_types,
+        _opcodes,
+        _operands,
+        _iattrs,
+        _output_refs
+      ) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  # eval_program — replays a compiled ProgramResource against runtime inputs.
+  # Worker-routed (argv[0] = worker). Returns a list of output MLX array refs.
+  # Arity = 1 (worker) + 2 = 3 registered.
+  def eval_program(_worker, _program_ref, _input_refs) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  # native_expr_opcode_table/0 — returns [{:add, 0}, ...] from the C++ enum.
+  # Non-worker-routed; pure metadata query (no MLX graph access).
+  def native_expr_opcode_table do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end

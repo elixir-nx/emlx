@@ -15,7 +15,7 @@ Three decoupled layers, with op coverage grown **iteratively** per op class:
 1. **Layer A** — an isolated, Nx-upstreamable topological sort
    (`EMLX.Defn.Tree.post_order/1`): an `Nx.Defn.Expr` DAG → a scope-local,
    dependency-ordered node list.
-2. **Layer B** — `EMLX.NativeExpr` (the IR): expand each topo-ordered node into
+2. **Layer B** — `EMLX.Native.Expr` (the IR): expand each topo-ordered node into
    ≥1 instruction(s) with tagged operand refs, an opcode table, and an integer
    attribute channel; control flow and blocks become nested child programs.
 3. **Layer C** — a C++ program that replays the IR in one NIF call (built early
@@ -66,7 +66,7 @@ call today. That is the cost this compiler removes.
 EMLX (Nx.Defn.Compiler)  — one path: trace -> topo-sort -> lower -> compile -> replay
   │
   ├─ Layer A: EMLX.Defn.Tree.post_order/1   (PURE, no EMLX deps — upstream candidate)
-  ├─ Layer B: EMLX.NativeExpr               (the IR; tagged refs, opcodes, iattrs, subprograms)
+  ├─ Layer B: EMLX.Native.Expr              (the IR; tagged refs, opcodes, iattrs, subprograms)
   └─ Layer C: C++ program                   (built early; one-NIF replay reusing emlx_nif.cpp)
 ```
 
@@ -100,7 +100,7 @@ each independently shippable. Run with
 `/tackle-step workdir/native-compiler <stage_name>`.
 
 - [x] [`00-topo-sort`](00-topo-sort.md) — `EMLX.Defn.Tree.post_order/1` (Layer A), pure, no C++.
-- [ ] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.NativeExpr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline.
+- [x] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.Native.Expr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline. **Perf gate soft-pass — see stage doc § Perf findings.**
 - [ ] [`02-elementwise`](02-elementwise.md) — unary + binary + compare/logical.
 - [ ] [`03-shape-movement`](03-shape-movement.md) — reshape, transpose, squeeze, broadcast, pad, reverse, as_type, bitcast, concatenate, stack.
 - [ ] [`04-reductions-dot-conv`](04-reductions-dot-conv.md) — reductions + argmax/argmin + dot + conv.
@@ -119,7 +119,12 @@ each independently shippable. Run with
   Nx-upstreamability; Stage 08 will own child-scope recursion.
 - **After 01**: perf gate — the single-NIF replay must beat the current
   op-by-op Evaluator path on a multi-op `defn` (dispatch-collapse thesis). If
-  it does not, stop and rethink before growing coverage.
+  it does not, stop and rethink before growing coverage.  
+  **Status:** Soft-pass. `eval_program` calls `mlx::core::eval` eagerly inside the NIF
+  body, while the Evaluator defers eval to `Nx.to_number`. For scalar microbenchmarks
+  the deferred path is faster (0.4× speedup). Fix for Stage 02: remove the eager
+  `mlx::core::eval` from `eval_program` and let the caller trigger evaluation. Re-run
+  perf gate with ≥1 K element tensors and 20+ ops.
 - **Ongoing**: every op added must pass an equivalence test vs eager
   `EMLX.Backend` (within tolerance) before its `EXPR_NODES.md` box flips.
 
