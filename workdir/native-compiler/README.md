@@ -1,0 +1,146 @@
+# EMLX Native Expr Compiler — planning
+
+Overall task overview and stage index. Each stage is a separate doc in this
+directory, designed for `/tackle-step <planning_dir> <stage_name>`.
+`EXPR_NODES.md` is the companion node taxonomy / coverage checklist.
+
+## Goal
+
+Give EMLX a single-NIF graph-replay compiler for `defn`. The win: **collapse
+the per-op BEAM↔NIF round-trips a `defn` pays today into one NIF call per
+invocation**, and cross weights over the NIF boundary once instead of per op.
+
+Three decoupled layers, with op coverage grown **iteratively** per op class:
+
+1. **Layer A** — an isolated, Nx-upstreamable topological sort
+   (`EMLX.Defn.Tree.post_order/1`): an `Nx.Defn.Expr` DAG → a scope-local,
+   dependency-ordered node list.
+2. **Layer B** — `EMLX.NativeExpr` (the IR): expand each topo-ordered node into
+   ≥1 instruction(s) with tagged operand refs, an opcode table, and an integer
+   attribute channel; control flow and blocks become nested child programs.
+3. **Layer C** — a C++ program that replays the IR in one NIF call (built early
+   so end-to-end perf is validated from the first op), reusing EMLX's existing
+   per-op C++ implementations.
+
+The `EMLX` compiler is **single-mode**: it always lowers via this structure.
+There is no `:native` flag and no eager-Evaluator fallback lane; lowering
+control is structural, via `Nx.Defn.Block` (see "Lowering control" below).
+
+## Resolved decisions (drive everything)
+
+1. **Single-mode compiler.** One execution path: the new lowering structure.
+   Lowering is total over the primitive op set; control over native-vs-default
+   lowering is expressed through `Nx.Defn.Block`, not compiler options.
+2. **Topo-sort vendored as `EMLX.Defn.Tree.post_order/1`** —
+   `emlx/lib/emlx/defn/tree.ex`, namespaced to mirror `Nx.Defn.Tree` so the
+   eventual upstream move is a rename.
+3. **C++ compile/eval lands early** (Stage 01) so perf is validated from the
+   start; each op class is then implemented in steps.
+4. **Module home**: `emlx/lib/emlx/defn/`.
+5. **`post_order/1` emits the same `%Nx.Tensor{}` structs it received**,
+   reordered into dependency-first sequence (pure reordering of one scope).
+6. **`while`/`fun`/`cond` sub-scopes are part of the IR** as nested child
+   programs (subprograms).
+
+## Why feasible for EMLX specifically
+
+The compiler is a graph-compiler front end layered on EMLX's existing backend
+and queue dispatch. EMLX already owns most of the substrate:
+
+- A complete `Nx.Backend` — **every backend-callback op already has C++/MLX
+  semantics** (`emlx/c_src/emlx_nif.cpp`). Lowering reuses those; we build each
+  op into a graph instead of eval'ing it eagerly. No new kernels.
+- `EMLX.CommandQueue` worker/queue dispatch — the substrate the replay NIF runs on.
+- `EMLX.Fast` fused kernels (RMSNorm / RoPE / SDPA / LayerNorm).
+- A `Nx.Defn.Compiler` already wired up in `emlx/lib/emlx.ex`
+  (`__jit__/__compile__/__partitions_options__/__to_backend__`) that today
+  **delegates to `Nx.Defn.Evaluator`** — the seam we replace.
+
+MLX is lazy, so EMLX already gets intra-defn graph fusion before the final read.
+What it lacks is dispatch-cost amortization — every Expr node is its own NIF
+call today. That is the cost this compiler removes.
+
+## Architecture (single lane)
+
+```
+EMLX (Nx.Defn.Compiler)  — one path: trace -> topo-sort -> lower -> compile -> replay
+  │
+  ├─ Layer A: EMLX.Defn.Tree.post_order/1   (PURE, no EMLX deps — upstream candidate)
+  ├─ Layer B: EMLX.NativeExpr               (the IR; tagged refs, opcodes, iattrs, subprograms)
+  └─ Layer C: C++ program                   (built early; one-NIF replay reusing emlx_nif.cpp)
+```
+
+Per-layer oracle (a bug can only live in the layer whose test fails): Layer A
+vs hand-checked orderings; Layer B vs eager `EMLX.Backend` (via an Elixir IR
+interpreter); Layer C vs Layer B.
+
+## Lowering control via `Nx.Defn.Block`
+
+Single-mode ⇒ no "route the whole defn through the Evaluator" escape hatch.
+Control over native-vs-primitive lowering is structural:
+
+- A `block` Expr node carries `[struct, block_args, default_expr, fun]`. The
+  `struct` is an `Nx.Block.*` value (e.g. `Nx.Block.LinAlg.QR`,
+  `Nx.Block.CumulativeSum`, `Nx.Block.TopK`, `Nx.Block.FFT2`,
+  `Nx.Block.AllClose`, `Nx.Block.Phase`, …); `default_expr` is the traced
+  primitive decomposition.
+- The lowerer handles a `block` node either by **recognizing the struct**
+  (emit a native / fused instruction — the LinAlg / `EMLX.Fast` path), or by
+  **descending into `default_expr`** (lower the primitive expansion — the
+  built-in, always-available per-block default).
+- Genuinely unlowerable nodes (`token`/`attach_token` hooks, `runtime_call`,
+  any host side-effecting construct) **raise** — no silent fallback. During
+  incremental development, a not-yet-implemented op class also raises; that is
+  expected and bounded by the burndown.
+
+## Stages
+
+Tackle in order. Stages 00–01 are foundational; 02–10 grow op coverage and are
+each independently shippable. Run with
+`/tackle-step workdir/native-compiler <stage_name>`.
+
+- [ ] [`00-topo-sort`](00-topo-sort.md) — `EMLX.Defn.Tree.post_order/1` (Layer A), pure, no C++.
+- [ ] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.NativeExpr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline.
+- [ ] [`02-elementwise`](02-elementwise.md) — unary + binary + compare/logical.
+- [ ] [`03-shape-movement`](03-shape-movement.md) — reshape, transpose, squeeze, broadcast, pad, reverse, as_type, bitcast, concatenate, stack.
+- [ ] [`04-reductions-dot-conv`](04-reductions-dot-conv.md) — reductions + argmax/argmin + dot + conv.
+- [ ] [`05-indexing-selection`](05-indexing-selection.md) — select, clip, slice, put_slice, gather, take, take_along_axis, indexed_add/put.
+- [ ] [`06-sort-window-cumulative-fft`](06-sort-window-cumulative-fft.md) — sort/argsort, window reductions, cumulative, fft family.
+- [ ] [`07-creation-rng`](07-creation-rng.md) — iota, eye, `Nx.Random` primitives.
+- [ ] [`08-control-flow`](08-control-flow.md) — `cond`, `while` via child programs.
+- [ ] [`09-blocks-linalg`](09-blocks-linalg.md) — `Nx.Block.LinAlg.*` recognize-struct path + `default_expr` descent.
+- [ ] [`10-fast-kernels`](10-fast-kernels.md) — pattern-route to `EMLX.Fast`.
+
+## Decision gates
+
+- **After 00**: confirm the `post_order/1` shape — minimal (lowerer recurses
+  into child scopes) vs richer (`{ordered_nodes, child_scopes}`). Leaning
+  minimal; revisit with 08 in view.
+- **After 01**: perf gate — the single-NIF replay must beat the current
+  op-by-op Evaluator path on a multi-op `defn` (dispatch-collapse thesis). If
+  it does not, stop and rethink before growing coverage.
+- **Ongoing**: every op added must pass an equivalence test vs eager
+  `EMLX.Backend` (within tolerance) before its `EXPR_NODES.md` box flips.
+
+## Testing philosophy (per-layer oracle)
+
+| Layer | Oracle |
+|-------|--------|
+| A (topo-sort) | Hand-checked orderings; property: every node after its operands |
+| B (lowering)  | Eager `EMLX.Backend` via the IR interpreter, same inputs |
+| C (replay)    | Layer B interpreter output |
+| E2E           | Existing EMLX conformance / Bumblebee suites |
+
+## Key file references
+
+- EMLX compiler seam: `emlx/lib/emlx.ex` (`__compile__/4` ~line 1320).
+- Nx traversal: `emlx/deps/nx/lib/nx/defn/tree.ex` (`apply_args/4` `:scope`,
+  `scope_ids/1`), `emlx/deps/nx/lib/nx/defn/composite.ex`.
+- Node taxonomy: `emlx/deps/nx/lib/nx/backend.ex` (callbacks) +
+  `emlx/deps/nx/lib/nx/defn/expr.ex` (syntax nodes) +
+  `emlx/deps/nx/lib/nx/shared.ex` (`unary_math_funs/0`) +
+  `emlx/deps/nx/lib/nx/block.ex` (`Nx.Block.*` structs).
+- Coverage probe: an op-coverage script (to be written) that probes every Nx
+  op through `compiler: EMLX` and reports OK/MISS for the burndown.
+- C++ to reuse: `emlx/c_src/emlx_nif.cpp`, `emlx/c_src/emlx_fast.cpp`,
+  worker/queue in `emlx/c_src/emlx_worker.hpp`.
