@@ -259,10 +259,6 @@ defmodule EMLX.MixProject do
 
   defp to_boolean(nil), do: false
 
-  defp to_boolean(var) when is_boolean(var) do
-    var
-  end
-
   defp to_boolean(var) do
     String.downcase(to_string(var)) in ["1", "true", "on", "yes", "y"]
   end

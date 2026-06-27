@@ -998,7 +998,7 @@ defmodule EMLX do
     }
 
     weight_shape = EMLX.shape(weight_ref)
-    template = Nx.template(Nx.shape(tensor), type)
+    %Nx.Tensor{} = template = Nx.template(Nx.shape(tensor), type)
 
     %Nx.Tensor{
       template

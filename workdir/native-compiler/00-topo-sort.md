@@ -1,6 +1,6 @@
 # Stage 00 — `EMLX.Defn.Tree.post_order/1` (Layer A)
 
-Status: not started
+Status: done
 
 ## Why this stage exists
 
@@ -56,7 +56,7 @@ C++/MLX dependency, so it can land and be proven first.
 
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
-| `post_order/1` implemented | | |
-| Return shape (minimal vs richer) | | |
-| Tests passing | | |
-| compile/format clean | | |
+| `post_order/1` implemented | ✅ done | `emlx/lib/emlx/defn/tree.ex` — recursive DFS, `fun` short-circuited, `while`/`block` use `:scope` traversal for parent-scope deps |
+| Return shape (minimal vs richer) | ✅ minimal (`[node]`) | Richer shape would couple Stage 00 to IR concerns and hurt Nx-upstreamability; Stage 08 will own child-scope recursion |
+| Tests passing | ✅ 6/6 | `emlx/test/emlx/defn/tree_test.exs`: linear chain, diamond, multi-output, leaves, while scope boundary, post-order invariant |
+| compile/format clean | ✅ clean | Zero new warnings; all pre-existing warnings are in `backend.ex`/`mix.exs` (not in new files) |

@@ -99,7 +99,7 @@ Tackle in order. Stages 00–01 are foundational; 02–10 grow op coverage and a
 each independently shippable. Run with
 `/tackle-step workdir/native-compiler <stage_name>`.
 
-- [ ] [`00-topo-sort`](00-topo-sort.md) — `EMLX.Defn.Tree.post_order/1` (Layer A), pure, no C++.
+- [x] [`00-topo-sort`](00-topo-sort.md) — `EMLX.Defn.Tree.post_order/1` (Layer A), pure, no C++.
 - [ ] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.NativeExpr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline.
 - [ ] [`02-elementwise`](02-elementwise.md) — unary + binary + compare/logical.
 - [ ] [`03-shape-movement`](03-shape-movement.md) — reshape, transpose, squeeze, broadcast, pad, reverse, as_type, bitcast, concatenate, stack.
@@ -114,8 +114,9 @@ each independently shippable. Run with
 ## Decision gates
 
 - **After 00**: confirm the `post_order/1` shape — minimal (lowerer recurses
-  into child scopes) vs richer (`{ordered_nodes, child_scopes}`). Leaning
-  minimal; revisit with 08 in view.
+  into child scopes) vs richer (`{ordered_nodes, child_scopes}`). **Decision:
+  minimal.** Richer shape couples Stage 00 to IR concerns and hurts
+  Nx-upstreamability; Stage 08 will own child-scope recursion.
 - **After 01**: perf gate — the single-NIF replay must beat the current
   op-by-op Evaluator path on a multi-op `defn` (dispatch-collapse thesis). If
   it does not, stop and rethink before growing coverage.

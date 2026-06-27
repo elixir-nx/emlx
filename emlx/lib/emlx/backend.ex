@@ -4,8 +4,6 @@ defmodule EMLX.Backend do
   alias Nx.Tensor, as: T
   alias EMLX.Backend, as: Backend
 
-  require Logger
-
   # Compile-time debug flags. Both default to false (zero runtime cost when off).
   # Enable only in development via config/dev.exs:
   #   config :emlx, enable_bounds_check: true
@@ -450,10 +448,16 @@ defmodule EMLX.Backend do
     end
   end
 
-  defp maybe_modify_binary(binary, {:u, size}, {:u, 8}) when size in [2, 4] do
-    for <<bits::integer-native-size(size) <- binary>>, into: <<>> do
-      <<bits::integer-native-size(8)>>
-    end
+  defp maybe_modify_binary(binary, {:u, 2}, {:u, 8}) do
+    for <<bits::integer-native-size(2) <- binary>>,
+      into: <<>>,
+      do: <<bits::integer-native-size(8)>>
+  end
+
+  defp maybe_modify_binary(binary, {:u, 4}, {:u, 8}) do
+    for <<bits::integer-native-size(4) <- binary>>,
+      into: <<>>,
+      do: <<bits::integer-native-size(8)>>
   end
 
   defp maybe_modify_binary(binary, {:u, 8}, {:u, size}) when size in [2, 4] do
@@ -916,7 +920,7 @@ defmodule EMLX.Backend do
       # Apply reversal for tie_break after NaN check
       t_mx =
         if opts[:tie_break] == :high do
-          reverse_mlx(t_mx, tensor.shape, [axis] || Nx.axes(tensor))
+          reverse_mlx(t_mx, tensor.shape, if(axis, do: [axis], else: Nx.axes(tensor)))
         else
           t_mx
         end

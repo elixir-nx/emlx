@@ -91,7 +91,7 @@ defmodule EMLX.Quantization do
     config = %Config{scales: scales, biases: biases, group_size: group_size, bits: bits}
 
     weight_shape = EMLX.shape(weight_ref)
-    template = Nx.template(original_shape, type)
+    %Nx.Tensor{} = template = Nx.template(original_shape, type)
 
     %Nx.Tensor{
       template
