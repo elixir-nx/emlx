@@ -1,6 +1,6 @@
 # Stage 03 — Shape / movement ops
 
-Status: not started
+Status: done
 
 ## Why this stage exists
 
@@ -35,7 +35,13 @@ same axis-encoding machinery.
 
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
-| Shape ops lowered | | |
-| iattrs encoding documented | | |
-| Variadic (concat/stack) | | |
-| Equivalence tests | | |
+| Shape ops lowered | ✅ 10 ops | reshape/squeeze/transpose/as_type/bitcast/broadcast/pad/reverse/concatenate/stack in `emlx/lib/emlx/native/expr.ex` |
+| iattrs encoding documented | ✅ | Opcode table in `EMLX.Native.Expr` moduledoc; encoding mirrored in `emlx_compiler.cpp` comment block |
+| Variadic (concat/stack) | ✅ | All tensor refs emitted as `operands`; axis in `attrs[0]`; negative axis normalised in Elixir |
+| Equivalence tests | ✅ 31 tests | All §D ops tested vs eager `EMLX.Backend` across f32/s32/bf16/u8; negative axes, rank-changing, broadcasting edge cases; concat/stack with 3+ tensors; 3 Interpreter↔C++ parity tests (reshape, broadcast, concatenate); squeeze with no explicit axes |
+
+**Notes:**
+- `pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered; raises with clear message).
+- `as_type` reuses Stage 02's `:astype` opcode; `emit_cast_to` always emits the cast for explicit `:as_type` nodes.
+- `broadcast` mirrors `EMLX.Backend.maybe_reshape` + `broadcast_to` exactly: builds intermediate all-1s shape then places input dims at axis positions.
+- All 79 tests pass (31 new Stage 03 + 48 previous). `mix compile --warnings-as-errors` and `mix format --check-formatted` clean.

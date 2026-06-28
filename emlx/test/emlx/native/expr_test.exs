@@ -29,6 +29,11 @@ defmodule EMLX.Native.ExprTest do
   defn cmp_mixed(a, b), do: Nx.greater(a, b)
   defn mixed_add(a, b), do: Nx.add(a, b)
 
+  # Stage 03 helpers for interpreter↔C++ parity tests.
+  defn reshape_23(x), do: Nx.reshape(x, {2, 3})
+  defn broadcast_23(x), do: Nx.broadcast(x, {2, 3})
+  defn concat_axis0(a, b), do: Nx.concatenate([a, b], axis: 0)
+
   # ── IR shape ─────────────────────────────────────────────────────────────
 
   describe "program shape" do
@@ -724,6 +729,292 @@ defmodule EMLX.Native.ExprTest do
       a = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
       b = Nx.tensor([1.0, 3.0, 3.0], backend: EMLX.Backend)
       expr = Nx.Defn.debug_expr_apply(&eq_f32/2, [Nx.template({3}, :f32), Nx.template({3}, :f32)])
+      prog = EMLX.Native.Expr.lower(expr)
+
+      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [a, b])
+
+      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
+      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+
+      %EMLX.Backend{ref: {_, ref_a}} = a.data
+      %EMLX.Backend{ref: {_, ref_b}} = b.data
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_a, ref_b])
+      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
+
+      assert_all_close(interp_out, cpp_out)
+    end
+  end
+
+  # ── Stage 03: shape / movement equivalence tests ────────────────────────────
+  #
+  # For each op: (a) Interpreter == eager EMLX.Backend, (b) C++ replay == Interpreter.
+  # check_equiv/2 does both via the EMLX compiler seam.
+
+  describe "Stage 03 — reshape" do
+    @tag :stage03
+    test "1D → 2D, 2D → 1D" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reshape(t, {2, 3}) end, [x])
+      check_equiv(fn t -> Nx.reshape(t, {3, 2}) end, [x])
+    end
+
+    @tag :stage03
+    test "2D → 1D (flatten)" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reshape(t, {4}) end, [x])
+    end
+
+    @tag :stage03
+    test "rank-changing — s32" do
+      x = Nx.tensor([[[1, 2], [3, 4]]], type: :s32, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reshape(t, {2, 2}) end, [x])
+      check_equiv(fn t -> Nx.reshape(t, {4}) end, [x])
+    end
+  end
+
+  describe "Stage 03 — squeeze" do
+    @tag :stage03
+    test "remove singleton dimension" do
+      x = Nx.tensor([[1.0, 2.0, 3.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.squeeze(t, axes: [0]) end, [x])
+    end
+
+    @tag :stage03
+    test "multiple axes, negative axis" do
+      x = Nx.tensor([[[1.0], [2.0], [3.0]]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.squeeze(t, axes: [0, 2]) end, [x])
+      check_equiv(fn t -> Nx.squeeze(t, axes: [-1]) end, [x])
+    end
+  end
+
+  describe "Stage 03 — transpose" do
+    @tag :stage03
+    test "2D matrix transpose" do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.transpose(t) end, [x])
+      check_equiv(fn t -> Nx.transpose(t, axes: [1, 0]) end, [x])
+    end
+
+    @tag :stage03
+    test "3D permutation, negative perm" do
+      x = Nx.tensor([[[1.0, 2.0], [3.0, 4.0]]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.transpose(t, axes: [2, 0, 1]) end, [x])
+      check_equiv(fn t -> Nx.transpose(t, axes: [-1, -3, -2]) end, [x])
+    end
+  end
+
+  describe "Stage 03 — as_type" do
+    @tag :stage03
+    test "f32 → s32 and back" do
+      x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.as_type(t, {:s, 32}) end, [x])
+      xi = Nx.tensor([1, 2, 3], type: :s32, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.as_type(t, {:f, 32}) end, [xi])
+    end
+
+    @tag :stage03
+    test "f32 → bf16 and back" do
+      x = Nx.tensor([0.5, 1.5, 2.5], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.as_type(t, {:bf, 16}) end, [x], tol: 1.0e-2)
+      xb = Nx.tensor([0.5, 1.5, 2.5], type: {:bf, 16}, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.as_type(t, {:f, 32}) end, [xb])
+    end
+  end
+
+  describe "Stage 03 — bitcast" do
+    @tag :stage03
+    test "u8 → s8 same bit pattern" do
+      # Values chosen so the bit pattern is unambiguous for both u8 and s8.
+      x = Nx.tensor([1, 2, 3, 127], type: :u8, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.bitcast(t, {:s, 8}) end, [x])
+    end
+
+    @tag :stage03
+    test "f32 → u32 round-trip" do
+      x = Nx.tensor([1.0, 2.0, 0.0], type: :f32, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.bitcast(t, {:u, 32}) end, [x])
+    end
+  end
+
+  describe "Stage 03 — broadcast" do
+    @tag :stage03
+    test "scalar → 1D" do
+      x = Nx.tensor(1.0, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.broadcast(t, {4}) end, [x])
+    end
+
+    @tag :stage03
+    test "1D → 2D row broadcast" do
+      x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.broadcast(t, {2, 3}) end, [x])
+    end
+
+    @tag :stage03
+    test "1D column broadcast (axes: [0])" do
+      x = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.broadcast(t, {2, 3}, axes: [0]) end, [x])
+    end
+
+    @tag :stage03
+    test "2D → 3D, broadcast_in_dim style" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.broadcast(t, {3, 2, 2}) end, [x])
+    end
+  end
+
+  describe "Stage 03 — pad" do
+    @tag :stage03
+    test "zero-padding on 1D" do
+      x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, 0.0, [{1, 1, 0}]) end, [x])
+    end
+
+    @tag :stage03
+    test "zero-padding on 2D, asymmetric" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, 0.0, [{0, 1, 0}, {1, 0, 0}]) end, [x])
+    end
+
+    @tag :stage03
+    test "scalar pad value" do
+      x = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, -1.0, [{2, 2, 0}]) end, [x])
+    end
+  end
+
+  describe "Stage 03 — reverse" do
+    @tag :stage03
+    test "1D reverse" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reverse(t) end, [x])
+    end
+
+    @tag :stage03
+    test "2D reverse single axis, both axes" do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reverse(t, axes: [0]) end, [x])
+      check_equiv(fn t -> Nx.reverse(t, axes: [1]) end, [x])
+      check_equiv(fn t -> Nx.reverse(t, axes: [0, 1]) end, [x])
+    end
+
+    @tag :stage03
+    test "negative axis" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reverse(t, axes: [-1]) end, [x])
+    end
+  end
+
+  describe "Stage 03 — concatenate" do
+    @tag :stage03
+    test "concat 1D along axis 0" do
+      a = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+      b = Nx.tensor([3.0, 4.0, 5.0], backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.concatenate([x, y], axis: 0) end, [a, b])
+    end
+
+    @tag :stage03
+    test "concat 2D along axis 0 and axis 1" do
+      a = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      b = Nx.tensor([[5.0, 6.0]], backend: EMLX.Backend)
+      c = Nx.tensor([[7.0, 8.0], [9.0, 10.0]], backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.concatenate([x, y], axis: 0) end, [a, b])
+      check_equiv(fn x, y -> Nx.concatenate([x, y], axis: 1) end, [a, c])
+    end
+
+    @tag :stage03
+    test "three tensors" do
+      a = Nx.tensor([1.0], backend: EMLX.Backend)
+      b = Nx.tensor([2.0, 3.0], backend: EMLX.Backend)
+      c = Nx.tensor([4.0], backend: EMLX.Backend)
+      check_equiv(fn x, y, z -> Nx.concatenate([x, y, z]) end, [a, b, c])
+    end
+  end
+
+  describe "Stage 03 — stack" do
+    @tag :stage03
+    test "stack 1D tensors → 2D along axis 0" do
+      a = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
+      b = Nx.tensor([4.0, 5.0, 6.0], backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.stack([x, y]) end, [a, b])
+    end
+
+    @tag :stage03
+    test "stack along axis 1" do
+      a = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+      b = Nx.tensor([3.0, 4.0], backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.stack([x, y], axis: 1) end, [a, b])
+    end
+
+    @tag :stage03
+    test "negative axis" do
+      a = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+      b = Nx.tensor([3.0, 4.0], backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.stack([x, y], axis: -1) end, [a, b])
+    end
+  end
+
+  describe "Stage 03 — squeeze without explicit axes" do
+    @tag :stage03
+    test "squeeze all singleton dims" do
+      x = Nx.tensor([[[1.0]]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.squeeze(t) end, [x])
+    end
+  end
+
+  describe "Stage 03 — interpreter ↔ C++ replay parity" do
+    setup do
+      device = EMLX.default_device()
+      {worker, _} = EMLX.resolve_worker(device)
+      %{worker: worker, device: device}
+    end
+
+    @tag :stage03
+    test "interpreter and C++ agree on reshape {6} → {2, 3}", %{worker: worker, device: device} do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], backend: EMLX.Backend)
+      expr = Nx.Defn.debug_expr_apply(&reshape_23/1, [Nx.template({6}, :f32)])
+      prog = EMLX.Native.Expr.lower(expr)
+
+      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
+
+      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
+      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+
+      %EMLX.Backend{ref: {_, ref_x}} = x.data
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
+      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
+
+      assert_all_close(interp_out, cpp_out)
+    end
+
+    @tag :stage03
+    test "interpreter and C++ agree on broadcast {3} → {2, 3}", %{worker: worker, device: device} do
+      x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
+      expr = Nx.Defn.debug_expr_apply(&broadcast_23/1, [Nx.template({3}, :f32)])
+      prog = EMLX.Native.Expr.lower(expr)
+
+      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
+
+      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
+      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+
+      %EMLX.Backend{ref: {_, ref_x}} = x.data
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
+      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
+
+      assert_all_close(interp_out, cpp_out)
+    end
+
+    @tag :stage03
+    test "interpreter and C++ agree on concatenate axis 0", %{worker: worker, device: device} do
+      a = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+      b = Nx.tensor([3.0, 4.0, 5.0], backend: EMLX.Backend)
+
+      expr =
+        Nx.Defn.debug_expr_apply(&concat_axis0/2, [
+          Nx.template({2}, :f32),
+          Nx.template({3}, :f32)
+        ])
+
       prog = EMLX.Native.Expr.lower(expr)
 
       [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [a, b])

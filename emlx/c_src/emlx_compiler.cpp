@@ -183,6 +183,135 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        auto t2 = mlx::core::logical_not(mlx::core::logical_and(ops[0], ops[1]));
        return mlx::core::logical_and(t1, t2);
      }},
+
+    // ── shape / movement ops ──────────────────────────────────────────────────
+    //
+    // iattrs encoding (must stay in sync with EMLX.Native.Expr moduledoc):
+    //   reshape:     attrs = [d0, d1, …]                       — target shape dims (flat)
+    //   squeeze:     attrs = [a0, a1, …]                       — axes to remove (non-negative)
+    //   transpose:   attrs = [p0, p1, …]                       — permutation (non-negative)
+    //   bitcast:     attrs = [dtype_int]                       — target dtype
+    //   broadcast:   attrs = [n, d0..dn-1, m, a0..am-1]       — shape then axes (length-delimited)
+    //   pad:         attrs = [n_dims, lo0,hi0,int0, …]        — n_dims triples per dim
+    //   reverse:     attrs = [a0, a1, …]                       — axes to flip (non-negative)
+    //   concatenate: attrs = [axis]; ops = all input tensors
+    //   stack:       attrs = [axis]; ops = all input tensors
+
+    {"reshape",
+     [](const auto &ops, const auto &attrs) {
+       std::vector<int> shape;
+       shape.reserve(attrs.size());
+       for (auto d : attrs)
+         shape.push_back(static_cast<int>(d));
+       return mlx::core::reshape(ops[0], to_shape(shape));
+     }},
+
+    {"squeeze",
+     [](const auto &ops, const auto &attrs) {
+       if (attrs.empty())
+         return ops[0];
+       std::vector<int> axes;
+       axes.reserve(attrs.size());
+       for (auto a : attrs)
+         axes.push_back(static_cast<int>(a));
+       return mlx::core::squeeze(ops[0], axes);
+     }},
+
+    {"transpose",
+     [](const auto &ops, const auto &attrs) {
+       std::vector<int> axes;
+       axes.reserve(attrs.size());
+       for (auto a : attrs)
+         axes.push_back(static_cast<int>(a));
+       return mlx::core::transpose(ops[0], axes);
+     }},
+
+    {"bitcast",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::view(ops[0], int_to_dtype(attrs[0]));
+     }},
+
+    // broadcast: reshape input to place source dims at the axis positions, then broadcast_to.
+    // Mirrors EMLX.Backend.broadcast / maybe_reshape logic exactly.
+    {"broadcast",
+     [](const auto &ops, const auto &attrs) {
+       int n_shape = static_cast<int>(attrs[0]);
+       std::vector<int> target_shape;
+       target_shape.reserve(n_shape);
+       for (int i = 0; i < n_shape; i++)
+         target_shape.push_back(static_cast<int>(attrs[1 + i]));
+
+       int n_axes = static_cast<int>(attrs[1 + n_shape]);
+       std::vector<int> axes;
+       axes.reserve(n_axes);
+       for (int i = 0; i < n_axes; i++)
+         axes.push_back(static_cast<int>(attrs[1 + n_shape + 1 + i]));
+
+       auto tensor = ops[0];
+       auto in_shape = tensor.shape();
+
+       // Build broadcast_shape: 1s everywhere, input dims at axis positions.
+       std::vector<int> broadcast_shape(n_shape, 1);
+       for (int i = 0; i < n_axes; i++) {
+         if (!in_shape.empty())
+           broadcast_shape[axes[i]] = static_cast<int>(in_shape[i]);
+       }
+       auto reshaped = mlx::core::reshape(tensor, to_shape(broadcast_shape));
+       return mlx::core::broadcast_to(reshaped, to_shape(target_shape));
+     }},
+
+    // pad: non-negative lo/hi, interior always 0 (Elixir raises otherwise).
+    {"pad",
+     [](const auto &ops, const auto &attrs) {
+       int n_dims = static_cast<int>(attrs[0]);
+       std::vector<int> axes, low_pads, high_pads;
+       axes.reserve(n_dims);
+       low_pads.reserve(n_dims);
+       high_pads.reserve(n_dims);
+       for (int i = 0; i < n_dims; i++) {
+         axes.push_back(i);
+         low_pads.push_back(static_cast<int>(attrs[1 + i * 3 + 0]));
+         high_pads.push_back(static_cast<int>(attrs[1 + i * 3 + 1]));
+         // attrs[1 + i*3 + 2] = interior, always 0 (validated in Elixir lowerer)
+       }
+       return mlx::core::pad(ops[0], axes, to_shape(low_pads), to_shape(high_pads), ops[1],
+                             "constant");
+     }},
+
+    // reverse: implemented via slice with negative strides, matching EMLX.Backend.reverse_mlx.
+    {"reverse",
+     [](const auto &ops, const auto &attrs) {
+       auto tensor = ops[0];
+       auto shape = tensor.shape();
+       int rank = static_cast<int>(shape.size());
+
+       std::vector<int> starts(rank), stops(rank), strides(rank);
+       for (int i = 0; i < rank; i++) {
+         starts[i] = 0;
+         stops[i] = static_cast<int>(shape[i]);
+         strides[i] = 1;
+       }
+       for (auto a : attrs) {
+         int ax = static_cast<int>(a);
+         int d = static_cast<int>(shape[ax]);
+         starts[ax] = d - 1;
+         stops[ax] = -(d + 1);
+         strides[ax] = -1;
+       }
+       return mlx::core::slice(tensor, to_shape(starts), to_shape(stops), to_shape(strides));
+     }},
+
+    {"concatenate",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       return mlx::core::concatenate(ops, axis);
+     }},
+
+    {"stack",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       return mlx::core::stack(ops, axis);
+     }},
 };
 
 // ── Expr destructor ───────────────────────────────────────────────────────────

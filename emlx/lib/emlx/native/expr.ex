@@ -19,11 +19,28 @@ defmodule EMLX.Native.Expr do
                        for `:astype` it carries a single dtype integer (see `@mlx_type_to_int`).
   - `outputs`  — list of refs identifying the return values.
 
-  ## astype encoding
+  ## iattrs encoding per opcode
 
-  `:astype` instructions carry the target MLX dtype as `attrs[0]`. The mapping is
-  the `@mlx_type_to_int` module attribute (see below), which must stay in sync with
-  the `int_to_dtype` helper in `emlx_compiler.cpp`.
+  The integer attribute list (`attrs`) is opcode-specific. The encoding is the
+  source of truth shared with `emlx_compiler.cpp`; keep them in sync.
+
+  | Opcode       | `attrs` layout                                          |
+  |-------------|----------------------------------------------------------|
+  | `:astype`   | `[dtype_int]` — target MLX dtype (see `@mlx_type_to_int`) |
+  | `:bitcast`  | `[dtype_int]` — target MLX dtype                        |
+  | `:reshape`  | `[d0, d1, …]` — new shape dims (flat)                   |
+  | `:squeeze`  | `[a0, a1, …]` — axes to remove (non-negative)           |
+  | `:transpose`| `[p0, p1, …]` — axis permutation (non-negative)         |
+  | `:broadcast`| `[n, d0..dn-1, m, a0..am-1]` — `n` shape dims then `m` axes (length-delimited) |
+  | `:pad`      | `[n_dims, lo0, hi0, int0, lo1, hi1, int1, …]` — n_dims triples per dim |
+  | `:reverse`  | `[a0, a1, …]` — axes to flip (non-negative)             |
+  | `:concatenate` | `[axis]` — concat axis; all input tensors in `operands` |
+  | `:stack`    | `[axis]` — stack axis; all input tensors in `operands`  |
+
+  Non-negative axes: the lowerer normalises negative axis values before encoding
+  so C++ handlers can use them directly as 0-based indices.
+
+  `:pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered).
   """
 
   import Bitwise
@@ -310,6 +327,167 @@ defmodule EMLX.Native.Expr do
     expand_binary_node(id, :remainder, out_type, left, right, state)
   end
 
+  # ── shape / movement ops ──────────────────────────────────────────────────────
+
+  # reshape: iattrs = new shape dims (flat list); shape from the output tensor.
+  defp expand_node(
+         %T{shape: out_shape, data: %Nx.Defn.Expr{id: id, op: :reshape, args: [tensor]}},
+         state
+       ) do
+    ref = make_ref()
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    shape_attrs = Tuple.to_list(out_shape)
+
+    %{
+      state
+      | instructions: [{ref, :reshape, [operand_ref], shape_attrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # squeeze: iattrs = axes to remove (non-negative).
+  defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :squeeze, args: [tensor, axes]}}, state) do
+    ref = make_ref()
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    norm_axes = normalize_axes(axes, tuple_size(tensor.shape))
+
+    %{
+      state
+      | instructions: [{ref, :squeeze, [operand_ref], norm_axes} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # transpose: iattrs = axis permutation (non-negative).
+  defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :transpose, args: [tensor, axes]}}, state) do
+    ref = make_ref()
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    norm_axes = normalize_axes(axes, tuple_size(tensor.shape))
+
+    %{
+      state
+      | instructions: [{ref, :transpose, [operand_ref], norm_axes} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # as_type: reuse existing :astype opcode; always emit the cast.
+  defp expand_node(
+         %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :as_type, args: [tensor]}},
+         state
+       ) do
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {result_ref, state} = emit_cast_to(operand_ref, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  # bitcast: iattrs = [target_dtype_int]. Target type from the output tensor.
+  defp expand_node(
+         %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :bitcast, args: [tensor]}},
+         state
+       ) do
+    ref = make_ref()
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    mlx_type = EMLX.Native.to_mlx_type(out_type)
+    type_int = Map.fetch!(@mlx_type_to_int, mlx_type)
+
+    %{
+      state
+      | instructions: [{ref, :bitcast, [operand_ref], [type_int]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # broadcast: iattrs = [n_shape, d0…, n_axes, a0…] (both shape and axes, length-delimited).
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :broadcast, args: [tensor, shape, axes]}},
+         state
+       ) do
+    ref = make_ref()
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    shape_list = Tuple.to_list(shape)
+    n_shape = length(shape_list)
+    n_axes = length(axes)
+    iattrs = [n_shape | shape_list] ++ [n_axes | axes]
+
+    %{
+      state
+      | instructions: [{ref, :broadcast, [operand_ref], iattrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # pad: raises for interior > 0 or negative lo/hi (not yet lowered).
+  # iattrs = [n_dims, lo0, hi0, int0, lo1, hi1, int1, …].
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :pad, args: [tensor, pad_value, config]}},
+         state
+       ) do
+    if Enum.any?(config, fn {lo, hi, interior} -> lo < 0 or hi < 0 or interior > 0 end) do
+      raise ArgumentError,
+            "does not yet lower op :pad with interior padding or negative lo/hi values"
+    end
+
+    ref = make_ref()
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    pad_value_ref = Map.fetch!(state.node_to_ref, pad_value.data.id)
+    n_dims = length(config)
+    iattrs = [n_dims | Enum.flat_map(config, fn {lo, hi, interior} -> [lo, hi, interior] end)]
+
+    %{
+      state
+      | instructions: [{ref, :pad, [operand_ref, pad_value_ref], iattrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # reverse: iattrs = axes to flip (non-negative).
+  defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :reverse, args: [tensor, axes]}}, state) do
+    ref = make_ref()
+    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    norm_axes = normalize_axes(axes, tuple_size(tensor.shape))
+
+    %{
+      state
+      | instructions: [{ref, :reverse, [operand_ref], norm_axes} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # concatenate / stack: variadic — args is [list_of_tensors, axis].
+  # iattrs = [axis], all tensor refs go into operands.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :concatenate, args: [tensors, axis]}},
+         state
+       ) do
+    ref = make_ref()
+    operand_refs = Enum.map(tensors, &Map.fetch!(state.node_to_ref, &1.data.id))
+    norm_axis = if axis < 0, do: tuple_size(hd(tensors).shape) + axis, else: axis
+
+    %{
+      state
+      | instructions: [{ref, :concatenate, operand_refs, [norm_axis]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :stack, args: [tensors, axis]}},
+         state
+       ) do
+    ref = make_ref()
+    operand_refs = Enum.map(tensors, &Map.fetch!(state.node_to_ref, &1.data.id))
+    # stack output rank = input rank + 1; normalise axis against output rank
+    out_rank = tuple_size(hd(tensors).shape) + 1
+    norm_axis = if axis < 0, do: out_rank + axis, else: axis
+
+    %{
+      state
+      | instructions: [{ref, :stack, operand_refs, [norm_axis]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
@@ -356,6 +534,11 @@ defmodule EMLX.Native.Expr do
     else
       emit_cast_to(ref, to_type, state)
     end
+  end
+
+  # Normalise negative axis values to non-negative, given the input tensor rank.
+  defp normalize_axes(axes, rank) do
+    Enum.map(axes, fn ax -> if ax < 0, do: rank + ax, else: ax end)
   end
 
   # ── int ↔ Nx.Type conversion (used by Interpreter) ────────────────────────
@@ -567,6 +750,44 @@ defmodule EMLX.Native.Expr.Interpreter do
   defp dispatch(:logical_and, [a, b], []), do: Nx.logical_and(a, b)
   defp dispatch(:logical_or, [a, b], []), do: Nx.logical_or(a, b)
   defp dispatch(:logical_xor, [a, b], []), do: Nx.logical_xor(a, b)
+
+  # shape / movement
+  defp dispatch(:reshape, [tensor], attrs),
+    do: Nx.reshape(tensor, List.to_tuple(attrs))
+
+  defp dispatch(:squeeze, [tensor], attrs),
+    do: Nx.squeeze(tensor, axes: attrs)
+
+  defp dispatch(:transpose, [tensor], attrs),
+    do: Nx.transpose(tensor, axes: attrs)
+
+  defp dispatch(:bitcast, [tensor], [type_int]),
+    do: Nx.bitcast(tensor, Expr.int_to_nx_type(type_int))
+
+  defp dispatch(:broadcast, [tensor], [n_shape | rest]) do
+    shape_dims = Enum.take(rest, n_shape)
+    [n_axes | axes] = Enum.drop(rest, n_shape)
+    axes = Enum.take(axes, n_axes)
+    Nx.broadcast(tensor, List.to_tuple(shape_dims), axes: axes)
+  end
+
+  defp dispatch(:pad, [tensor, pad_value], [n_dims | rest]) do
+    config =
+      Enum.map(0..(n_dims - 1), fn i ->
+        {Enum.at(rest, i * 3), Enum.at(rest, i * 3 + 1), Enum.at(rest, i * 3 + 2)}
+      end)
+
+    Nx.pad(tensor, pad_value, config)
+  end
+
+  defp dispatch(:reverse, [tensor], attrs),
+    do: Nx.reverse(tensor, axes: attrs)
+
+  defp dispatch(:concatenate, tensors, [axis]),
+    do: Nx.concatenate(tensors, axis: axis)
+
+  defp dispatch(:stack, tensors, [axis]),
+    do: Nx.stack(tensors, axis: axis)
 
   defp dispatch(op, _args, _attrs),
     do: raise(ArgumentError, "Native.Expr.Interpreter: unknown op #{inspect(op)}")

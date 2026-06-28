@@ -80,16 +80,16 @@ logical_and, logical_or, logical_xor.
 
 ## D. Shape / movement
 
-- [ ] reshape
-- [ ] squeeze
-- [ ] transpose
-- [ ] broadcast
-- [ ] as_type
-- [ ] bitcast
-- [ ] pad
-- [ ] reverse
-- [ ] concatenate (variadic — args is `[list | ...]`)
-- [ ] stack (variadic)
+- [x] reshape
+- [x] squeeze
+- [x] transpose
+- [x] broadcast
+- [x] as_type
+- [x] bitcast
+- [x] pad (simple: non-negative lo/hi, interior=0; interior/negative raises — not yet lowered)
+- [x] reverse
+- [x] concatenate (variadic — args is `[list | ...]`)
+- [x] stack (variadic)
 
 ## E. Reductions / contraction / conv
 
