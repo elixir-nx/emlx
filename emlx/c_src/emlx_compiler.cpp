@@ -1,18 +1,55 @@
 // emlx_compiler.cpp — implements emlx::native compile/eval NIF logic.
 //
-// This file owns all of the EMLX.Native.Expr compiler substrate: the packed-ref
-// helpers, interpreter dispatch loop, and the three NIF implementations.  The thin
-// NIF wrappers in emlx_nif.cpp forward directly to the *_impl functions here.
-//
-// compile_program_impl bakes the program into a capturing lambda and wraps it with
+// compile_program bakes the program into a capturing lambda and wraps it with
 // mlx::core::compile(), so MLX traces the computation graph on first eval and
-// replays the cached compiled graph on subsequent calls.  eval_program_impl is a
+// replays the cached compiled graph on subsequent calls.  eval_program is a
 // thin caller: compiled_fn(inputs) → eval → wrap outputs.
+//
+// Op dispatch uses a string→function registry instead of an integer opcode enum.
+// Adding a new op: register it in `op_registry` below.  No enum, no wire
+// integers, no lockstep parity table to maintain.
 
 #include "emlx_compiler.hpp"
+#include "mlx/compile_impl.h"
+#include <atomic>
+#include <unordered_map>
 
 namespace emlx {
 namespace native {
+
+// ── Op registry ───────────────────────────────────────────────────────────────
+//
+// Each entry maps an op name string (matching the atom used in the Elixir IR)
+// to a C++ function: (resolved_operands, integer_attrs) → result array.
+// `operands` are already-resolved mlx::core::arrays; `attrs` are the integer
+// attribute channel (e.g. axis indices, shape components) passed verbatim from
+// the IR.
+//
+// This is the single source of truth for op semantics on the compiler path.
+// No explicit device: ops run on the default stream of the current worker thread.
+
+using OpFn = std::function<
+    mlx::core::array(const std::vector<mlx::core::array> &ops,
+                     const std::vector<int64_t> &attrs)>;
+
+static const std::unordered_map<std::string, OpFn> op_registry = {
+    {"add",
+     [](const auto &ops, const auto & /*attrs*/) {
+       return mlx::core::add(ops[0], ops[1]);
+     }},
+};
+
+// ── Expr destructor ───────────────────────────────────────────────────────────
+//
+// Evicts the per-Expr entry from MLX's global compile cache so stale compiled
+// graphs don't accumulate.  Called by default_dtor<Expr> when the BEAM resource
+// is GC'd.
+
+Expr::~Expr() {
+  if (compile_id != 0) {
+    mlx::core::detail::compile_erase(compile_id);
+  }
+}
 
 // ── Packed-ref helpers ────────────────────────────────────────────────────────
 //
@@ -37,8 +74,6 @@ static int64_t ref_idx(int64_t packed) {
 
 // ── NIF argument parsing helpers ──────────────────────────────────────────────
 
-// Parse a list of int64 lists (one sub-list per instruction) from an
-// ERL_NIF_TERM.  Used for operands and attrs.
 static bool parse_nested_int64_list(ErlNifEnv *env, ERL_NIF_TERM list,
                                     std::vector<std::vector<int64_t>> &out) {
   unsigned length;
@@ -59,22 +94,19 @@ static bool parse_nested_int64_list(ErlNifEnv *env, ERL_NIF_TERM list,
 // ── NIF implementations ───────────────────────────────────────────────────────
 
 // compile_program — decodes the serialised EMLX.Native.Expr wire format, builds
-// a capturing interpreter lambda, wraps it with mlx::core::compile(), and stores
-// the result as an opaque emlx::native::Expr BEAM resource.
-//
-// MLX will trace the lambda on the first eval_program call, build a compiled
-// computation graph, and replay that cached graph on all subsequent calls.
+// a capturing interpreter lambda backed by the op registry, wraps it with
+// mlx::core::compile(), and stores the result as an opaque Expr BEAM resource.
 //
 // argv[0] : num_inputs    (int)
 // argv[1] : capture_refs  (list of MLX array resource refs)
 // argv[2] : const_values  (list of doubles or ints)
 // argv[3] : const_types   (list of dtype atoms, e.g. :float32)
-// argv[4] : opcodes       (list of ints)
+// argv[4] : op_names      (list of strings — atom names matching op_registry keys)
 // argv[5] : operands      (list of list of int64 — packed refs per instr)
 // argv[6] : attrs         (list of list of int64 — integer attrs per instr)
 // argv[7] : output_refs   (list of int64 — packed output refs)
-ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
-                                  const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
+                             const ERL_NIF_TERM argv[]) {
   try {
     PARAM(0, int, num_inputs_val);
     LIST_PARAM(1, std::vector<mlx::core::array>, captures);
@@ -102,7 +134,7 @@ ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
     }
 
     LIST_PARAM(3, std::vector<std::string>, const_types);
-    LIST_PARAM(4, std::vector<int>, opcodes);
+    LIST_PARAM(4, std::vector<std::string>, op_names);
 
     std::vector<std::vector<int64_t>> operands;
     if (!parse_nested_int64_list(env, argv[5], operands))
@@ -113,6 +145,14 @@ ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
       return nx::nif::error(env, "Unable to get attrs nested list");
 
     LIST_PARAM(7, std::vector<int64_t>, output_refs);
+
+    // Validate all op names against the registry at compile time so that any
+    // unknown op surfaces here rather than inside the lambda at eval time.
+    for (const auto &name : op_names) {
+      if (op_registry.find(name) == op_registry.end())
+        return nx::nif::error(
+            env, ("emlx::native: unknown op \"" + name + "\"").c_str());
+    }
 
     // Build constant arrays on the current (worker) thread using its default stream.
     std::vector<mlx::core::array> constants;
@@ -129,16 +169,15 @@ ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
     emlx::function fn =
         [captures = std::move(captures),
          constants = std::move(constants),
-         opcodes = std::move(opcodes),
+         op_names = std::move(op_names),
          operands = std::move(operands),
          attrs = std::move(attrs),
          output_refs = std::move(output_refs)](
             const std::vector<mlx::core::array> &inputs)
         -> std::vector<mlx::core::array> {
       std::vector<mlx::core::array> results;
-      results.reserve(opcodes.size());
+      results.reserve(op_names.size());
 
-      // Resolve a packed ref to a concrete array.
       auto resolve = [&](int64_t packed) -> mlx::core::array {
         int kind = ref_kind(packed);
         int64_t idx = ref_idx(packed);
@@ -157,23 +196,13 @@ ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
         }
       };
 
-      for (size_t i = 0; i < opcodes.size(); i++) {
-        auto op = static_cast<Op>(opcodes[i]);
-        const auto &ops = operands[i];
-
-        switch (op) {
-        case Op::Add: {
-          auto a = resolve(ops[0]);
-          auto b = resolve(ops[1]);
-          // No explicit device: uses default stream on the current worker thread.
-          results.push_back(mlx::core::add(a, b));
-          break;
+      for (size_t i = 0; i < op_names.size(); i++) {
+        std::vector<mlx::core::array> op_inputs;
+        op_inputs.reserve(operands[i].size());
+        for (int64_t ref : operands[i]) {
+          op_inputs.push_back(resolve(ref));
         }
-        default:
-          throw std::runtime_error(
-              "emlx::native: unknown opcode " +
-              std::to_string(static_cast<int>(op)));
-        }
+        results.push_back(op_registry.at(op_names[i])(op_inputs, attrs[i]));
       }
 
       std::vector<mlx::core::array> outputs;
@@ -190,9 +219,17 @@ ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
     if (!ptr)
       return nx::nif::error(env, "Failed to allocate Expr resource");
 
+    // Assign a unique ID so MLX's global compile cache has a distinct entry per
+    // Expr resource.  All our lambdas share the same C++ type (same capture
+    // types), so the public mlx::core::compile() would map them all to the same
+    // cache key — causing stale graph reuse across different compiled programs.
+    static std::atomic<std::uintptr_t> next_id{1};
+    std::uintptr_t unique_id = next_id.fetch_add(1, std::memory_order_relaxed);
+
     new (ptr) Expr();
     ptr->num_inputs = num_inputs_val;
-    ptr->compiled_fn = mlx::core::compile(std::move(fn));
+    ptr->compile_id = unique_id;
+    ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
 
     ERL_NIF_TERM ret = enif_make_resource(env, ptr);
     enif_release_resource(ptr);
@@ -203,12 +240,13 @@ ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
 
 // eval_program — calls the MLX-compiled function against runtime inputs.
 // MLX traces on the first call and replays the cached graph on subsequent calls.
-// Returns the output arrays as a list of MLX array resource refs.
+// Returns lazy output array refs — materialization is deferred to the caller
+// (to_binary / Nx.to_number), matching the Evaluator's deferred-eval pattern.
 //
 // argv[0] : program_ref  (emlx::native::Expr resource)
 // argv[1] : input_refs   (list of MLX array resource refs — runtime inputs)
-ERL_NIF_TERM eval_program_impl(ErlNifEnv *env, int argc,
-                               const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
+                          const ERL_NIF_TERM argv[]) {
   try {
     Expr *prog;
     if (!enif_get_resource(env, argv[0], resource_object<Expr>::type,
@@ -217,14 +255,10 @@ ERL_NIF_TERM eval_program_impl(ErlNifEnv *env, int argc,
 
     LIST_PARAM(1, std::vector<mlx::core::array>, inputs);
 
-    // Call the MLX-compiled function.  First call traces; subsequent calls
-    // replay the cached compiled graph without rebuilding it.
+    // Tracing (first call) and graph replay (subsequent calls) both happen
+    // inside compiled_fn.  Outputs are lazy — no eval needed here.
     auto outputs = prog->compiled_fn(inputs);
 
-    // Materialise the lazy graph on the worker's stream.
-    mlx::core::eval(outputs);
-
-    // Return as a list of tensor resource refs.
     size_t n = outputs.size();
     std::vector<ERL_NIF_TERM> terms;
     terms.reserve(n);
@@ -236,19 +270,6 @@ ERL_NIF_TERM eval_program_impl(ErlNifEnv *env, int argc,
     return nx::nif::ok(env, list);
   }
   CATCH()
-}
-
-// native_expr_opcode_table/0 — returns [{:add, 0}, ...] so Elixir tests can
-// verify the Elixir opcode table and C++ enum are in lockstep.
-// Non-worker-routed: pure metadata, no MLX graph access.
-ERL_NIF_TERM opcode_table_impl(ErlNifEnv *env, int argc,
-                               const ERL_NIF_TERM argv[]) {
-  ERL_NIF_TERM pairs[] = {
-      enif_make_tuple2(env, enif_make_atom(env, "add"),
-                       enif_make_int(env, static_cast<int>(Op::Add))),
-  };
-  ERL_NIF_TERM list = enif_make_list_from_array(env, pairs, 1);
-  return nx::nif::ok(env, list);
 }
 
 } // namespace native

@@ -1792,13 +1792,11 @@ ASYNC_NIF(window_scatter_min)
 
 // ── Native compiler NIFs (thin wrappers — logic lives in emlx_compiler.cpp) ──
 
-NIF(compile_program) { return emlx::native::compile_program_impl(env, argc, argv); }
+NIF(compile_program) { return emlx::native::compile_program(env, argc, argv); }
 ASYNC_NIF(compile_program)
 
-NIF(eval_program) { return emlx::native::eval_program_impl(env, argc, argv); }
+NIF(eval_program) { return emlx::native::eval_program(env, argc, argv); }
 ASYNC_NIF(eval_program)
-
-NIF(native_expr_opcode_table) { return emlx::native::opcode_table_impl(env, argc, argv); }
 
 static ErlNifFunc nif_funcs[] = {
     {"eval", 2, eval_async},
@@ -1981,8 +1979,6 @@ static ErlNifFunc nif_funcs[] = {
     // compile_program: 1 (worker) + 8 args = 9 registered.
     {"compile_program", 9, compile_program_async},
     // eval_program: 1 (worker) + 2 args = 3 registered.
-    {"eval_program", 3, eval_program_async},
-    // native_expr_opcode_table: 0 args, non-worker-routed.
-    {"native_expr_opcode_table", 0, native_expr_opcode_table}};
+    {"eval_program", 3, eval_program_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

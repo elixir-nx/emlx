@@ -6,7 +6,6 @@ defmodule EMLX.Native.ExprTest do
     - EMLX.Native.Expr.Interpreter (pure-Elixir reference evaluator)
     - compile_program / eval_program NIFs via to_wire/1 (C++ replay)
     - Compiler seam: Nx.Defn.compile(..., compiler: EMLX) via single-NIF replay
-    - Opcode parity: Elixir wire_opcodes/0 ↔ C++ NativeExprOpcode enum
     - Perf gate: single-NIF replay vs Evaluator on a multi-add chain
   """
   use ExUnit.Case, async: false
@@ -60,24 +59,6 @@ defmodule EMLX.Native.ExprTest do
                  "operand ref #{inspect(ref)} not in known node set"
         end
       end
-    end
-  end
-
-  # ── opcode table ─────────────────────────────────────────────────────────
-
-  describe "opcodes" do
-    test "add is in the wire opcode table" do
-      assert Keyword.fetch!(Expr.wire_opcodes(), :add) == 0
-    end
-
-    test "wire_opcodes/0 matches C++ NativeExprOpcode enum" do
-      elixir_map = Map.new(Expr.wire_opcodes())
-      {:ok, cpp_table} = EMLX.NIF.native_expr_opcode_table()
-      cpp_map = Map.new(cpp_table)
-
-      assert elixir_map == cpp_map,
-             "Opcode mismatch between Elixir and C++.\n" <>
-               "Elixir: #{inspect(elixir_map)}\nC++:    #{inspect(cpp_map)}"
     end
   end
 
@@ -174,12 +155,12 @@ defmodule EMLX.Native.ExprTest do
       assert outs == [0]
     end
 
-    test "add program: opcode is integer 0, operands encode the two inputs" do
+    test "add program: op_name is :add, operands encode the two inputs" do
       expr = Nx.Defn.debug_expr_apply(&add_two/2, [Nx.template({}, :f32), Nx.template({}, :f32)])
       prog = Expr.lower(expr)
-      {_n, _caps, _cvs, _cts, [opcode], [operands], [_ia], [output]} = Expr.to_wire(prog)
+      {_n, _caps, _cvs, _cts, [op_name], [operands], [_ia], [output]} = Expr.to_wire(prog)
 
-      assert opcode == 0
+      assert op_name == :add
       # inputs packed as kind=0 (bits 61:60 = 0), so just the index
       assert operands == [0, 1]
       # output is the first instruction (kind=3, idx=0): 3 <<< 60 ||| 0

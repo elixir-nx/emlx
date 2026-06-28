@@ -12,31 +12,25 @@
 namespace emlx {
 namespace native {
 
-// Opcode enum — wire values must stay in lockstep with
-// EMLX.Native.Expr.wire_opcodes/0 in lib/emlx/native/expr.ex.
-// The NIF native_expr_opcode_table/0 exposes this enum at runtime so the
-// Elixir test can verify both tables match.
-enum class Op : int {
-  Add = 0,
-};
-
 // Compiled representation of an EMLX.Native.Expr program.
 // Stored as an opaque BEAM resource; one instance per compiled defn cache entry.
 // compile_program bakes the program into a capturing lambda, wraps it with
-// mlx::core::compile() so MLX traces and caches the graph, and stores the
-// result here.  eval_program just calls compiled_fn(inputs).
+// mlx::core::detail::compile() (using a unique per-Expr ID) so MLX traces and
+// caches the graph.  eval_program just calls compiled_fn(inputs).
+// The destructor evicts the per-ID entry from MLX's global compile cache.
 struct Expr {
   int num_inputs = 0;
-  emlx::function compiled_fn;  // mlx::core::compile()-wrapped interpreter lambda
+  std::uintptr_t compile_id = 0;  // unique key for mlx::core::detail compile cache
+  emlx::function compiled_fn;
+
+  ~Expr();
 };
 
 // NIF implementation functions — thin wrappers in emlx_nif.cpp delegate here.
-ERL_NIF_TERM compile_program_impl(ErlNifEnv *env, int argc,
-                                  const ERL_NIF_TERM argv[]);
-ERL_NIF_TERM eval_program_impl(ErlNifEnv *env, int argc,
-                               const ERL_NIF_TERM argv[]);
-ERL_NIF_TERM opcode_table_impl(ErlNifEnv *env, int argc,
-                               const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
+                             const ERL_NIF_TERM argv[]);
+ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
+                          const ERL_NIF_TERM argv[]);
 
 } // namespace native
 } // namespace emlx

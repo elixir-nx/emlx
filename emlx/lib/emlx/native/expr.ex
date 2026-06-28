@@ -30,9 +30,6 @@ defmodule EMLX.Native.Expr do
   alias Nx.Defn.Composite
   alias Nx.Tensor, as: T
 
-  # Wire-integer opcode table. Must match the C++ NativeExprOpcode enum.
-  @opcode_table [add: 0]
-
   # Kind tag bits used when packing refs for the NIF wire format.
   # Only referenced in to_wire/1; not part of the public struct.
   @kind_input   0
@@ -52,10 +49,6 @@ defmodule EMLX.Native.Expr do
           instructions: [{node_ref(), atom(), [node_ref()]}],
           outputs: [node_ref()]
         }
-
-  @doc "Opcode wire table `[{name, integer}]`. Mirrors the C++ `NativeExprOpcode` enum."
-  @spec wire_opcodes() :: keyword(non_neg_integer())
-  def wire_opcodes, do: @opcode_table
 
   # ── lowering ──────────────────────────────────────────────────────────────
 
@@ -165,12 +158,15 @@ defmodule EMLX.Native.Expr do
   # ── wire serialisation ────────────────────────────────────────────────────
 
   @doc """
-  Translates an `EMLX.Native.Expr` to the flat integer wire format expected by
+  Translates an `EMLX.Native.Expr` to the wire format expected by
   `EMLX.NIF.compile_program/9`.
 
   Returns an 8-tuple:
   `{num_inputs, capture_nif_refs, constant_values, constant_types,
-    opcodes, operands, iattrs, output_packed_refs}`
+    op_names, operands, iattrs, output_packed_refs}`
+
+  `op_names` is a list of strings (e.g. `"add"`) that map directly to entries
+  in the C++ `op_registry`; no integer opcode table is required.
 
   This runs once per compilation cache miss; it has no effect on hot-path
   performance.
@@ -197,15 +193,14 @@ defmodule EMLX.Native.Expr do
     ref_to_packed = Map.merge(input_map, Map.merge(capture_map, constant_map))
 
     # Walk instructions in order, building the wire arrays and extending the map.
-    {opcodes, operands, iattrs, ref_to_packed} =
+    {op_names, operands, iattrs, ref_to_packed} =
       prog.instructions
       |> Enum.with_index()
       |> Enum.reduce({[], [], [], ref_to_packed}, fn {{id, op, operand_refs}, idx},
                                                      {ops, ors, ias, rmap} ->
-        wire_op = Keyword.fetch!(@opcode_table, op)
         wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
         rmap2 = Map.put(rmap, id, (@kind_instr <<< @kind_shift) ||| idx)
-        {[wire_op | ops], [wire_operands | ors], [[] | ias], rmap2}
+        {[op | ops], [wire_operands | ors], [[] | ias], rmap2}
       end)
 
     wire_outputs = Enum.map(prog.outputs, &Map.fetch!(ref_to_packed, &1))
@@ -219,7 +214,7 @@ defmodule EMLX.Native.Expr do
     constant_types = Enum.map(prog.constants, fn {_, _, t} -> EMLX.Native.to_mlx_type(t) end)
 
     {length(prog.inputs), capture_nif_refs, constant_values, constant_types,
-     Enum.reverse(opcodes), Enum.reverse(operands), Enum.reverse(iattrs), wire_outputs}
+     Enum.reverse(op_names), Enum.reverse(operands), Enum.reverse(iattrs), wire_outputs}
   end
 
 end

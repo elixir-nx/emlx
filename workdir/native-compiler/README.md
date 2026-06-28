@@ -16,11 +16,14 @@ Three decoupled layers, with op coverage grown **iteratively** per op class:
    (`EMLX.Defn.Tree.post_order/1`): an `Nx.Defn.Expr` DAG → a scope-local,
    dependency-ordered node list.
 2. **Layer B** — `EMLX.Native.Expr` (the IR): expand each topo-ordered node into
-   ≥1 instruction(s) with tagged operand refs, an opcode table, and an integer
-   attribute channel; control flow and blocks become nested child programs.
-3. **Layer C** — a C++ program that replays the IR in one NIF call (built early
-   so end-to-end perf is validated from the first op), reusing EMLX's existing
-   per-op C++ implementations.
+   ≥1 instruction(s) with tagged operand refs (kind + index packed into int64),
+   op-name atoms, and an integer attribute channel; control flow and blocks become
+   nested child programs.
+3. **Layer C** — a C++ program backed by an op-name→function registry
+   (`emlx_compiler.cpp`); `compile_program` bakes the interpreter into a lambda
+   wrapped with `mlx::core::detail::compile` (unique ID per Expr), so MLX traces
+   and caches the graph on first call and replays it on subsequent calls. One NIF
+   call per `defn` invocation.
 
 The `EMLX` compiler is **single-mode**: it always lowers via this structure.
 There is no `:native` flag and no eager-Evaluator fallback lane; lowering
@@ -66,8 +69,8 @@ call today. That is the cost this compiler removes.
 EMLX (Nx.Defn.Compiler)  — one path: trace -> topo-sort -> lower -> compile -> replay
   │
   ├─ Layer A: EMLX.Defn.Tree.post_order/1   (PURE, no EMLX deps — upstream candidate)
-  ├─ Layer B: EMLX.Native.Expr              (the IR; tagged refs, opcodes, iattrs, subprograms)
-  └─ Layer C: C++ program                   (built early; one-NIF replay reusing emlx_nif.cpp)
+  ├─ Layer B: EMLX.Native.Expr              (the IR; tagged refs, op-name atoms, iattrs, subprograms)
+  └─ Layer C: C++ program                   (op-name registry; mlx::core::detail::compile per Expr)
 ```
 
 Per-layer oracle (a bug can only live in the layer whose test fails): Layer A
@@ -100,7 +103,7 @@ each independently shippable. Run with
 `/tackle-step workdir/native-compiler <stage_name>`.
 
 - [x] [`00-topo-sort`](00-topo-sort.md) — `EMLX.Defn.Tree.post_order/1` (Layer A), pure, no C++.
-- [x] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.Native.Expr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline. **Perf gate soft-pass — see stage doc § Perf findings.**
+- [x] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.Native.Expr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline. Post-stage: `mlx::core::detail::compile` with unique IDs; op-name string registry replaces enum + wire integers. **Perf gate soft-pass — see stage doc § Perf findings.**
 - [ ] [`02-elementwise`](02-elementwise.md) — unary + binary + compare/logical.
 - [ ] [`03-shape-movement`](03-shape-movement.md) — reshape, transpose, squeeze, broadcast, pad, reverse, as_type, bitcast, concatenate, stack.
 - [ ] [`04-reductions-dot-conv`](04-reductions-dot-conv.md) — reductions + argmax/argmin + dot + conv.
@@ -121,10 +124,12 @@ each independently shippable. Run with
   op-by-op Evaluator path on a multi-op `defn` (dispatch-collapse thesis). If
   it does not, stop and rethink before growing coverage.  
   **Status:** Soft-pass. `eval_program` calls `mlx::core::eval` eagerly inside the NIF
-  body, while the Evaluator defers eval to `Nx.to_number`. For scalar microbenchmarks
-  the deferred path is faster (0.4× speedup). Fix for Stage 02: remove the eager
-  `mlx::core::eval` from `eval_program` and let the caller trigger evaluation. Re-run
-  perf gate with ≥1 K element tensors and 20+ ops.
+  body (synchronous barrier), while the Evaluator defers eval to `Nx.to_number`.
+  For scalar microbenchmarks the deferred path is faster (~0.3–0.7× speedup).
+  `mlx::core::detail::compile` is now used (graph is traced once, replayed
+  cheaply thereafter). Fix for Stage 02: remove the eager `mlx::core::eval` from
+  `eval_program` and let the caller trigger evaluation. Re-run perf gate with ≥1 K
+  element tensors and 20+ ops.
 - **Ongoing**: every op added must pass an equivalence test vs eager
   `EMLX.Backend` (within tolerance) before its `EXPR_NODES.md` box flips.
 

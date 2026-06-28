@@ -1401,6 +1401,8 @@ defmodule EMLX do
   # `output_expr` is the traced expression (used as a type/shape template for
   # reconstructing output tensors after the NIF returns raw resource refs).
   defp build_native_eval_fn(program_resource, output_expr, effective_device) do
+    output_expr = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
+    
     fn [params] ->
       {worker, dev} = resolve_worker(effective_device)
 
