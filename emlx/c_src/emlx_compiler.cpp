@@ -312,6 +312,187 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        int axis = static_cast<int>(attrs[0]);
        return mlx::core::stack(ops, axis);
      }},
+
+    // ── reductions ────────────────────────────────────────────────────────────
+    //
+    // iattrs = [keep_axes_int, a0, a1, …]
+    // keep_axes_int: 0 = false, 1 = true.  Axis list always explicit (Elixir resolves nil).
+    // sum, product, reduce_max, reduce_min: emit astype in Elixir lowerer for type changes.
+    // all, any: Elixir always emits astype since MLX returns bool_.
+
+    {"sum",
+     [](const auto &ops, const auto &attrs) {
+       bool keepdims = static_cast<bool>(attrs[0]);
+       std::vector<int> axes;
+       for (size_t i = 1; i < attrs.size(); i++)
+         axes.push_back(static_cast<int>(attrs[i]));
+       return mlx::core::sum(ops[0], axes, keepdims);
+     }},
+
+    {"product",
+     [](const auto &ops, const auto &attrs) {
+       bool keepdims = static_cast<bool>(attrs[0]);
+       std::vector<int> axes;
+       for (size_t i = 1; i < attrs.size(); i++)
+         axes.push_back(static_cast<int>(attrs[i]));
+       return mlx::core::prod(ops[0], axes, keepdims);
+     }},
+
+    {"all",
+     [](const auto &ops, const auto &attrs) {
+       bool keepdims = static_cast<bool>(attrs[0]);
+       std::vector<int> axes;
+       for (size_t i = 1; i < attrs.size(); i++)
+         axes.push_back(static_cast<int>(attrs[i]));
+       return mlx::core::all(ops[0], axes, keepdims);
+     }},
+
+    {"any",
+     [](const auto &ops, const auto &attrs) {
+       bool keepdims = static_cast<bool>(attrs[0]);
+       std::vector<int> axes;
+       for (size_t i = 1; i < attrs.size(); i++)
+         axes.push_back(static_cast<int>(attrs[i]));
+       return mlx::core::any(ops[0], axes, keepdims);
+     }},
+
+    {"reduce_max",
+     [](const auto &ops, const auto &attrs) {
+       bool keepdims = static_cast<bool>(attrs[0]);
+       std::vector<int> axes;
+       for (size_t i = 1; i < attrs.size(); i++)
+         axes.push_back(static_cast<int>(attrs[i]));
+       return mlx::core::max(ops[0], axes, keepdims);
+     }},
+
+    {"reduce_min",
+     [](const auto &ops, const auto &attrs) {
+       bool keepdims = static_cast<bool>(attrs[0]);
+       std::vector<int> axes;
+       for (size_t i = 1; i < attrs.size(); i++)
+         axes.push_back(static_cast<int>(attrs[i]));
+       return mlx::core::min(ops[0], axes, keepdims);
+     }},
+
+    // argmax / argmin — iattrs = [axis, keep_axis_int]; axis = -1 means global.
+    {"argmax",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool keepdims = static_cast<bool>(attrs[1]);
+       if (axis < 0)
+         return mlx::core::argmax(ops[0], keepdims);
+       return mlx::core::argmax(ops[0], axis, keepdims);
+     }},
+
+    {"argmin",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool keepdims = static_cast<bool>(attrs[1]);
+       if (axis < 0)
+         return mlx::core::argmin(ops[0], keepdims);
+       return mlx::core::argmin(ops[0], axis, keepdims);
+     }},
+
+    // ── dot ───────────────────────────────────────────────────────────────────
+    //
+    // iattrs = [n_ca, ca…, n_cb, cb…, n_ba, ba…, n_bb, bb…]
+    // Elixir lowerer casts both operands to computation_type before the dot op.
+    // Non-batched (n_ba=0, n_bb=0): mlx::core::tensordot(left, right, ca, cb).
+    // Batched: rebuild einsum spec from shapes + 4 axis lists, call einsum.
+
+    {"dot",
+     [](const auto &ops, const auto &attrs) {
+       // Parse 4 length-delimited axis lists.
+       size_t off = 0;
+       auto parse_axis_list = [&]() -> std::vector<int> {
+         int n = static_cast<int>(attrs[off++]);
+         std::vector<int> v(n);
+         for (int i = 0; i < n; i++)
+           v[i] = static_cast<int>(attrs[off++]);
+         return v;
+       };
+       auto ca = parse_axis_list();
+       auto cb = parse_axis_list();
+       auto ba = parse_axis_list();
+       auto bb = parse_axis_list();
+
+       if (ba.empty() && bb.empty()) {
+         return mlx::core::tensordot(ops[0], ops[1], ca, cb);
+       }
+
+       // Batched: build einsum spec by assigning letter labels.
+       auto left_shape = ops[0].shape();
+       auto right_shape = ops[1].shape();
+       int n_left = static_cast<int>(left_shape.size());
+       int n_right = static_cast<int>(right_shape.size());
+
+       // Assign a label to every left and right axis.
+       const std::string alphabet = "abcdefghijklmnopqrstuvwxyz";
+       std::vector<char> ll(n_left), rl(n_right);
+       for (int i = 0; i < n_left; i++)
+         ll[i] = alphabet[i];
+       for (int i = 0; i < n_right; i++)
+         rl[i] = alphabet[n_left + i];
+
+       // Share labels for batch and contraction axes.
+       auto share = [&](const std::vector<int> &la, const std::vector<int> &ra) {
+         for (size_t i = 0; i < la.size(); i++)
+           rl[ra[i]] = ll[la[i]];
+       };
+       share(ba, bb);
+       share(ca, cb);
+
+       // Output: batch axes, then free left axes, then free right axes.
+       auto contains = [](const std::vector<int> &v, int x) {
+         return std::find(v.begin(), v.end(), x) != v.end();
+       };
+       std::string output;
+       for (int b : ba)
+         output += ll[b];
+       for (int i = 0; i < n_left; i++)
+         if (!contains(ca, i) && !contains(ba, i))
+           output += ll[i];
+       for (int i = 0; i < n_right; i++)
+         if (!contains(cb, i) && !contains(bb, i))
+           output += rl[i];
+
+       std::string spec = std::string(ll.begin(), ll.end()) + "," +
+                          std::string(rl.begin(), rl.end()) + "->" + output;
+       return mlx::core::einsum(spec, {ops[0], ops[1]});
+     }},
+
+    // ── conv_general ─────────────────────────────────────────────────────────
+    //
+    // iattrs = [n_dims, s0..sn-1, pl0,ph0,pl1,ph1,…, kd0..kdn-1, id0..idn-1, fgs]
+    // Inputs (ops[0]=processed_input, ops[1]=processed_kernel) are already:
+    //   - cast to out_type
+    //   - transposed to channels-last format
+    // The result from mlx::core::conv_general is also channels-last; the Elixir
+    // lowerer emits :transpose ops afterward to restore the desired layout.
+
+    {"conv_general",
+     [](const auto &ops, const auto &attrs) {
+       int n_dims = static_cast<int>(attrs[0]);
+       int off = 1;
+
+       std::vector<int> strides(n_dims), padding_lo(n_dims), padding_hi(n_dims),
+           kernel_dilation(n_dims), input_dilation(n_dims);
+
+       for (int i = 0; i < n_dims; i++)
+         strides[i] = static_cast<int>(attrs[off++]);
+       for (int i = 0; i < n_dims; i++) {
+         padding_lo[i] = static_cast<int>(attrs[off++]);
+         padding_hi[i] = static_cast<int>(attrs[off++]);
+       }
+       for (int i = 0; i < n_dims; i++)
+         kernel_dilation[i] = static_cast<int>(attrs[off++]);
+       for (int i = 0; i < n_dims; i++)
+         input_dilation[i] = static_cast<int>(attrs[off++]);
+       int fgs = static_cast<int>(attrs[off]);
+
+       return mlx::core::conv_general(ops[0], ops[1], strides, padding_lo, padding_hi,
+                                      kernel_dilation, input_dilation, fgs);
+     }},
 };
 
 // ── Expr destructor ───────────────────────────────────────────────────────────

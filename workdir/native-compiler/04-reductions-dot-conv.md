@@ -1,6 +1,6 @@
 # Stage 04 — Reductions + dot + conv
 
-Status: not started
+Status: done
 
 ## Why this stage exists
 
@@ -34,9 +34,11 @@ models and the first ops with rich keyword options (axes, keep_axes, contraction
 
 ## Results
 
-| Item | Outcome | Notes / artifacts |
-|------|---------|-------------------|
-| Reductions lowered | | |
-| dot lowered | | |
-| conv lowered | | |
-| custom-fun reduce decision | | |
+| Item | Outcome | Notes |
+|------|---------|-------|
+| Reductions lowered | ✅ | sum, product, all, any, reduce_max, reduce_min; `iattrs = [keep_axes_int, a0, a1, …]`; all/any always emit astype (MLX returns bool_) |
+| argmax / argmin | ✅ | `iattrs = [axis, keep_axis_int]`; axis = −1 encodes global; always cast to out_type (MLX returns uint32) |
+| dot lowered | ✅ | Elixir upcasts to computation_type; four length-delimited axis lists in iattrs; C++ uses tensordot (non-batched) or reconstructed einsum spec (batched) |
+| conv lowered | ✅ | Expanded in Elixir into astype + transpose + :conv_general op; C++ calls mlx::core::conv_general; output re-transposed to canonical layout |
+| custom-fun reduce | deferred | Raises ArgumentError at lower time; requires child-program support (Stage 08) |
+| Tests | 112/112 ✅ | 33 new Stage 04 tests: reductions, argmax/argmin, dot (batched + non-batched), conv 1D/2D, interpreter↔C++ parity, E2E jit smoke |

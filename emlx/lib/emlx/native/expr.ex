@@ -36,11 +36,16 @@ defmodule EMLX.Native.Expr do
   | `:reverse`  | `[a0, a1, …]` — axes to flip (non-negative)             |
   | `:concatenate` | `[axis]` — concat axis; all input tensors in `operands` |
   | `:stack`    | `[axis]` — stack axis; all input tensors in `operands`  |
+  | `:sum`, `:product`, `:all`, `:any`, `:reduce_max`, `:reduce_min` | `[keep_axes_int, a0, a1, …]` — 0/1 keep-axes flag then explicit axis list |
+  | `:argmax`, `:argmin` | `[axis, keep_axis_int]` — axis index (−1 = global/no-axis) then 0/1 keep flag |
+  | `:dot`      | `[n_ca, ca…, n_cb, cb…, n_ba, ba…, n_bb, bb…]` — four length-delimited axis lists: contract-left, contract-right, batch-left, batch-right |
+  | `:conv_general` | `[n_dims, s0..sn-1, pl0, ph0, pl1, ph1, …, kd0..kdn-1, id0..idn-1, fgs]` — spatial dims count, strides, padding lo/hi pairs, kernel dilation, input dilation, feature group count |
 
   Non-negative axes: the lowerer normalises negative axis values before encoding
   so C++ handlers can use them directly as 0-based indices.
 
   `:pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered).
+  `:reduce` (custom-fun reduce) raises — deferred to Stage 08 (requires child programs).
   """
 
   import Bitwise
@@ -488,6 +493,235 @@ defmodule EMLX.Native.Expr do
     }
   end
 
+  # ── reductions ──────────────────────────────────────────────────────────────
+
+  # sum, product: emit reduction then cast to out_type.
+  # all, any: MLX returns bool_; always cast to out_type (u8).
+  @reduction_cast_ops [:sum, :product, :all, :any]
+
+  for op <- @reduction_cast_ops do
+    defp expand_node(
+           %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: unquote(op), args: [tensor, opts]}},
+           state
+         ) do
+      ref = make_ref()
+      operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+      axes = opts[:axes] || Nx.axes(tensor)
+      keep_axes = if opts[:keep_axes], do: 1, else: 0
+      iattrs = [keep_axes | normalize_axes(axes, tuple_size(tensor.shape))]
+
+      state = %{
+        state
+        | instructions: [{ref, unquote(op), [operand_ref], iattrs} | state.instructions]
+      }
+
+      {result_ref, state} = emit_cast_to(ref, out_type, state)
+      %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+    end
+  end
+
+  # reduce_max, reduce_min: MLX preserves input dtype, no cast needed.
+  @reduction_nocast_ops [:reduce_max, :reduce_min]
+
+  for op <- @reduction_nocast_ops do
+    defp expand_node(
+           %T{data: %Nx.Defn.Expr{id: id, op: unquote(op), args: [tensor, opts]}},
+           state
+         ) do
+      ref = make_ref()
+      operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+      axes = opts[:axes] || Nx.axes(tensor)
+      keep_axes = if opts[:keep_axes], do: 1, else: 0
+      iattrs = [keep_axes | normalize_axes(axes, tuple_size(tensor.shape))]
+
+      %{
+        state
+        | instructions: [{ref, unquote(op), [operand_ref], iattrs} | state.instructions],
+          node_to_ref: Map.put(state.node_to_ref, id, ref)
+      }
+    end
+  end
+
+  # argmax / argmin: axis = nil → -1 (global), otherwise normalised non-negative.
+  # MLX returns uint32; always cast to out_type.
+  @argreduce_ops [:argmax, :argmin]
+
+  for op <- @argreduce_ops do
+    defp expand_node(
+           %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: unquote(op), args: [tensor, opts]}},
+           state
+         ) do
+      ref = make_ref()
+      operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+      axis = opts[:axis]
+      keep_axis = if opts[:keep_axis], do: 1, else: 0
+
+      norm_axis =
+        cond do
+          is_nil(axis) -> -1
+          axis < 0 -> tuple_size(tensor.shape) + axis
+          true -> axis
+        end
+
+      state = %{
+        state
+        | instructions: [
+            {ref, unquote(op), [operand_ref], [norm_axis, keep_axis]} | state.instructions
+          ]
+      }
+
+      {result_ref, state} = emit_cast_to(ref, out_type, state)
+      %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+    end
+  end
+
+  # custom-fun reduce: deferred — requires child programs (Stage 08).
+  defp expand_node(%T{data: %Nx.Defn.Expr{op: :reduce}}, _state) do
+    raise ArgumentError, "does not yet lower op :reduce"
+  end
+
+  # ── dot ─────────────────────────────────────────────────────────────────────
+
+  # dot: args = [left, c_left, b_left, right, c_right, b_right]
+  # Cast both operands to computation_type in Elixir; emit :dot with 4-axis-list
+  # iattrs; cast result to out_type.
+  defp expand_node(
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :dot,
+             args: [left, c_left, b_left, right, c_right, b_right]
+           }
+         },
+         state
+       ) do
+    left_ref0 = Map.fetch!(state.node_to_ref, left.data.id)
+    right_ref0 = Map.fetch!(state.node_to_ref, right.data.id)
+
+    computation_type =
+      if Nx.Type.integer?(out_type), do: Nx.Type.to_floating(out_type), else: out_type
+
+    {left_ref, state} = emit_cast_if_needed(left_ref0, left.type, computation_type, state)
+    {right_ref, state} = emit_cast_if_needed(right_ref0, right.type, computation_type, state)
+
+    iattrs =
+      [length(c_left) | c_left] ++
+        [length(c_right) | c_right] ++
+        [length(b_left) | b_left] ++
+        [length(b_right) | b_right]
+
+    dot_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{dot_ref, :dot, [left_ref, right_ref], iattrs} | state.instructions]
+    }
+
+    {result_ref, state} = emit_cast_if_needed(dot_ref, computation_type, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  # ── conv ─────────────────────────────────────────────────────────────────────
+
+  # conv: expanded into existing astype/transpose instructions + a single
+  # :conv_general op.  This mirrors EMLX.Backend.conv exactly:
+  #   1. Cast input + kernel to out_type.
+  #   2. Apply input_permutation then channels-last transpose to input.
+  #   3. Apply kernel_permutation then channels-last transpose to kernel.
+  #   4. Emit :conv_general with strides/padding/dilations/fgs.
+  #   5. Apply channels-first then inverse-output-permutation transpose.
+  defp expand_node(
+         %T{
+           type: out_type,
+           shape: out_shape,
+           data: %Nx.Defn.Expr{id: id, op: :conv, args: [input, kernel, opts]}
+         },
+         state
+       ) do
+    batch_group_size = opts[:batch_group_size]
+
+    if batch_group_size != 1 do
+      raise ArgumentError, "does not yet lower op :conv with batch_group_size != 1"
+    end
+
+    input_permutation = opts[:input_permutation]
+    kernel_permutation = opts[:kernel_permutation]
+    output_permutation = opts[:output_permutation]
+    strides = opts[:strides]
+    padding = opts[:padding]
+    input_dilation = opts[:input_dilation]
+    kernel_dilation = opts[:kernel_dilation]
+    feature_group_count = opts[:feature_group_size]
+
+    input_ref = Map.fetch!(state.node_to_ref, input.data.id)
+    kernel_ref = Map.fetch!(state.node_to_ref, kernel.data.id)
+
+    # 1. Cast to out_type.
+    {input_casted, state} = emit_cast_if_needed(input_ref, input.type, out_type, state)
+    {kernel_casted, state} = emit_cast_if_needed(kernel_ref, kernel.type, out_type, state)
+
+    # 2. Transpose input: user permutation then channels-last.
+    input_rank = tuple_size(input.shape)
+    {input_perm1, state} = emit_transpose_instr(input_casted, input_permutation, state)
+
+    {input_processed, state} =
+      emit_transpose_instr(
+        input_perm1,
+        move_channels_last(Enum.to_list(0..(input_rank - 1))),
+        state
+      )
+
+    # 3. Transpose kernel: user permutation then channels-last.
+    kernel_rank = tuple_size(kernel.shape)
+    {kernel_perm1, state} = emit_transpose_instr(kernel_casted, kernel_permutation, state)
+
+    {kernel_processed, state} =
+      emit_transpose_instr(
+        kernel_perm1,
+        move_channels_last(Enum.to_list(0..(kernel_rank - 1))),
+        state
+      )
+
+    # 4. :conv_general — attrs = [n_dims, s…, pl0,ph0,…, kd…, id…, fgs]
+    n_dims = input_rank - 2
+    {padding_low, padding_high} = Enum.unzip(padding)
+
+    conv_attrs =
+      [n_dims | strides] ++
+        Enum.flat_map(Enum.zip(padding_low, padding_high), fn {lo, hi} -> [lo, hi] end) ++
+        kernel_dilation ++
+        input_dilation ++
+        [feature_group_count]
+
+    conv_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [
+          {conv_ref, :conv_general, [input_processed, kernel_processed], conv_attrs}
+          | state.instructions
+        ]
+    }
+
+    # 5. Transpose output: channels-first then inverse of output_permutation.
+    out_rank = tuple_size(out_shape)
+    [batch | spatial_and_channels] = Enum.to_list(0..(out_rank - 1))
+    {channels, spatial} = List.pop_at(spatial_and_channels, -1)
+    permute_channels_first = [batch, channels | spatial]
+
+    output_perm_inverse =
+      output_permutation
+      |> Enum.with_index()
+      |> Enum.sort()
+      |> Enum.map(&elem(&1, 1))
+
+    {conv_perm1, state} = emit_transpose_instr(conv_ref, permute_channels_first, state)
+    {result_ref, state} = emit_transpose_instr(conv_perm1, output_perm_inverse, state)
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
@@ -539,6 +773,19 @@ defmodule EMLX.Native.Expr do
   # Normalise negative axis values to non-negative, given the input tensor rank.
   defp normalize_axes(axes, rank) do
     Enum.map(axes, fn ax -> if ax < 0, do: rank + ax, else: ax end)
+  end
+
+  # Emit a :transpose instruction; returns {result_ref, updated_state}.
+  defp emit_transpose_instr(operand_ref, perm, state) do
+    ref = make_ref()
+    {ref, %{state | instructions: [{ref, :transpose, [operand_ref], perm} | state.instructions]}}
+  end
+
+  # Move the second element (channels) to the last position.
+  # [0, 1, 2, 3] → [0, 2, 3, 1]  (NCHW → NHWC permutation)
+  # Mirrors EMLX.Backend.move_channels_last/1.
+  defp move_channels_last([head | [second | rest]]) do
+    [head | rest] ++ [second]
   end
 
   # ── int ↔ Nx.Type conversion (used by Interpreter) ────────────────────────
@@ -788,6 +1035,75 @@ defmodule EMLX.Native.Expr.Interpreter do
 
   defp dispatch(:stack, tensors, [axis]),
     do: Nx.stack(tensors, axis: axis)
+
+  # reductions — iattrs = [keep_axes_int, a0, a1, …]
+  for op <- [:sum, :product, :all, :any, :reduce_max, :reduce_min] do
+    defp dispatch(unquote(op), [tensor], [keep_axes | axes]) do
+      apply(Nx, unquote(op), [tensor, [axes: axes, keep_axes: keep_axes == 1]])
+    end
+  end
+
+  # argmax / argmin — iattrs = [axis, keep_axis_int]; axis = -1 means global
+  for op <- [:argmax, :argmin] do
+    defp dispatch(unquote(op), [tensor], [axis, keep_axis]) do
+      opts = [keep_axis: keep_axis == 1]
+      opts = if axis < 0, do: opts, else: Keyword.put(opts, :axis, axis)
+      apply(Nx, unquote(op), [tensor, opts])
+    end
+  end
+
+  # dot — iattrs = [n_ca, ca…, n_cb, cb…, n_ba, ba…, n_bb, bb…]
+  defp dispatch(:dot, [left, right], attrs) do
+    {n_ca, attrs} = List.pop_at(attrs, 0)
+    {ca, attrs} = Enum.split(attrs, n_ca)
+    {n_cb, attrs} = List.pop_at(attrs, 0)
+    {cb, attrs} = Enum.split(attrs, n_cb)
+    {n_ba, attrs} = List.pop_at(attrs, 0)
+    {ba, attrs} = Enum.split(attrs, n_ba)
+    {_n_bb, attrs} = List.pop_at(attrs, 0)
+    bb = attrs
+    # inputs already cast to computation_type; Nx.dot does its own type promotion
+    Nx.dot(left, ca, ba, right, cb, bb)
+  end
+
+  # conv_general — calls EMLX directly since there is no Nx public API for
+  # an already-transposed conv.  Inputs are %Nx.Tensor{data: %EMLX.Backend{}}.
+  # iattrs = [n_dims, s…, pl0,ph0,…, kd…, id…, fgs]
+  defp dispatch(:conv_general, [input, kernel], attrs) do
+    [n_dims | rest] = attrs
+    strides = Enum.slice(rest, 0, n_dims)
+    off = n_dims
+    padding_lo = for i <- 0..(n_dims - 1), do: Enum.at(rest, off + i * 2)
+    padding_hi = for i <- 0..(n_dims - 1), do: Enum.at(rest, off + i * 2 + 1)
+    off = off + n_dims * 2
+    kernel_dilation = Enum.slice(rest, off, n_dims)
+    off = off + n_dims
+    input_dilation = Enum.slice(rest, off, n_dims)
+    fgs = Enum.at(rest, off + n_dims)
+
+    in_mx = input.data.ref
+    kern_mx = kernel.data.ref
+
+    result_mx =
+      EMLX.conv_general(
+        in_mx,
+        kern_mx,
+        strides,
+        padding_lo,
+        padding_hi,
+        kernel_dilation,
+        input_dilation,
+        fgs
+      )
+
+    shape = EMLX.shape(result_mx) |> List.to_tuple()
+
+    EMLX.Backend.to_nx(result_mx, %Nx.Tensor{
+      type: input.type,
+      shape: shape,
+      names: List.duplicate(nil, tuple_size(shape))
+    })
+  end
 
   defp dispatch(op, _args, _attrs),
     do: raise(ArgumentError, "Native.Expr.Interpreter: unknown op #{inspect(op)}")

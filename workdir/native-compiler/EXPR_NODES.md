@@ -93,12 +93,12 @@ logical_and, logical_or, logical_xor.
 
 ## E. Reductions / contraction / conv
 
-- [ ] sum, product, all, any
-- [ ] reduce_max, reduce_min
-- [ ] argmax, argmin
-- [ ] reduce (custom fun — may need fallback / fun lowering)
-- [ ] dot
-- [ ] conv
+- [x] sum, product, all, any
+- [x] reduce_max, reduce_min
+- [x] argmax, argmin
+- [~] reduce (custom fun — deferred; raises "does not yet lower op :reduce"; requires Stage 08 child programs)
+- [x] dot
+- [x] conv
 
 ## F. Indexing / selection
 

@@ -156,8 +156,9 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
+      # sort is not yet lowered (Stage 06); use it as the unknown-op sentinel.
       expr =
-        Nx.Defn.debug_expr_apply(&Nx.sum/1, [Nx.template({3}, :f32)])
+        Nx.Defn.debug_expr_apply(fn t -> Nx.sort(t) end, [Nx.template({3}, :f32)])
 
       assert_raise ArgumentError, ~r/does not yet lower op/, fn -> Expr.lower(expr) end
     end
@@ -1028,6 +1029,312 @@ defmodule EMLX.Native.ExprTest do
       cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
 
       assert_all_close(interp_out, cpp_out)
+    end
+  end
+
+  # ── Stage 04: reductions ─────────────────────────────────────────────────
+
+  describe "Stage 04 — sum" do
+    @tag :stage04
+    test "sum all axes f32" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.sum(t) end, [x])
+    end
+
+    @tag :stage04
+    test "sum along axis 0 with keep_axes" do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.sum(t, axes: [0], keep_axes: true) end, [x])
+    end
+
+    @tag :stage04
+    test "sum along axis 1 f32" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.sum(t, axes: [1]) end, [x])
+    end
+
+    @tag :stage04
+    test "sum 3D along multiple axes" do
+      x = Nx.tensor([[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.sum(t, axes: [0, 2]) end, [x])
+    end
+  end
+
+  describe "Stage 04 — product" do
+    @tag :stage04
+    test "product all axes f32" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.product(t) end, [x])
+    end
+
+    @tag :stage04
+    test "product along axis 0" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.product(t, axes: [0]) end, [x])
+    end
+  end
+
+  describe "Stage 04 — all / any" do
+    @tag :stage04
+    test "all on boolean-like tensor" do
+      x = Nx.tensor([[1, 1], [1, 0]], type: :u8, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.all(t) end, [x])
+    end
+
+    @tag :stage04
+    test "all along axis 0" do
+      x = Nx.tensor([[1, 0], [1, 1]], type: :u8, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.all(t, axes: [0]) end, [x])
+    end
+
+    @tag :stage04
+    test "any all axes" do
+      x = Nx.tensor([[0, 0], [0, 1]], type: :u8, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.any(t) end, [x])
+    end
+
+    @tag :stage04
+    test "any along axis 1 with keep_axes" do
+      x = Nx.tensor([[0, 1], [0, 0]], type: :u8, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.any(t, axes: [1], keep_axes: true) end, [x])
+    end
+  end
+
+  describe "Stage 04 — reduce_max / reduce_min" do
+    @tag :stage04
+    test "reduce_max all axes f32" do
+      x = Nx.tensor([[1.0, 5.0], [3.0, 2.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reduce_max(t) end, [x])
+    end
+
+    @tag :stage04
+    test "reduce_max along axis 1 keep_axes" do
+      x = Nx.tensor([[1.0, 5.0], [3.0, 2.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reduce_max(t, axes: [1], keep_axes: true) end, [x])
+    end
+
+    @tag :stage04
+    test "reduce_min all axes" do
+      x = Nx.tensor([[4.0, 2.0], [1.0, 3.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reduce_min(t) end, [x])
+    end
+
+    @tag :stage04
+    test "reduce_min along axis 0" do
+      x = Nx.tensor([[4.0, 2.0], [1.0, 3.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.reduce_min(t, axes: [0]) end, [x])
+    end
+  end
+
+  describe "Stage 04 — argmax / argmin" do
+    @tag :stage04
+    test "argmax along axis 1" do
+      x = Nx.tensor([[1.0, 3.0, 2.0], [4.0, 0.0, 5.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.argmax(t, axis: 1) end, [x])
+    end
+
+    @tag :stage04
+    test "argmax along axis 0 keep_axis" do
+      x = Nx.tensor([[1.0, 3.0], [4.0, 2.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.argmax(t, axis: 0, keep_axis: true) end, [x])
+    end
+
+    @tag :stage04
+    test "argmin along axis 0" do
+      x = Nx.tensor([[4.0, 2.0], [1.0, 5.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.argmin(t, axis: 0) end, [x])
+    end
+
+    @tag :stage04
+    test "argmax global (no axis)" do
+      x = Nx.tensor([[1.0, 7.0], [3.0, 2.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.argmax(t) end, [x])
+    end
+  end
+
+  # ── Stage 04: dot ────────────────────────────────────────────────────────
+
+  describe "Stage 04 — dot (non-batched)" do
+    @tag :stage04
+    test "matmul {2,3} × {3,4} → {2,4}" do
+      a = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+
+      b =
+        Nx.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
+          backend: EMLX.Backend
+        )
+
+      check_equiv(fn x, y -> Nx.dot(x, y) end, [a, b])
+    end
+
+    @tag :stage04
+    test "inner product {4} · {4} → scalar" do
+      a = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
+      b = Nx.tensor([5.0, 6.0, 7.0, 8.0], backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.dot(x, y) end, [a, b])
+    end
+
+    @tag :stage04
+    test "tensordot explicit contraction axes" do
+      a = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      b = Nx.tensor([[1.0, 0.0], [0.0, 1.0]], backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.dot(x, [1], [], y, [0], []) end, [a, b])
+    end
+  end
+
+  describe "Stage 04 — dot (batched)" do
+    @tag :stage04
+    test "batched matmul {2,3,4} · {2,4,5} → {2,3,5}" do
+      a = Nx.iota({2, 3, 4}, type: :f32, backend: EMLX.Backend)
+      b = Nx.iota({2, 4, 5}, type: :f32, backend: EMLX.Backend)
+      check_equiv(fn x, y -> Nx.dot(x, [2], [0], y, [1], [0]) end, [a, b], tol: 1.0e-3)
+    end
+  end
+
+  # ── Stage 04: conv ───────────────────────────────────────────────────────
+
+  describe "Stage 04 — conv (1D)" do
+    @tag :stage04
+    test "1D conv {1,1,5} input, {1,1,3} kernel" do
+      # 3D: {batch=1, in_channels=1, length=5}; kernel {out=1, in=1, size=3}
+      input = Nx.tensor([[[1.0, 2.0, 3.0, 4.0, 5.0]]], backend: EMLX.Backend)
+      kernel = Nx.tensor([[[1.0, 0.0, -1.0]]], backend: EMLX.Backend)
+      check_equiv(fn x, k -> Nx.conv(x, k) end, [input, kernel], tol: 1.0e-4)
+    end
+
+    @tag :stage04
+    test "1D conv with stride 2 and padding" do
+      input = Nx.tensor([[[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]]], backend: EMLX.Backend)
+      kernel = Nx.tensor([[[1.0, 1.0]]], backend: EMLX.Backend)
+
+      check_equiv(fn x, k -> Nx.conv(x, k, strides: [2], padding: :same) end, [input, kernel],
+        tol: 1.0e-4
+      )
+    end
+  end
+
+  describe "Stage 04 — conv (2D)" do
+    @tag :stage04
+    test "2D conv identity kernel {1,1,3,3} × 1-ch input" do
+      input = Nx.iota({1, 1, 4, 4}, type: :f32, backend: EMLX.Backend)
+
+      kernel =
+        Nx.tensor([[[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]]], backend: EMLX.Backend)
+
+      check_equiv(fn x, k -> Nx.conv(x, k, padding: :same) end, [input, kernel], tol: 1.0e-4)
+    end
+
+    @tag :stage04
+    test "2D conv with strides and dilations" do
+      input = Nx.iota({1, 1, 6, 6}, type: :f32, backend: EMLX.Backend)
+      kernel = Nx.tensor([[[[1.0, 1.0], [1.0, 1.0]]]], backend: EMLX.Backend)
+      check_equiv(fn x, k -> Nx.conv(x, k, strides: [2, 2]) end, [input, kernel], tol: 1.0e-4)
+    end
+
+    @tag :stage04
+    test "2D conv multi-channel" do
+      input = Nx.iota({1, 3, 4, 4}, type: :f32, backend: EMLX.Backend)
+      kernel = Nx.iota({2, 3, 2, 2}, type: :f32, backend: EMLX.Backend)
+      check_equiv(fn x, k -> Nx.conv(x, k) end, [input, kernel], tol: 1.0e-3)
+    end
+  end
+
+  # ── Stage 04: Interpreter ↔ C++ parity ──────────────────────────────────
+
+  defn sum_all(x), do: Nx.sum(x)
+  defn matmul_22(a, b), do: Nx.dot(a, b)
+
+  describe "Stage 04 — interpreter ↔ C++ parity" do
+    setup do
+      device = EMLX.default_device()
+      {worker, _} = EMLX.resolve_worker(device)
+      %{worker: worker, device: device}
+    end
+
+    @tag :stage04
+    test "interpreter and C++ agree on sum {2,3}", %{worker: worker, device: device} do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+      expr = Nx.Defn.debug_expr_apply(&sum_all/1, [Nx.template({2, 3}, :f32)])
+      prog = EMLX.Native.Expr.lower(expr)
+
+      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
+
+      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
+      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+
+      %EMLX.Backend{ref: {_, ref_x}} = x.data
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
+      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
+
+      assert_all_close(interp_out, cpp_out)
+    end
+
+    @tag :stage04
+    test "interpreter and C++ agree on matmul {2,3}×{3,2}", %{worker: worker, device: device} do
+      a = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+      b = Nx.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], backend: EMLX.Backend)
+
+      expr =
+        Nx.Defn.debug_expr_apply(&matmul_22/2, [
+          Nx.template({2, 3}, :f32),
+          Nx.template({3, 2}, :f32)
+        ])
+
+      prog = EMLX.Native.Expr.lower(expr)
+
+      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [a, b])
+
+      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
+      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+
+      %EMLX.Backend{ref: {_, ref_a}} = a.data
+      %EMLX.Backend{ref: {_, ref_b}} = b.data
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_a, ref_b])
+      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
+
+      assert_all_close(interp_out, cpp_out)
+    end
+  end
+
+  # ── Stage 04: E2E jit smoke tests ───────────────────────────────────────
+
+  defn sum_axis1_keep(x), do: Nx.sum(x, axes: [1], keep_axes: true)
+  defn argmax_axis0(x), do: Nx.argmax(x, axis: 0)
+  defn matmul_defn(a, b), do: Nx.dot(a, b)
+  defn reduce_max_defn(x), do: Nx.reduce_max(x)
+
+  describe "Stage 04 — E2E jit smoke" do
+    @tag :stage04
+    test "sum with keep_axes=true via jit" do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+      result = Nx.Defn.jit(&sum_axis1_keep/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&sum_axis1_keep/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(result, eager, 1.0e-4)
+    end
+
+    @tag :stage04
+    test "argmax via jit" do
+      x = Nx.tensor([[1.0, 3.0], [4.0, 2.0]], backend: EMLX.Backend)
+      result = Nx.Defn.jit(&argmax_axis0/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&argmax_axis0/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(result, eager, 1.0e-4)
+    end
+
+    @tag :stage04
+    test "matmul via jit" do
+      a = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
+      b = Nx.tensor([[5.0, 6.0], [7.0, 8.0]], backend: EMLX.Backend)
+      result = Nx.Defn.jit(&matmul_defn/2, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(&matmul_defn/2, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(result, eager, 1.0e-3)
+    end
+
+    @tag :stage04
+    test "reduce_max via jit" do
+      x = Nx.tensor([[4.0, 1.0], [2.0, 3.0]], backend: EMLX.Backend)
+      result = Nx.Defn.jit(&reduce_max_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&reduce_max_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(result, eager, 1.0e-4)
     end
   end
 
