@@ -104,7 +104,7 @@ each independently shippable. Run with
 
 - [x] [`00-topo-sort`](00-topo-sort.md) — `EMLX.Defn.Tree.post_order/1` (Layer A), pure, no C++.
 - [x] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.Native.Expr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline. Post-stage: `mlx::core::detail::compile` with unique IDs; op-name string registry replaces enum + wire integers. **Perf gate soft-pass — see stage doc § Perf findings.**
-- [ ] [`02-elementwise`](02-elementwise.md) — unary + binary + compare/logical.
+- [x] [`02-elementwise`](02-elementwise.md) — unary + binary + compare/logical.
 - [ ] [`03-shape-movement`](03-shape-movement.md) — reshape, transpose, squeeze, broadcast, pad, reverse, as_type, bitcast, concatenate, stack.
 - [ ] [`04-reductions-dot-conv`](04-reductions-dot-conv.md) — reductions + argmax/argmin + dot + conv.
 - [ ] [`05-indexing-selection`](05-indexing-selection.md) — select, clip, slice, put_slice, gather, take, take_along_axis, indexed_add/put.
@@ -123,13 +123,7 @@ each independently shippable. Run with
 - **After 01**: perf gate — the single-NIF replay must beat the current
   op-by-op Evaluator path on a multi-op `defn` (dispatch-collapse thesis). If
   it does not, stop and rethink before growing coverage.  
-  **Status:** Soft-pass. `eval_program` calls `mlx::core::eval` eagerly inside the NIF
-  body (synchronous barrier), while the Evaluator defers eval to `Nx.to_number`.
-  For scalar microbenchmarks the deferred path is faster (~0.3–0.7× speedup).
-  `mlx::core::detail::compile` is now used (graph is traced once, replayed
-  cheaply thereafter). Fix for Stage 02: remove the eager `mlx::core::eval` from
-  `eval_program` and let the caller trigger evaluation. Re-run perf gate with ≥1 K
-  element tensors and 20+ ops.
+  **Status:** Hard-pass as of Stage 02. The Stage 01 benchmark used `Nx.add(x, 1)` chained 10×; Nx.Defn constant-folds repeated scalar additions into a single op, so the "10-add chain" was a 1-op graph. Stage 02 switched to `Nx.add(x, y)` with a runtime `y` — a genuine 10-instruction program. Native path is dramatically faster. `eval_program` no longer calls `mlx::core::eval` eagerly (lazy outputs since Stage 02).
 - **Ongoing**: every op added must pass an equivalence test vs eager
   `EMLX.Backend` (within tolerance) before its `EXPR_NODES.md` box flips.
 

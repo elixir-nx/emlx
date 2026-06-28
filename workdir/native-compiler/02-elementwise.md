@@ -1,6 +1,6 @@
 # Stage 02 — Elementwise (unary + binary + compare/logical)
 
-Status: not started
+Status: done
 
 ## Why this stage exists
 
@@ -40,7 +40,15 @@ the native lane matches the eager backend numerically.
 
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
-| Unary lowered (count) | | |
-| Binary lowered (count) | | |
-| Compare/logical lowered | | |
-| Equivalence tests | | |
+| Unary lowered (count) | ✅ 36 | 23 math funs + abs/negate/sign/ceil/floor/round/bitwise_not/is_nan/is_infinity/conjugate/real/imag/logical_not/cbrt/erfc; count_leading_zeros/population_count raise (EMLX unsupported) |
+| Binary lowered (count) | ✅ 15 | add/subtract/multiply/divide/pow/remainder/atan2/min/max/quotient + bitwise_and/or/xor/left_shift/right_shift |
+| Compare/logical lowered | ✅ 9 | equal/not_equal/greater/less/greater_equal/less_equal + logical_and/or/xor (+ logical_not above) |
+| dtype coercion | ✅ | Explicit `astype` IR instructions around binary ops; `@mlx_type_to_int` / `int_to_dtype` maintain Elixir↔C++ parity |
+| Equivalence tests | ✅ 23 tests | f32/bf16/s32/u8 across all op groups; mixed-dtype upcast; compare→u8; interpreter↔C++ parity |
+| compile/format clean | ✅ | `mix compile --warnings-as-errors` + `mix format --check-formatted` both clean |
+| astype opcode | ✅ | First-class IR opcode with dtype int in `attrs[0]`; synced Elixir `@mlx_type_to_int` ↔ C++ `int_to_dtype()` table |
+| instruction format | ✅ | 4-tuple `{ref, op, operands, attrs}`; all Stage 01 + tree tests remain green |
+
+All 53 tests (24 Stage 02 + 23 Stage 01/seam + 6 tree) pass. 1 perf gate excluded.
+
+**Parity note:** The original integer-opcode parity table was removed in Stage 01's post-stage refactor (string registry replaced it). The C++ `compile_program` NIF validates every op name against the registry at compile time and returns `"emlx::native: unknown op \"foo\""` for any unknown key. The 24 Stage 02 tests therefore implicitly verify Elixir↔C++ op-name parity across all registered ops.

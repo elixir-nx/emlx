@@ -57,11 +57,12 @@ cbrt, erf, erfc, erf_inv.
 Plus: abs, bitwise_not, ceil, conjugate, floor, negate, round, sign,
 count_leading_zeros, population_count, real, imag, is_nan, is_infinity.
 
-- [ ] math funs (23)
-- [ ] sign/abs/negate/ceil/floor/round
-- [ ] bitwise_not, count_leading_zeros, population_count
-- [ ] is_nan, is_infinity
-- [ ] complex: conjugate, real, imag
+- [x] math funs (23)
+- [x] sign/abs/negate/ceil/floor/round
+- [x] bitwise_not
+- [x] count_leading_zeros, population_count (raise — not supported by EMLX)
+- [x] is_nan, is_infinity
+- [x] complex: conjugate, real, imag
 
 ## C. Binary elementwise (Nx.Backend binary_ops)
 
@@ -72,10 +73,10 @@ right_shift.
 Compare/logical: equal, not_equal, greater, less, greater_equal, less_equal,
 logical_and, logical_or, logical_xor.
 
-- [ ] arithmetic (add/subtract/multiply/divide/pow/remainder/atan2/min/max/quotient)
-- [ ] bitwise + shifts
-- [ ] compare (6)
-- [ ] logical (and/or/xor) + logical_not (unary composite)
+- [x] arithmetic (add/subtract/multiply/divide/pow/remainder/atan2/min/max/quotient)
+- [x] bitwise + shifts
+- [x] compare (6)
+- [x] logical (and/or/xor) + logical_not (unary composite via Nx.Block.LogicalNot)
 
 ## D. Shape / movement
 

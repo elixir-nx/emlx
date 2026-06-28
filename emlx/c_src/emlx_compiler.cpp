@@ -22,8 +22,7 @@ namespace native {
 // Each entry maps an op name string (matching the atom used in the Elixir IR)
 // to a C++ function: (resolved_operands, integer_attrs) → result array.
 // `operands` are already-resolved mlx::core::arrays; `attrs` are the integer
-// attribute channel (e.g. axis indices, shape components) passed verbatim from
-// the IR.
+// attribute channel passed verbatim from the IR.
 //
 // This is the single source of truth for op semantics on the compiler path.
 // No explicit device: ops run on the default stream of the current worker thread.
@@ -32,10 +31,157 @@ using OpFn = std::function<
     mlx::core::array(const std::vector<mlx::core::array> &ops,
                      const std::vector<int64_t> &attrs)>;
 
+// Maps the dtype integer (from EMLX.Native.Expr.@mlx_type_to_int) to mlx Dtype.
+// Must stay in sync with the @mlx_type_to_int map in emlx/lib/emlx/native/expr.ex.
+static mlx::core::Dtype int_to_dtype(int64_t val) {
+  static const mlx::core::Dtype table[] = {
+      mlx::core::bool_,    // 0
+      mlx::core::uint8,    // 1
+      mlx::core::uint16,   // 2
+      mlx::core::uint32,   // 3
+      mlx::core::uint64,   // 4
+      mlx::core::int8,     // 5
+      mlx::core::int16,    // 6
+      mlx::core::int32,    // 7
+      mlx::core::int64,    // 8
+      mlx::core::float16,  // 9
+      mlx::core::bfloat16, // 10
+      mlx::core::float32,  // 11
+      mlx::core::complex64 // 12
+  };
+  if (val < 0 || val > 12)
+    throw std::runtime_error("int_to_dtype: invalid dtype int " +
+                             std::to_string(val));
+  return table[static_cast<size_t>(val)];
+}
+
 static const std::unordered_map<std::string, OpFn> op_registry = {
-    {"add",
-     [](const auto &ops, const auto & /*attrs*/) {
-       return mlx::core::add(ops[0], ops[1]);
+    // ── cast ──────────────────────────────────────────────────────────────
+    {"astype",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::astype(ops[0], int_to_dtype(attrs[0]));
+     }},
+
+    // ── unary ops ─────────────────────────────────────────────────────────
+    {"abs", [](const auto &ops, const auto &) { return mlx::core::abs(ops[0]); }},
+    {"ceil", [](const auto &ops, const auto &) { return mlx::core::ceil(ops[0]); }},
+    {"floor", [](const auto &ops, const auto &) { return mlx::core::floor(ops[0]); }},
+    {"negate", [](const auto &ops, const auto &) { return mlx::core::negative(ops[0]); }},
+    {"round", [](const auto &ops, const auto &) { return mlx::core::round(ops[0]); }},
+    {"sign", [](const auto &ops, const auto &) { return mlx::core::sign(ops[0]); }},
+    {"real", [](const auto &ops, const auto &) { return mlx::core::real(ops[0]); }},
+    {"imag", [](const auto &ops, const auto &) { return mlx::core::imag(ops[0]); }},
+    {"is_nan", [](const auto &ops, const auto &) { return mlx::core::isnan(ops[0]); }},
+    {"is_infinity", [](const auto &ops, const auto &) { return mlx::core::isinf(ops[0]); }},
+    {"bitwise_not",
+     [](const auto &ops, const auto &) {
+       return mlx::core::bitwise_invert(ops[0]);
+     }},
+    {"conjugate",
+     [](const auto &ops, const auto &) { return mlx::core::conjugate(ops[0]); }},
+    {"logical_not",
+     [](const auto &ops, const auto &) { return mlx::core::logical_not(ops[0]); }},
+    {"sigmoid", [](const auto &ops, const auto &) { return mlx::core::sigmoid(ops[0]); }},
+    {"asin", [](const auto &ops, const auto &) { return mlx::core::arcsin(ops[0]); }},
+    {"asinh", [](const auto &ops, const auto &) { return mlx::core::arcsinh(ops[0]); }},
+    {"acos", [](const auto &ops, const auto &) { return mlx::core::arccos(ops[0]); }},
+    {"acosh", [](const auto &ops, const auto &) { return mlx::core::arccosh(ops[0]); }},
+    {"atan", [](const auto &ops, const auto &) { return mlx::core::arctan(ops[0]); }},
+    {"atanh", [](const auto &ops, const auto &) { return mlx::core::arctanh(ops[0]); }},
+    {"cos", [](const auto &ops, const auto &) { return mlx::core::cos(ops[0]); }},
+    {"cosh", [](const auto &ops, const auto &) { return mlx::core::cosh(ops[0]); }},
+    {"erf", [](const auto &ops, const auto &) { return mlx::core::erf(ops[0]); }},
+    {"erf_inv", [](const auto &ops, const auto &) { return mlx::core::erfinv(ops[0]); }},
+    {"exp", [](const auto &ops, const auto &) { return mlx::core::exp(ops[0]); }},
+    {"expm1", [](const auto &ops, const auto &) { return mlx::core::expm1(ops[0]); }},
+    {"log", [](const auto &ops, const auto &) { return mlx::core::log(ops[0]); }},
+    {"log1p", [](const auto &ops, const auto &) { return mlx::core::log1p(ops[0]); }},
+    {"rsqrt", [](const auto &ops, const auto &) { return mlx::core::rsqrt(ops[0]); }},
+    {"sin", [](const auto &ops, const auto &) { return mlx::core::sin(ops[0]); }},
+    {"sinh", [](const auto &ops, const auto &) { return mlx::core::sinh(ops[0]); }},
+    {"sqrt", [](const auto &ops, const auto &) { return mlx::core::sqrt(ops[0]); }},
+    {"tan", [](const auto &ops, const auto &) { return mlx::core::tan(ops[0]); }},
+    {"tanh", [](const auto &ops, const auto &) { return mlx::core::tanh(ops[0]); }},
+
+    // cbrt = x^(1/3); returns NaN for negative real inputs (matches EMLX.Backend)
+    {"cbrt",
+     [](const auto &ops, const auto &) {
+       return mlx::core::power(
+           ops[0], mlx::core::full({}, static_cast<float>(1.0 / 3.0), mlx::core::float32));
+     }},
+
+    // erfc = 1 - erf(x)
+    {"erfc",
+     [](const auto &ops, const auto &) {
+       auto e = mlx::core::erf(ops[0]);
+       return mlx::core::subtract(mlx::core::ones({}, e.dtype()), e);
+     }},
+
+    // ── binary ops ────────────────────────────────────────────────────────
+    {"add", [](const auto &ops, const auto &) { return mlx::core::add(ops[0], ops[1]); }},
+    {"subtract",
+     [](const auto &ops, const auto &) { return mlx::core::subtract(ops[0], ops[1]); }},
+    {"multiply",
+     [](const auto &ops, const auto &) { return mlx::core::multiply(ops[0], ops[1]); }},
+    {"divide",
+     [](const auto &ops, const auto &) { return mlx::core::divide(ops[0], ops[1]); }},
+    {"pow",
+     [](const auto &ops, const auto &) { return mlx::core::power(ops[0], ops[1]); }},
+    {"atan2",
+     [](const auto &ops, const auto &) { return mlx::core::arctan2(ops[0], ops[1]); }},
+    {"min",
+     [](const auto &ops, const auto &) { return mlx::core::minimum(ops[0], ops[1]); }},
+    {"max",
+     [](const auto &ops, const auto &) { return mlx::core::maximum(ops[0], ops[1]); }},
+    {"quotient",
+     [](const auto &ops, const auto &) { return mlx::core::floor_divide(ops[0], ops[1]); }},
+    {"left_shift",
+     [](const auto &ops, const auto &) { return mlx::core::left_shift(ops[0], ops[1]); }},
+    {"right_shift",
+     [](const auto &ops, const auto &) { return mlx::core::right_shift(ops[0], ops[1]); }},
+    {"bitwise_and",
+     [](const auto &ops, const auto &) { return mlx::core::bitwise_and(ops[0], ops[1]); }},
+    {"bitwise_or",
+     [](const auto &ops, const auto &) { return mlx::core::bitwise_or(ops[0], ops[1]); }},
+    {"bitwise_xor",
+     [](const auto &ops, const auto &) { return mlx::core::bitwise_xor(ops[0], ops[1]); }},
+
+    // remainder: MLX uses floor-division semantics; fix up to truncation (same sign as dividend)
+    // to match EMLX.Backend.remainder which applies this same correction.
+    {"remainder",
+     [](const auto &ops, const auto &) {
+       auto rem = mlx::core::remainder(ops[0], ops[1]);
+       auto zero = mlx::core::full({}, 0, ops[0].dtype());
+       auto neg_dividend = mlx::core::less(ops[0], zero);
+       auto adjusted = mlx::core::subtract(rem, ops[1]);
+       return mlx::core::where(neg_dividend, adjusted, rem);
+     }},
+
+    // compare — result is MLX bool_; Elixir lowerer emits astype(bool_, uint8) after
+    {"equal",
+     [](const auto &ops, const auto &) { return mlx::core::equal(ops[0], ops[1]); }},
+    {"not_equal",
+     [](const auto &ops, const auto &) { return mlx::core::not_equal(ops[0], ops[1]); }},
+    {"greater",
+     [](const auto &ops, const auto &) { return mlx::core::greater(ops[0], ops[1]); }},
+    {"less",
+     [](const auto &ops, const auto &) { return mlx::core::less(ops[0], ops[1]); }},
+    {"greater_equal",
+     [](const auto &ops, const auto &) { return mlx::core::greater_equal(ops[0], ops[1]); }},
+    {"less_equal",
+     [](const auto &ops, const auto &) { return mlx::core::less_equal(ops[0], ops[1]); }},
+
+    // logical binary
+    {"logical_and",
+     [](const auto &ops, const auto &) { return mlx::core::logical_and(ops[0], ops[1]); }},
+    {"logical_or",
+     [](const auto &ops, const auto &) { return mlx::core::logical_or(ops[0], ops[1]); }},
+    // logical_xor = (a || b) && !(a && b)
+    {"logical_xor",
+     [](const auto &ops, const auto &) {
+       auto t1 = mlx::core::logical_or(ops[0], ops[1]);
+       auto t2 = mlx::core::logical_not(mlx::core::logical_and(ops[0], ops[1]));
+       return mlx::core::logical_and(t1, t2);
      }},
 };
 

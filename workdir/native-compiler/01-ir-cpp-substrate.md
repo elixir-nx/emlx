@@ -115,30 +115,16 @@ ops with no structural change.
 | Evaluator (10× lazy `Nx.add`) + `Nx.to_number` | ~57–124 µs |
 | Speedup | ~0.3–0.7× (native slower at scalar scale) |
 
-**Root cause — eager eval vs. deferred eval:**
+**Root cause — constant folding + eager eval:**
 
-`eval_program` calls `mlx::core::eval(outputs)` **inside the NIF body** (on the
-worker thread) before returning. This forces synchronous completion of the entire
-compute graph before the BEAM gets control back.
+The benchmark used `Nx.add(x, 1)` chained 10×. `Nx.Defn` constant-folds repeated
+scalar additions: the traced graph contained **a single `:add` instruction**, not 10.
+The "10-add chain" was a 1-op graph, making the NIF-dispatch saving negligible while
+the eager `mlx::core::eval` barrier in `eval_program` dominated.
 
-The Evaluator defers `mlx::core::eval` until `Nx.to_number` → `EMLX.to_binary`,
-where MLX can schedule evaluation while the BEAM is still doing work.
+**Fixed in Stage 02:**
 
-**The thesis is sound, the benchmark is a worst case:**
-
-The dispatch-collapse benefit shows up when:
-
-- The tensor workload is large enough that N×NIF-dispatch overhead dominates.
-- The program has enough ops that the NIF-call-count saving is significant.
-
-Scalar microbenchmarks expose only the scheduler startup cost, not the dispatch
-saving. The crossover point is expected at medium-to-large tensors (>1 K elements)
-with >20 ops.
-
-**Mitigation for Stage 02+:**
-
-1. Remove the `mlx::core::eval` call from `eval_program` (return lazy refs, let
-   the caller trigger eval via a subsequent `to_binary`). This matches the
-   Evaluator pattern and eliminates the premature barrier.
-2. Re-run the perf gate with ≥1 K element tensors and a 20-op chain.
-3. Track `speedup` in the results table above once the gate passes.
+1. `eval_program` no longer calls `mlx::core::eval` — outputs are lazy (matches Evaluator).
+2. Perf gate definition changed to `Nx.add(x, y)` chained 10× with a runtime tensor `y`
+   (cannot be folded → genuine 10-instruction program). Native path is dramatically faster.
+   Hard assertion passes.

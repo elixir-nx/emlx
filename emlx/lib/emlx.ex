@@ -1366,7 +1366,8 @@ defmodule EMLX do
     # Resolve the compile-time worker for compile_program.
     {worker, effective_device} = resolve_worker(device)
 
-    {num_inputs, capture_nif_refs, constant_values, constant_types, opcodes, operands, iattrs, wire_outputs} =
+    {num_inputs, capture_nif_refs, constant_values, constant_types, opcodes, operands, iattrs,
+     wire_outputs} =
       EMLX.Native.Expr.to_wire(program)
 
     job_ref =
@@ -1402,7 +1403,7 @@ defmodule EMLX do
   # reconstructing output tensors after the NIF returns raw resource refs).
   defp build_native_eval_fn(program_resource, output_expr, effective_device) do
     output_expr = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
-    
+
     fn [params] ->
       {worker, dev} = resolve_worker(effective_device)
 
@@ -1410,8 +1411,16 @@ defmodule EMLX do
       # Call it to materialise the actual %Nx.Tensor{} with EMLX.Backend data.
       input_refs =
         Enum.map(params, fn lazy ->
-          %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, ref}}} = lazy.()
-          ref
+          case lazy.() do
+            %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, ref}}} ->
+              ref
+
+            %Nx.Tensor{} = t ->
+              %{data: %EMLX.Backend{ref: {_dev, ref}}} =
+                Nx.backend_copy(t, {EMLX.Backend, device: dev})
+
+              ref
+          end
         end)
 
       job_ref =
