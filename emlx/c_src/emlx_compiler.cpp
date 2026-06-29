@@ -12,6 +12,8 @@
 #include "emlx_compiler.hpp"
 #include "mlx/compile_impl.h"
 #include <atomic>
+#include <mutex>
+#include <numeric>
 #include <unordered_map>
 
 namespace emlx {
@@ -461,15 +463,248 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        return mlx::core::einsum(spec, {ops[0], ops[1]});
      }},
 
-    // ── conv_general ─────────────────────────────────────────────────────────
+    // ── indexing / selection ─────────────────────────────────────────────────
     //
-    // iattrs = [n_dims, s0..sn-1, pl0,ph0,pl1,ph1,…, kd0..kdn-1, id0..idn-1, fgs]
-    // Inputs (ops[0]=processed_input, ops[1]=processed_kernel) are already:
-    //   - cast to out_type
-    //   - transposed to channels-last format
-    // The result from mlx::core::conv_general is also channels-last; the Elixir
-    // lowerer emits :transpose ops afterward to restore the desired layout.
+    // select: operands = [pred, on_true, on_false]; no attrs.
+    {"select",
+     [](const auto &ops, const auto &) {
+       return mlx::core::where(ops[0], ops[1], ops[2]);
+     }},
 
+    // clip: operands = [tensor, min, max]; no attrs.
+    {"clip",
+     [](const auto &ops, const auto &) {
+       return mlx::core::clip(ops[0], ops[1], ops[2]);
+     }},
+
+    // slice: attrs = [n_dims, dyn_mask, d0..dn-1, l0..ln-1, str0..strn-1, sv0..svn-1]
+    // Operands: [tensor, dyn_start_0, dyn_start_1, …] — dynamic starts in axis order.
+    //
+    // Strategy: one static mlx::core::slice for all static dims (full span for dynamic dims),
+    // then mlx::core::take per dynamic dim to apply the dynamic start + strided selection.
+    {"slice",
+     [](const auto &ops, const auto &attrs) {
+       int n_dims = static_cast<int>(attrs[0]);
+       int64_t dyn_mask = attrs[1];
+
+       std::vector<int> input_shape(n_dims), lengths(n_dims), strides_v(n_dims),
+           sv(n_dims);
+       for (int i = 0; i < n_dims; i++)
+         input_shape[i] = static_cast<int>(attrs[2 + i]);
+       for (int i = 0; i < n_dims; i++)
+         lengths[i] = static_cast<int>(attrs[2 + n_dims + i]);
+       for (int i = 0; i < n_dims; i++)
+         strides_v[i] = static_cast<int>(attrs[2 + 2 * n_dims + i]);
+       for (int i = 0; i < n_dims; i++)
+         sv[i] = static_cast<int>(attrs[2 + 3 * n_dims + i]);
+
+       // Build the static slice: use clamped static values for static dims,
+       // full extent for dynamic dims (handled below via take).
+       std::vector<int> starts(n_dims), stops(n_dims), slice_strides(n_dims);
+       for (int i = 0; i < n_dims; i++) {
+         slice_strides[i] = ((dyn_mask >> i) & 1) ? 1 : strides_v[i];
+         if (!((dyn_mask >> i) & 1)) {
+           starts[i] = std::max(0, std::min(sv[i], input_shape[i] - lengths[i]));
+           stops[i] = starts[i] + lengths[i];
+         } else {
+           starts[i] = 0;
+           stops[i] = input_shape[i];
+         }
+       }
+       auto result =
+           mlx::core::slice(ops[0], to_shape(starts), to_shape(stops), to_shape(slice_strides));
+
+       // For each dynamic dim, apply take with arange*stride + clamped_start.
+       int dyn_op_idx = 1;
+       for (int i = 0; i < n_dims; i++) {
+         if (!((dyn_mask >> i) & 1))
+           continue;
+         int len_i = lengths[i];
+         int str_i = strides_v[i];
+         // clamped_start = clip(start_arr, 0, dim_i - len_i)
+         auto s = mlx::core::astype(ops[dyn_op_idx++], mlx::core::int32);
+         auto zero = mlx::core::zeros({}, mlx::core::int32);
+         auto max_s = mlx::core::full({}, input_shape[i] - len_i, mlx::core::int32);
+         auto clamped = mlx::core::minimum(mlx::core::maximum(s, zero), max_s);
+         // idx = arange(len_i) * str_i + clamped
+         auto base = mlx::core::arange(0, len_i, 1, mlx::core::int32);
+         if (str_i != 1)
+           base = mlx::core::multiply(base, mlx::core::full({}, str_i, mlx::core::int32));
+         auto idx = mlx::core::add(base, clamped);
+         result = mlx::core::take(result, idx, i);
+       }
+       return result;
+     }},
+
+    // put_slice: attrs = [n_dims, dyn_mask, d0..dn-1, l0..ln-1, sv0..svn-1]
+    // Operands: [input, slice, dyn_start_0, …]
+    //
+    // Builds a clamped int32 start array and calls the dynamic slice_update overload.
+    {"put_slice",
+     [](const auto &ops, const auto &attrs) {
+       int n_dims = static_cast<int>(attrs[0]);
+       int64_t dyn_mask = attrs[1];
+
+       std::vector<int> input_shape(n_dims), lengths(n_dims), sv(n_dims);
+       for (int i = 0; i < n_dims; i++)
+         input_shape[i] = static_cast<int>(attrs[2 + i]);
+       for (int i = 0; i < n_dims; i++)
+         lengths[i] = static_cast<int>(attrs[2 + n_dims + i]);
+       for (int i = 0; i < n_dims; i++)
+         sv[i] = static_cast<int>(attrs[2 + 2 * n_dims + i]);
+
+       // Build per-dim clamped start components (shape [1]) then concatenate.
+       std::vector<mlx::core::array> start_components;
+       start_components.reserve(n_dims);
+       int dyn_op_idx = 2; // ops[0]=input, ops[1]=slice, ops[2..]=dynamic starts
+       for (int i = 0; i < n_dims; i++) {
+         int max_start_i = input_shape[i] - lengths[i];
+         if ((dyn_mask >> i) & 1) {
+           auto s = mlx::core::astype(ops[dyn_op_idx++], mlx::core::int32);
+           s = mlx::core::reshape(s, {1});
+           auto max_s = mlx::core::full({1}, max_start_i, mlx::core::int32);
+           auto zero = mlx::core::zeros({1}, mlx::core::int32);
+           start_components.push_back(mlx::core::minimum(mlx::core::maximum(s, zero), max_s));
+         } else {
+           int clamped_i = std::max(0, std::min(sv[i], max_start_i));
+           start_components.push_back(mlx::core::full({1}, clamped_i, mlx::core::int32));
+         }
+       }
+       auto start_arr = mlx::core::concatenate(start_components, 0);
+
+       // All axes: [0, 1, ..., n_dims-1]
+       std::vector<int> all_axes(n_dims);
+       std::iota(all_axes.begin(), all_axes.end(), 0);
+       return mlx::core::slice_update(ops[0], ops[1], start_arr, all_axes);
+     }},
+
+    // gather: attrs = [n_gather_axes, a0…, n_tensor_dims, ss0…, n_out_dims, od0…]
+    // Operands: [tensor, indices]  — indices shape = [batch…, n_gather_axes]
+    {"gather",
+     [](const auto &ops, const auto &attrs) {
+       int n_gather_axes = static_cast<int>(attrs[0]);
+       std::vector<int> axes(n_gather_axes);
+       for (int i = 0; i < n_gather_axes; i++)
+         axes[i] = static_cast<int>(attrs[1 + i]);
+
+       int n_tensor_dims = static_cast<int>(attrs[1 + n_gather_axes]);
+       std::vector<int> slice_sizes(n_tensor_dims);
+       for (int i = 0; i < n_tensor_dims; i++)
+         slice_sizes[i] = static_cast<int>(attrs[2 + n_gather_axes + i]);
+
+       int n_out_dims = static_cast<int>(attrs[2 + n_gather_axes + n_tensor_dims]);
+       std::vector<int> out_shape_v(n_out_dims);
+       for (int i = 0; i < n_out_dims; i++)
+         out_shape_v[i] = static_cast<int>(attrs[3 + n_gather_axes + n_tensor_dims + i]);
+
+       // Split indices along its last axis: one array per gather axis.
+       auto indices = ops[1];
+       auto idx_shape = indices.shape();
+       int last = static_cast<int>(idx_shape.size()) - 1;
+
+       std::vector<mlx::core::array> indices_list;
+       indices_list.reserve(n_gather_axes);
+       for (int i = 0; i < n_gather_axes; i++) {
+         std::vector<int> s_starts(idx_shape.size(), 0), s_stops(idx_shape.size());
+         std::vector<int> s_strides(idx_shape.size(), 1);
+         for (size_t j = 0; j < idx_shape.size(); j++)
+           s_stops[j] = static_cast<int>(idx_shape[j]);
+         s_starts[last] = i;
+         s_stops[last] = i + 1;
+         auto sl = mlx::core::slice(indices, to_shape(s_starts), to_shape(s_stops),
+                                    to_shape(s_strides));
+         indices_list.push_back(mlx::core::squeeze(sl, {last}));
+       }
+
+       auto result = mlx::core::gather(ops[0], indices_list, axes, to_shape(slice_sizes));
+       return mlx::core::reshape(result, to_shape(out_shape_v));
+     }},
+
+    // take: operands = [tensor, indices]; attrs = [axis].
+    {"take",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       return mlx::core::take(ops[0], ops[1], axis);
+     }},
+
+    // take_along_axis: operands = [tensor, indices]; attrs = [axis].
+    {"take_along_axis",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       return mlx::core::take_along_axis(ops[0], ops[1], axis);
+     }},
+
+    // indexed_add: attrs = [n_axes, a0…, n_updates_shape, us0…]
+    // Operands: [target, indices, updates_pre_reshape]
+    // Mirrors EMLX.Backend.indexed_op(:scatter_add, …)
+    {"indexed_add",
+     [](const auto &ops, const auto &attrs) {
+       int n_axes = static_cast<int>(attrs[0]);
+       std::vector<int> axes(n_axes);
+       for (int i = 0; i < n_axes; i++)
+         axes[i] = static_cast<int>(attrs[1 + i]);
+       int n_upd = static_cast<int>(attrs[1 + n_axes]);
+       std::vector<int> upd_shape(n_upd);
+       for (int i = 0; i < n_upd; i++)
+         upd_shape[i] = static_cast<int>(attrs[2 + n_axes + i]);
+
+       auto indices = ops[1];
+       auto idx_shape = indices.shape();
+       int last = static_cast<int>(idx_shape.size()) - 1;
+
+       std::vector<mlx::core::array> indices_list;
+       indices_list.reserve(n_axes);
+       for (int i = 0; i < n_axes; i++) {
+         std::vector<int> s_starts(idx_shape.size(), 0), s_stops(idx_shape.size());
+         std::vector<int> s_strides(idx_shape.size(), 1);
+         for (size_t j = 0; j < idx_shape.size(); j++)
+           s_stops[j] = static_cast<int>(idx_shape[j]);
+         s_starts[last] = i;
+         s_stops[last] = i + 1;
+         auto sl = mlx::core::slice(indices, to_shape(s_starts), to_shape(s_stops),
+                                    to_shape(s_strides));
+         indices_list.push_back(mlx::core::squeeze(sl, {last}));
+       }
+
+       auto updates_reshaped = mlx::core::reshape(ops[2], to_shape(upd_shape));
+       return mlx::core::scatter_add(ops[0], indices_list, updates_reshaped, axes);
+     }},
+
+    // indexed_put: same structure as indexed_add but uses scatter (replace semantics).
+    {"indexed_put",
+     [](const auto &ops, const auto &attrs) {
+       int n_axes = static_cast<int>(attrs[0]);
+       std::vector<int> axes(n_axes);
+       for (int i = 0; i < n_axes; i++)
+         axes[i] = static_cast<int>(attrs[1 + i]);
+       int n_upd = static_cast<int>(attrs[1 + n_axes]);
+       std::vector<int> upd_shape(n_upd);
+       for (int i = 0; i < n_upd; i++)
+         upd_shape[i] = static_cast<int>(attrs[2 + n_axes + i]);
+
+       auto indices = ops[1];
+       auto idx_shape = indices.shape();
+       int last = static_cast<int>(idx_shape.size()) - 1;
+
+       std::vector<mlx::core::array> indices_list;
+       indices_list.reserve(n_axes);
+       for (int i = 0; i < n_axes; i++) {
+         std::vector<int> s_starts(idx_shape.size(), 0), s_stops(idx_shape.size());
+         std::vector<int> s_strides(idx_shape.size(), 1);
+         for (size_t j = 0; j < idx_shape.size(); j++)
+           s_stops[j] = static_cast<int>(idx_shape[j]);
+         s_starts[last] = i;
+         s_stops[last] = i + 1;
+         auto sl = mlx::core::slice(indices, to_shape(s_starts), to_shape(s_stops),
+                                    to_shape(s_strides));
+         indices_list.push_back(mlx::core::squeeze(sl, {last}));
+       }
+
+       auto updates_reshaped = mlx::core::reshape(ops[2], to_shape(upd_shape));
+       return mlx::core::scatter(ops[0], indices_list, updates_reshaped, axes);
+     }},
+
+    // ── conv_general ─────────────────────────────────────────────────────────
     {"conv_general",
      [](const auto &ops, const auto &attrs) {
        int n_dims = static_cast<int>(attrs[0]);
@@ -495,6 +730,18 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      }},
 };
 
+// ── Global compile-cache mutex ────────────────────────────────────────────────
+//
+// mlx::core::detail::compile and compile_erase both mutate MLX's process-wide
+// compile cache.  compile_program runs on the worker thread; ~Expr runs on
+// whichever BEAM scheduler/GC thread drops the last resource reference.  These
+// two paths can race, corrupting the cache and causing stale graph replay (e.g.
+// a static-indexed put_slice graph replayed for a dynamic-indexed program).
+//
+// All three cache-touching calls (compile, erase, and the first compiled_fn
+// invocation that inserts the traced graph) are serialised through this mutex.
+static std::mutex s_mlx_compile_mutex;
+
 // ── Expr destructor ───────────────────────────────────────────────────────────
 //
 // Evicts the per-Expr entry from MLX's global compile cache so stale compiled
@@ -503,6 +750,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
 Expr::~Expr() {
   if (compile_id != 0) {
+    std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
     mlx::core::detail::compile_erase(compile_id);
   }
 }
@@ -685,7 +933,10 @@ ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
     new (ptr) Expr();
     ptr->num_inputs = num_inputs_val;
     ptr->compile_id = unique_id;
-    ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
+    {
+      std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
+      ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
+    }
 
     ERL_NIF_TERM ret = enif_make_resource(env, ptr);
     enif_release_resource(ptr);
@@ -711,9 +962,22 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
 
     LIST_PARAM(1, std::vector<mlx::core::array>, inputs);
 
-    // Tracing (first call) and graph replay (subsequent calls) both happen
-    // inside compiled_fn.  Outputs are lazy — no eval needed here.
-    auto outputs = prog->compiled_fn(inputs);
+
+    // Force-evaluate all inputs on the worker thread before passing them to the
+    // compiled function.  MLX tensors created via Elixir (e.g. Nx.tensor/2) may
+    // arrive as unevaluated lazy nodes associated with a different computation.
+    // If they are consumed inside compiled_fn while still lazy, MLX may
+    // propagate stale or garbage data from a previously-evaluated graph that
+    // happened to share the same underlying buffer.  Forcing eval here ensures
+    // all inputs are materialized scalars/arrays on the worker's stream before
+    // the compiled graph is built or replayed.
+    mlx::core::eval(inputs);
+
+    std::vector<mlx::core::array> outputs;
+    {
+      std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
+      outputs = prog->compiled_fn(inputs);
+    }
 
     size_t n = outputs.size();
     std::vector<ERL_NIF_TERM> terms;

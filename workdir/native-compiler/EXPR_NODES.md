@@ -26,15 +26,15 @@ Source of truth:
 
 | Node | Args | Lowering approach | Status |
 |------|------|-------------------|--------|
-| `parameter` | `(index)` | `{:input, i}` ref | [ ] |
-| `constant` | `(number)` | materialize → `{:const, i}` | [ ] |
-| `tensor` | `(tensor)` | bake weight → `{:capture, i}` | [ ] |
-| `metadata` | `(expr, meta)` | passthrough to inner expr | [ ] |
+| `parameter` | `(index)` | `{:input, i}` ref | [x] |
+| `constant` | `(number)` | materialize → `{:const, i}` | [x] |
+| `tensor` | `(tensor)` | bake weight → `{:capture, i}` | [x] |
+| `metadata` | `(expr, meta)` | passthrough to inner expr | [x] |
 | `elem` | `(tuple, pos)` | select sub-result of a multi-output instr | [ ] |
 | `fun` | `(params, expr, mfa)` | inline at call site / child program | [ ] |
 | `cond` | `(clauses, last)` | child programs + select, or native cond | [ ] |
 | `while` | `(initial, arg, pred, body)` | child programs (cond+body); host loop | [ ] |
-| `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [ ] |
+| `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [~] |
 | `optional` | `(name, args, default)` | lower default expr, or route to native | [ ] |
 | `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] |
 | `runtime_call` | `(expr, cb, out, opts)` | unsupported → raises | [ ] |
@@ -102,15 +102,15 @@ logical_and, logical_or, logical_xor.
 
 ## F. Indexing / selection
 
-- [ ] select
-- [ ] clip
-- [ ] slice (start_indices may be tensors — see `apply_args` special case)
-- [ ] put_slice
-- [ ] gather
-- [ ] take
-- [ ] take_along_axis
-- [ ] indexed_add
-- [ ] indexed_put
+- [x] select
+- [x] clip
+- [x] slice (static indices + dynamic tensor start indices via take-based fallback)
+- [x] put_slice (static + dynamic via MLX dynamic `slice_update` overload)
+- [x] gather
+- [x] take
+- [x] take_along_axis
+- [x] indexed_add
+- [x] indexed_put
 
 ## G. Sort / window / cumulative
 

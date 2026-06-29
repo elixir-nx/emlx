@@ -40,6 +40,15 @@ defmodule EMLX.Native.Expr do
   | `:argmax`, `:argmin` | `[axis, keep_axis_int]` — axis index (−1 = global/no-axis) then 0/1 keep flag |
   | `:dot`      | `[n_ca, ca…, n_cb, cb…, n_ba, ba…, n_bb, bb…]` — four length-delimited axis lists: contract-left, contract-right, batch-left, batch-right |
   | `:conv_general` | `[n_dims, s0..sn-1, pl0, ph0, pl1, ph1, …, kd0..kdn-1, id0..idn-1, fgs]` — spatial dims count, strides, padding lo/hi pairs, kernel dilation, input dilation, feature group count |
+  | `:select`       | (no attrs) — operands are `[pred, on_true, on_false]`               |
+  | `:clip`         | (no attrs) — operands are `[tensor, min, max]`                       |
+  | `:slice`        | `[n_dims, dyn_mask, d0..dn-1, l0..ln-1, str0..strn-1, sv0..svn-1]` — rank, dynamic bitmask, input shape, lengths, strides, static starts (0 for dynamic). Dynamic tensor starts are operands after the tensor. |
+  | `:put_slice`    | `[n_dims, dyn_mask, d0..dn-1, l0..ln-1, sv0..svn-1]` — rank, dynamic bitmask, input shape, slice shape, static starts (0 for dynamic). Operands are `[input, slice, dyn_starts…]`. |
+  | `:gather`       | `[n_gather_axes, a0…, n_tensor_dims, ss0…, n_out_dims, od0…]` — axes, slice_sizes, output shape. Operands: `[tensor, indices]`. |
+  | `:take`         | `[axis]` — operands are `[tensor, indices]`                           |
+  | `:take_along_axis` | `[axis]` — operands are `[tensor, indices]`                      |
+  | `:indexed_add`  | `[n_axes, a0…, n_updates_shape, us0…]` — axes and reshaped-updates dims. Operands: `[target, indices, updates]`. |
+  | `:indexed_put`  | same as `:indexed_add`                                               |
 
   Non-negative axes: the lowerer normalises negative axis values before encoding
   so C++ handlers can use them directly as 0-based indices.
@@ -722,8 +731,292 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
+  # ── indexing / selection ops ──────────────────────────────────────────────
+
+  # select: cast on_true and on_false to out_type, then emit :select.
+  defp expand_node(
+         %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :select, args: [pred, on_true, on_false]}},
+         state
+       ) do
+    pred_ref = Map.fetch!(state.node_to_ref, pred.data.id)
+    true_ref0 = Map.fetch!(state.node_to_ref, on_true.data.id)
+    false_ref0 = Map.fetch!(state.node_to_ref, on_false.data.id)
+    {true_ref, state} = emit_cast_if_needed(true_ref0, on_true.type, out_type, state)
+    {false_ref, state} = emit_cast_if_needed(false_ref0, on_false.type, out_type, state)
+    ref = make_ref()
+
+    %{
+      state
+      | instructions: [{ref, :select, [pred_ref, true_ref, false_ref], []} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # clip: operands = [tensor, min, max].
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :clip, args: [tensor, min_t, max_t]}},
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    min_ref = Map.fetch!(state.node_to_ref, min_t.data.id)
+    max_ref = Map.fetch!(state.node_to_ref, max_t.data.id)
+
+    %{
+      state
+      | instructions: [{ref, :clip, [tensor_ref, min_ref, max_ref], []} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # slice: start_indices can be integers (static) or tensors (dynamic).
+  #
+  # iattrs = [n_dims, dynamic_mask, d0..dn-1, l0..ln-1, str0..strn-1, sv0..svn-1]
+  #   n_dims       = rank of the input tensor
+  #   dynamic_mask = n-bit integer, bit i = 1 if start index i is a tensor
+  #   d0..dn-1     = input shape dims (for clamping)
+  #   l0..ln-1     = slice lengths (always static)
+  #   str0..strn-1 = strides (always static)
+  #   sv0..svn-1   = static start values (0 for dynamic dims)
+  # Operands = [tensor_ref, dyn_ref_0, dyn_ref_1, ...] — dynamic starts in axis order.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :slice, args: [tensor, start_indices, lengths, strides]}},
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    n_dims = tuple_size(tensor.shape)
+    input_shape = Tuple.to_list(tensor.shape)
+
+    # Partition start_indices into dynamic (tensor refs) and static (integers).
+    {dynamic_mask, static_vals, dyn_operand_refs, state} =
+      Enum.reduce(Enum.with_index(start_indices), {0, [], [], state}, fn
+        {idx, _i}, {mask, statics, dyn_refs, st} when is_integer(idx) ->
+          {mask, statics ++ [idx], dyn_refs, st}
+
+        {%T{} = idx_tensor, i}, {mask, statics, dyn_refs, st} ->
+          dyn_ref = Map.fetch!(st.node_to_ref, idx_tensor.data.id)
+          {mask ||| 1 <<< i, statics ++ [0], dyn_refs ++ [dyn_ref], st}
+      end)
+
+    iattrs =
+      [n_dims, dynamic_mask] ++
+        input_shape ++
+        lengths ++
+        strides ++
+        static_vals
+
+    operands = [tensor_ref | dyn_operand_refs]
+
+    %{
+      state
+      | instructions: [{ref, :slice, operands, iattrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # put_slice: start_indices can be integers (static) or tensors (dynamic).
+  #
+  # iattrs = [n_dims, dynamic_mask, d0..dn-1, l0..ln-1, sv0..svn-1]
+  # Operands = [input_ref, slice_ref, dyn_ref_0, ...] — dynamic starts in axis order.
+  defp expand_node(
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{id: id, op: :put_slice, args: [input, start_indices, slice]}
+         },
+         state
+       ) do
+    ref = make_ref()
+    input_ref0 = Map.fetch!(state.node_to_ref, input.data.id)
+    slice_ref0 = Map.fetch!(state.node_to_ref, slice.data.id)
+
+    # Cast both to out_type.
+    {input_ref, state} = emit_cast_if_needed(input_ref0, input.type, out_type, state)
+    {slice_ref, state} = emit_cast_if_needed(slice_ref0, slice.type, out_type, state)
+
+    n_dims = tuple_size(input.shape)
+    input_shape = Tuple.to_list(input.shape)
+    lengths = Tuple.to_list(slice.shape)
+
+    {dynamic_mask, static_vals, dyn_operand_refs, state} =
+      Enum.reduce(Enum.with_index(start_indices), {0, [], [], state}, fn
+        {idx, _i}, {mask, statics, dyn_refs, st} when is_integer(idx) ->
+          {mask, statics ++ [idx], dyn_refs, st}
+
+        {%T{} = idx_tensor, i}, {mask, statics, dyn_refs, st} ->
+          dyn_ref = Map.fetch!(st.node_to_ref, idx_tensor.data.id)
+          {mask ||| 1 <<< i, statics ++ [0], dyn_refs ++ [dyn_ref], st}
+      end)
+
+    iattrs = [n_dims, dynamic_mask] ++ input_shape ++ lengths ++ static_vals
+    operands = [input_ref, slice_ref | dyn_operand_refs]
+
+    %{
+      state
+      | instructions: [{ref, :put_slice, operands, iattrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # gather: args = [tensor, indices, opts], opts has axes: [...].
+  #
+  # Mirrors EMLX.Backend.gather: decomposes the indices tensor along its last axis
+  # into per-axis index arrays; calls mlx::core::gather + reshape.
+  #
+  # iattrs = [n_gather_axes, a0, a1, ..., n_tensor_dims, ss0, ss1, ..., n_out_dims, od0, od1, ...]
+  #   n_gather_axes = number of indexed axes
+  #   a0..          = axis indices
+  #   n_tensor_dims = rank of tensor
+  #   ss0..         = slice_sizes (1 for gathered axes, full dim size for others)
+  #   n_out_dims    = rank of out tensor
+  #   od0..         = output shape dims
+  # Operands = [tensor_ref, indices_ref]
+  defp expand_node(
+         %T{shape: out_shape, data: %Nx.Defn.Expr{id: id, op: :gather, args: [tensor, indices, opts]}},
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    indices_ref = Map.fetch!(state.node_to_ref, indices.data.id)
+    axes = opts[:axes]
+    n_gather_axes = length(axes)
+    n_tensor_dims = tuple_size(tensor.shape)
+
+    slice_sizes =
+      Enum.map(Nx.axes(tensor), fn axis ->
+        if axis in axes, do: 1, else: elem(tensor.shape, axis)
+      end)
+
+    out_shape_list = Tuple.to_list(out_shape)
+
+    iattrs =
+      [n_gather_axes | axes] ++
+        [n_tensor_dims | slice_sizes] ++
+        [length(out_shape_list) | out_shape_list]
+
+    %{
+      state
+      | instructions: [{ref, :gather, [tensor_ref, indices_ref], iattrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # block: Nx.Block.Take — take(tensor, indices, axis).
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.Take{axis: axis}, [tensor, indices], _default, _fun]
+           }
+         },
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    indices_ref = Map.fetch!(state.node_to_ref, indices.data.id)
+    norm_axis = if axis < 0, do: tuple_size(tensor.shape) + axis, else: axis
+
+    %{
+      state
+      | instructions: [{ref, :take, [tensor_ref, indices_ref], [norm_axis]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # block: Nx.Block.TakeAlongAxis — take_along_axis(tensor, indices, axis).
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.TakeAlongAxis{axis: axis}, [tensor, indices], _default, _fun]
+           }
+         },
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    indices_ref = Map.fetch!(state.node_to_ref, indices.data.id)
+    norm_axis = if axis < 0, do: tuple_size(tensor.shape) + axis, else: axis
+
+    %{
+      state
+      | instructions: [
+          {ref, :take_along_axis, [tensor_ref, indices_ref], [norm_axis]} | state.instructions
+        ],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # indexed_add / indexed_put: scatter_add / scatter.
+  # Mirrors EMLX.Backend.indexed_op: decomposes indices along last axis,
+  # reshapes updates, then emits :indexed_add/:indexed_put.
+  #
+  # iattrs = [n_axes, a0, a1, ..., n_updates_shape_dims, us0, us1, ...]
+  # Operands = [target_ref, indices_ref, updates_ref]
+  defp expand_node(
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{id: id, op: :indexed_add, args: [target, indices, updates, opts]}
+         },
+         state
+       ) do
+    expand_indexed_node(id, :indexed_add, out_type, target, indices, updates, opts, state)
+  end
+
+  defp expand_node(
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{id: id, op: :indexed_put, args: [target, indices, updates, opts]}
+         },
+         state
+       ) do
+    expand_indexed_node(id, :indexed_put, out_type, target, indices, updates, opts, state)
+  end
+
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
+  end
+
+  # ── indexing helpers ──────────────────────────────────────────────────────
+
+  # Shared lowering for indexed_add / indexed_put.
+  # Computes the reshaped updates shape (same as EMLX.Backend.indexed_op), emits
+  # astype casts for target and updates, then emits the opcode.
+  defp expand_indexed_node(id, op, out_type, target, indices, updates, opts, state) do
+    ref = make_ref()
+    axes = opts[:axes] || Nx.axes(target)
+    num_axes = elem(indices.shape, tuple_size(indices.shape) - 1)
+
+    # Mirror EMLX.Backend.indexed_op: compute reshape of updates.
+    insert_index =
+      axes
+      |> Enum.scan(&(&1 - &2))
+      |> Enum.find_index(&(&1 > 1))
+      |> then(&(&1 || num_axes))
+
+    [num_updates | updates_inner_shape] = Tuple.to_list(updates.shape)
+
+    updates_shape =
+      [num_updates | List.duplicate(1, num_axes)]
+      |> List.insert_at(insert_index + 1, updates_inner_shape)
+      |> List.flatten()
+
+    target_ref0 = Map.fetch!(state.node_to_ref, target.data.id)
+    indices_ref = Map.fetch!(state.node_to_ref, indices.data.id)
+    updates_ref0 = Map.fetch!(state.node_to_ref, updates.data.id)
+
+    {target_ref, state} = emit_cast_if_needed(target_ref0, target.type, out_type, state)
+    {updates_ref, state} = emit_cast_if_needed(updates_ref0, updates.type, out_type, state)
+
+    iattrs = [length(axes) | axes] ++ [length(updates_shape) | updates_shape]
+
+    %{
+      state
+      | instructions: [{ref, op, [target_ref, indices_ref, updates_ref], iattrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
   end
 
   # ── binary lowering helpers ────────────────────────────────────────────────
@@ -885,6 +1178,8 @@ defmodule EMLX.Native.Expr.Interpreter do
   a new op here before its C++ counterpart lets you verify the lowering logic
   in isolation.
   """
+
+  import Bitwise
 
   alias EMLX.Native.Expr
 
@@ -1103,6 +1398,106 @@ defmodule EMLX.Native.Expr.Interpreter do
       shape: shape,
       names: List.duplicate(nil, tuple_size(shape))
     })
+  end
+
+  # indexing / selection
+  defp dispatch(:select, [pred, on_true, on_false], []),
+    do: Nx.select(pred, on_true, on_false)
+
+  defp dispatch(:clip, [tensor, min_t, max_t], []),
+    do: Nx.clip(tensor, min_t, max_t)
+
+  # slice: iattrs = [n_dims, dyn_mask, d0..dn-1, l0..ln-1, str0..strn-1, sv0..svn-1]
+  # Dynamic starts are extra operands after the tensor.
+  defp dispatch(:slice, [tensor | dyn_starts], attrs) do
+    [n_dims, _dyn_mask | rest] = attrs
+    input_shape = Enum.slice(rest, 0, n_dims)
+    lengths = Enum.slice(rest, n_dims, n_dims)
+    strides = Enum.slice(rest, 2 * n_dims, n_dims)
+    sv = Enum.slice(rest, 3 * n_dims, n_dims)
+    dyn_mask = Enum.at(attrs, 1)
+
+    {starts, _} =
+      Enum.reduce(Enum.with_index(sv), {[], 0}, fn {sv_i, i}, {acc, dyn_idx} ->
+        start_i =
+          if (dyn_mask >>> i &&& 1) == 1 do
+            Nx.to_number(Enum.at(dyn_starts, dyn_idx))
+          else
+            sv_i
+          end
+
+        clamped = min(max(start_i, 0), Enum.at(input_shape, i) - Enum.at(lengths, i))
+        dyn_next = if (dyn_mask >>> i &&& 1) == 1, do: dyn_idx + 1, else: dyn_idx
+        {acc ++ [clamped], dyn_next}
+      end)
+
+    stops = Enum.zip_with(starts, lengths, &(&1 + &2))
+    # Nx.slice takes starts + lengths; we ignore strides for the interpreter
+    # (Nx.slice doesn't expose strides in the public API so we call backend slice)
+    start_indices = starts
+    _ = stops
+    _ = strides
+    Nx.slice(tensor, start_indices, lengths, strides: strides)
+  end
+
+  # put_slice: iattrs = [n_dims, dyn_mask, d0..dn-1, l0..ln-1, sv0..svn-1]
+  # Operands: [input, slice, dyn_starts…]
+  defp dispatch(:put_slice, [input, slice | dyn_starts], attrs) do
+    [n_dims, dyn_mask | rest] = attrs
+    input_shape = Enum.slice(rest, 0, n_dims)
+    lengths = Enum.slice(rest, n_dims, n_dims)
+    sv = Enum.slice(rest, 2 * n_dims, n_dims)
+
+    {starts, _} =
+      Enum.reduce(Enum.with_index(sv), {[], 0}, fn {sv_i, i}, {acc, dyn_idx} ->
+        start_i =
+          if (dyn_mask >>> i &&& 1) == 1 do
+            Nx.to_number(Enum.at(dyn_starts, dyn_idx))
+          else
+            sv_i
+          end
+
+        clamped = min(max(start_i, 0), Enum.at(input_shape, i) - Enum.at(lengths, i))
+        dyn_next = if (dyn_mask >>> i &&& 1) == 1, do: dyn_idx + 1, else: dyn_idx
+        {acc ++ [clamped], dyn_next}
+      end)
+
+    Nx.put_slice(input, starts, slice)
+  end
+
+  # gather: iattrs = [n_gather_axes, a0…, n_tensor_dims, ss0…, n_out_dims, od0…]
+  # Operands: [tensor, indices]
+  defp dispatch(:gather, [tensor, indices], attrs) do
+    [n_gather_axes | rest] = attrs
+    axes = Enum.slice(rest, 0, n_gather_axes)
+    [_n_tensor_dims | rest2] = Enum.drop(rest, n_gather_axes)
+    [n_out_dims | rest3] = Enum.drop(rest2, n_gather_axes + 1)
+    # rest2 starts with n_tensor_dims, then slice_sizes; skip n_tensor_dims count
+    _slice_sizes = Enum.slice(rest2, 1, length(rest2) - 1 - 1 - n_out_dims)
+    out_shape = Enum.take(rest3, n_out_dims) |> List.to_tuple()
+    _ = out_shape
+    Nx.gather(tensor, indices, axes: axes)
+  end
+
+  defp dispatch(:take, [tensor, indices], [axis]),
+    do: Nx.take(tensor, indices, axis: axis)
+
+  defp dispatch(:take_along_axis, [tensor, indices], [axis]),
+    do: Nx.take_along_axis(tensor, indices, axis: axis)
+
+  # indexed_add: iattrs = [n_axes, a0…, n_updates_shape, us0…]
+  # The interpreter calls the public Nx API with original updates (no pre-reshape).
+  defp dispatch(:indexed_add, [target, indices, updates], attrs) do
+    [n_axes | rest] = attrs
+    axes = Enum.slice(rest, 0, n_axes)
+    Nx.indexed_add(target, indices, updates, axes: axes)
+  end
+
+  defp dispatch(:indexed_put, [target, indices, updates], attrs) do
+    [n_axes | rest] = attrs
+    axes = Enum.slice(rest, 0, n_axes)
+    _ = rest
+    Nx.indexed_put(target, indices, updates, axes: axes)
   end
 
   defp dispatch(op, _args, _attrs),

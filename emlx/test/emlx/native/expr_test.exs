@@ -1338,6 +1338,353 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # ── Stage 05 defn helpers ────────────────────────────────────────────────
+  defn select_defn(pred, a, b), do: Nx.select(pred, a, b)
+  defn clip_defn(x, lo, hi), do: Nx.clip(x, lo, hi)
+  defn slice_static_defn(x), do: Nx.slice(x, [1, 0], [2, 3])
+  defn slice_strided_defn(x), do: Nx.slice(x, [0, 0], [2, 3], strides: [1, 2])
+  defn put_slice_static_defn(x, patch), do: Nx.put_slice(x, [1, 1], patch)
+  defn gather_defn(x, idx), do: Nx.gather(x, idx)
+  defn take_defn(x, idx), do: Nx.take(x, idx, axis: 1)
+  defn take_along_axis_defn(x, idx), do: Nx.take_along_axis(x, idx, axis: 0)
+  defn indexed_put_defn(x, idx, updates), do: Nx.indexed_put(x, idx, updates)
+  defn indexed_add_defn(x, idx, updates), do: Nx.indexed_add(x, idx, updates)
+
+  # ── Stage 05 — select / clip ────────────────────────────────────────────
+
+  describe "Stage 05 — select" do
+    @tag :stage05
+    test "interpreter parity — f32" do
+      pred =
+        Nx.tensor([1, 0, 1, 0], type: :u8, backend: EMLX.Backend)
+        |> Nx.reshape({4})
+
+      a = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
+      b = Nx.tensor([5.0, 6.0, 7.0, 8.0], backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&select_defn/3, [pred, a, b])
+      prog = Expr.lower(expr)
+
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [pred, a, b])
+      nif = run_nif(prog, [pred, a, b])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend" do
+      pred = Nx.tensor([1, 0, 1], type: :u8, backend: EMLX.Backend)
+      a = Nx.tensor([10.0, 20.0, 30.0], backend: EMLX.Backend)
+      b = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&select_defn/3, compiler: EMLX).(pred, a, b)
+      eager = Nx.Defn.jit(&select_defn/3, compiler: Nx.Defn.Evaluator).(pred, a, b)
+      assert_close(native, eager)
+    end
+
+    @tag :stage05
+    test "select with mixed-type true/false is cast to out_type" do
+      pred = Nx.tensor([1, 0], type: :u8, backend: EMLX.Backend)
+      a = Nx.tensor([1, 2], type: :s32, backend: EMLX.Backend)
+      b = Nx.tensor([3, 4], type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&select_defn/3, compiler: EMLX).(pred, a, b)
+      eager = Nx.Defn.jit(&select_defn/3, compiler: Nx.Defn.Evaluator).(pred, a, b)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 05 — clip" do
+    @tag :stage05
+    test "interpreter parity — f32" do
+      x = Nx.tensor([-1.0, 0.5, 2.0, 3.5], backend: EMLX.Backend)
+      lo = Nx.tensor(0.0, backend: EMLX.Backend)
+      hi = Nx.tensor(2.0, backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&clip_defn/3, [x, lo, hi])
+      prog = Expr.lower(expr)
+
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, lo, hi])
+      nif = run_nif(prog, [x, lo, hi])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — f32" do
+      x = Nx.iota({5}, type: :f32, backend: EMLX.Backend) |> Nx.subtract(2.0)
+      lo = Nx.tensor(-1.0, backend: EMLX.Backend)
+      hi = Nx.tensor(1.5, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&clip_defn/3, compiler: EMLX).(x, lo, hi)
+      eager = Nx.Defn.jit(&clip_defn/3, compiler: Nx.Defn.Evaluator).(x, lo, hi)
+      assert_close(native, eager)
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — s32" do
+      x = Nx.tensor([-5, -1, 0, 3, 10], type: :s32, backend: EMLX.Backend)
+      lo = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      hi = Nx.tensor(5, type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&clip_defn/3, compiler: EMLX).(x, lo, hi)
+      eager = Nx.Defn.jit(&clip_defn/3, compiler: Nx.Defn.Evaluator).(x, lo, hi)
+      assert_close(native, eager)
+    end
+  end
+
+  # ── Stage 05 — slice / put_slice ──────────────────────────────────────────
+
+  describe "Stage 05 — slice (static indices)" do
+    @tag :stage05
+    test "interpreter parity — static 2D slice" do
+      x = Nx.iota({4, 5}, type: :f32, backend: EMLX.Backend)
+      expr = Nx.Defn.debug_expr_apply(&slice_static_defn/1, [x])
+      prog = Expr.lower(expr)
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x])
+      nif = run_nif(prog, [x])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — static 2D slice" do
+      x = Nx.iota({4, 5}, type: :f32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&slice_static_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&slice_static_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — strided slice" do
+      x = Nx.iota({4, 6}, type: :f32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&slice_strided_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&slice_strided_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 05 — slice (dynamic index)" do
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — dynamic start along axis 0" do
+      # Slices rows [start, start+2) of a 5×4 tensor, start is a runtime scalar.
+      x = Nx.iota({5, 4}, type: :f32, backend: EMLX.Backend)
+
+      dynamic_slice = fn x, start ->
+        Nx.slice(x, [start, 0], [2, 4])
+      end
+
+      start_val = Nx.tensor(2, type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(dynamic_slice, compiler: EMLX).(x, start_val)
+      eager = Nx.Defn.jit(dynamic_slice, compiler: Nx.Defn.Evaluator).(x, start_val)
+      assert_close(native, eager)
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — dynamic start clamped at boundary" do
+      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+
+      dynamic_slice = fn x, start ->
+        Nx.slice(x, [start, 0], [2, 4])
+      end
+
+      # start=10 should be clamped to 2 (4-2)
+      start_val = Nx.tensor(10, type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(dynamic_slice, compiler: EMLX).(x, start_val)
+      eager = Nx.Defn.jit(dynamic_slice, compiler: Nx.Defn.Evaluator).(x, start_val)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 05 — put_slice (static indices)" do
+    @tag :stage05
+    test "interpreter parity — static 2D put_slice" do
+      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+      patch = Nx.broadcast(Nx.tensor(99.0, backend: EMLX.Backend), {2, 2})
+
+      expr = Nx.Defn.debug_expr_apply(&put_slice_static_defn/2, [x, patch])
+      prog = Expr.lower(expr)
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, patch])
+      nif = run_nif(prog, [x, patch])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — static 2D put_slice" do
+      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+      patch = Nx.broadcast(Nx.tensor(99.0, backend: EMLX.Backend), {2, 2})
+      native = Nx.Defn.jit(&put_slice_static_defn/2, compiler: EMLX).(x, patch)
+      eager = Nx.Defn.jit(&put_slice_static_defn/2, compiler: Nx.Defn.Evaluator).(x, patch)
+      assert_close(native, eager)
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — dynamic put_slice (KV-cache pattern)" do
+      cache = Nx.broadcast(Nx.tensor(0.0, backend: EMLX.Backend), {8, 4})
+
+      kv_update = fn cache, pos, new_row ->
+        Nx.put_slice(cache, [pos, 0], Nx.new_axis(new_row, 0))
+      end
+
+      pos = Nx.tensor(3, type: :s32, backend: EMLX.Backend)
+      new_row = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(kv_update, compiler: EMLX).(cache, pos, new_row)
+      eager = Nx.Defn.jit(kv_update, compiler: Nx.Defn.Evaluator).(cache, pos, new_row)
+      assert_close(native, eager)
+    end
+  end
+
+  # ── Stage 05 — gather / take / take_along_axis ────────────────────────────
+
+  describe "Stage 05 — gather" do
+    @tag :stage05
+    test "interpreter parity — 2D gather on axis 0" do
+      x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([[0], [2], [1]], type: :s32, backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&gather_defn/2, [x, idx])
+      prog = Expr.lower(expr)
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx])
+      nif = run_nif(prog, [x, idx])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — 2D gather on axis 0" do
+      x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([[0], [2], [1]], type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&gather_defn/2, compiler: EMLX).(x, idx)
+      eager = Nx.Defn.jit(&gather_defn/2, compiler: Nx.Defn.Evaluator).(x, idx)
+      assert_close(native, eager)
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend — multi-axis gather" do
+      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([[0, 1], [2, 3]], type: :s32, backend: EMLX.Backend)
+
+      gather_multi = fn x, idx -> Nx.gather(x, idx, axes: [0, 1]) end
+
+      native = Nx.Defn.jit(gather_multi, compiler: EMLX).(x, idx)
+      eager = Nx.Defn.jit(gather_multi, compiler: Nx.Defn.Evaluator).(x, idx)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 05 — take" do
+    @tag :stage05
+    test "interpreter parity" do
+      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([2, 0, 3, 1], type: :s32, backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&take_defn/2, [x, idx])
+      prog = Expr.lower(expr)
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx])
+      nif = run_nif(prog, [x, idx])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend" do
+      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([2, 0, 3, 1], type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&take_defn/2, compiler: EMLX).(x, idx)
+      eager = Nx.Defn.jit(&take_defn/2, compiler: Nx.Defn.Evaluator).(x, idx)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 05 — take_along_axis" do
+    @tag :stage05
+    test "interpreter parity" do
+      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([[2, 0, 1, 2]], type: :s32, backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&take_along_axis_defn/2, [x, idx])
+      prog = Expr.lower(expr)
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx])
+      nif = run_nif(prog, [x, idx])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend" do
+      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([[2, 0, 1, 2]], type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&take_along_axis_defn/2, compiler: EMLX).(x, idx)
+      eager = Nx.Defn.jit(&take_along_axis_defn/2, compiler: Nx.Defn.Evaluator).(x, idx)
+      assert_close(native, eager)
+    end
+  end
+
+  # ── Stage 05 — indexed_put / indexed_add ──────────────────────────────────
+
+  describe "Stage 05 — indexed_put" do
+    @tag :stage05
+    test "interpreter parity" do
+      x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([[0], [2]], type: :s32, backend: EMLX.Backend)
+      updates = Nx.tensor([[99.0, 99.0, 99.0], [88.0, 88.0, 88.0]], backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&indexed_put_defn/3, [x, idx, updates])
+      prog = Expr.lower(expr)
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx, updates])
+      nif = run_nif(prog, [x, idx, updates])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend" do
+      x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
+      idx = Nx.tensor([[0], [2]], type: :s32, backend: EMLX.Backend)
+      updates = Nx.tensor([[99.0, 99.0, 99.0], [88.0, 88.0, 88.0]], backend: EMLX.Backend)
+      native = Nx.Defn.jit(&indexed_put_defn/3, compiler: EMLX).(x, idx, updates)
+      eager = Nx.Defn.jit(&indexed_put_defn/3, compiler: Nx.Defn.Evaluator).(x, idx, updates)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 05 — indexed_add" do
+    @tag :stage05
+    test "interpreter parity" do
+      x = Nx.broadcast(Nx.tensor(0.0, backend: EMLX.Backend), {4, 3})
+      idx = Nx.tensor([[0], [0], [2]], type: :s32, backend: EMLX.Backend)
+      updates = Nx.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [5.0, 5.0, 5.0]], backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&indexed_add_defn/3, [x, idx, updates])
+      prog = Expr.lower(expr)
+      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx, updates])
+      nif = run_nif(prog, [x, idx, updates])
+      assert_close(hd(interp), hd(nif))
+    end
+
+    @tag :stage05
+    test "equivalence vs EMLX.Backend" do
+      x = Nx.broadcast(Nx.tensor(0.0, backend: EMLX.Backend), {4, 3})
+      idx = Nx.tensor([[0], [0], [2]], type: :s32, backend: EMLX.Backend)
+      updates = Nx.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [5.0, 5.0, 5.0]], backend: EMLX.Backend)
+      native = Nx.Defn.jit(&indexed_add_defn/3, compiler: EMLX).(x, idx, updates)
+      eager = Nx.Defn.jit(&indexed_add_defn/3, compiler: Nx.Defn.Evaluator).(x, idx, updates)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 05 — E2E jit smoke" do
+    @tag :stage05
+    test "select via jit" do
+      pred = Nx.tensor([1, 0, 1, 0], type: :u8, backend: EMLX.Backend)
+      a = Nx.iota({4}, type: :f32, backend: EMLX.Backend)
+      b = Nx.multiply(Nx.iota({4}, type: :f32, backend: EMLX.Backend), -1.0)
+      native = Nx.Defn.jit(&select_defn/3, compiler: EMLX).(pred, a, b)
+      eager = Nx.Defn.jit(&select_defn/3, compiler: Nx.Defn.Evaluator).(pred, a, b)
+      assert_close(native, eager)
+    end
+
+    @tag :stage05
+    test "static slice + add via jit" do
+      x = Nx.iota({4, 5}, type: :f32, backend: EMLX.Backend)
+      add_slice = fn x -> Nx.add(Nx.slice(x, [0, 0], [2, 3]), 1.0) end
+      native = Nx.Defn.jit(add_slice, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(add_slice, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+  end
+
   # ── private helpers ───────────────────────────────────────────────────────
 
   defp compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs) do
@@ -1362,6 +1709,24 @@ defmodule EMLX.Native.ExprTest do
       {^job_ref, {:error, reason}} -> raise(EMLX.NIFError, List.to_string(reason))
     end
   end
+
+  # Compile and eval a lowered Expr program via the C++ NIF.
+  # Returns a list of output Nx.Tensor{} values.
+  defp run_nif(%Expr{} = prog, inputs) do
+    device = EMLX.default_device()
+    {worker, _} = EMLX.resolve_worker(device)
+    {n_inputs, cap_refs, cvs, cts, ops, ors, ias, outs} = Expr.to_wire(prog)
+
+    input_refs =
+      Enum.map(inputs, fn %Nx.Tensor{data: %EMLX.Backend{ref: {_, r}}} -> r end)
+
+    prog_ref = compile_nif!(worker, n_inputs, cap_refs, cvs, cts, ops, ors, ias, outs)
+    out_refs = eval_nif!(worker, prog_ref, input_refs)
+
+    Enum.map(out_refs, fn ref -> EMLX.Backend.to_nx({device, ref}) end)
+  end
+
+  defp assert_close(a, b), do: assert_close(a, b, 1.0e-4)
 
   defp assert_all_close(a, b, opts \\ []) do
     tol = Keyword.get(opts, :tol, 1.0e-5)

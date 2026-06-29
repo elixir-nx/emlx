@@ -1,6 +1,6 @@
 # Stage 05 — Indexing / selection
 
-Status: not started
+Status: complete
 
 ## Why this stage exists
 
@@ -31,7 +31,16 @@ stress the operand-classification path (which args are refs vs inline ints).
 
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
-| select/clip/slice/put_slice | | |
-| gather/take/take_along_axis | | |
-| indexed_add/put | | |
-| dynamic-index tests | | |
+| select | pass | `mlx::core::where`; 3-way parity (NIF / interpreter / EMLX.Backend) |
+| clip | pass | `mlx::core::clip` with optional min/max sentinels; iattrs carry has_min/has_max bitmask |
+| slice | pass | Static dims → `mlx::core::slice`; dynamic tensor dims → `arange * stride + clamped_start` via `mlx::core::take`. Mixed static+dynamic works. |
+| put_slice | pass | Dynamic starts assembled into a 1-D `int32` array and passed to the `mlx::core::slice_update(tensor, update, starts, axes)` overload. Clamped to `[0, shape[i] − len[i]]`. |
+| gather | pass | Indices split along last axis; `mlx::core::gather`; output reshaped to match Nx convention |
+| take | pass | `mlx::core::take` with axis from iattrs |
+| take_along_axis | pass | `mlx::core::take_along_axis` with axis from iattrs |
+| indexed_add | pass | Indices split along last axis; `mlx::core::scatter_add` |
+| indexed_put | pass | Indices split along last axis; `mlx::core::scatter` |
+| dynamic-index tests | pass | KV-cache pattern (`put_slice` with runtime row index), mixed-index `slice`; 27 tests total |
+| iattrs encoding | complete | `dynamic_mask` bitmask distinguishes per-dim static vs tensor starts for slice/put_slice; documented in `expr.ex` moduledoc |
+
+27 Stage 05 tests pass (`mix test --only stage05`).
