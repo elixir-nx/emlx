@@ -49,12 +49,20 @@ defmodule EMLX.Native.Expr do
   | `:take_along_axis` | `[axis]` — operands are `[tensor, indices]`                      |
   | `:indexed_add`  | `[n_axes, a0…, n_updates_shape, us0…]` — axes and reshaped-updates dims. Operands: `[target, indices, updates]`. |
   | `:indexed_put`  | same as `:indexed_add`                                               |
+  | `:sort`         | `[axis, asc_int]` — axis (non-negative), 1=asc / 0=desc. NaN-aware (matches EMLX.Backend). |
+  | `:argsort`      | `[axis, asc_int]` — same; C++ returns sorted uint32 indices.         |
+  | `:window_sum`, `:window_product`, `:window_max`, `:window_min` | `[n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]` — op_int: 0=sum 1=product 2=max 3=min; then n_dims lo/hi pairs, strides, window dims, window dilations. Operands: `[tensor]`. |
+  | `:window_scatter_max`, `:window_scatter_min` | `[n_dims, lo0, hi0, …, s0, …, w0, …]` — n_dims lo/hi pairs, strides, window dims. Operands: `[tensor_t, source, init_value]`. |
+  | `:cumulative_sum`, `:cumulative_product`, `:cumulative_min`, `:cumulative_max` | `[axis, reverse_int]` — axis (non-negative), 0/1 reverse. Always inclusive. |
+  | `:fft`, `:ifft` | `[axis, n]` — axis and FFT length.                                  |
+  | `:fft2`, `:ifft2` | `[ax0, ax1, n0, n1]` — two axes and two lengths.                |
 
   Non-negative axes: the lowerer normalises negative axis values before encoding
   so C++ handlers can use them directly as 0-based indices.
 
   `:pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered).
   `:reduce` (custom-fun reduce) raises — deferred to Stage 08 (requires child programs).
+  Unrecognized `Nx.Block.*` structs descend into `default_expr` (primitive decomposition).
   """
 
   import Bitwise
@@ -735,7 +743,10 @@ defmodule EMLX.Native.Expr do
 
   # select: cast on_true and on_false to out_type, then emit :select.
   defp expand_node(
-         %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :select, args: [pred, on_true, on_false]}},
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{id: id, op: :select, args: [pred, on_true, on_false]}
+         },
          state
        ) do
     pred_ref = Map.fetch!(state.node_to_ref, pred.data.id)
@@ -780,7 +791,13 @@ defmodule EMLX.Native.Expr do
   #   sv0..svn-1   = static start values (0 for dynamic dims)
   # Operands = [tensor_ref, dyn_ref_0, dyn_ref_1, ...] — dynamic starts in axis order.
   defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :slice, args: [tensor, start_indices, lengths, strides]}},
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :slice,
+             args: [tensor, start_indices, lengths, strides]
+           }
+         },
          state
        ) do
     ref = make_ref()
@@ -872,7 +889,10 @@ defmodule EMLX.Native.Expr do
   #   od0..         = output shape dims
   # Operands = [tensor_ref, indices_ref]
   defp expand_node(
-         %T{shape: out_shape, data: %Nx.Defn.Expr{id: id, op: :gather, args: [tensor, indices, opts]}},
+         %T{
+           shape: out_shape,
+           data: %Nx.Defn.Expr{id: id, op: :gather, args: [tensor, indices, opts]}
+         },
          state
        ) do
     ref = make_ref()
@@ -975,6 +995,302 @@ defmodule EMLX.Native.Expr do
     expand_indexed_node(id, :indexed_put, out_type, target, indices, updates, opts, state)
   end
 
+  # ── sort / argsort ────────────────────────────────────────────────────────
+
+  # sort: args = [tensor, opts], opts has :axis and :direction.
+  # iattrs = [axis, asc_int]  (1 = ascending, 0 = descending)
+  # C++ replicates EMLX.Backend.sort NaN-aware algorithm.
+  defp expand_node(
+         %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :sort, args: [tensor, opts]}},
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    axis = opts[:axis]
+    norm_axis = if axis < 0, do: tuple_size(tensor.shape) + axis, else: axis
+    asc_int = if opts[:direction] == :asc, do: 1, else: 0
+
+    state = %{
+      state
+      | instructions: [{ref, :sort, [tensor_ref], [norm_axis, asc_int]} | state.instructions]
+    }
+
+    {result_ref, state} = emit_cast_if_needed(ref, tensor.type, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  # argsort: args = [tensor, opts], opts has :axis and :direction.
+  # iattrs = [axis, asc_int]
+  # MLX returns uint32; always cast to out_type.
+  defp expand_node(
+         %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :argsort, args: [tensor, opts]}},
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    axis = opts[:axis]
+    norm_axis = if axis < 0, do: tuple_size(tensor.shape) + axis, else: axis
+    asc_int = if opts[:direction] == :asc, do: 1, else: 0
+
+    state = %{
+      state
+      | instructions: [{ref, :argsort, [tensor_ref], [norm_axis, asc_int]} | state.instructions]
+    }
+
+    {result_ref, state} = emit_cast_if_needed(ref, {:u, 32}, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  # ── window reductions ─────────────────────────────────────────────────────
+
+  # window_sum/max/min/product: args = [tensor, window_dims_tuple, opts].
+  # opts has :padding (list of {lo, hi} per dim), :strides, :window_dilations.
+  #
+  # iattrs = [n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]
+  #   op_int: 0=sum, 1=product, 2=max, 3=min
+  #   lo/hi pairs: padding per dim (2*n_dims values)
+  #   s0…: strides per dim
+  #   w0…: window dims per dim
+  #   wd0…: window dilations per dim
+  # Operands: [tensor_ref]
+  @window_op_int %{window_sum: 0, window_product: 1, window_max: 2, window_min: 3}
+
+  for op <- [:window_sum, :window_product, :window_max, :window_min] do
+    defp expand_node(
+           %T{
+             type: out_type,
+             data: %Nx.Defn.Expr{
+               id: id,
+               op: unquote(op),
+               args: [tensor, window_dims_tuple, opts]
+             }
+           },
+           state
+         ) do
+      ref = make_ref()
+      tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+      n_dims = tuple_size(window_dims_tuple)
+      window_dims = Tuple.to_list(window_dims_tuple)
+      {low_pads, high_pads} = Enum.unzip(opts[:padding])
+      strides = opts[:strides] || List.duplicate(1, n_dims)
+      window_dilations = opts[:window_dilations] || List.duplicate(1, n_dims)
+      op_int = @window_op_int[unquote(op)]
+
+      iattrs =
+        [n_dims, op_int] ++
+          Enum.flat_map(0..(n_dims - 1), fn i ->
+            [Enum.at(low_pads, i), Enum.at(high_pads, i)]
+          end) ++
+          strides ++ window_dims ++ window_dilations
+
+      state = %{
+        state
+        | instructions: [{ref, unquote(op), [tensor_ref], iattrs} | state.instructions]
+      }
+
+      {result_ref, state} = emit_cast_if_needed(ref, tensor.type, out_type, state)
+      %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+    end
+  end
+
+  # window_scatter_max / window_scatter_min:
+  # args = [tensor_t, source, init_value, window_dims_tuple, opts].
+  # opts has :padding, :strides.
+  #
+  # iattrs = [n_dims, lo0, hi0, …, s0, …, w0, …]
+  # Operands: [tensor_t_ref, source_ref, init_value_ref]
+  for op <- [:window_scatter_max, :window_scatter_min] do
+    defp expand_node(
+           %T{
+             data: %Nx.Defn.Expr{
+               id: id,
+               op: unquote(op),
+               args: [tensor_t, source, init_value, window_dims_tuple, opts]
+             }
+           },
+           state
+         ) do
+      ref = make_ref()
+      t_ref = Map.fetch!(state.node_to_ref, tensor_t.data.id)
+      src_ref = Map.fetch!(state.node_to_ref, source.data.id)
+      init_ref = Map.fetch!(state.node_to_ref, init_value.data.id)
+
+      n_dims = tuple_size(window_dims_tuple)
+      window_dims = Tuple.to_list(window_dims_tuple)
+      {low_pads, high_pads} = Enum.unzip(opts[:padding])
+      strides = opts[:strides] || List.duplicate(1, n_dims)
+
+      iattrs =
+        [n_dims] ++
+          Enum.flat_map(0..(n_dims - 1), fn i ->
+            [Enum.at(low_pads, i), Enum.at(high_pads, i)]
+          end) ++
+          strides ++ window_dims
+
+      %{
+        state
+        | instructions: [
+            {ref, unquote(op), [t_ref, src_ref, init_ref], iattrs} | state.instructions
+          ],
+          node_to_ref: Map.put(state.node_to_ref, id, ref)
+      }
+    end
+  end
+
+  # ── Nx.Block.Cumulative* — recognize-struct path ─────────────────────────
+  #
+  # Cumulative ops surface as Nx.Block.Cumulative{Sum,Product,Min,Max}.
+  # The struct carries :axis and :reverse (both already resolved to non-negative
+  # axis and boolean by Nx.cumulative_op).
+  #
+  # iattrs = [axis, reverse_int]  (0/1 booleans)
+  # inclusive is always 1 (MLX inclusive mode matches Nx semantics).
+  for {block_mod, op} <- [
+        {Nx.Block.CumulativeSum, :cumulative_sum},
+        {Nx.Block.CumulativeProduct, :cumulative_product},
+        {Nx.Block.CumulativeMin, :cumulative_min},
+        {Nx.Block.CumulativeMax, :cumulative_max}
+      ] do
+    defp expand_node(
+           %T{
+             type: out_type,
+             data: %Nx.Defn.Expr{
+               id: id,
+               op: :block,
+               args: [%unquote(block_mod){axis: axis, reverse: reverse}, [tensor], _default, _fun]
+             }
+           },
+           state
+         ) do
+      ref = make_ref()
+      tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+      norm_axis = if axis < 0, do: tuple_size(tensor.shape) + axis, else: axis
+      reverse_int = if reverse, do: 1, else: 0
+
+      state = %{
+        state
+        | instructions: [
+            {ref, unquote(op), [tensor_ref], [norm_axis, reverse_int]} | state.instructions
+          ]
+      }
+
+      {result_ref, state} = emit_cast_if_needed(ref, tensor.type, out_type, state)
+      %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+    end
+  end
+
+  # ── fft / ifft ────────────────────────────────────────────────────────────
+
+  # fft/ifft: args = [tensor, opts], opts has :length and :axis (already resolved).
+  # iattrs = [axis, n]  where n is the FFT length (positive int).
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :fft, args: [tensor, opts]}},
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    axis = opts[:axis]
+    n = opts[:length]
+
+    %{
+      state
+      | instructions: [{ref, :fft, [tensor_ref], [axis, n]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :ifft, args: [tensor, opts]}},
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    axis = opts[:axis]
+    n = opts[:length]
+
+    %{
+      state
+      | instructions: [{ref, :ifft, [tensor_ref], [axis, n]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # ── Nx.Block.FFT2 / IFFT2 — recognize-struct path ─────────────────────────
+  #
+  # fft2/ifft2: Nx.Block.FFT2/IFFT2{lengths: [n0, n1], axes: [ax0, ax1]}.
+  # iattrs = [ax0, ax1, n0, n1]
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.FFT2{lengths: lengths, axes: axes}, [tensor], _default, _fun]
+           }
+         },
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    [ax0, ax1] = axes || [-2, -1]
+    rank = tuple_size(tensor.shape)
+    ax0 = if ax0 < 0, do: rank + ax0, else: ax0
+    ax1 = if ax1 < 0, do: rank + ax1, else: ax1
+    [n0, n1] = lengths || [elem(tensor.shape, ax0), elem(tensor.shape, ax1)]
+
+    %{
+      state
+      | instructions: [{ref, :fft2, [tensor_ref], [ax0, ax1, n0, n1]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.IFFT2{lengths: lengths, axes: axes}, [tensor], _default, _fun]
+           }
+         },
+         state
+       ) do
+    ref = make_ref()
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    [ax0, ax1] = axes || [-2, -1]
+    rank = tuple_size(tensor.shape)
+    ax0 = if ax0 < 0, do: rank + ax0, else: ax0
+    ax1 = if ax1 < 0, do: rank + ax1, else: ax1
+    [n0, n1] = lengths || [elem(tensor.shape, ax0), elem(tensor.shape, ax1)]
+
+    %{
+      state
+      | instructions: [{ref, :ifft2, [tensor_ref], [ax0, ax1, n0, n1]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # ── block fallback: descend into default_expr ─────────────────────────────
+  #
+  # For any Nx.Block.* struct not specifically recognized above (e.g. RFFT,
+  # IRFFT, AllClose, Phase, unrecognized future blocks), lower the block's
+  # traced default implementation instead of raising.
+  #
+  # The default_expr was traced by expr_block using fresh :parameter nodes as
+  # stand-ins for the in_args. We map those inner params to the parent-scope
+  # refs for in_args, then expand the inner scope's nodes inline.
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [_struct, in_args, default_expr, _fun]
+           }
+         },
+         state
+       ) do
+    expand_block_via_default(id, in_args, default_expr, state)
+  end
+
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
@@ -1014,9 +1330,67 @@ defmodule EMLX.Native.Expr do
 
     %{
       state
-      | instructions: [{ref, op, [target_ref, indices_ref, updates_ref], iattrs} | state.instructions],
+      | instructions: [
+          {ref, op, [target_ref, indices_ref, updates_ref], iattrs} | state.instructions
+        ],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
+  end
+
+  # ── block-descent helper ──────────────────────────────────────────────────
+
+  # Lower a :block node via its traced default_expr (the primitive decomposition).
+  #
+  # Nx.Defn.Expr.expr_block creates fresh :parameter nodes for the block's fun
+  # and passes them into the fun instead of the real in_args.  The default_expr
+  # therefore has inner :parameter nodes (at positions 0, 1, …) whose IDs are
+  # distinct from the parent-scope in_args IDs.
+  #
+  # We:
+  #   1. topo-sort the inner scope from default_expr.
+  #   2. Find the inner :parameter nodes and map them → parent-scope refs.
+  #   3. Expand the inner scope nodes (skipping the already-mapped params).
+  #   4. Alias the block node's output to the default_expr's result ref.
+  defp expand_block_via_default(id, in_args, default_expr, state) do
+    inner_ordered = EMLX.Defn.Tree.post_order(default_expr)
+
+    # Collect inner :parameter nodes; sort by position (args[0]).
+    inner_params =
+      inner_ordered
+      |> Enum.filter(&(&1.data.op == :parameter))
+      |> Enum.sort_by(fn t -> hd(t.data.args) end)
+
+    # Map each inner param id → the corresponding parent-scope arg ref.
+    parent_arg_refs = Enum.map(in_args, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    inner_param_id_set =
+      inner_params
+      |> Enum.zip(parent_arg_refs)
+      |> Enum.reduce(MapSet.new(), fn {param, _}, acc ->
+        MapSet.put(acc, param.data.id)
+      end)
+
+    inner_param_ref_map =
+      inner_params
+      |> Enum.zip(parent_arg_refs)
+      |> Map.new(fn {param, ref} -> {param.data.id, ref} end)
+
+    # Extend node_to_ref with inner param → parent ref mappings.
+    merged_node_to_ref = Map.merge(state.node_to_ref, inner_param_ref_map)
+    inner_state = %{state | node_to_ref: merged_node_to_ref}
+
+    # Expand inner scope, skipping inner :parameter nodes (already mapped).
+    inner_state =
+      Enum.reduce(inner_ordered, inner_state, fn node, st ->
+        if MapSet.member?(inner_param_id_set, node.data.id) do
+          st
+        else
+          expand_node(node, st)
+        end
+      end)
+
+    result_ref = Map.fetch!(inner_state.node_to_ref, default_expr.data.id)
+    %{inner_state | node_to_ref: Map.put(inner_state.node_to_ref, id, result_ref)}
   end
 
   # ── binary lowering helpers ────────────────────────────────────────────────

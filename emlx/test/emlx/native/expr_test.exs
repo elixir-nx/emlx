@@ -156,9 +156,9 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
-      # sort is not yet lowered (Stage 06); use it as the unknown-op sentinel.
+      # iota is not yet lowered (Stage 07); use it as the unknown-op sentinel.
       expr =
-        Nx.Defn.debug_expr_apply(fn t -> Nx.sort(t) end, [Nx.template({3}, :f32)])
+        Nx.Defn.debug_expr_apply(fn t -> Nx.add(t, Nx.iota({3})) end, [Nx.template({3}, :f32)])
 
       assert_raise ArgumentError, ~r/does not yet lower op/, fn -> Expr.lower(expr) end
     end
@@ -1644,7 +1644,9 @@ defmodule EMLX.Native.ExprTest do
     test "interpreter parity" do
       x = Nx.broadcast(Nx.tensor(0.0, backend: EMLX.Backend), {4, 3})
       idx = Nx.tensor([[0], [0], [2]], type: :s32, backend: EMLX.Backend)
-      updates = Nx.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [5.0, 5.0, 5.0]], backend: EMLX.Backend)
+
+      updates =
+        Nx.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [5.0, 5.0, 5.0]], backend: EMLX.Backend)
 
       expr = Nx.Defn.debug_expr_apply(&indexed_add_defn/3, [x, idx, updates])
       prog = Expr.lower(expr)
@@ -1657,7 +1659,10 @@ defmodule EMLX.Native.ExprTest do
     test "equivalence vs EMLX.Backend" do
       x = Nx.broadcast(Nx.tensor(0.0, backend: EMLX.Backend), {4, 3})
       idx = Nx.tensor([[0], [0], [2]], type: :s32, backend: EMLX.Backend)
-      updates = Nx.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [5.0, 5.0, 5.0]], backend: EMLX.Backend)
+
+      updates =
+        Nx.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [5.0, 5.0, 5.0]], backend: EMLX.Backend)
+
       native = Nx.Defn.jit(&indexed_add_defn/3, compiler: EMLX).(x, idx, updates)
       eager = Nx.Defn.jit(&indexed_add_defn/3, compiler: Nx.Defn.Evaluator).(x, idx, updates)
       assert_close(native, eager)
@@ -1699,6 +1704,294 @@ defmodule EMLX.Native.ExprTest do
     |> await_worker!()
   end
 
+  # ── Stage 06 defn helpers ─────────────────────────────────────────────────
+
+  defn sort_asc_defn(x), do: Nx.sort(x, axis: 0, direction: :asc)
+  defn sort_desc_defn(x), do: Nx.sort(x, axis: 1, direction: :desc)
+  defn argsort_asc_defn(x), do: Nx.argsort(x, axis: 0, direction: :asc)
+  defn argsort_desc_defn(x), do: Nx.argsort(x, axis: 1, direction: :desc)
+
+  defn window_sum_defn(x), do: Nx.window_sum(x, {2, 2})
+  defn window_max_defn(x), do: Nx.window_max(x, {2, 2})
+  defn window_min_defn(x), do: Nx.window_min(x, {2, 2})
+  defn window_product_defn(x), do: Nx.window_product(x, {2, 2})
+
+  defn cumulative_sum_defn(x), do: Nx.cumulative_sum(x, axis: 1)
+  defn cumulative_product_defn(x), do: Nx.cumulative_product(x, axis: 0)
+  defn cumulative_min_defn(x), do: Nx.cumulative_min(x, axis: 0)
+  defn cumulative_max_defn(x), do: Nx.cumulative_max(x, axis: 0, reverse: true)
+
+  defn fft_defn(x), do: Nx.fft(x)
+  defn ifft_defn(x), do: Nx.ifft(x)
+  defn fft2_defn(x), do: Nx.fft2(x)
+  defn rfft_defn(x), do: Nx.rfft(x)
+
+  # ── Stage 06 — sort / argsort ────────────────────────────────────────────
+
+  describe "Stage 06 — sort" do
+    @tag :stage06
+    test "sort ascending, axis 0 vs EMLX.Backend — f32" do
+      x =
+        Nx.tensor([[3.0, 1.0, 2.0], [9.0, 4.0, 7.0]], backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&sort_asc_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&sort_asc_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "sort descending, axis 1 vs EMLX.Backend — f32" do
+      x =
+        Nx.tensor([[3.0, 1.0, 2.0], [9.0, 4.0, 7.0]], backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&sort_desc_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&sort_desc_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "sort with NaN values — NaN goes to end in asc" do
+      x = Nx.tensor([1.0, :nan, 2.0, :nan, 0.0], backend: EMLX.Backend)
+
+      native =
+        Nx.Defn.jit(fn t -> Nx.sort(t, axis: 0, direction: :asc) end, compiler: EMLX).(x)
+
+      eager =
+        Nx.Defn.jit(fn t -> Nx.sort(t, axis: 0, direction: :asc) end,
+          compiler: Nx.Defn.Evaluator
+        ).(x)
+
+      # Both should have NaN at the end; compare non-NaN prefix.
+      native_list = Nx.to_flat_list(native)
+      eager_list = Nx.to_flat_list(eager)
+
+      Enum.zip(native_list, eager_list)
+      |> Enum.each(fn {n, e} ->
+        if e == :nan, do: assert(n == :nan), else: assert_in_delta(n, e, 1.0e-4)
+      end)
+    end
+
+    @tag :stage06
+    test "sort s32 ascending" do
+      x = Nx.tensor([5, 3, 1, 4, 2], type: :s32, backend: EMLX.Backend)
+
+      native =
+        Nx.Defn.jit(fn t -> Nx.sort(t, axis: 0) end, compiler: EMLX).(x)
+
+      eager =
+        Nx.Defn.jit(fn t -> Nx.sort(t, axis: 0) end, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 06 — argsort" do
+    @tag :stage06
+    test "argsort ascending, axis 0 vs EMLX.Backend" do
+      x =
+        Nx.tensor([[3.0, 1.0, 2.0], [9.0, 4.0, 7.0]], backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&argsort_asc_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&argsort_asc_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "argsort descending, axis 1 vs EMLX.Backend" do
+      x =
+        Nx.tensor([[3.0, 1.0, 2.0], [9.0, 4.0, 7.0]], backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&argsort_desc_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&argsort_desc_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "argsort output type matches out tensor type" do
+      x = Nx.tensor([3.0, 1.0, 2.0], backend: EMLX.Backend)
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(fn t -> Nx.argsort(t, axis: 0) end, [x]))
+      # argsort output should be :u64 (Nx default for argsort)
+      assert Enum.any?(prog.instructions, fn {_, op, _, _} -> op == :argsort end)
+    end
+  end
+
+  # ── Stage 06 — window reductions ─────────────────────────────────────────
+
+  describe "Stage 06 — window reductions" do
+    @tag :stage06
+    test "window_sum 2x2, no padding vs EMLX.Backend — f32" do
+      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&window_sum_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&window_sum_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "window_max 2x2, no padding vs EMLX.Backend — f32" do
+      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&window_max_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&window_max_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "window_min 2x2, no padding vs EMLX.Backend — f32" do
+      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&window_min_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&window_min_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "window_product 2x2, no padding vs EMLX.Backend — f32" do
+      x =
+        Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+        |> Nx.add(1.0)
+
+      native = Nx.Defn.jit(&window_product_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&window_product_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "window_sum with padding vs EMLX.Backend" do
+      x = Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend)
+
+      f = fn t -> Nx.window_sum(t, {2, 2}, padding: :same) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "window_max with strides vs EMLX.Backend" do
+      x = Nx.iota({6, 6}, type: :f32, backend: EMLX.Backend)
+
+      f = fn t -> Nx.window_max(t, {2, 2}, strides: [2, 2]) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "window_sum 1D vs EMLX.Backend" do
+      x = Nx.iota({6}, type: :f32, backend: EMLX.Backend)
+
+      f = fn t -> Nx.window_sum(t, {3}) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+  end
+
+  # ── Stage 06 — cumulative reductions ─────────────────────────────────────
+
+  describe "Stage 06 — cumulative reductions" do
+    @tag :stage06
+    test "cumulative_sum axis 1 vs EMLX.Backend — f32" do
+      x = Nx.iota({2, 4}, type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&cumulative_sum_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&cumulative_sum_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "cumulative_product axis 0 vs EMLX.Backend — f32" do
+      x = Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(1.0)
+
+      native = Nx.Defn.jit(&cumulative_product_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&cumulative_product_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "cumulative_min axis 0 vs EMLX.Backend — s32" do
+      x = Nx.tensor([[3, 1, 4], [1, 5, 9], [2, 6, 5]], type: :s32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&cumulative_min_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&cumulative_min_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "cumulative_max axis 0 reverse vs EMLX.Backend — f32" do
+      x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&cumulative_max_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&cumulative_max_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage06
+    test "cumulative_sum s32 axis 0 vs EMLX.Backend" do
+      x = Nx.tensor([1, 2, 3, 4], type: :s32, backend: EMLX.Backend)
+
+      f = fn t -> Nx.cumulative_sum(t, axis: 0) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+  end
+
+  # ── Stage 06 — FFT ───────────────────────────────────────────────────────
+
+  describe "Stage 06 — fft / ifft" do
+    @tag :stage06
+    test "fft 1D vs EMLX.Backend" do
+      x = Nx.tensor([1.0, 1.0, 0.0, 0.0], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&fft_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&fft_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_complex_close(native, eager)
+    end
+
+    @tag :stage06
+    test "ifft 1D vs EMLX.Backend" do
+      x = Nx.tensor([1.0, 1.0, 0.0, 0.0], type: :f32, backend: EMLX.Backend)
+      x_fft = Nx.Defn.jit(&fft_defn/1, compiler: EMLX).(x)
+
+      native = Nx.Defn.jit(&ifft_defn/1, compiler: EMLX).(x_fft)
+      eager = Nx.Defn.jit(&ifft_defn/1, compiler: Nx.Defn.Evaluator).(x_fft)
+      assert_complex_close(native, eager)
+    end
+
+    @tag :stage06
+    test "fft with explicit length vs EMLX.Backend" do
+      x = Nx.tensor([1.0, 1.0], type: :f32, backend: EMLX.Backend)
+
+      f = fn t -> Nx.fft(t, length: 4) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(x)
+      assert_complex_close(native, eager)
+    end
+
+    @tag :stage06
+    test "fft2 2D vs EMLX.Backend" do
+      x =
+        Nx.tensor([[1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]],
+          type: :f32,
+          backend: EMLX.Backend
+        )
+
+      native = Nx.Defn.jit(&fft2_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&fft2_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_complex_close(native, eager)
+    end
+
+    @tag :stage06
+    test "rfft via default_expr descent vs EMLX.Backend" do
+      x = Nx.tensor([1.0, 1.0, 0.0, 0.0], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&rfft_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&rfft_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_complex_close(native, eager)
+    end
+  end
+
   defp unwrap!({:ok, v}), do: v
   defp unwrap!({:error, e}), do: raise(EMLX.NIFError, List.to_string(e))
 
@@ -1724,6 +2017,12 @@ defmodule EMLX.Native.ExprTest do
     out_refs = eval_nif!(worker, prog_ref, input_refs)
 
     Enum.map(out_refs, fn ref -> EMLX.Backend.to_nx({device, ref}) end)
+  end
+
+  # Compare complex tensors by comparing real and imaginary parts separately.
+  defp assert_complex_close(a, b, tol \\ 1.0e-4) do
+    assert_all_close(Nx.real(a), Nx.real(b), tol: tol)
+    assert_all_close(Nx.imag(a), Nx.imag(b), tol: tol)
   end
 
   defp assert_close(a, b), do: assert_close(a, b, 1.0e-4)

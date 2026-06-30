@@ -114,15 +114,17 @@ logical_and, logical_or, logical_xor.
 
 ## G. Sort / window / cumulative
 
-- [ ] sort, argsort
-- [ ] window_sum/max/min/product (+ window_reduce custom fun → maybe fallback)
-- [ ] window_scatter_max/min
-- [ ] cumulative_sum/product/max/min (last-axis fast path + interior-axis)
+- [x] sort, argsort
+- [x] window_sum/max/min/product
+- [x] window_scatter_max/min
+- [x] cumulative_sum/product/max/min
+- [~] window_reduce (custom fun — deferred; raises, requires Stage 08 child programs)
 
 ## H. FFT
 
-- [ ] fft, ifft (1-D)
-- [ ] fft2/ifft2, rfft/irfft (route via n-D transform)
+- [x] fft, ifft (1-D)
+- [x] fft2/ifft2
+- [x] rfft/irfft (via default_expr descent — Nx.Block.RFFT/IRFFT → fft+slice decomp)
 
 ## I. Creation
 

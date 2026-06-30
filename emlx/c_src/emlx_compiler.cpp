@@ -57,6 +57,286 @@ static mlx::core::Dtype int_to_dtype(int64_t val) {
   return table[static_cast<size_t>(val)];
 }
 
+// ── Window-op helpers ─────────────────────────────────────────────────────
+//
+// These mirror the Elixir backend's sliding-window algorithm, which uses
+// as_strided to build a view then reduces over the window dims.
+// No explicit device needed: MLX ops inherit stream from input arrays.
+
+// Build a sliding window view.  padded has shape [...]; window and strides
+// have length n=padded.ndim().  Result shape: [o0,...,on-1, w0,...,wn-1].
+static mlx::core::array compiler_sliding_window_view(const mlx::core::array &padded,
+                                                     const std::vector<int> &window,
+                                                     const std::vector<int> &strides) {
+  int n = padded.ndim();
+  auto ps = padded.shape();
+
+  // Doubled element strides: output dims and window dims share the same strides.
+  auto orig_strides = padded.strides();
+  std::vector<int64_t> view_strides(orig_strides.begin(), orig_strides.end());
+  for (auto s : orig_strides)
+    view_strides.push_back(static_cast<int64_t>(s));
+
+  std::vector<int> view_shape;
+  for (int i = 0; i < n; ++i)
+    view_shape.push_back(ps[i] - window[i] + 1);
+  for (int w : window)
+    view_shape.push_back(w);
+
+  auto strided = mlx::core::as_strided(padded, to_shape(view_shape),
+                                       to_strides(view_strides), 0);
+
+  std::vector<int> starts(2 * n, 0);
+  std::vector<int> stops = view_shape;
+  std::vector<int> sl_strides = strides;
+  for (int i = 0; i < n; ++i)
+    sl_strides.push_back(1);
+
+  return mlx::core::slice(strided, to_shape(starts), to_shape(stops), to_shape(sl_strides));
+}
+
+// Decode attrs and run a window reduction (sum/product/max/min).
+// op_code: 0=sum, 1=product, 2=max, 3=min.
+// attrs = [n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]
+static mlx::core::array window_reduce_impl(const mlx::core::array &t,
+                                           const std::vector<int64_t> &attrs,
+                                           int op_code) {
+  int n = static_cast<int>(attrs[0]);
+  // attrs[1] is op_int — matches op_code parameter; keep in sync.
+
+  std::vector<int> low_pad(n), high_pad(n), strides(n), window(n), wd(n);
+  int off = 2;
+  for (int i = 0; i < n; ++i) {
+    low_pad[i] = static_cast<int>(attrs[off++]);
+    high_pad[i] = static_cast<int>(attrs[off++]);
+  }
+  for (int i = 0; i < n; ++i)
+    strides[i] = static_cast<int>(attrs[off++]);
+  for (int i = 0; i < n; ++i)
+    window[i] = static_cast<int>(attrs[off++]);
+  for (int i = 0; i < n; ++i)
+    wd[i] = static_cast<int>(attrs[off++]);
+
+  // Apply window dilations by interior-padding the window mask.
+  // The mask is a bool_ array of shape `window` with interior zeros inserted.
+  // We achieve this via interior_padding: expanded window dims are
+  //   expanded[i] = window[i] + (window[i]-1)*(wd[i]-1).
+  std::vector<int> expanded_window(n);
+  for (int i = 0; i < n; ++i)
+    expanded_window[i] = window[i] + (window[i] - 1) * (wd[i] - 1);
+
+  // Build a 1-filled window mask (bools), dilated via pad + interior zeros.
+  auto one_bool = mlx::core::ones(to_shape(window), mlx::core::bool_);
+  auto zero_bool = mlx::core::zeros({}, mlx::core::bool_);
+  auto window_mask = one_bool;
+  for (int i = 0; i < n; ++i) {
+    if (wd[i] > 1) {
+      // Interior-pad axis i by (wd[i]-1).
+      std::vector<int> ax = {i};
+      std::vector<int> lo_i(n, 0), hi_i(n, 0);
+      auto cur_shape = window_mask.shape();
+      int interior = wd[i] - 1;
+      // Reconstruct the shape after interior padding.
+      // Use as_strided trick: this is complex — use a simpler approach:
+      // create full expanded shape, fill with zeros, scatter ones.
+      // Alternatively: concatenate [1, 0, 0, ...] along axis repeatedly.
+      // Simplest: use pad with interior param — but mlx::core::pad doesn't
+      // support interior padding.  Instead use reshape+broadcast trick:
+      // reshape from [w] to [w, 1], broadcast to [w, wd], reshape to [w*wd],
+      // then slice [0, wd-1, 2*wd-1, …] — i.e. stride-wd indices.
+      // We'll do this per axis sequentially.
+      int w_i = (int)cur_shape[i];
+      // New size after dilation on axis i.
+      int new_size = w_i + (w_i - 1) * interior;
+      // Build dilated axis: start with zeros, then set positions 0, wd, 2*wd, ...
+      auto arange_full = mlx::core::arange(0, new_size, 1, mlx::core::int32);
+      // Positions occupied by real values: 0, wd, 2*wd, ...
+      auto divisible = mlx::core::equal(
+          mlx::core::remainder(arange_full,
+                               mlx::core::full({}, wd[i], mlx::core::int32)),
+          mlx::core::zeros({}, mlx::core::int32));
+      // Build dilated from current using take at strided positions.
+      // Take the [0, wd, 2*wd, ...] positions from the window_mask axis i.
+      auto src_idx = mlx::core::astype(
+          mlx::core::divide(arange_full, mlx::core::full({}, wd[i], mlx::core::int32)),
+          mlx::core::uint32);
+      // For interior positions, take from mask (value 1); replace interior zeros.
+      // It's simpler to: take all, then where(divisible, val, 0).
+      auto taken = mlx::core::take(window_mask, src_idx, i);
+      // Mask out non-original positions.
+      // Broadcast divisible to match taken shape.
+      std::vector<int> div_shape(window_mask.ndim(), 1);
+      div_shape[i] = new_size;
+      auto div_nd = mlx::core::reshape(divisible, to_shape(div_shape));
+      auto div_bc = mlx::core::broadcast_to(div_nd, taken.shape());
+      window_mask = mlx::core::where(div_bc, taken, mlx::core::zeros({}, mlx::core::bool_));
+    }
+  }
+  // expanded_window is now the shape of window_mask.
+
+  // Pad the input tensor.
+  std::vector<int> all_axes(n);
+  std::iota(all_axes.begin(), all_axes.end(), 0);
+
+  // Build pad_value for this op.
+  auto make_pad_val = [&]() -> mlx::core::array {
+    switch (op_code) {
+    case 0: // sum: 0
+      return mlx::core::full({}, 0, t.dtype());
+    case 1: // product: 1
+      return mlx::core::full({}, 1, t.dtype());
+    case 2: // max: lowest representable value
+      if (mlx::core::issubdtype(t.dtype(), mlx::core::floating)) {
+        return mlx::core::full({}, -std::numeric_limits<float>::infinity(), t.dtype());
+      } else {
+        return mlx::core::full({}, std::numeric_limits<int32_t>::min(), t.dtype());
+      }
+    case 3: // min: highest representable value
+      if (mlx::core::issubdtype(t.dtype(), mlx::core::floating)) {
+        return mlx::core::full({}, std::numeric_limits<float>::infinity(), t.dtype());
+      } else {
+        return mlx::core::full({}, std::numeric_limits<int32_t>::max(), t.dtype());
+      }
+    default:
+      throw std::runtime_error("window_reduce_impl: unknown op_code");
+    }
+  };
+  auto pad_val = make_pad_val();
+
+  auto padded = mlx::core::pad(t, all_axes, to_shape(low_pad), to_shape(high_pad), pad_val,
+                               "constant");
+
+  // Sliding window view: shape [o0,...,on-1, w0,...,wn-1].
+  auto view = compiler_sliding_window_view(padded, expanded_window, strides);
+
+  // Broadcast window_mask (shape expanded_window) to match view: all batch dims are 1.
+  std::vector<int> mask_bc_shape(n, 1);
+  for (int w : expanded_window)
+    mask_bc_shape.push_back(w);
+  auto mask_reshaped = mlx::core::reshape(window_mask, to_shape(mask_bc_shape));
+  auto mask_bc = mlx::core::broadcast_to(mask_reshaped, view.shape());
+
+  // Apply mask: replace masked-out positions with pad_val.
+  auto masked_view = mlx::core::where(mask_bc, view, mlx::core::broadcast_to(
+      mlx::core::reshape(pad_val, to_shape(std::vector<int>{})), view.shape()));
+
+  // Reduce over the last n dims (the window axes).
+  std::vector<int> window_axes;
+  for (int i = n; i < 2 * n; ++i)
+    window_axes.push_back(i);
+
+  switch (op_code) {
+  case 0:
+    return mlx::core::sum(masked_view, window_axes, false);
+  case 1:
+    return mlx::core::prod(masked_view, window_axes, false);
+  case 2:
+    return mlx::core::max(masked_view, window_axes, false);
+  case 3:
+    return mlx::core::min(masked_view, window_axes, false);
+  default:
+    throw std::runtime_error("window_reduce_impl: unknown op_code");
+  }
+}
+
+// Window scatter (max or min): replicate window_scatter_impl from emlx_nif.cpp.
+// attrs = [n_dims, lo0, hi0, …, s0, …, w0, …]
+// ops = [tensor_t, source, init_value]
+static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &tensor_t,
+                                                     const mlx::core::array &tensor_source,
+                                                     const mlx::core::array &tensor_init_value,
+                                                     const std::vector<int64_t> &attrs,
+                                                     bool scatter_max) {
+  int n = static_cast<int>(attrs[0]);
+  std::vector<int> low_pad(n), high_pad(n), strides(n), window(n);
+  int off = 1;
+  for (int i = 0; i < n; ++i) {
+    low_pad[i] = static_cast<int>(attrs[off++]);
+    high_pad[i] = static_cast<int>(attrs[off++]);
+  }
+  for (int i = 0; i < n; ++i)
+    strides[i] = static_cast<int>(attrs[off++]);
+  for (int i = 0; i < n; ++i)
+    window[i] = static_cast<int>(attrs[off++]);
+
+  auto init_casted = mlx::core::astype(tensor_init_value, tensor_t.dtype());
+  std::vector<int> all_axes(n);
+  std::iota(all_axes.begin(), all_axes.end(), 0);
+  auto padded = mlx::core::pad(tensor_t, all_axes, to_shape(low_pad), to_shape(high_pad),
+                               init_casted, "constant");
+
+  auto padded_shape = padded.shape();
+  std::vector<int> padded_shape_vec(padded_shape.begin(), padded_shape.end());
+
+  auto window_view = compiler_sliding_window_view(padded, window, strides);
+
+  std::vector<int> out_shape(window_view.shape().begin(), window_view.shape().begin() + n);
+
+  int K = 1;
+  for (int w : window)
+    K *= w;
+
+  std::vector<int> flat_shape = out_shape;
+  flat_shape.push_back(K);
+  auto windows_flat = mlx::core::reshape(window_view, to_shape(flat_shape));
+
+  auto arg_idx = [&]() -> mlx::core::array {
+    if (scatter_max) {
+      return mlx::core::argmax(windows_flat, n, false);
+    }
+    auto m = mlx::core::min(windows_flat, std::vector<int>{n}, true);
+    auto mask =
+        mlx::core::astype(mlx::core::equal(windows_flat, m), mlx::core::uint32);
+    auto arange_k = mlx::core::astype(mlx::core::arange(0, K, 1), mlx::core::uint32);
+    std::vector<int> arange_shape(n + 1, 1);
+    arange_shape[n] = K;
+    auto arange_nd = mlx::core::reshape(arange_k, to_shape(arange_shape));
+    auto weighted = mlx::core::multiply(mask, arange_nd);
+    return mlx::core::argmax(weighted, n, false);
+  }();
+
+  std::vector<int> arg_exp_shape = out_shape;
+  arg_exp_shape.push_back(1);
+  auto arg_idx_exp = mlx::core::reshape(arg_idx, to_shape(arg_exp_shape));
+
+  std::vector<mlx::core::array> abs_indices;
+  for (int a = 0; a < n; ++a) {
+    auto arange_a = mlx::core::astype(mlx::core::arange(0, (int)padded_shape[a], 1),
+                                      mlx::core::int32);
+    std::vector<int> iota_shape(n, 1);
+    iota_shape[a] = (int)padded_shape[a];
+    auto iota_nd = mlx::core::reshape(arange_a, to_shape(iota_shape));
+    auto iota_bc = mlx::core::broadcast_to(iota_nd, to_shape(padded_shape_vec));
+    auto iota_view = compiler_sliding_window_view(iota_bc, window, strides);
+    auto iota_flat = mlx::core::reshape(iota_view, to_shape(flat_shape));
+    auto abs_a = mlx::core::take_along_axis(iota_flat, arg_idx_exp, n);
+    abs_indices.push_back(mlx::core::reshape(abs_a, to_shape(out_shape)));
+  }
+
+  auto source_shape_2n = std::vector<int>(tensor_source.shape().begin(),
+                                          tensor_source.shape().end());
+  for (int i = 0; i < n; ++i)
+    source_shape_2n.push_back(1);
+  auto updates = mlx::core::reshape(tensor_source, to_shape(source_shape_2n));
+
+  auto buffer = mlx::core::broadcast_to(
+      mlx::core::reshape(init_casted, to_shape(std::vector<int>{})),
+      to_shape(padded_shape_vec));
+
+  std::vector<int> scatter_axes(n);
+  std::iota(scatter_axes.begin(), scatter_axes.end(), 0);
+  auto scattered = mlx::core::scatter_add(buffer, abs_indices, updates, scatter_axes);
+
+  auto orig_shape = tensor_t.shape();
+  std::vector<int> slice_starts = low_pad;
+  std::vector<int> slice_stops(n);
+  for (int i = 0; i < n; ++i)
+    slice_stops[i] = low_pad[i] + (int)orig_shape[i];
+  std::vector<int> slice_ones(n, 1);
+  return mlx::core::slice(scattered, to_shape(slice_starts), to_shape(slice_stops),
+                          to_shape(slice_ones));
+}
+
 static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
     {"astype",
@@ -702,6 +982,185 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
        auto updates_reshaped = mlx::core::reshape(ops[2], to_shape(upd_shape));
        return mlx::core::scatter(ops[0], indices_list, updates_reshaped, axes);
+     }},
+
+    // ── sort / argsort ─────────────────────────────────────────────────────────
+    //
+    // iattrs = [axis, asc_int]  (asc_int: 1=ascending, 0=descending)
+    //
+    // Replicates EMLX.Backend.sort/argsort NaN-aware algorithm:
+    //   1. argsort(t, axis)  (negate t first if descending)
+    //   2. sorted_values = take_along_axis(t, sort_indices, axis)
+    //   3. is_nan = isnan(sorted_values)
+    //   4. partition_indices = argsort(is_nan, axis)        (ascending)
+    //               OR        argsort(!is_nan, axis)        (descending)
+    //      (cast bool→uint8 to avoid Metal metallib gap)
+    //   5. return take_along_axis(sorted_values, partition, axis)
+    // argsort: same but step 5 applies partition to sort_indices.
+
+    {"sort",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool asc = (attrs[1] != 0);
+
+       // Step 1: get initial argsort indices.
+       auto t = ops[0];
+       auto sort_input = asc ? t : mlx::core::negative(t);
+       auto sort_idx = mlx::core::argsort(sort_input, axis);
+
+       // Step 2: gather sorted values.
+       auto sorted_vals = mlx::core::take_along_axis(t, sort_idx, axis);
+
+       // Step 3: NaN mask.
+       auto is_nan = mlx::core::isnan(sorted_vals);
+
+       // Step 4: partition indices (move NaNs to correct end).
+       auto is_nan_u8 = mlx::core::astype(is_nan, mlx::core::uint8);
+       mlx::core::array partition_input =
+           asc ? is_nan_u8
+               : mlx::core::astype(mlx::core::logical_not(is_nan), mlx::core::uint8);
+       auto partition = mlx::core::argsort(partition_input, axis);
+
+       // Step 5: reorder sorted_values by partition.
+       return mlx::core::take_along_axis(sorted_vals, partition, axis);
+     }},
+
+    {"argsort",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool asc = (attrs[1] != 0);
+
+       // Step 1: get initial argsort indices.
+       auto t = ops[0];
+       auto sort_input = asc ? t : mlx::core::negative(t);
+       auto sort_idx = mlx::core::argsort(sort_input, axis);
+
+       // Step 2: gather sorted values to check NaN.
+       auto sorted_vals = mlx::core::take_along_axis(t, sort_idx, axis);
+
+       // Step 3: NaN mask.
+       auto is_nan = mlx::core::isnan(sorted_vals);
+
+       // Step 4: partition indices.
+       auto is_nan_u8 = mlx::core::astype(is_nan, mlx::core::uint8);
+       mlx::core::array partition_input =
+           asc ? is_nan_u8
+               : mlx::core::astype(mlx::core::logical_not(is_nan), mlx::core::uint8);
+       auto partition = mlx::core::argsort(partition_input, axis);
+
+       // Step 5: reorder sort_idx by partition.
+       return mlx::core::take_along_axis(sort_idx, partition, axis);
+     }},
+
+    // ── window reductions ─────────────────────────────────────────────────────
+    //
+    // Shared helper: build a sliding-window view of a padded tensor.
+    // Returns shape [o0,...,on-1, w0,...,wn-1] where oi = (ps[i]-w[i])/s[i]+1.
+    // Uses as_strided + slice, matching EMLX.Backend.sliding_window_view.
+    //
+    // iattrs = [n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]
+    //   op_int: 0=sum, 1=product, 2=max, 3=min
+    //   lo/hi: n_dims pairs of padding (2*n_dims values starting at offset 2)
+    //   strides: n_dims values
+    //   window: n_dims values
+    //   window_dilations: n_dims values
+
+    {"window_sum",
+     [](const auto &ops, const auto &attrs) {
+       return window_reduce_impl(ops[0], attrs, 0);
+     }},
+    {"window_product",
+     [](const auto &ops, const auto &attrs) {
+       return window_reduce_impl(ops[0], attrs, 1);
+     }},
+    {"window_max",
+     [](const auto &ops, const auto &attrs) {
+       return window_reduce_impl(ops[0], attrs, 2);
+     }},
+    {"window_min",
+     [](const auto &ops, const auto &attrs) {
+       return window_reduce_impl(ops[0], attrs, 3);
+     }},
+
+    // ── window_scatter_max / min ───────────────────────────────────────────────
+    //
+    // iattrs = [n_dims, lo0, hi0, …, s0, …, w0, …]
+    // Operands: [tensor_t, source, init_value]
+    // Replicates window_scatter_impl from emlx_nif.cpp.
+
+    {"window_scatter_max",
+     [](const auto &ops, const auto &attrs) {
+       return window_scatter_impl_compiler(ops[0], ops[1], ops[2], attrs, true);
+     }},
+    {"window_scatter_min",
+     [](const auto &ops, const auto &attrs) {
+       return window_scatter_impl_compiler(ops[0], ops[1], ops[2], attrs, false);
+     }},
+
+    // ── cumulative reductions ─────────────────────────────────────────────────
+    //
+    // iattrs = [axis, reverse_int]
+    // inclusive is always 1 (matches Nx semantics).
+
+    {"cumulative_sum",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool rev = (attrs[1] != 0);
+       return mlx::core::cumsum(ops[0], axis, rev, true);
+     }},
+    {"cumulative_product",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool rev = (attrs[1] != 0);
+       return mlx::core::cumprod(ops[0], axis, rev, true);
+     }},
+    {"cumulative_min",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool rev = (attrs[1] != 0);
+       return mlx::core::cummin(ops[0], axis, rev, true);
+     }},
+    {"cumulative_max",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       bool rev = (attrs[1] != 0);
+       return mlx::core::cummax(ops[0], axis, rev, true);
+     }},
+
+    // ── fft / ifft ────────────────────────────────────────────────────────────
+    //
+    // iattrs = [axis, n]  where n is the FFT length.
+
+    {"fft",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       int n = static_cast<int>(attrs[1]);
+       return mlx::core::fft::fft(ops[0], n, axis, mlx::core::fft::FFTNorm::Backward);
+     }},
+    {"ifft",
+     [](const auto &ops, const auto &attrs) {
+       int axis = static_cast<int>(attrs[0]);
+       int n = static_cast<int>(attrs[1]);
+       return mlx::core::fft::ifft(ops[0], n, axis, mlx::core::fft::FFTNorm::Backward);
+     }},
+
+    // ── fft2 / ifft2 ──────────────────────────────────────────────────────────
+    //
+    // iattrs = [ax0, ax1, n0, n1]
+
+    {"fft2",
+     [](const auto &ops, const auto &attrs) {
+       std::vector<int> axes = {static_cast<int>(attrs[0]), static_cast<int>(attrs[1])};
+       std::vector<int> ns = {static_cast<int>(attrs[2]), static_cast<int>(attrs[3])};
+       return mlx::core::fft::fft2(ops[0], to_shape(ns), axes,
+                                   mlx::core::fft::FFTNorm::Backward);
+     }},
+    {"ifft2",
+     [](const auto &ops, const auto &attrs) {
+       std::vector<int> axes = {static_cast<int>(attrs[0]), static_cast<int>(attrs[1])};
+       std::vector<int> ns = {static_cast<int>(attrs[2]), static_cast<int>(attrs[3])};
+       return mlx::core::fft::ifft2(ops[0], to_shape(ns), axes,
+                                    mlx::core::fft::FFTNorm::Backward);
      }},
 
     // ── conv_general ─────────────────────────────────────────────────────────
