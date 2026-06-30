@@ -106,7 +106,7 @@ logical_and, logical_or, logical_xor.
 - [x] sum, product, all, any
 - [x] reduce_max, reduce_min
 - [x] argmax, argmin
-- [~] reduce (custom fun — deferred; raises "does not yet lower op :reduce"; requires custom-fun lowering (future stage))
+- [~] reduce (custom fun — now lowers via static trace-time unroll, Stage 12 spike; Stage 13 finalizes large-extent strategy + flips this box)
 - [x] dot
 - [x] conv
 

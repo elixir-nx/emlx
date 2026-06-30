@@ -156,10 +156,12 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
-      # custom-fun reduce is not yet lowered (deferred to Stage 08); use as sentinel.
+      # custom-fun window_reduce is not yet lowered (deferred to Stage 13); use as sentinel.
       expr =
         Nx.Defn.debug_expr_apply(
-          fn t -> Nx.reduce(t, 0, fn x, acc -> Nx.add(x, acc) end) end,
+          fn t ->
+            Nx.window_reduce(t, 0, {2}, [padding: :valid], fn x, acc -> Nx.add(x, acc) end)
+          end,
           [Nx.template({3}, :f32)]
         )
 
@@ -435,6 +437,29 @@ defmodule EMLX.Native.ExprTest do
     compiled = Nx.Defn.compile(fun, templates, compiler: EMLX)
     result = apply(compiled, inputs_eager)
     eager = apply(Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator), inputs_eager)
+    assert_close(result, eager, tol)
+  end
+
+  # Reduce oracle: eager EMLX has no `reduce`, so the equivalence target is the
+  # Evaluator on BinaryBackend (Stage 12 spike — custom-fun reduce unroll).
+  defp check_reduce_equiv(fun, inputs_eager, opts \\ []) do
+    tol = Keyword.get(opts, :tol, 1.0e-4)
+    templates = Enum.map(inputs_eager, &Nx.template(&1.shape, &1.type))
+    compiled = Nx.Defn.compile(fun, templates, compiler: EMLX)
+    result = apply(compiled, inputs_eager)
+
+    bin_inputs = Enum.map(inputs_eager, &Nx.backend_copy(&1, Nx.BinaryBackend))
+    prev = Nx.default_backend(Nx.BinaryBackend)
+
+    eager =
+      try do
+        apply(Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator), bin_inputs)
+      after
+        Nx.default_backend(prev)
+      end
+
+    assert result.shape == eager.shape
+    assert result.type == eager.type
     assert_close(result, eager, tol)
   end
 
@@ -1100,6 +1125,73 @@ defmodule EMLX.Native.ExprTest do
     test "any along axis 1 with keep_axes" do
       x = Nx.tensor([[0, 1], [0, 0]], type: :u8, backend: EMLX.Backend)
       check_equiv(fn t -> Nx.any(t, axes: [1], keep_axes: true) end, [x])
+    end
+  end
+
+  describe "Stage 12 — custom-fun reduce (static unroll)" do
+    @tag :stage12
+    test "1d sum reducer" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
+      check_reduce_equiv(fn t -> Nx.reduce(t, 0.0, fn a, b -> Nx.add(a, b) end) end, [x])
+    end
+
+    @tag :stage12
+    test "1d product reducer" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
+      check_reduce_equiv(fn t -> Nx.reduce(t, 1.0, fn a, b -> Nx.multiply(a, b) end) end, [x])
+    end
+
+    @tag :stage12
+    test "non-commutative affine reducer (validates fold order)" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t -> Nx.reduce(t, 0.0, fn a, b -> Nx.add(Nx.multiply(a, 2.0), b) end) end,
+        [x]
+      )
+    end
+
+    @tag :stage12
+    test "2d reduce along single axis" do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t -> Nx.reduce(t, 0.0, [axes: [1]], fn a, b -> Nx.add(a, b) end) end,
+        [x]
+      )
+    end
+
+    @tag :stage12
+    test "2d reduce along single axis keep_axes" do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t -> Nx.reduce(t, 0.0, [axes: [1], keep_axes: true], fn a, b -> Nx.add(a, b) end) end,
+        [x]
+      )
+    end
+
+    @tag :stage12
+    test "3d reduce over multiple axes" do
+      x = Nx.iota({2, 3, 4}, type: :f32, backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t -> Nx.reduce(t, 0.0, [axes: [0, 2]], fn a, b -> Nx.add(a, b) end) end,
+        [x]
+      )
+    end
+
+    @tag :stage12
+    test "integer max reducer" do
+      x = Nx.tensor([3, 1, 4, 1, 5, 9, 2, 6], backend: EMLX.Backend)
+      check_reduce_equiv(fn t -> Nx.reduce(t, 0, fn a, b -> Nx.max(a, b) end) end, [x])
+    end
+
+    @tag :stage12
+    test "runtime accumulator input" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
+      acc = Nx.tensor(10.0, backend: EMLX.Backend)
+      check_reduce_equiv(fn t, a -> Nx.reduce(t, a, fn x, y -> Nx.add(x, y) end) end, [x, acc])
     end
   end
 
@@ -2454,7 +2546,9 @@ defmodule EMLX.Native.ExprTest do
   describe "Stage 09 — LinAlg.qr / eigh / svd (native, reconstruction)" do
     @tag :stage09
     test "qr: Q·R reconstructs A and Q is orthonormal" do
-      a = Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
+      a =
+        Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend)
+        |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
 
       {q, r} = Nx.Defn.jit(&Nx.LinAlg.qr/1, compiler: EMLX).(a)
       assert_close(Nx.dot(q, r), a)
@@ -2473,7 +2567,10 @@ defmodule EMLX.Native.ExprTest do
 
     @tag :stage09
     test "svd: U·diag(S)·Vᵀ reconstructs A" do
-      a = Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
+      a =
+        Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend)
+        |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
+
       n = 3
 
       {u, s, vt} = Nx.Defn.jit(&Nx.LinAlg.svd/1, compiler: EMLX).(a)
@@ -2597,8 +2694,11 @@ defmodule EMLX.Native.ExprTest do
         {fn x, w -> EMLX.Fast.layer_norm(x, w, 1.0e-5) end,
          [Nx.template({2, 16}, :f32), Nx.template({16}, :f32)], :fast_layer_norm_no_bias},
         {fn q, k, v -> EMLX.Fast.scaled_dot_product_attention_causal(q, k, v, 0.125) end,
-         [Nx.template({1, 2, 4, 8}, :f32), Nx.template({1, 2, 4, 8}, :f32),
-          Nx.template({1, 2, 4, 8}, :f32)], :fast_sdpa_causal}
+         [
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({1, 2, 4, 8}, :f32)
+         ], :fast_sdpa_causal}
       ]
 
       for {fun, templates, opcode} <- cases do
@@ -2610,11 +2710,18 @@ defmodule EMLX.Native.ExprTest do
     @tag :stage10
     test "prefill RoPE (T>1) raises a fallback-eligible error" do
       fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 64, false, 10_000.0, 1.0) end
-      expr = Nx.Defn.debug_expr_apply(fun, [Nx.template({2, 4, 2, 64}, :f32), Nx.template({2, 4}, :s32)])
 
-      assert_raise ArgumentError, ~r/^does not yet lower op :runtime_call.*rope_with_positions_callback/, fn ->
-        Expr.lower(expr)
-      end
+      expr =
+        Nx.Defn.debug_expr_apply(fun, [
+          Nx.template({2, 4, 2, 64}, :f32),
+          Nx.template({2, 4}, :s32)
+        ])
+
+      assert_raise ArgumentError,
+                   ~r/^does not yet lower op :runtime_call.*rope_with_positions_callback/,
+                   fn ->
+                     Expr.lower(expr)
+                   end
     end
   end
 

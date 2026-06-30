@@ -63,7 +63,8 @@ defmodule EMLX.Native.Expr do
   so C++ handlers can use them directly as 0-based indices.
 
   `:pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered).
-  `:reduce` (custom-fun reduce) raises — deferred to Stage 08 (requires child programs).
+  `:reduce` (custom-fun reduce) lowers by static trace-time unrolling: the
+  reducer body is re-lowered inline once per reduce-extent element (Stage 12).
   Unrecognized `Nx.Block.*` structs descend into `default_expr` (primitive decomposition).
   `Nx.Random.*` functions decompose via `threefry2x32` into primitive ops (bitwise, add, iota)
   and work automatically once `:iota` is lowered.
@@ -596,9 +597,21 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # custom-fun reduce: deferred — requires child programs (Stage 08).
-  defp expand_node(%T{data: %Nx.Defn.Expr{op: :reduce}}, _state) do
-    raise ArgumentError, "does not yet lower op :reduce"
+  # custom-fun reduce: lowered by static trace-time unrolling (Stage 12 spike).
+  # The reduce axes have a trace-time-known extent, so we fold the user's scalar
+  # reducer `fun` over that extent, vectorized across the kept axes — each fold
+  # step re-lowers the reducer body inline (acc ← prev result). Graph-equivalent
+  # to a held child-program fold but reuses existing primitive opcodes, so no C++
+  # change is needed.  See workdir/native-compiler/12-childprogram-spike.md.
+  defp expand_node(
+         %T{
+           type: out_type,
+           shape: out_shape,
+           data: %Nx.Defn.Expr{id: id, op: :reduce, args: [tensor, acc, opts, fun]}
+         },
+         state
+       ) do
+    expand_reduce_unroll(id, out_type, out_shape, tensor, acc, opts, fun, state)
   end
 
   # ── dot ─────────────────────────────────────────────────────────────────────
@@ -1539,12 +1552,18 @@ defmodule EMLX.Native.Expr do
 
         # Right-fold: most-priority clause wraps the least-priority accumulator.
         {result_ref, st} =
-          Enum.reduce(Enum.reverse(clause_ref_pairs), {last_ref_i, st}, fn {pred_ref,
-                                                                             body_refs},
-                                                                            {acc_ref, st2} ->
+          Enum.reduce(Enum.reverse(clause_ref_pairs), {last_ref_i, st}, fn {pred_ref, body_refs},
+                                                                           {acc_ref, st2} ->
             body_ref_i = Enum.at(body_refs, i)
             ref = make_ref()
-            st2 = %{st2 | instructions: [{ref, :select, [pred_ref, body_ref_i, acc_ref], []} | st2.instructions]}
+
+            st2 = %{
+              st2
+              | instructions: [
+                  {ref, :select, [pred_ref, body_ref_i, acc_ref], []} | st2.instructions
+                ]
+            }
+
             {ref, st2}
           end)
 
@@ -1642,6 +1661,12 @@ defmodule EMLX.Native.Expr do
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
   end
+
+  # :fun nodes surface as opaque leaves in the parent ordering (post_order does
+  # not descend their bodies).  They carry no value on their own — the owning op
+  # (e.g. :reduce) reaches into `fun.data.args` and lowers the body itself — so
+  # the leaf is a no-op here.
+  defp expand_node(%T{data: %Nx.Defn.Expr{op: :fun}}, state), do: state
 
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
@@ -1745,6 +1770,147 @@ defmodule EMLX.Native.Expr do
     %{inner_state | node_to_ref: Map.put(inner_state.node_to_ref, id, result_ref)}
   end
 
+  # ── custom-fun reduce (static unroll — Stage 12 spike) ────────────────────
+  #
+  # `reduce` folds a user scalar reducer `fun(element, acc)` over the reduce
+  # axes.  Their extent is known at trace time, so we transpose the reduce axes
+  # last, collapse them into one trailing axis of size `extent`, slice that axis
+  # into `extent` kept-shape elements, and fold the reducer over them —
+  # vectorised across the kept axes.  Each fold step re-lowers the reducer body
+  # inline with `acc` bound to the previous step's result.
+  defp expand_reduce_unroll(id, out_type, out_shape, tensor, acc, opts, fun, state) do
+    in_rank = tuple_size(tensor.shape)
+
+    reduce_axes =
+      case opts[:axes] do
+        nil -> Enum.to_list(0..(in_rank - 1)//1)
+        axes -> Enum.sort(normalize_axes(axes, in_rank))
+      end
+
+    if in_rank == 0 or reduce_axes == [] do
+      raise ArgumentError, "does not yet lower op :reduce with no reduction axes"
+    end
+
+    [params, body, _mfa] = fun.data.args
+
+    unless length(params) == 2 do
+      raise ArgumentError, "does not yet lower op :reduce with a non-binary reducer"
+    end
+
+    reduce_set = MapSet.new(reduce_axes)
+    kept_axes = Enum.reject(0..(in_rank - 1)//1, &MapSet.member?(reduce_set, &1))
+    in_dims = Tuple.to_list(tensor.shape)
+    kept_shape = Enum.map(kept_axes, &Enum.at(in_dims, &1))
+    reduce_extent = reduce_axes |> Enum.map(&Enum.at(in_dims, &1)) |> Enum.product()
+
+    # Cast input + initial acc to the reducer/output type.
+    tensor_ref0 = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {tensor_ref, state} = emit_cast_if_needed(tensor_ref0, tensor.type, out_type, state)
+    acc_ref0 = Map.fetch!(state.node_to_ref, acc.data.id)
+    {acc_scalar_ref, state} = emit_cast_if_needed(acc_ref0, acc.type, out_type, state)
+
+    # Move reduce axes last, then collapse them into a single trailing axis.
+    perm = kept_axes ++ reduce_axes
+
+    {perm_ref, state} =
+      if perm == Enum.to_list(0..(in_rank - 1)//1) do
+        {tensor_ref, state}
+      else
+        emit_transpose_instr(tensor_ref, perm, state)
+      end
+
+    combined_shape = kept_shape ++ [reduce_extent]
+    {combined_ref, state} = emit_reshape_instr(perm_ref, combined_shape, state)
+
+    # Seed acc broadcast to the kept shape, then fold over the extent.
+    {acc_ref, state} = emit_broadcast_to(acc_scalar_ref, kept_shape, state)
+
+    {final_ref, state} =
+      Enum.reduce(0..(reduce_extent - 1)//1, {acc_ref, state}, fn i, {acc_i, st} ->
+        {elem_ref, st} = emit_reduce_slice(combined_ref, combined_shape, kept_shape, i, st)
+        lower_fun_body(body, %{0 => elem_ref, 1 => acc_i}, st)
+      end)
+
+    # Reshape to the declared output shape (restores keep_axes 1-dims).
+    {out_ref, state} = emit_reshape_instr(final_ref, Tuple.to_list(out_shape), state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, out_ref)}
+  end
+
+  # Lower a reducer `:fun` body inline, binding its scalar parameters (by
+  # position) to the given refs.  Each call expands the body afresh — body node
+  # ids are constant across fold iterations, so the body-local `node_to_ref`
+  # must NOT leak back into the parent state, otherwise iteration 1+ would reuse
+  # iteration 0's results instead of re-lowering with the new acc/element refs.
+  # Returns {result_ref, state} with the body's instructions appended.
+  defp lower_fun_body(body, param_ref_by_pos, state) do
+    inner_ordered = EMLX.Defn.Tree.post_order(body)
+
+    param_id_to_ref =
+      inner_ordered
+      |> Enum.filter(&(&1.data.op == :parameter))
+      |> Map.new(fn p -> {p.data.id, Map.fetch!(param_ref_by_pos, hd(p.data.args))} end)
+
+    param_id_set = MapSet.new(Map.keys(param_id_to_ref))
+    local_base = Map.merge(state.node_to_ref, param_id_to_ref)
+
+    inner_state =
+      Enum.reduce(inner_ordered, %{state | node_to_ref: local_base}, fn node, st ->
+        if MapSet.member?(param_id_set, node.data.id), do: st, else: expand_node(node, st)
+      end)
+
+    result_ref = Map.fetch!(inner_state.node_to_ref, body.data.id)
+
+    # Carry forward everything the body produced, but discard its node_to_ref.
+    {result_ref,
+     %{
+       state
+       | instructions: inner_state.instructions,
+         captures: inner_state.captures,
+         constants: inner_state.constants,
+         inputs: inner_state.inputs
+     }}
+  end
+
+  # Emit a :reshape instruction; returns {new_ref, state}.
+  defp emit_reshape_instr(ref, shape_list, state) do
+    new_ref = make_ref()
+
+    {new_ref,
+     %{state | instructions: [{new_ref, :reshape, [ref], shape_list} | state.instructions]}}
+  end
+
+  # Broadcast a scalar ref to `shape_list` (no-op when the target is scalar).
+  defp emit_broadcast_to(ref, [], state), do: {ref, state}
+
+  defp emit_broadcast_to(ref, shape_list, state) do
+    new_ref = make_ref()
+    iattrs = [length(shape_list) | shape_list] ++ [0]
+
+    {new_ref,
+     %{state | instructions: [{new_ref, :broadcast, [ref], iattrs} | state.instructions]}}
+  end
+
+  # Slice element `i` along the collapsed trailing axis then squeeze it away,
+  # yielding a kept-shape element.
+  defp emit_reduce_slice(ref, combined_shape, kept_shape, i, state) do
+    n_dims = length(combined_shape)
+    last_axis = n_dims - 1
+    lengths = kept_shape ++ [1]
+    strides = List.duplicate(1, n_dims)
+    starts = List.duplicate(0, length(kept_shape)) ++ [i]
+    iattrs = [n_dims, 0] ++ combined_shape ++ lengths ++ strides ++ starts
+
+    slice_ref = make_ref()
+    state = %{state | instructions: [{slice_ref, :slice, [ref], iattrs} | state.instructions]}
+    squeeze_ref = make_ref()
+
+    {squeeze_ref,
+     %{
+       state
+       | instructions: [{squeeze_ref, :squeeze, [slice_ref], [last_axis]} | state.instructions]
+     }}
+  end
+
   # ── EMLX.Fast runtime_call recognition ─────────────────────────────────────
   #
   # Maps a recognized `&EMLX.Fast.*_callback/2` capture to a fused opcode and its
@@ -1799,7 +1965,12 @@ defmodule EMLX.Native.Expr do
 
       :rope_with_positions_fast_callback ->
         {:fast_rope_ids,
-         [opts[:dims], bool_int(opts[:traditional]), f64_bits(opts[:base]), f64_bits(opts[:scale])]}
+         [
+           opts[:dims],
+           bool_int(opts[:traditional]),
+           f64_bits(opts[:base]),
+           f64_bits(opts[:scale])
+         ]}
 
       :rope_with_freqs_fast_callback ->
         {:fast_rope_with_freqs,
@@ -2408,7 +2579,8 @@ defmodule EMLX.Native.Expr.Interpreter do
   end
 
   defp dispatch(:fast_layer_norm_no_bias, [x, weight], [eps_bits]) do
-    EMLX.fast_layer_norm_no_bias(from_nx(x), from_nx(weight), Expr.bits_to_f64(eps_bits)) |> to_nx()
+    EMLX.fast_layer_norm_no_bias(from_nx(x), from_nx(weight), Expr.bits_to_f64(eps_bits))
+    |> to_nx()
   end
 
   defp dispatch(:fast_swiglu, [gate, up], []) do
@@ -2420,12 +2592,19 @@ defmodule EMLX.Native.Expr.Interpreter do
   end
 
   defp dispatch(:fast_sdpa_masked, [q, k, v, mask], [scale_bits]) do
-    EMLX.fast_sdpa_masked(from_nx(q), from_nx(k), from_nx(v), from_nx(mask), Expr.bits_to_f64(scale_bits))
+    EMLX.fast_sdpa_masked(
+      from_nx(q),
+      from_nx(k),
+      from_nx(v),
+      from_nx(mask),
+      Expr.bits_to_f64(scale_bits)
+    )
     |> to_nx()
   end
 
   defp dispatch(:fast_sdpa_causal, [q, k, v], [scale_bits]) do
-    EMLX.fast_sdpa_causal(from_nx(q), from_nx(k), from_nx(v), Expr.bits_to_f64(scale_bits)) |> to_nx()
+    EMLX.fast_sdpa_causal(from_nx(q), from_nx(k), from_nx(v), Expr.bits_to_f64(scale_bits))
+    |> to_nx()
   end
 
   defp dispatch(:fast_sdpa_causal_key_masked, [q, k, v, key_mask], [scale_bits, kv_offset]) do

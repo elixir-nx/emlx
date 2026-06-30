@@ -85,15 +85,34 @@ the wrong `vars`/scope being threaded into a sub-expression (while body / block
 
 All three acceptance items met. The benchmark runs end-to-end:
 
-| path        | throughput   |
-| ----------- | ------------ |
-| `bb base`   | 7.3 tok/s    |
-| `bb+rewrite`| 23.4 tok/s   |
-| `native`    | 71.4 tok/s   |
+| path        | throughput        |
+| ----------- | ----------------- |
+| `bb base`   | 7.3–9.1 tok/s     |
+| `bb+rewrite`| 23.4–34.5 tok/s   |
+| `native`    | 62.6–71.4 tok/s   |
 
-Suites green: `nx` fork 2673 passed, `emlx` 2513 passed. Regression tests added
+(Ranges across runs; throughput is unchanged after warmup, as expected —
+the regression was purely in compile-time graph splitting, not in execution.)
+
+Suites green: `nx` fork 2676 passed, `emlx` 2513 passed. Regression tests added
 in `emlx/test/emlx/native/expr_test.exs` under `describe "Stage 11 — splitter
 regressions"` (tag `:stage11`), one per bug below.
+
+### Landed fix (upstream in the nx fork)
+
+The fix is **committed** in the nx fork, not in emlx:
+
+- `7290b7fa` / `1316bb74` `fix: keep subscopes hermetic`
+- `631afbf5` `fix: handle generic containers`
+
+The landed fix is **broader than the three bugs below**. In addition to the
+three discrete fixes, it reworks `Graph.split` so that `while`/`cond`/`fun`
+**sub-scopes are hermetic**: the splitter gets dedicated `eval_while`/`eval_cond`/
+`eval_fun` traversal and a `force_none` flag, so conditionally-executed
+computation is never hoisted out of a `cond` branch and sub-scope `:parameter`
+indices never leak into the parent scope. That hermeticity is the deeper root
+cause; Bug 2 below (runtime_call operands) was one surface symptom of the
+splitter walking sub-scope/operand structure it should have treated as opaque.
 
 ### Root cause — three bugs, all in the splitter (`Nx.Defn.Graph`)
 

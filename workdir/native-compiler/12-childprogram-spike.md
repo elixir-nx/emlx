@@ -1,6 +1,10 @@
 # Stage 12 — Spike: C++ child-program substrate
 
-Status: open (spike). Depends on Stage 11 (a working benchmark to measure on).
+Status: done. **Gate outcome: no-go on the C++ child-program path.** The spike
+pivoted (advisor-blessed) to the cheaper Elixir inline-unroll baseline first;
+that baseline turned out to be graph-equivalent to the proposed C++ `:fold`, so
+the C++ subprogram channel buys nothing measurable and was not built. Stage 13
+proceeds as an Elixir unroll; the speculative Stage 14 C++ `while` is dropped.
 
 ## Why this stage exists
 
@@ -69,3 +73,86 @@ data-dependent control-flow primitive** (no `while_loop` / `fori_loop` / `scan`
 - Sub-IR plumbing lands behind one `:fold` opcode, validated on `Nx.reduce`.
 - Gate decisions recorded here (fold mechanism for Stage 13; go/no-go for the
   Stage 14 `while` refactor).
+
+## Results
+
+### What was built (deviation from procedure, advisor-blessed)
+
+The advisor flagged that for a **static** fold, a C++ `:fold` child program and
+a pure-Elixir inline-unroll compile to the **identical** cached MLX graph — so
+they are graph-equivalent and replay identically. The only axis on which they
+can differ is trace-time cost and wire-payload at large extent. The leanest path
+to a defensible gate is therefore: build the Elixir unroll first (cheap), then
+measure whether its trace cost/payload blows up enough to justify the C++
+plumbing. It did not — so the C++ subprogram channel + `run_program` refactor
+(procedure tasks 2–4) were **not built**.
+
+What landed instead (`emlx/lib/emlx/native/expr.ex`):
+
+- `:reduce` lowered by **static trace-time unroll**: transpose reduce axes last,
+  collapse them into one trailing axis of size `extent`, slice that axis into
+  `extent` kept-shape elements, and fold the reducer over them — vectorised
+  across the kept axes. Each fold step re-lowers the reducer body inline with
+  `acc` bound to the previous step's result. Reuses existing opcodes
+  (`slice`/`squeeze`/`broadcast`/`transpose`/`reshape` + the reducer's own ops):
+  **zero C++ change**.
+- `lower_fun_body/3` — generalises `expand_block_via_default/4`'s param-remapping
+  into a "lower a `:fun` sub-expr into emitted ops" helper, with a body-local
+  `node_to_ref` that does not leak across fold iterations (constant body node ids
+  would otherwise alias iteration 0's results).
+- A no-op `:fun` `expand_node` clause (the `:fun` leaf is opaque in the parent
+  ordering; the owning `:reduce` reaches into `fun.data.args` itself).
+
+| Item | Outcome | Notes / artifacts |
+|------|---------|-------------------|
+| Task 1 — verify MLX 0.31.2 API | ✅ | `compile.h`/`transforms.h`/`ops.h`/`compile_impl.h` confirm **no** `while_loop`/`fori_loop`/`scan`/`cond` in the public core. `eval(std::vector<array>)` + `array::item<T>()` exist ⇒ a dynamic loop can only be eval-per-iteration (trace broken each iter). Confirms the static/dynamic split. |
+| `:reduce` static unroll | ✅ | 12/12 ad-hoc cases + 8/8 committed tests (`describe "Stage 12 …"`) match the Evaluator/BinaryBackend oracle, incl. multi-axis, `keep_axes`, a **non-commutative** affine reducer (validates fold order), int, runtime acc. |
+| Validation oracle | ✅ | Eager EMLX has no `reduce`; oracle is `Nx.Defn.Evaluator` on `BinaryBackend` (`check_reduce_equiv/3`). |
+| Suite | ✅ | `mix test test/emlx/native/expr_test.exs` → 227 passed. Old reduce fallback-sentinel test repointed to `window_reduce` (still unlowered). |
+
+### Benchmark — the decisive axis (trace/payload vs extent, not replay)
+
+1-D `Nx.reduce(x, 0.0, &Nx.add/2)`, Apple M-series CPU. Steady-state `replay` is
+shown only to demonstrate graph-equivalence — it is **not** used to choose the
+mechanism (both flavours produce the same O(extent)-op graph).
+
+| extent | instrs | payload (int64) | lower µs | replay µs | Evaluator µs |
+|-------:|-------:|----------------:|---------:|----------:|-------------:|
+| 10     | 32     | 114             | ~1.4k*   | 334       | 11           |
+| 100    | 302    | 1,104           | 123      | 1,140     | 51           |
+| 500    | 1,502  | 5,504           | 549      | 9,045     | 221          |
+| 1000   | 3,002  | 11,004          | 1,020    | 30,918    | 523          |
+| 2000   | 6,002  | 22,004          | 2,036    | 143,998   | 852          |
+
+(* first-iteration warmup.) `instrs ≈ 3·extent`, `payload ≈ 11·extent` — both
+linear and tiny in absolute terms (≤176 KB, sent once per compile, then cached).
+Elixir lowering stays sub-2 ms. Replay is O(extent) and dominates.
+
+## Go/no-go gate — decisions
+
+1. **Static-fold reduce works + matches the Evaluator → GREEN for Stage 13.** ✅
+2. **C++ `:fold` vs Elixir unroll → drop the C++ path; Stage 13 = Elixir unroll.**
+   They are graph-equivalent (identical cached graph, identical O(extent) replay).
+   The only axis where they differ — wire-payload and Elixir build-time — is
+   negligible (≤176 KB once; ≤2 ms). The C++ child-program substrate +
+   `run_program` refactor would be pure cost for zero measurable benefit. The
+   reduce unroll already landed here is the Stage 13 mechanism.
+3. **Stage 14 C++ `while` → no-go (dropped).** Task 1 confirms MLX 0.31.2 has no
+   in-trace control flow, so a C++ `while` is eval-per-iteration: the trace
+   breaks every iteration (no cross-iteration fusion) — the **same** fusion
+   profile as the proven Stage-08 `Graph.split` host loop. Its only theoretical
+   edge is avoiding a per-iteration BEAM↔NIF round-trip, and the spike shows the
+   child-program abstraction's costs are not justified by the measurable case.
+   Revisit only if a concrete decode-loop benchmark shows per-iteration BEAM
+   round-trips dominate.
+
+### Hand-off note for Stage 13 (not a spike blocker)
+
+The unroll produces an O(extent)-op graph that, at large extents, is far slower
+to replay than the eager Evaluator loop (~170× at extent 2000). Stage 13 should
+gate on extent: small extents unroll natively (keeps the defn single-NIF); large
+extents should stay Evaluator-fallback, or — when the reducer matches a known
+associative op (add/mul/max/min) — route to the native primitive
+(`sum`/`product`/`reduce_max`/`reduce_min`). Also add `window_reduce` (reuse
+`compiler_sliding_window_view` + the same `lower_fun_body/3` fold) before
+flipping `EXPR_NODES.md` lines 109 / 131.
