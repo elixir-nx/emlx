@@ -24,9 +24,10 @@ defmodule EMLXAxon.MixProject do
 
   defp deps do
     [
-      
+
       {:emlx, path: "../emlx"},
       # {:emlx, "~> 0.3"},
+      {:nx, path: "../../nx/nx", override: true},
       {:axon, "~> 0.7"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}

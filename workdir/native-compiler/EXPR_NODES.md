@@ -37,7 +37,7 @@ Source of truth:
 | `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [~] |
 | `optional` | `(name, args, default)` | lower default expr, or route to native | [ ] |
 | `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] |
-| `runtime_call` | `(expr, cb, out, opts)` | unsupported → raises | [ ] |
+| `runtime_call` | `(expr, cb, out, opts)` | recognize `EMLX.Fast.*` callback → fused opcode (see L); else raises | [~] |
 
 Notes:
 - `cond`: all predicate and body tensors are in the **parent scope** (`apply_args`
@@ -157,14 +157,18 @@ logical_and, logical_or, logical_xor.
 
 ## L. EMLX.Fast fused kernels (optimization, not correctness)
 
-Recognize lowered patterns and route to `EMLX.Fast` instead of the primitive
-expansion:
+`EMLX.Fast.*` functions surface as `:runtime_call` nodes (not blocks/primitive
+subgraphs — see Stage 10). The lowerer recognizes the callback (by
+module+name+arity via `fast_kernel_dispatch/2`) and emits a single fused opcode
+calling `mlx::core::fast::*` inside the compiled graph (one NIF replay, no host
+hop). Float opts (eps/scale/base) ride the int64 attr channel as IEEE-754 bits.
+Metal-only kernels → E2E tests run on a GPU worker (`device: :gpu`, `:metal`).
 
-- [ ] rms_norm
-- [ ] layer_norm
-- [ ] rope / rope_with_positions / rope_with_freqs
-- [ ] scaled_dot_product_attention (+ causal / key-masked variants)
-- [ ] swiglu
+- [x] rms_norm
+- [x] layer_norm (+ no-bias variant)
+- [x] rope / rope_with_positions / rope_with_freqs (decode/T=1 fast callbacks; per-token prefill paths raise → Evaluator fallback)
+- [x] scaled_dot_product_attention (+ causal / additive-mask / causal-key-masked variants)
+- [x] swiglu
 
 ---
 

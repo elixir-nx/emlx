@@ -57,6 +57,14 @@ static mlx::core::Dtype int_to_dtype(int64_t val) {
   return table[static_cast<size_t>(val)];
 }
 
+// Float opts (eps/scale/base) ride the int64 attr channel as their IEEE-754
+// double bits (see EMLX.Native.Expr.f64_bits/1).  Reverse the reinterpret here.
+static inline float attr_to_float(int64_t bits) {
+  double d;
+  std::memcpy(&d, &bits, sizeof(double));
+  return static_cast<float>(d);
+}
+
 // ── Window-op helpers ─────────────────────────────────────────────────────
 //
 // These mirror the Elixir backend's sliding-window algorithm, which uses
@@ -1270,6 +1278,141 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        return mlx::core::contiguous(
            mlx::core::linalg::solve_triangular(ops[0], ops[1], upper, k_linalg_cpu),
            false, k_linalg_cpu);
+     }},
+
+    // ── EMLX.Fast fused kernels (mlx::core::fast) ──────────────────────────
+    //
+    // Recognized from EMLX.Fast.* runtime_call callbacks (see expr.ex
+    // fast_kernel_dispatch/2).  Run on the worker's default stream — these are
+    // Metal kernels, so the defn must be compiled/replayed on a GPU worker.
+    // Float opts (eps/scale/base) arrive as IEEE-754 bits via attr_to_float.
+
+    // rms_norm: operands = [x, weight]; attrs = [eps_bits].
+    {"fast_rms_norm",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::rms_norm(ops[0], ops[1], attr_to_float(attrs[0]));
+     }},
+
+    // layer_norm (with bias): operands = [x, weight, bias]; attrs = [eps_bits].
+    {"fast_layer_norm",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::layer_norm(ops[0], ops[1], ops[2], attr_to_float(attrs[0]));
+     }},
+
+    // layer_norm (weight-only): operands = [x, weight]; attrs = [eps_bits].
+    {"fast_layer_norm_no_bias",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::layer_norm(ops[0], ops[1], std::nullopt,
+                                          attr_to_float(attrs[0]));
+     }},
+
+    // swiglu: operands = [gate, up]; no attrs.  silu(gate) * up.
+    {"fast_swiglu",
+     [](const auto &ops, const auto &) {
+       return mlx::core::multiply(
+           mlx::core::multiply(ops[0], mlx::core::sigmoid(ops[0])), ops[1]);
+     }},
+
+    // sdpa (no mask): operands = [q, k, v]; attrs = [scale_bits].
+    {"fast_sdpa",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::scaled_dot_product_attention(
+           ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
+           std::nullopt);
+     }},
+
+    // sdpa (array mask): operands = [q, k, v, mask]; attrs = [scale_bits].
+    {"fast_sdpa_masked",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::scaled_dot_product_attention(
+           ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
+           std::nullopt);
+     }},
+
+    // sdpa (causal): operands = [q, k, v]; attrs = [scale_bits].
+    {"fast_sdpa_causal",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::scaled_dot_product_attention(
+           ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
+           std::nullopt, std::nullopt);
+     }},
+
+    // sdpa (causal + key_mask): operands = [q, k, v, key_mask];
+    // attrs = [scale_bits, kv_offset].  Unlike the eager NIF, the compiled
+    // graph cannot branch on a runtime `all(key_mask)` (that forces an eval),
+    // so we always build the combined causal+key_mask additive mask in-graph.
+    {"fast_sdpa_causal_key_masked",
+     [](const auto &ops, const auto &attrs) {
+       const auto &q = ops[0];
+       const auto &k = ops[1];
+       const auto &v = ops[2];
+       const auto &key_mask = ops[3];
+       float scale = attr_to_float(attrs[0]);
+       int kv_offset = static_cast<int>(attrs[1]);
+
+       auto km = mlx::core::reshape(
+           key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)});
+       int T_q = q.shape(2);
+       int T_kv = k.shape(2);
+
+       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32),
+                                     {1, 1, T_q, 1});
+       auto col = mlx::core::reshape(mlx::core::arange(T_kv, mlx::core::int32),
+                                     {1, 1, 1, T_kv});
+       auto causal_bool = mlx::core::less_equal(
+           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32)));
+       auto keep = mlx::core::logical_and(km, causal_bool);
+
+       auto mask_dtype = q.dtype();
+       auto zero_val = mlx::core::zeros({}, mask_dtype);
+       auto neginf_val = mlx::core::full(
+           {}, -std::numeric_limits<float>::infinity(), mask_dtype);
+       auto additive = mlx::core::where(keep, zero_val, neginf_val);
+
+       return mlx::core::fast::scaled_dot_product_attention(
+           q, k, v, scale, "array", additive, std::nullopt);
+     }},
+
+    // rope (scalar offset): operands = [a];
+    // attrs = [dims, traditional, base_bits, scale_bits, offset].
+    {"fast_rope",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::rope(
+           ops[0], static_cast<int>(attrs[0]), attrs[1] != 0,
+           attr_to_float(attrs[2]), attr_to_float(attrs[3]),
+           static_cast<int>(attrs[4]), std::nullopt);
+     }},
+
+    // rope (per-batch offset array): operands = [a, position_ids];
+    // attrs = [dims, traditional, base_bits, scale_bits].  Offsets are
+    // position_ids[:, 0] (matches EMLX.Fast.rope_with_positions_fast_callback).
+    {"fast_rope_ids",
+     [](const auto &ops, const auto &attrs) {
+       const auto &pos = ops[1];
+       int B = pos.shape(0);
+       auto offsets = mlx::core::reshape(
+           mlx::core::slice(pos, to_shape({0, 0}), to_shape({B, 1}),
+                            to_shape({1, 1})),
+           to_shape({B}));
+       return mlx::core::fast::rope(
+           ops[0], static_cast<int>(attrs[0]), attrs[1] != 0,
+           attr_to_float(attrs[2]), attr_to_float(attrs[3]), offsets,
+           std::nullopt);
+     }},
+
+    // rope (precomputed freqs): operands = [a, position_ids, freqs];
+    // attrs = [dims, traditional, scale_bits].  base = nullopt (freqs supplied).
+    {"fast_rope_with_freqs",
+     [](const auto &ops, const auto &attrs) {
+       const auto &pos = ops[1];
+       int B = pos.shape(0);
+       auto offsets = mlx::core::reshape(
+           mlx::core::slice(pos, to_shape({0, 0}), to_shape({B, 1}),
+                            to_shape({1, 1})),
+           to_shape({B}));
+       return mlx::core::fast::rope(
+           ops[0], static_cast<int>(attrs[0]), attrs[1] != 0, std::nullopt,
+           attr_to_float(attrs[2]), offsets, ops[2]);
      }},
 };
 

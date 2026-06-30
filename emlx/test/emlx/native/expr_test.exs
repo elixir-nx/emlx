@@ -2468,6 +2468,301 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # ── Stage 10 — EMLX.Fast fused kernels (recognize-and-route) ──────────────
+  #
+  # EMLX.Fast.* functions surface as :runtime_call nodes; the lowerer recognizes
+  # the callback and emits a single fused opcode that calls mlx::core::fast::*
+  # inside the compiled graph (one NIF replay, no host hop). The fused kernels
+  # are Metal-only, so the E2E tests run on a GPU worker (device: :gpu) and are
+  # tagged :metal. Lowering-shape / fallback tests are pure (no GPU).
+
+  # Routing/IR-shape assertions are pure Elixir (no NIF) — run without GPU.
+  describe "Stage 10 — fused-kernel recognition (lowering)" do
+    @tag :stage10
+    test "rms_norm runtime_call lowers to a single :fast_rms_norm instruction" do
+      fun = fn x, w -> EMLX.Fast.rms_norm(x, w, 1.0e-5) end
+      expr = Nx.Defn.debug_expr_apply(fun, [Nx.template({2, 16}, :f32), Nx.template({16}, :f32)])
+      prog = Expr.lower(expr)
+
+      assert [{_, :fast_rms_norm, [_x, _w], [eps_bits]}] = prog.instructions
+      assert_in_delta(Expr.bits_to_f64(eps_bits), 1.0e-5, 1.0e-12)
+    end
+
+    @tag :stage10
+    test "f64_bits/1 ↔ bits_to_f64/1 round-trips through the int64 attr channel" do
+      for v <- [1.0e-6, 1.0e-5, 0.08838834764831845, 10_000.0, 1_000_000.0] do
+        assert Expr.bits_to_f64(Expr.f64_bits(v)) == v
+      end
+    end
+
+    @tag :stage10
+    test "swiglu / layer_norm / sdpa each lower to a single fused opcode" do
+      cases = [
+        {fn g, u -> EMLX.Fast.swiglu(g, u) end,
+         [Nx.template({2, 8}, :f32), Nx.template({2, 8}, :f32)], :fast_swiglu},
+        {fn x, w, b -> EMLX.Fast.layer_norm(x, w, b, 1.0e-5) end,
+         [Nx.template({2, 16}, :f32), Nx.template({16}, :f32), Nx.template({16}, :f32)],
+         :fast_layer_norm},
+        {fn x, w -> EMLX.Fast.layer_norm(x, w, 1.0e-5) end,
+         [Nx.template({2, 16}, :f32), Nx.template({16}, :f32)], :fast_layer_norm_no_bias},
+        {fn q, k, v -> EMLX.Fast.scaled_dot_product_attention_causal(q, k, v, 0.125) end,
+         [Nx.template({1, 2, 4, 8}, :f32), Nx.template({1, 2, 4, 8}, :f32),
+          Nx.template({1, 2, 4, 8}, :f32)], :fast_sdpa_causal}
+      ]
+
+      for {fun, templates, opcode} <- cases do
+        prog = Expr.lower(Nx.Defn.debug_expr_apply(fun, templates))
+        assert [{_, ^opcode, _operands, _attrs}] = prog.instructions
+      end
+    end
+
+    @tag :stage10
+    test "prefill RoPE (T>1) raises a fallback-eligible error" do
+      fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 64, false, 10_000.0, 1.0) end
+      expr = Nx.Defn.debug_expr_apply(fun, [Nx.template({2, 4, 2, 64}, :f32), Nx.template({2, 4}, :s32)])
+
+      assert_raise ArgumentError, ~r/^does not yet lower op :runtime_call.*rope_with_positions_callback/, fn ->
+        Expr.lower(expr)
+      end
+    end
+  end
+
+  describe "Stage 10 — fused kernels vs eager + primitive (Metal)" do
+    @describetag :metal
+    @describetag :stage10
+
+    test "rms_norm: fused replay matches eager and hand-written primitive" do
+      fun = fn x, w -> EMLX.Fast.rms_norm(x, w, 1.0e-5) end
+      x = Nx.iota({2, 4, 16}, type: :f32) |> Nx.divide(50) |> gpu_t()
+      w = Nx.broadcast(Nx.tensor(1.0, type: :f32), {16}) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(x, w)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(x, w)
+      assert_all_close(native, eager, tol: 1.0e-3)
+
+      prim_fun = fn x, w ->
+        rms = Nx.sqrt(Nx.add(Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true), 1.0e-5))
+        Nx.divide(x, rms) |> Nx.multiply(w)
+      end
+
+      prim = Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(x, w)
+      assert_all_close(native, prim, tol: 1.0e-3)
+    end
+
+    test "layer_norm (with bias) and no-bias: fused vs eager and primitive" do
+      x = Nx.iota({2, 16}, type: :f32) |> Nx.divide(30) |> gpu_t()
+      w = Nx.broadcast(Nx.tensor(1.2, type: :f32), {16}) |> gpu_t()
+      b = Nx.broadcast(Nx.tensor(0.3, type: :f32), {16}) |> gpu_t()
+
+      with_bias = fn x, w, b -> EMLX.Fast.layer_norm(x, w, b, 1.0e-5) end
+      native = Nx.Defn.jit(with_bias, compiler: EMLX, device: :gpu).(x, w, b)
+      eager = Nx.Defn.jit(with_bias, compiler: Nx.Defn.Evaluator).(x, w, b)
+      assert_all_close(native, eager, tol: 1.0e-3)
+
+      ln_prim = fn x, w, b ->
+        mean = Nx.mean(x, axes: [-1], keep_axes: true)
+        var = Nx.mean(Nx.pow(Nx.subtract(x, mean), 2), axes: [-1], keep_axes: true)
+        normed = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(var, 1.0e-5)))
+        Nx.add(Nx.multiply(normed, w), b)
+      end
+
+      prim = Nx.Defn.jit(ln_prim, compiler: EMLX, device: :gpu).(x, w, b)
+      assert_all_close(native, prim, tol: 1.0e-3)
+
+      no_bias = fn x, w -> EMLX.Fast.layer_norm(x, w, 1.0e-5) end
+      nb_native = Nx.Defn.jit(no_bias, compiler: EMLX, device: :gpu).(x, w)
+      nb_eager = Nx.Defn.jit(no_bias, compiler: Nx.Defn.Evaluator).(x, w)
+      assert_all_close(nb_native, nb_eager, tol: 1.0e-3)
+    end
+
+    test "swiglu: fused replay matches hand-written silu(gate)*up" do
+      fun = fn g, u -> EMLX.Fast.swiglu(g, u) end
+      gate = Nx.iota({2, 8}, type: :f32) |> Nx.divide(10) |> gpu_t()
+      up = Nx.iota({2, 8}, type: :f32) |> Nx.divide(7) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(gate, up)
+      prim = Nx.multiply(Nx.multiply(gate, Nx.sigmoid(gate)), up)
+      assert_all_close(native, prim, tol: 1.0e-4)
+    end
+
+    test "sdpa (no mask): fused replay matches eager and softmax(QKᵀ)·V primitive" do
+      scale = 0.125
+      fun = fn q, k, v -> EMLX.Fast.scaled_dot_product_attention(q, k, v, scale) end
+      q = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v)
+      assert_all_close(native, eager, tol: 1.0e-3)
+
+      prim_fun = fn q, k, v ->
+        scores = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
+        Nx.dot(Nx.exp(scores) |> normalize_rows(), [3], [0, 1], v, [2], [0, 1])
+      end
+
+      prim = Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(q, k, v)
+      assert_all_close(native, prim, tol: 1.0e-3)
+    end
+
+    test "sdpa (causal): fused replay matches eager and masked-softmax primitive" do
+      scale = 0.125
+      fun = fn q, k, v -> EMLX.Fast.scaled_dot_product_attention_causal(q, k, v, scale) end
+      q = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v)
+      assert_all_close(native, eager, tol: 1.0e-3)
+
+      # Primitive causal attention (T_q == T_kv): row i attends keys 0..i.
+      prim_fun = fn q, k, v ->
+        scores = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
+        rows = Nx.iota({4, 4}, axis: 0)
+        cols = Nx.iota({4, 4}, axis: 1)
+        bias = Nx.select(Nx.greater_equal(rows, cols), 0.0, -1.0e9) |> Nx.reshape({1, 1, 4, 4})
+        attn = normalize_rows(Nx.exp(Nx.add(scores, bias)))
+        Nx.dot(attn, [3], [0, 1], v, [2], [0, 1])
+      end
+
+      prim = Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(q, k, v)
+      assert_all_close(native, prim, tol: 1.0e-3)
+    end
+
+    test "sdpa (additive mask): fused replay matches eager and masked-softmax primitive" do
+      scale = 0.125
+      fun = fn q, k, v, m -> EMLX.Fast.scaled_dot_product_attention(q, k, v, scale, m) end
+      q = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      # Mask out the last key position for every query (non-trivial additive mask).
+      mask =
+        Nx.tensor([[[[0.0, 0.0, 0.0, -1.0e9]]]], type: :f32)
+        |> Nx.broadcast({1, 1, 4, 4})
+        |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, mask)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, mask)
+      assert_all_close(native, eager, tol: 1.0e-3)
+
+      prim_fun = fn q, k, v, m ->
+        scores = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
+        attn = normalize_rows(Nx.exp(Nx.add(scores, m)))
+        Nx.dot(attn, [3], [0, 1], v, [2], [0, 1])
+      end
+
+      prim = Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(q, k, v, mask)
+      assert_all_close(native, prim, tol: 1.0e-3)
+    end
+
+    test "sdpa (causal + key_mask, decode): fused replay matches eager (padded and all-present)" do
+      fun = fn q, k, v, km ->
+        EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q, k, v, 0.125, km)
+      end
+
+      q = Nx.iota({2, 2, 1, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({2, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({2, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+
+      # Padded batch: the eager NIF builds an additive mask; so does the opcode.
+      padded = Nx.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], type: :s32) |> gpu_t()
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, padded)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, padded)
+      assert_all_close(native, eager, tol: 1.0e-3)
+
+      # All keys present: the eager NIF host-fast-paths to pure "causal" (no mask
+      # alloc) while the compiled opcode always builds the additive mask. They
+      # must still agree — this exercises that branch divergence.
+      all_present = Nx.broadcast(Nx.tensor(1, type: :s32), {2, 4}) |> gpu_t()
+      native_ap = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, all_present)
+      eager_ap = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, all_present)
+      assert_all_close(native_ap, eager_ap, tol: 1.0e-3)
+    end
+
+    test "rope (scalar offset): fused replay matches eager" do
+      fun = fn a -> EMLX.Fast.rope(a, 64, false, 10_000.0, 1.0, 3) end
+      a = Nx.iota({1, 4, 1, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "rope_with_positions (decode T=1): fused replay matches eager" do
+      fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 64, false, 10_000.0, 1.0) end
+      a = Nx.iota({2, 1, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[3], [5]], type: :s32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "rope_with_freqs (decode T=1): fused replay matches eager" do
+      fun = fn a, pos, freqs -> EMLX.Fast.rope_with_freqs(a, pos, 64, false, 1.0, freqs) end
+      a = Nx.iota({2, 1, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[3], [5]], type: :s32) |> gpu_t()
+      freqs = Nx.iota({32}, type: :f32) |> Nx.add(1) |> Nx.divide(1000) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos, freqs)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "decode-shaped block: fused path improves over primitive replay" do
+      # A small attention+norm decode step: RMSNorm → causal SDPA → RMSNorm.
+      scale = 0.125
+
+      fused = fn q, k, v, w ->
+        a = EMLX.Fast.scaled_dot_product_attention_causal(q, k, v, scale)
+        flat = Nx.reshape(a, {1, 16})
+        EMLX.Fast.rms_norm(flat, w, 1.0e-5)
+      end
+
+      primitive = fn q, k, v, w ->
+        scores = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
+        a = Nx.dot(normalize_rows(Nx.exp(scores)), [3], [0, 1], v, [2], [0, 1])
+        flat = Nx.reshape(a, {1, 16})
+        rms = Nx.sqrt(Nx.add(Nx.mean(Nx.pow(flat, 2), axes: [-1], keep_axes: true), 1.0e-5))
+        Nx.divide(flat, rms) |> Nx.multiply(w)
+      end
+
+      q = Nx.iota({1, 2, 1, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      w = Nx.broadcast(Nx.tensor(1.0, type: :f32), {16}) |> gpu_t()
+
+      fused_c = Nx.Defn.jit(fused, compiler: EMLX, device: :gpu)
+      prim_c = Nx.Defn.jit(primitive, compiler: EMLX, device: :gpu)
+
+      # Correctness: same result within fused-kernel tolerance.
+      assert_all_close(fused_c.(q, k, v, w), prim_c.(q, k, v, w), tol: 1.0e-2)
+
+      # Warm both compiled graphs, then time the replay-only hot path.
+      for _ <- 1..5, do: fused_c.(q, k, v, w) |> Nx.backend_transfer()
+      for _ <- 1..5, do: prim_c.(q, k, v, w) |> Nx.backend_transfer()
+
+      fused_us = bench_us(200, fn -> fused_c.(q, k, v, w) |> Nx.backend_transfer() end)
+      prim_us = bench_us(200, fn -> prim_c.(q, k, v, w) |> Nx.backend_transfer() end)
+
+      IO.puts(
+        "\n[Stage 10] decode block: fused #{Float.round(fused_us, 2)} µs/call vs " <>
+          "primitive #{Float.round(prim_us, 2)} µs/call " <>
+          "(#{Float.round(prim_us / fused_us, 2)}×)"
+      )
+
+      assert fused_us <= prim_us * 1.1
+    end
+  end
+
+  # Softmax normalisation over the last axis (primitive SDPA oracle helper).
+  defp normalize_rows(t) do
+    Nx.divide(t, Nx.sum(t, axes: [-1], keep_axes: true))
+  end
+
+  defp gpu_t(t), do: Nx.backend_transfer(t, {EMLX.Backend, device: :gpu})
+
   defp unwrap!({:ok, v}), do: v
   defp unwrap!({:error, e}), do: raise(EMLX.NIFError, List.to_string(e))
 

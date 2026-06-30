@@ -1615,6 +1615,34 @@ defmodule EMLX.Native.Expr do
     }
   end
 
+  # ── runtime_call: route EMLX.Fast.* fused kernels to native opcodes ────────
+  #
+  # EMLX.Fast.* functions emit `Nx.runtime_call(out, container, opts, &cb/2)`.
+  # We recognize the callback (by module+name+arity) and emit a single fused
+  # opcode that calls the matching `mlx::core::fast::*` primitive inside the
+  # compiled graph — keeping the whole defn in one NIF replay. Operands come
+  # from the call's tensor container (in flatten order); float opts (eps/scale/
+  # base) ride the int-attr channel as IEEE-754 bits (see `f64_bits/1`).
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :runtime_call, args: [tensor_expr, fun, _out, opts]}},
+         state
+       ) do
+    {opcode, attrs} = fast_kernel_dispatch(fun, opts)
+
+    operand_refs =
+      [tensor_expr]
+      |> Composite.flatten_list()
+      |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
+
+    ref = make_ref()
+
+    %{
+      state
+      | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
@@ -1715,6 +1743,95 @@ defmodule EMLX.Native.Expr do
 
     result_ref = Map.fetch!(inner_state.node_to_ref, default_expr.data.id)
     %{inner_state | node_to_ref: Map.put(inner_state.node_to_ref, id, result_ref)}
+  end
+
+  # ── EMLX.Fast runtime_call recognition ─────────────────────────────────────
+  #
+  # Maps a recognized `&EMLX.Fast.*_callback/2` capture to a fused opcode and its
+  # integer-attr list. Only the single-NIF (decode / T=1) callbacks are routable
+  # to a single fused opcode; the per-token prefill RoPE callbacks are Elixir
+  # compositions over eager NIFs (not a single kernel) and raise here — deferred.
+  defp fast_kernel_dispatch(fun, opts) when is_function(fun, 2) do
+    info = Function.info(fun)
+    module = info[:module]
+    name = info[:name]
+
+    unless module == EMLX.Fast do
+      raise ArgumentError,
+            "does not yet lower op :runtime_call for #{inspect(module)}.#{name}/2 " <>
+              "(only EMLX.Fast.* fused kernels are recognized)"
+    end
+
+    case name do
+      :rms_norm_callback ->
+        {:fast_rms_norm, [f64_bits(opts[:eps])]}
+
+      :layer_norm_callback ->
+        {:fast_layer_norm, [f64_bits(opts[:eps])]}
+
+      :layer_norm_no_bias_callback ->
+        {:fast_layer_norm_no_bias, [f64_bits(opts[:eps])]}
+
+      :swiglu_callback ->
+        {:fast_swiglu, []}
+
+      :sdpa_callback ->
+        {:fast_sdpa, [f64_bits(opts[:scale])]}
+
+      :sdpa_masked_callback ->
+        {:fast_sdpa_masked, [f64_bits(opts[:scale])]}
+
+      :sdpa_causal_callback ->
+        {:fast_sdpa_causal, [f64_bits(opts[:scale])]}
+
+      :sdpa_causal_key_masked_callback ->
+        {:fast_sdpa_causal_key_masked, [f64_bits(opts[:scale]), opts[:kv_offset]]}
+
+      :rope_callback ->
+        {:fast_rope,
+         [
+           opts[:dims],
+           bool_int(opts[:traditional]),
+           f64_bits(opts[:base]),
+           f64_bits(opts[:scale]),
+           opts[:offset]
+         ]}
+
+      :rope_with_positions_fast_callback ->
+        {:fast_rope_ids,
+         [opts[:dims], bool_int(opts[:traditional]), f64_bits(opts[:base]), f64_bits(opts[:scale])]}
+
+      :rope_with_freqs_fast_callback ->
+        {:fast_rope_with_freqs,
+         [opts[:dims], bool_int(opts[:traditional]), f64_bits(opts[:scale])]}
+
+      name when name in [:rope_with_positions_callback, :rope_with_freqs_callback] ->
+        raise ArgumentError,
+              "does not yet lower op :runtime_call for EMLX.Fast.#{name}/2 " <>
+                "(per-token prefill RoPE path; only the T=1 decode fast path is lowered)"
+
+      other ->
+        raise ArgumentError, "does not yet lower op :runtime_call for EMLX.Fast.#{other}/2"
+    end
+  end
+
+  defp bool_int(true), do: 1
+  defp bool_int(false), do: 0
+
+  # Float opts ride the int-attr channel as their IEEE-754 double bits
+  # (reinterpreted as a signed int64). The C++ side reverses it via memcpy.
+  @doc false
+  @spec f64_bits(number()) :: integer()
+  def f64_bits(v) when is_number(v) do
+    <<bits::signed-64>> = <<v * 1.0::float-64>>
+    bits
+  end
+
+  @doc false
+  @spec bits_to_f64(integer()) :: float()
+  def bits_to_f64(bits) when is_integer(bits) do
+    <<v::float-64>> = <<bits::signed-64>>
+    v
   end
 
   # ── cond helper ───────────────────────────────────────────────────────────
@@ -2278,6 +2395,100 @@ defmodule EMLX.Native.Expr.Interpreter do
     [EMLX.Backend.to_nx(piv), EMLX.Backend.to_nx(l), EMLX.Backend.to_nx(u)]
   end
 
+  # EMLX.Fast fused kernels — call the same eager NIFs the C++ opcodes wrap so
+  # the interpreter (Layer B oracle) matches the C++ replay. Float attrs are the
+  # IEEE-754 bits encoded by the lowerer; decode via Expr.bits_to_f64/1.
+  defp dispatch(:fast_rms_norm, [x, weight], [eps_bits]) do
+    EMLX.fast_rms_norm(from_nx(x), from_nx(weight), Expr.bits_to_f64(eps_bits)) |> to_nx()
+  end
+
+  defp dispatch(:fast_layer_norm, [x, weight, bias], [eps_bits]) do
+    EMLX.fast_layer_norm(from_nx(x), from_nx(weight), from_nx(bias), Expr.bits_to_f64(eps_bits))
+    |> to_nx()
+  end
+
+  defp dispatch(:fast_layer_norm_no_bias, [x, weight], [eps_bits]) do
+    EMLX.fast_layer_norm_no_bias(from_nx(x), from_nx(weight), Expr.bits_to_f64(eps_bits)) |> to_nx()
+  end
+
+  defp dispatch(:fast_swiglu, [gate, up], []) do
+    EMLX.fast_swiglu(from_nx(gate), from_nx(up)) |> to_nx()
+  end
+
+  defp dispatch(:fast_sdpa, [q, k, v], [scale_bits]) do
+    EMLX.fast_sdpa(from_nx(q), from_nx(k), from_nx(v), Expr.bits_to_f64(scale_bits)) |> to_nx()
+  end
+
+  defp dispatch(:fast_sdpa_masked, [q, k, v, mask], [scale_bits]) do
+    EMLX.fast_sdpa_masked(from_nx(q), from_nx(k), from_nx(v), from_nx(mask), Expr.bits_to_f64(scale_bits))
+    |> to_nx()
+  end
+
+  defp dispatch(:fast_sdpa_causal, [q, k, v], [scale_bits]) do
+    EMLX.fast_sdpa_causal(from_nx(q), from_nx(k), from_nx(v), Expr.bits_to_f64(scale_bits)) |> to_nx()
+  end
+
+  defp dispatch(:fast_sdpa_causal_key_masked, [q, k, v, key_mask], [scale_bits, kv_offset]) do
+    EMLX.fast_sdpa_causal_key_masked(
+      from_nx(q),
+      from_nx(k),
+      from_nx(v),
+      Expr.bits_to_f64(scale_bits),
+      from_nx(key_mask),
+      kv_offset
+    )
+    |> to_nx()
+  end
+
+  defp dispatch(:fast_rope, [a], [dims, trad, base_bits, scale_bits, offset]) do
+    EMLX.fast_rope(
+      from_nx(a),
+      dims,
+      trad == 1,
+      Expr.bits_to_f64(base_bits),
+      Expr.bits_to_f64(scale_bits),
+      offset
+    )
+    |> to_nx()
+  end
+
+  defp dispatch(:fast_rope_ids, [a, position_ids], [dims, trad, base_bits, scale_bits]) do
+    offsets = column0(position_ids)
+
+    EMLX.fast_rope_ids(
+      from_nx(a),
+      dims,
+      trad == 1,
+      Expr.bits_to_f64(base_bits),
+      Expr.bits_to_f64(scale_bits),
+      from_nx(offsets)
+    )
+    |> to_nx()
+  end
+
+  defp dispatch(:fast_rope_with_freqs, [a, position_ids, freqs], [dims, trad, scale_bits]) do
+    offsets = column0(position_ids)
+
+    EMLX.fast_rope_with_freqs(
+      from_nx(a),
+      dims,
+      trad == 1,
+      Expr.bits_to_f64(scale_bits),
+      from_nx(offsets),
+      from_nx(freqs)
+    )
+    |> to_nx()
+  end
+
   defp dispatch(op, _args, _attrs),
     do: raise(ArgumentError, "Native.Expr.Interpreter: unknown op #{inspect(op)}")
+
+  defp from_nx(t), do: EMLX.Backend.from_nx(t)
+  defp to_nx(t), do: EMLX.Backend.to_nx(t)
+
+  # position_ids[:, 0] → {B}; matches EMLX.Fast.rope_with_positions_fast_callback.
+  defp column0(position_ids) do
+    b = elem(Nx.shape(position_ids), 0)
+    position_ids[[.., 0]] |> Nx.reshape({b})
+  end
 end
