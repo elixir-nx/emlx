@@ -1295,6 +1295,73 @@ defmodule EMLX.Native.Expr do
     expand_block_via_default(id, in_args, default_expr, state)
   end
 
+  # ── cond: lower as nested :select ops ────────────────────────────────────
+  #
+  # All cond predicates and bodies are in the parent scope: Nx's apply_args
+  # for :cond traverses everything (no :scope vs :all distinction), so every
+  # pred and body tensor is already in node_to_ref when we reach the :cond
+  # node in the topo order.
+  #
+  # Strategy: for each output element index i, right-fold the clauses:
+  #   select(pred1, body1_i, select(pred2, body2_i, ..., select(predN, bodyN_i, last_i)))
+  #
+  # Single-tensor output  → store one ref in node_to_ref.
+  # Tuple output (type {:tuple, n}) → store a list of n refs in node_to_ref.
+  # :elem nodes that follow pick the correct element from that list.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :cond, args: [clauses, last]}},
+         state
+       ) do
+    last_refs = flat_refs(last, state)
+
+    clause_ref_pairs =
+      Enum.map(clauses, fn {pred, body} ->
+        {Map.fetch!(state.node_to_ref, pred.data.id), flat_refs(body, state)}
+      end)
+
+    n = length(last_refs)
+
+    {per_elem_refs, state} =
+      Enum.reduce(0..(n - 1), {[], state}, fn i, {elem_results, st} ->
+        last_ref_i = Enum.at(last_refs, i)
+
+        # Right-fold: most-priority clause wraps the least-priority accumulator.
+        {result_ref, st} =
+          Enum.reduce(Enum.reverse(clause_ref_pairs), {last_ref_i, st}, fn {pred_ref,
+                                                                             body_refs},
+                                                                            {acc_ref, st2} ->
+            body_ref_i = Enum.at(body_refs, i)
+            ref = make_ref()
+            st2 = %{st2 | instructions: [{ref, :select, [pred_ref, body_ref_i, acc_ref], []} | st2.instructions]}
+            {ref, st2}
+          end)
+
+        {elem_results ++ [result_ref], st}
+      end)
+
+    node_val = if n == 1, do: hd(per_elem_refs), else: per_elem_refs
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, node_val)}
+  end
+
+  # ── elem: extract element from a tuple-output op (cond/while) ─────────────
+  #
+  # Tuple-output ops (e.g. a :cond or :while with tuple carry) store a LIST of
+  # refs in node_to_ref. :elem picks the pos-th element from that list.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :elem, args: [tuple_node, pos]}},
+         state
+       ) do
+    case Map.fetch!(state.node_to_ref, tuple_node.data.id) do
+      refs when is_list(refs) ->
+        elem_ref = Enum.at(refs, pos)
+        %{state | node_to_ref: Map.put(state.node_to_ref, id, elem_ref)}
+
+      single_ref when pos == 0 ->
+        # Degenerate single-element tuple — shouldn't normally appear.
+        %{state | node_to_ref: Map.put(state.node_to_ref, id, single_ref)}
+    end
+  end
+
   # ── creation ops ─────────────────────────────────────────────────────────
 
   # iota: no tensor operands; all info in iattrs.
@@ -1436,6 +1503,15 @@ defmodule EMLX.Native.Expr do
 
     result_ref = Map.fetch!(inner_state.node_to_ref, default_expr.data.id)
     %{inner_state | node_to_ref: Map.put(inner_state.node_to_ref, id, result_ref)}
+  end
+
+  # ── cond helper ───────────────────────────────────────────────────────────
+
+  # Flatten a composite (single tensor or Elixir tuple of tensors) to a list
+  # of refs looked up in node_to_ref, one per leaf tensor.
+  defp flat_refs(composite, state) do
+    Composite.flatten_list([composite])
+    |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
   end
 
   # ── binary lowering helpers ────────────────────────────────────────────────

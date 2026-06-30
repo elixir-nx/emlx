@@ -30,19 +30,29 @@ Source of truth:
 | `constant` | `(number)` | materialize → `{:const, i}` | [x] |
 | `tensor` | `(tensor)` | bake weight → `{:capture, i}` | [x] |
 | `metadata` | `(expr, meta)` | passthrough to inner expr | [x] |
-| `elem` | `(tuple, pos)` | select sub-result of a multi-output instr | [ ] |
+| `elem` | `(tuple, pos)` | index into list of refs stored for tuple-output op | [x] |
 | `fun` | `(params, expr, mfa)` | inline at call site / child program | [ ] |
-| `cond` | `(clauses, last)` | child programs + select, or native cond | [ ] |
-| `while` | `(initial, arg, pred, body)` | child programs (cond+body); host loop | [ ] |
+| `cond` | `(clauses, last)` | right-folded nested `:select` ops (all branches in parent scope) | [x] |
+| `while` | `(initial, arg, pred, body)` | `Nx.Defn.Graph.split` on `:while`; cond/body recompiled via `compiler: EMLX`; Elixir host loop | [x] |
 | `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [~] |
 | `optional` | `(name, args, default)` | lower default expr, or route to native | [ ] |
 | `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] |
 | `runtime_call` | `(expr, cb, out, opts)` | unsupported → raises | [ ] |
 
 Notes:
-- `cond`/`while` introduce sub-scopes — Layer A (`EMLX.Defn.Tree.post_order/1`)
-  treats them as opaque single nodes; the lowerer recurses into `args` and
-  topo-sorts each inner scope as a child program.
+- `cond`: all predicate and body tensors are in the **parent scope** (`apply_args`
+  for `:cond` traverses everything without scope distinction). By the time the
+  `:cond` node is expanded, every ref is already in `node_to_ref`. Lowered as
+  right-folded `:select` ops — no child programs, no C++ changes.
+- `while`: handled structurally, not as an IR instruction. `build_eval_fn/3`
+  splits the expression on its `:while` nodes (`Nx.Defn.Graph.split`, `:both`)
+  and replays the chain with `Nx.Defn.Graph.run(…, compiler: EMLX)`, so each
+  stage re-enters this compiler. An isolated `while` stage (the base case: its
+  `initial` carry is exactly the stage parameters) runs a host loop whose
+  condition/body are recompiled via `Nx.Defn.jit(compiler: EMLX)` — recursing
+  for nested whiles. Stage inputs are reordered into carry-parameter order
+  before binding. Non-tail and nested `while`s (and `while`-as-input) compile
+  natively without an Evaluator fallback.
 - `block` is the lowering-control lever (PLAN.md §6): recognize the
   `Nx.Block.*` struct for a native/fused path, else lower `default_expr`.
 - `token`/`runtime_call`/hooks imply host side effects → not lowerable to a
@@ -96,7 +106,7 @@ logical_and, logical_or, logical_xor.
 - [x] sum, product, all, any
 - [x] reduce_max, reduce_min
 - [x] argmax, argmin
-- [~] reduce (custom fun — deferred; raises "does not yet lower op :reduce"; requires Stage 08 child programs)
+- [~] reduce (custom fun — deferred; raises "does not yet lower op :reduce"; requires custom-fun lowering (future stage))
 - [x] dot
 - [x] conv
 
@@ -118,7 +128,7 @@ logical_and, logical_or, logical_xor.
 - [x] window_sum/max/min/product
 - [x] window_scatter_max/min
 - [x] cumulative_sum/product/max/min
-- [~] window_reduce (custom fun — deferred; raises, requires Stage 08 child programs)
+- [~] window_reduce (custom fun — deferred; raises, requires custom-fun lowering (future stage))
 
 ## H. FFT
 

@@ -1050,7 +1050,7 @@ defmodule EMLX.NxTest do
 
       assert_all_close(
         result,
-        Nx.tensor([
+        Nx.tensor([[
           [
             [15.0, 15.0],
             [51.0, 51.0],
@@ -1066,7 +1066,7 @@ defmodule EMLX.NxTest do
             [267.0, 267.0],
             [303.0, 303.0]
           ]
-        ])
+        ]])
       )
     end
 
@@ -1080,7 +1080,7 @@ defmodule EMLX.NxTest do
 
       assert_equal(
         result,
-        Nx.tensor([[0, 0, -1, 1, 0, -2], [-3, 0, 4, -4, 0, 5]])
+        Nx.tensor([[[[[0, 0, -1, 1, 0, -2], [-3, 0, 4, -4, 0, 5]]]]])
       )
     end
   end

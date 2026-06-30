@@ -1361,33 +1361,8 @@ defmodule EMLX do
   # accidentally swallow unrelated errors from the outer __compile__ body.
   defp try_native_compile(vars, fun, device) do
     output_expr = fun.(vars)
-    program = EMLX.Native.Expr.lower(output_expr)
-
-    # Resolve the compile-time worker for compile_program.
     {worker, effective_device} = resolve_worker(device)
-
-    {num_inputs, capture_nif_refs, constant_values, constant_types, opcodes, operands, iattrs,
-     wire_outputs} =
-      EMLX.Native.Expr.to_wire(program)
-
-    job_ref =
-      EMLX.NIF.compile_program(
-        worker,
-        num_inputs,
-        capture_nif_refs,
-        constant_values,
-        constant_types,
-        opcodes,
-        operands,
-        iattrs,
-        wire_outputs
-      )
-      |> unwrap!()
-
-    program_resource = await_worker(job_ref)
-
-    eval_fn = build_native_eval_fn(program_resource, output_expr, effective_device)
-
+    eval_fn = build_eval_fn(output_expr, worker, effective_device)
     {:ok, eval_fn}
   rescue
     e in ArgumentError ->
@@ -1398,7 +1373,99 @@ defmodule EMLX do
       end
   end
 
-  # Builds the per-call eval closure for the native path.
+  # Routes a traced expression to the right eval-closure builder. `while` is
+  # handled by structural splitting (`Nx.Defn.Graph`) rather than as an IR
+  # instruction, so the loop runs from Elixir while every straight-line segment
+  # compiles to a single-NIF native program:
+  #
+  #   * no `while` in the parent scope        -> one flat native program.
+  #   * a bare tail `while` (the base case)   -> host-driven loop; the condition
+  #     and body are compiled by re-entering this compiler (so a nested `while`
+  #     in the body recurses through the same path).
+  #   * a `while` with surrounding work       -> `Nx.Defn.Graph.split/2` on the
+  #     `while` nodes, replayed by `Nx.Defn.Graph.run/3` with `compiler: EMLX`;
+  #     each stage re-enters this compiler (flat stages compile flat, isolated
+  #     `while` stages hit the base case above).
+  defp build_eval_fn(output_expr, worker, effective_device) do
+    cond do
+      bare_while?(output_expr) ->
+        build_while_base_eval_fn(output_expr, effective_device)
+
+      not contains_while?(output_expr) ->
+        program = EMLX.Native.Expr.lower(output_expr)
+        resource = compile_native_program(worker, effective_device, program)
+        build_native_eval_fn(resource, output_expr, effective_device)
+
+      true ->
+        build_while_chain_eval_fn(output_expr, effective_device)
+    end
+  end
+
+  # True when the parent scope contains a `while` node. `post_order/1` treats
+  # `while` as an opaque leaf, so this only sees parent-scope loops (nested
+  # loops inside a body surface when that body is compiled).
+  defp contains_while?(output_expr) do
+    output_expr |> EMLX.Defn.Tree.post_order() |> Enum.any?(&(&1.data.op == :while))
+  end
+
+  # Compiles an `EMLX.Native.Expr` program to a NIF resource on `worker`.
+  # Captured host tensors are copied onto `device` first: a `defn`-embedded
+  # constant tensor (e.g. an RNG algorithm constant) is traced with the default
+  # backend, so it must be moved to EMLX before `to_wire` can extract its ref.
+  defp compile_native_program(worker, device, %EMLX.Native.Expr{} = program) do
+    program = ensure_emlx_captures(program, device)
+
+    {num_inputs, capture_nif_refs, constant_values, constant_types, opcodes, operands, iattrs,
+     wire_outputs} = EMLX.Native.Expr.to_wire(program)
+
+    EMLX.NIF.compile_program(
+      worker,
+      num_inputs,
+      capture_nif_refs,
+      constant_values,
+      constant_types,
+      opcodes,
+      operands,
+      iattrs,
+      wire_outputs
+    )
+    |> unwrap!()
+    |> await_worker()
+  end
+
+  # Ensures every captured tensor is EMLX-backed on `device` (copies any that
+  # were traced with another backend), so `to_wire` can read a NIF ref per
+  # capture.
+  defp ensure_emlx_captures(%EMLX.Native.Expr{captures: captures} = program, device) do
+    captures =
+      Enum.map(captures, fn
+        {ref, %Nx.Tensor{data: %EMLX.Backend{}} = tensor} ->
+          {ref, tensor}
+
+        {ref, %Nx.Tensor{} = tensor} ->
+          {ref, Nx.backend_copy(tensor, {EMLX.Backend, device: device})}
+      end)
+
+    %{program | captures: captures}
+  end
+
+  # Materialises defn input lazy refs to NIF resource refs on `dev`.
+  defp materialise_input_refs(params, dev) do
+    Enum.map(params, fn lazy ->
+      case lazy.() do
+        %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, ref}}} ->
+          ref
+
+        %Nx.Tensor{} = t ->
+          %{data: %EMLX.Backend{ref: {_dev, ref}}} =
+            Nx.backend_copy(t, {EMLX.Backend, device: dev})
+
+          ref
+      end
+    end)
+  end
+
+  # Builds the per-call eval closure for the flat (no-while) native path.
   # `output_expr` is the traced expression (used as a type/shape template for
   # reconstructing output tensors after the NIF returns raw resource refs).
   defp build_native_eval_fn(program_resource, output_expr, effective_device) do
@@ -1406,22 +1473,7 @@ defmodule EMLX do
 
     fn [params] ->
       {worker, dev} = resolve_worker(effective_device)
-
-      # Each element of `params` is a zero-arity function (lazy container).
-      # Call it to materialise the actual %Nx.Tensor{} with EMLX.Backend data.
-      input_refs =
-        Enum.map(params, fn lazy ->
-          case lazy.() do
-            %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, ref}}} ->
-              ref
-
-            %Nx.Tensor{} = t ->
-              %{data: %EMLX.Backend{ref: {_dev, ref}}} =
-                Nx.backend_copy(t, {EMLX.Backend, device: dev})
-
-              ref
-          end
-        end)
+      input_refs = materialise_input_refs(params, dev)
 
       job_ref =
         EMLX.NIF.eval_program(worker, program_resource, input_refs)
@@ -1439,6 +1491,166 @@ defmodule EMLX do
         end)
 
       [output_container]
+    end
+  end
+
+  # Builds the eval closure for a `while` surrounded by other computation. The
+  # expression is split on its `while` nodes and replayed by `Nx.Defn.Graph`:
+  # `compiler: EMLX` makes every stage re-enter this compiler, so straight-line
+  # stages compile flat and isolated `while` stages hit the base case below.
+  # `device:` keeps stage compilation on the same device; the command queue (if
+  # any) is propagated through the process binding set by the outer wrapper.
+  defp build_while_chain_eval_fn(output_expr, effective_device) do
+    stages = Nx.Defn.Graph.split(output_expr, &split_on_while/1)
+
+    fn [params] ->
+      {_worker, dev} = resolve_worker(effective_device)
+      inputs = Enum.map(params, &materialise_tensor(&1, dev))
+      result = Nx.Defn.Graph.run(stages, inputs, compiler: __MODULE__, device: effective_device)
+      [result]
+    end
+  end
+
+  defp split_on_while(%Nx.Tensor{data: %Nx.Defn.Expr{op: :while}}), do: :both
+  defp split_on_while(%Nx.Tensor{}), do: :none
+
+  # Builds the eval closure for the base case: a bare tail `while` whose initial
+  # carry is exactly the stage inputs (every output leaf is the `while` node or
+  # an `:elem` of it). The condition and body are compiled by re-entering this
+  # compiler via `Nx.Defn.jit/2`, so a nested `while` in the body recurses
+  # through the same splitting machinery. The loop itself is driven host-side.
+  defp build_while_base_eval_fn(output_expr, effective_device) do
+    while_node = find_while_node(output_expr)
+    [initial, _arg, cond_expr, body_expr] = while_node.data.args
+
+    jit_opts = [compiler: __MODULE__, device: effective_device]
+    cond_fn = Nx.Defn.jit(fn _ -> cond_expr end, jit_opts)
+    body_fn = Nx.Defn.jit(fn _ -> body_expr end, jit_opts)
+
+    # The stage inputs arrive in stage-argument order, which need not match the
+    # carry (sub-scope parameter) order: each flattened `initial` leaf is the
+    # parameter whose position picks the stage input feeding that carry slot.
+    # Reorder inputs into carry order so the condition/body parameters bind to
+    # the right tensors.
+    initial_positions =
+      [initial]
+      |> Nx.Defn.Composite.flatten_list()
+      |> Enum.map(fn %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos end)
+
+    while_id = while_node.data.id
+    output_flat = Nx.Defn.Composite.flatten_list([output_expr])
+    carry_indices = Enum.map(output_flat, &while_output_index(&1, while_id))
+    output_template = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
+
+    fn [params] ->
+      {_worker, dev} = resolve_worker(effective_device)
+      inputs = Enum.map(params, &materialise_tensor(&1, dev))
+      carry = Enum.map(initial_positions, &Enum.at(inputs, &1))
+      final_carry = run_while_loop(carry, cond_fn, body_fn)
+
+      output_tensors = Enum.map(carry_indices, &Enum.at(final_carry, &1))
+
+      {output_container, []} =
+        Nx.Defn.Composite.traverse(output_template, output_tensors, fn _leaf, [t | rest] ->
+          {t, rest}
+        end)
+
+      [output_container]
+    end
+  end
+
+  # Host-driven while loop. `carry` is the flat list of carry tensors; it is
+  # passed to the compiled condition/body as a single tuple argument (mirroring
+  # how `Nx.Defn.Graph.run` invokes a stage), which jit re-flattens to match the
+  # carry parameters of the sub-scope. The body result is flattened back to a
+  # flat list so a nested-container carry stays aligned with the leaf indices.
+  defp run_while_loop(carry, cond_fn, body_fn) do
+    if Nx.to_number(cond_fn.(List.to_tuple(carry))) == 0 do
+      carry
+    else
+      new_carry = Nx.Defn.Composite.flatten_list([body_fn.(List.to_tuple(carry))])
+      run_while_loop(new_carry, cond_fn, body_fn)
+    end
+  end
+
+  defp find_while_node(output_expr) do
+    output_expr
+    |> EMLX.Defn.Tree.post_order()
+    |> Enum.find(&(&1.data.op == :while))
+  end
+
+  # True for the base case: the output projects exactly one `while` (each leaf
+  # is the `while` node or an `:elem` of it) and that `while`'s initial carry is
+  # made entirely of parameters — i.e. all pre-loop work has already been split
+  # into an earlier stage, so the carry is the stage input as-is.
+  defp bare_while?(output_expr) do
+    leaves = Nx.Defn.Composite.flatten_list([output_expr])
+
+    while_ids =
+      leaves
+      |> Enum.flat_map(fn
+        %Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}} ->
+          [id]
+
+        %Nx.Tensor{
+          data: %Nx.Defn.Expr{op: :elem, args: [%Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}}, _]}
+        } ->
+          [id]
+
+        _ ->
+          []
+      end)
+      |> Enum.uniq()
+
+    case while_ids do
+      [wid] ->
+        all_project =
+          Enum.all?(leaves, fn
+            %Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: ^wid}} ->
+              true
+
+            %Nx.Tensor{
+              data: %Nx.Defn.Expr{op: :elem, args: [%Nx.Tensor{data: %Nx.Defn.Expr{id: ^wid}}, _]}
+            } ->
+              true
+
+            _ ->
+              false
+          end)
+
+        all_project and while_initial_all_params?(find_while_node(output_expr))
+
+      _ ->
+        false
+    end
+  end
+
+  defp while_initial_all_params?(%Nx.Tensor{data: %Nx.Defn.Expr{args: [initial | _]}}) do
+    [initial]
+    |> Nx.Defn.Composite.flatten_list()
+    |> Enum.all?(&match?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter}}, &1))
+  end
+
+  # Maps a flat output leaf to the carry index it projects from `while_id`.
+  defp while_output_index(%Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}}, while_id)
+       when id == while_id,
+       do: 0
+
+  defp while_output_index(
+         %Nx.Tensor{
+           data: %Nx.Defn.Expr{op: :elem, args: [%Nx.Tensor{data: %Nx.Defn.Expr{id: id}}, i]}
+         },
+         while_id
+       )
+       when id == while_id,
+       do: i
+
+  # Materialises a defn input lazy ref to a concrete EMLX-backed tensor on `dev`
+  # (for use as a `Nx.Defn.Graph.run` / jitted-stage argument).
+  defp materialise_tensor(lazy, dev) do
+    case lazy.() do
+      %Nx.Tensor{data: %EMLX.Backend{}} = tensor -> tensor
+      %Nx.Tensor{} = tensor -> Nx.backend_copy(tensor, {EMLX.Backend, device: dev})
     end
   end
 

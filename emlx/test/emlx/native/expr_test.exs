@@ -2170,6 +2170,105 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # ── Stage 08 defn helpers ─────────────────────────────────────────────────
+
+  # cond: simple two-branch predicate on a scalar.
+  defn cond_two_branch(x) do
+    cond do
+      Nx.less(x, 0) -> Nx.negate(x)
+      true -> x
+    end
+  end
+
+  # cond: three branches, each returning a different transformed value.
+  defn cond_three_branch(x) do
+    cond do
+      Nx.less(x, -1) -> Nx.multiply(x, -2)
+      Nx.less(x, 1) -> Nx.multiply(x, 3)
+      true -> Nx.multiply(x, 4)
+    end
+  end
+
+  # while: count up to 10 from a given start.
+  defn count_to_10(x), do: while(x, Nx.less(x, 10), do: Nx.add(x, 1))
+
+  # while: carried state with two tensors.
+  defn while_two_carry(a, b) do
+    while {a, b}, Nx.less(a, 5) do
+      {Nx.add(a, 1), Nx.multiply(b, 2)}
+    end
+  end
+
+  # ── Stage 08 — cond ──────────────────────────────────────────────────────
+
+  describe "Stage 08 — cond" do
+    @tag :stage08
+    test "cond two-branch: native matches evaluator (negative input)" do
+      x = Nx.tensor(-3.0, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&cond_two_branch/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&cond_two_branch/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage08
+    test "cond two-branch: native matches evaluator (positive input)" do
+      x = Nx.tensor(3.0, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&cond_two_branch/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&cond_two_branch/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage08
+    test "cond three-branch: all three branches produce correct results" do
+      for {input, _branch} <- [{-2.0, :first}, {0.0, :second}, {5.0, :third}] do
+        x = Nx.tensor(input, backend: EMLX.Backend)
+        native = Nx.Defn.jit(&cond_three_branch/1, compiler: EMLX).(x)
+        eager = Nx.Defn.jit(&cond_three_branch/1, compiler: Nx.Defn.Evaluator).(x)
+        assert_close(native, eager)
+      end
+    end
+  end
+
+  # ── Stage 08 — while ─────────────────────────────────────────────────────
+
+  describe "Stage 08 — while" do
+    @tag :stage08
+    test "while: count from 0 to 10" do
+      x = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&count_to_10/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&count_to_10/1, compiler: Nx.Defn.Evaluator).(x)
+      assert Nx.to_number(native) == Nx.to_number(eager)
+    end
+
+    @tag :stage08
+    test "while: trip count depends on runtime value (count from 5)" do
+      x = Nx.tensor(5, type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&count_to_10/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&count_to_10/1, compiler: Nx.Defn.Evaluator).(x)
+      assert Nx.to_number(native) == Nx.to_number(eager)
+    end
+
+    @tag :stage08
+    test "while: already past condition — zero iterations" do
+      x = Nx.tensor(15, type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&count_to_10/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&count_to_10/1, compiler: Nx.Defn.Evaluator).(x)
+      assert Nx.to_number(native) == Nx.to_number(eager)
+    end
+
+    @tag :stage08
+    test "while: two-element tuple carry" do
+      a = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      b = Nx.tensor(1, type: :s32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&while_two_carry/2, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(&while_two_carry/2, compiler: Nx.Defn.Evaluator).(a, b)
+      {na, nb} = native
+      {ea, eb} = eager
+      assert Nx.to_number(na) == Nx.to_number(ea)
+      assert Nx.to_number(nb) == Nx.to_number(eb)
+    end
+  end
+
   defp unwrap!({:ok, v}), do: v
   defp unwrap!({:error, e}), do: raise(EMLX.NIFError, List.to_string(e))
 

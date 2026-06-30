@@ -42,8 +42,11 @@ control is structural, via `Nx.Defn.Block` (see "Lowering control" below).
 4. **Module home**: `emlx/lib/emlx/defn/`.
 5. **`post_order/1` emits the same `%Nx.Tensor{}` structs it received**,
    reordered into dependency-first sequence (pure reordering of one scope).
-6. **`while`/`fun`/`cond` sub-scopes are part of the IR** as nested child
-   programs (subprograms).
+6. **Control-flow sub-scopes are resolved in Elixir, not the IR** (revised in
+   Stage 08): `cond` lowers inline as `:select` ops, and `while` is split out
+   with `Nx.Defn.Graph` and replayed by recursively re-entering this compiler
+   (`Graph.run(compiler: EMLX)`), with the loop driven host-side. `fun` is
+   still TBD.
 
 ## Why feasible for EMLX specifically
 
@@ -110,7 +113,7 @@ each independently shippable. Run with
 - [x] [`05-indexing-selection`](05-indexing-selection.md) — select, clip, slice, put_slice, gather, take, take_along_axis, indexed_add/put.
 - [x] [`06-sort-window-cumulative-fft`](06-sort-window-cumulative-fft.md) — sort/argsort, window reductions, cumulative, fft family. **`expand_block_via_default` fallback enables rfft/irfft and future unrecognized blocks.**
 - [x] [`07-creation-rng`](07-creation-rng.md) — iota, eye, `Nx.Random` primitives (via threefry2x32 decomposition).
-- [ ] [`08-control-flow`](08-control-flow.md) — `cond`, `while` via child programs.
+- [x] [`08-control-flow`](08-control-flow.md) — `cond`, `while`. **`cond` = inline `:select` ops; `while` = `Nx.Defn.Graph.split` + recursive `Graph.run(compiler: EMLX)`, Elixir host loop for each isolated while. Non-tail/nested/while-as-input compile natively.**
 - [ ] [`09-blocks-linalg`](09-blocks-linalg.md) — `Nx.Block.LinAlg.*` recognize-struct path + `default_expr` descent.
 - [ ] [`10-fast-kernels`](10-fast-kernels.md) — pattern-route to `EMLX.Fast`.
 

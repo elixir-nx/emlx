@@ -1,6 +1,6 @@
 # Stage 08 — Control flow (`cond`, `while`)
 
-Status: not started
+Status: complete
 
 ## Why this stage exists
 
@@ -40,9 +40,20 @@ autoregressive decode loops (`Bumblebee.Text.generation`-style `defn while`).
 
 ## Results
 
+The implementation deviates from the original procedure: rather than teaching
+the NIF about child programs, control flow is resolved entirely in Elixir.
+`cond` lowers inline; `while` is handled structurally via `Nx.Defn.Graph` so the
+loop runs host-side while every straight-line segment stays a single-NIF
+program. The compiler (`EMLX.build_eval_fn/3`) is recursive and re-enters itself
+through `Nx.Defn.jit`/`Nx.Defn.Graph.run` (with `compiler: EMLX`), which makes
+non-tail and nested `while`s — including `while`-as-input to later computation —
+compile natively without falling back to the Evaluator.
+
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
-| child-scope mechanism finalized | | |
-| cond lowered | | |
-| while lowered (host loop) | | |
-| child-program lifetime correct | | |
+| child-scope mechanism finalized | ✓ | No NIF child programs. `cond` stays in the parent scope (lowered inline). `while` sub-scopes are isolated by `Nx.Defn.Graph.split/2` (split `:both` on `:while`) and each stage is recompiled by re-entering this compiler. |
+| cond lowered | ✓ | Right-folded nested `:select` ops. All branches already in `node_to_ref` by the time the `:cond` node is processed. Tuple-output cond stores a list of refs; `:elem` picks from that list. |
+| while lowered (Graph split + host loop) | ✓ | `build_eval_fn/3` routes: no while → flat program; bare tail while (initial carry == params) → host loop; while + surrounding work → `Graph.split` replayed by `Graph.run(…, compiler: EMLX)`. The base case compiles the condition/body via `Nx.Defn.jit` (recursing for nested whiles) and drives iterations from Elixir (`run_while_loop/3`). |
+| input ordering | ✓ | Stage inputs arrive in stage-argument order, which need not match the carry/sub-scope parameter order; `build_while_base_eval_fn` reorders inputs by each `initial` parameter's position before binding the condition/body. Required for nested whiles (e.g. threefry). |
+| capture backends | ✓ | `defn`-embedded constant tensors (e.g. RNG algorithm constants) are traced on the default backend; `compile_native_program/3` copies any non-EMLX capture onto the device before `to_wire`. |
+| validated against | ✓ | User `cond`/`while` equivalence tests plus Nx threefry RNG (`Nx.Random.uniform`/`normal`) which is a nested `while`-as-input — now native, previously Evaluator fallback. No C++ changes required. |
