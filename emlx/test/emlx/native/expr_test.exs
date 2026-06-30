@@ -156,12 +156,10 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
-      # custom-fun window_reduce is not yet lowered (deferred to Stage 13); use as sentinel.
+      # interior :pad is not lowered; use as sentinel for the catch-all message.
       expr =
         Nx.Defn.debug_expr_apply(
-          fn t ->
-            Nx.window_reduce(t, 0, {2}, [padding: :valid], fn x, acc -> Nx.add(x, acc) end)
-          end,
+          fn t -> Nx.pad(t, 0.0, [{0, 0, 1}]) end,
           [Nx.template({3}, :f32)]
         )
 
@@ -1192,6 +1190,93 @@ defmodule EMLX.Native.ExprTest do
       x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
       acc = Nx.tensor(10.0, backend: EMLX.Backend)
       check_reduce_equiv(fn t, a -> Nx.reduce(t, a, fn x, y -> Nx.add(x, y) end) end, [x, acc])
+    end
+
+    @tag :stage13
+    test "dtype-changing reduce (s32 input, f32 acc → f32)" do
+      x = Nx.tensor([1, 2, 3, 4], type: :s32, backend: EMLX.Backend)
+      check_reduce_equiv(fn t -> Nx.reduce(t, 0.0, fn a, b -> Nx.add(a, b) end) end, [x])
+    end
+  end
+
+  describe "Stage 13 — custom-fun window_reduce (static unroll)" do
+    @tag :stage13
+    test "1d window sum reducer (valid, default strides)" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
+      check_reduce_equiv(fn t -> Nx.window_reduce(t, 0.0, {2}, fn a, b -> Nx.add(a, b) end) end, [x])
+    end
+
+    @tag :stage13
+    test "1d window max reducer with :same padding" do
+      x = Nx.tensor([1.0, 5.0, 2.0, 4.0, 3.0], backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t -> Nx.window_reduce(t, -100.0, {3}, [padding: :same], fn a, b -> Nx.max(a, b) end) end,
+        [x]
+      )
+    end
+
+    @tag :stage13
+    test "2d window sum with strides" do
+      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t -> Nx.window_reduce(t, 0.0, {2, 2}, [strides: [2, 2]], fn a, b -> Nx.add(a, b) end) end,
+        [x]
+      )
+    end
+
+    @tag :stage13
+    test "1d window with dilations" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t ->
+          Nx.window_reduce(t, 0.0, {2}, [window_dilations: [2]], fn a, b -> Nx.add(a, b) end)
+        end,
+        [x]
+      )
+    end
+
+    @tag :stage13
+    test "non-commutative affine reducer (validates window fold order)" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t -> Nx.window_reduce(t, 0.0, {3}, fn a, b -> Nx.add(Nx.multiply(a, 2.0), b) end) end,
+        [x]
+      )
+    end
+
+    @tag :stage13
+    test "explicit padding config (asymmetric lo/hi)" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t ->
+          Nx.window_reduce(t, 0.0, {2}, [padding: [{1, 0}]], fn a, b -> Nx.add(a, b) end)
+        end,
+        [x]
+      )
+    end
+
+    @tag :stage13
+    test "integer window_reduce (s32 in/out)" do
+      # window_reduce output dtype tracks the input tensor (not the acc), so the
+      # dtype coverage here is the integer path; acc casts to the s32 out type.
+      x = Nx.tensor([1, 2, 3, 4, 5], type: :s32, backend: EMLX.Backend)
+      check_reduce_equiv(fn t -> Nx.window_reduce(t, 0, {2}, fn a, b -> Nx.add(a, b) end) end, [x])
+    end
+
+    @tag :stage13
+    test "runtime accumulator input" do
+      x = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
+      acc = Nx.tensor(0.5, backend: EMLX.Backend)
+
+      check_reduce_equiv(
+        fn t, a -> Nx.window_reduce(t, a, {2}, fn x, y -> Nx.add(x, y) end) end,
+        [x, acc]
+      )
     end
   end
 

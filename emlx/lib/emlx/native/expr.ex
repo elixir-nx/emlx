@@ -63,8 +63,9 @@ defmodule EMLX.Native.Expr do
   so C++ handlers can use them directly as 0-based indices.
 
   `:pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered).
-  `:reduce` (custom-fun reduce) lowers by static trace-time unrolling: the
-  reducer body is re-lowered inline once per reduce-extent element (Stage 12).
+  `:reduce` / `:window_reduce` (custom-fun reductions) lower by static
+  trace-time unrolling: the reducer body is re-lowered inline once per
+  reduce-extent (resp. per within-window offset) element (Stages 12–13).
   Unrecognized `Nx.Block.*` structs descend into `default_expr` (primitive decomposition).
   `Nx.Random.*` functions decompose via `threefry2x32` into primitive ops (bitwise, add, iota)
   and work automatically once `:iota` is lowered.
@@ -1154,6 +1155,86 @@ defmodule EMLX.Native.Expr do
     end
   end
 
+  # window_reduce (custom fun): args = [tensor, acc, window_dims_tuple, opts, fun].
+  # MLX has no arbitrary-fun window reduce, so we static-unroll like :reduce: pad
+  # the input with `acc` per the padding config, then for each of the
+  # W = prod(window_dims) within-window offsets (row-major, last window dim
+  # varying fastest) emit a strided :slice yielding an out-shaped tensor, and
+  # fold the reducer over those W slices seeded with `acc`. This mirrors
+  # Nx.BinaryBackend.window_reduce, which pads with acc and folds fun(element,
+  # acc) over the window in row-major order. Reuses lower_fun_body/3.
+  defp expand_node(
+         %T{
+           type: out_type,
+           shape: out_shape,
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :window_reduce,
+             args: [tensor, acc, window_dims_tuple, opts, fun]
+           }
+         },
+         state
+       ) do
+    n_dims = tuple_size(window_dims_tuple)
+    window_dims = Tuple.to_list(window_dims_tuple)
+    {low_pads, high_pads} = Enum.unzip(opts[:padding])
+    strides = opts[:strides] || List.duplicate(1, n_dims)
+    dilations = opts[:window_dilations] || List.duplicate(1, n_dims)
+
+    if Enum.any?(low_pads ++ high_pads, &(&1 < 0)) do
+      raise ArgumentError, "does not yet lower op :window_reduce with negative padding"
+    end
+
+    [params, body, _mfa] = fun.data.args
+
+    unless length(params) == 2 do
+      raise ArgumentError, "does not yet lower op :window_reduce with a non-binary reducer"
+    end
+
+    # Cast input + acc to the reducer/output type before padding/folding.
+    tensor_ref0 = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {tensor_ref, state} = emit_cast_if_needed(tensor_ref0, tensor.type, out_type, state)
+    acc_ref0 = Map.fetch!(state.node_to_ref, acc.data.id)
+    {acc_scalar_ref, state} = emit_cast_if_needed(acc_ref0, acc.type, out_type, state)
+
+    # Pad with acc (interior 0). Padded shape drives the slice input-shape iattr.
+    in_dims = Tuple.to_list(tensor.shape)
+
+    padded_shape =
+      [in_dims, low_pads, high_pads]
+      |> Enum.zip()
+      |> Enum.map(fn {d, lo, hi} -> d + lo + hi end)
+
+    {padded_ref, state} =
+      if Enum.all?(low_pads ++ high_pads, &(&1 == 0)) do
+        {tensor_ref, state}
+      else
+        emit_pad_with(tensor_ref, acc_scalar_ref, low_pads, high_pads, state)
+      end
+
+    out_dims = Tuple.to_list(out_shape)
+
+    # Seed acc broadcast to the output shape, then fold the reducer over each of
+    # the W within-window offsets.
+    {acc_ref, state} = emit_broadcast_to(acc_scalar_ref, out_dims, state)
+    extent = Enum.product(window_dims)
+
+    # :slice takes a span (stop = start + length); with a stride it yields
+    # ceil(span/stride) elements, so the span for out_dim outputs is
+    # (out_dim - 1)*stride + 1.
+    spans = Enum.zip_with(out_dims, strides, fn d, s -> (d - 1) * s + 1 end)
+
+    {final_ref, state} =
+      Enum.reduce(0..(extent - 1)//1, {acc_ref, state}, fn k, {acc_k, st} ->
+        offsets = window_offsets(k, window_dims)
+        starts = Enum.zip_with(offsets, dilations, &(&1 * &2))
+        {slice_ref, st} = emit_static_slice(padded_ref, padded_shape, starts, spans, strides, st)
+        lower_fun_body(body, %{0 => slice_ref, 1 => acc_k}, st)
+      end)
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, final_ref)}
+  end
+
   # ── Nx.Block.Cumulative* — recognize-struct path ─────────────────────────
   #
   # Cumulative ops surface as Nx.Block.Cumulative{Sum,Product,Min,Max}.
@@ -1909,6 +1990,44 @@ defmodule EMLX.Native.Expr do
        state
        | instructions: [{squeeze_ref, :squeeze, [slice_ref], [last_axis]} | state.instructions]
      }}
+  end
+
+  # Emit a :pad instruction padding `ref` by lo/hi per dim (interior 0), using
+  # `pad_value_ref` (a scalar operand) as the fill value. Returns {new_ref, state}.
+  defp emit_pad_with(ref, pad_value_ref, low_pads, high_pads, state) do
+    new_ref = make_ref()
+    n_dims = length(low_pads)
+
+    iattrs =
+      [n_dims | Enum.flat_map(Enum.zip(low_pads, high_pads), fn {lo, hi} -> [lo, hi, 0] end)]
+
+    {new_ref,
+     %{
+       state
+       | instructions: [{new_ref, :pad, [ref, pad_value_ref], iattrs} | state.instructions]
+     }}
+  end
+
+  # Emit a static (non-dynamic) :slice; mirrors the :slice expand_node wire format
+  # `[n_dims, dynamic_mask=0] ++ input_shape ++ lengths ++ strides ++ starts`.
+  defp emit_static_slice(ref, input_shape, starts, lengths, strides, state) do
+    new_ref = make_ref()
+    n_dims = length(input_shape)
+    iattrs = [n_dims, 0] ++ input_shape ++ lengths ++ strides ++ starts
+
+    {new_ref,
+     %{state | instructions: [{new_ref, :slice, [ref], iattrs} | state.instructions]}}
+  end
+
+  # Decompose a flat window index `k` into per-dim offsets in row-major order
+  # (last window dim varies fastest), matching Nx.BinaryBackend's window traversal.
+  defp window_offsets(k, dims) do
+    {digits, _} =
+      dims
+      |> Enum.reverse()
+      |> Enum.reduce({[], k}, fn d, {acc, n} -> {[rem(n, d) | acc], div(n, d)} end)
+
+    digits
   end
 
   # ── EMLX.Fast runtime_call recognition ─────────────────────────────────────

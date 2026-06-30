@@ -106,7 +106,7 @@ logical_and, logical_or, logical_xor.
 - [x] sum, product, all, any
 - [x] reduce_max, reduce_min
 - [x] argmax, argmin
-- [~] reduce (custom fun — now lowers via static trace-time unroll, Stage 12 spike; Stage 13 finalizes large-extent strategy + flips this box)
+- [x] reduce (custom fun — static trace-time unroll: reducer body re-lowered inline once per reduce-extent element, Stages 12–13)
 - [x] dot
 - [x] conv
 
@@ -128,7 +128,7 @@ logical_and, logical_or, logical_xor.
 - [x] window_sum/max/min/product
 - [x] window_scatter_max/min
 - [x] cumulative_sum/product/max/min
-- [~] window_reduce (custom fun — deferred; raises, requires custom-fun lowering (future stage))
+- [x] window_reduce (custom fun — static unroll: pad with acc, then fold the reducer body inline over the prod(window_dims) within-window offsets via strided per-offset slices, Stage 13)
 
 ## H. FFT
 
