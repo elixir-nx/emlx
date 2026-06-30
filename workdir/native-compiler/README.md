@@ -106,10 +106,10 @@ each independently shippable. Run with
 - [x] [`01-ir-cpp-substrate`](01-ir-cpp-substrate.md) — `EMLX.Native.Expr` IR + C++ `compile_program`/`eval_program` + compiler seam + `add` end-to-end + perf baseline. Post-stage: `mlx::core::detail::compile` with unique IDs; op-name string registry replaces enum + wire integers. **Perf gate soft-pass — see stage doc § Perf findings.**
 - [x] [`02-elementwise`](02-elementwise.md) — unary + binary + compare/logical.
 - [x] [`03-shape-movement`](03-shape-movement.md) — reshape, transpose, squeeze, broadcast, pad, reverse, as_type, bitcast, concatenate, stack.
-- [ ] [`04-reductions-dot-conv`](04-reductions-dot-conv.md) — reductions + argmax/argmin + dot + conv.
-- [ ] [`05-indexing-selection`](05-indexing-selection.md) — select, clip, slice, put_slice, gather, take, take_along_axis, indexed_add/put.
+- [x] [`04-reductions-dot-conv`](04-reductions-dot-conv.md) — reductions + argmax/argmin + dot + conv.
+- [x] [`05-indexing-selection`](05-indexing-selection.md) — select, clip, slice, put_slice, gather, take, take_along_axis, indexed_add/put.
 - [x] [`06-sort-window-cumulative-fft`](06-sort-window-cumulative-fft.md) — sort/argsort, window reductions, cumulative, fft family. **`expand_block_via_default` fallback enables rfft/irfft and future unrecognized blocks.**
-- [ ] [`07-creation-rng`](07-creation-rng.md) — iota, eye, `Nx.Random` primitives.
+- [x] [`07-creation-rng`](07-creation-rng.md) — iota, eye, `Nx.Random` primitives (via threefry2x32 decomposition).
 - [ ] [`08-control-flow`](08-control-flow.md) — `cond`, `while` via child programs.
 - [ ] [`09-blocks-linalg`](09-blocks-linalg.md) — `Nx.Block.LinAlg.*` recognize-struct path + `default_expr` descent.
 - [ ] [`10-fast-kernels`](10-fast-kernels.md) — pattern-route to `EMLX.Fast`.

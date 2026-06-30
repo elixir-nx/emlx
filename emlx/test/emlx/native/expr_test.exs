@@ -156,9 +156,12 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
-      # iota is not yet lowered (Stage 07); use it as the unknown-op sentinel.
+      # custom-fun reduce is not yet lowered (deferred to Stage 08); use as sentinel.
       expr =
-        Nx.Defn.debug_expr_apply(fn t -> Nx.add(t, Nx.iota({3})) end, [Nx.template({3}, :f32)])
+        Nx.Defn.debug_expr_apply(
+          fn t -> Nx.reduce(t, 0, fn x, acc -> Nx.add(x, acc) end) end,
+          [Nx.template({3}, :f32)]
+        )
 
       assert_raise ArgumentError, ~r/does not yet lower op/, fn -> Expr.lower(expr) end
     end
@@ -1726,6 +1729,24 @@ defmodule EMLX.Native.ExprTest do
   defn fft2_defn(x), do: Nx.fft2(x)
   defn rfft_defn(x), do: Nx.rfft(x)
 
+  # ── Stage 07 defn helpers ─────────────────────────────────────────────────
+
+  defn iota_flat_defn(), do: Nx.iota({3, 4})
+  defn iota_axis1_defn(), do: Nx.iota({3, 4}, axis: 1)
+  defn iota_f32_defn(), do: Nx.iota({5}, type: :f32)
+  defn eye_3x3_defn(), do: Nx.eye({3, 3})
+  defn eye_2x4_defn(), do: Nx.eye({2, 4})
+
+  defn rng_uniform_defn(key) do
+    {samples, _key} = Nx.Random.uniform(key, shape: {8})
+    samples
+  end
+
+  defn rng_normal_defn(key) do
+    {samples, _key} = Nx.Random.normal(key, shape: {8})
+    samples
+  end
+
   # ── Stage 06 — sort / argsort ────────────────────────────────────────────
 
   describe "Stage 06 — sort" do
@@ -1989,6 +2010,163 @@ defmodule EMLX.Native.ExprTest do
       native = Nx.Defn.jit(&rfft_defn/1, compiler: EMLX).(x)
       eager = Nx.Defn.jit(&rfft_defn/1, compiler: Nx.Defn.Evaluator).(x)
       assert_complex_close(native, eager)
+    end
+  end
+
+  # ── Stage 07 — iota ──────────────────────────────────────────────────────
+
+  describe "Stage 07 — iota" do
+    @tag :stage07
+    test "iota flat: IR has :iota instruction, no operands" do
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&iota_flat_defn/0, []))
+
+      assert Enum.any?(prog.instructions, fn {_, op, operands, _} ->
+               op == :iota and operands == []
+             end)
+    end
+
+    @tag :stage07
+    test "iota flat lowering: iattrs encode shape and axis=-1" do
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&iota_flat_defn/0, []))
+
+      {_, :iota, [], [_dtype, n_dims, axis_int | shape]} =
+        Enum.find(prog.instructions, fn {_, op, _, _} -> op == :iota end)
+
+      assert n_dims == 2
+      assert axis_int == -1
+      assert shape == [3, 4]
+    end
+
+    @tag :stage07
+    test "iota flat: interpreter matches Nx.iota" do
+      alias EMLX.Native.Expr.Interpreter
+
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&iota_flat_defn/0, []))
+      [out] = Interpreter.eval(prog, [])
+      expected = Nx.iota({3, 4}, backend: EMLX.Backend)
+      assert_close(out, expected)
+    end
+
+    @tag :stage07
+    test "iota flat: C++ replay matches interpreter" do
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&iota_flat_defn/0, []))
+      [nif_out] = run_nif(prog, [])
+      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [])
+      assert_close(nif_out, interp_out)
+    end
+
+    @tag :stage07
+    test "iota flat: E2E jit vs Nx.Defn.Evaluator" do
+      native = Nx.Defn.jit(&iota_flat_defn/0, compiler: EMLX).()
+      eager = Nx.Defn.jit(&iota_flat_defn/0, compiler: Nx.Defn.Evaluator).()
+      assert_close(native, eager)
+    end
+
+    @tag :stage07
+    test "iota with axis=1: E2E jit vs Nx.Defn.Evaluator" do
+      native = Nx.Defn.jit(&iota_axis1_defn/0, compiler: EMLX).()
+      eager = Nx.Defn.jit(&iota_axis1_defn/0, compiler: Nx.Defn.Evaluator).()
+      assert_close(native, eager)
+    end
+
+    @tag :stage07
+    test "iota f32 flat: E2E jit vs Nx.Defn.Evaluator" do
+      native = Nx.Defn.jit(&iota_f32_defn/0, compiler: EMLX).()
+      eager = Nx.Defn.jit(&iota_f32_defn/0, compiler: Nx.Defn.Evaluator).()
+      assert_close(native, eager)
+    end
+  end
+
+  # ── Stage 07 — eye ───────────────────────────────────────────────────────
+
+  describe "Stage 07 — eye" do
+    @tag :stage07
+    test "eye: IR has :eye instruction, no operands" do
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
+
+      assert Enum.any?(prog.instructions, fn {_, op, operands, _} ->
+               op == :eye and operands == []
+             end)
+    end
+
+    @tag :stage07
+    test "eye 3x3: iattrs encode [dtype, 3, 3]" do
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
+
+      {_, :eye, [], [_dtype, m, n]} =
+        Enum.find(prog.instructions, fn {_, op, _, _} -> op == :eye end)
+
+      assert m == 3
+      assert n == 3
+    end
+
+    @tag :stage07
+    test "eye 3x3: interpreter matches Nx.eye" do
+      alias EMLX.Native.Expr.Interpreter
+
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
+      [out] = Interpreter.eval(prog, [])
+      expected = Nx.eye({3, 3}, backend: EMLX.Backend)
+      assert_close(out, expected)
+    end
+
+    @tag :stage07
+    test "eye 3x3: C++ replay matches interpreter" do
+      prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
+      [nif_out] = run_nif(prog, [])
+      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [])
+      assert_close(nif_out, interp_out)
+    end
+
+    @tag :stage07
+    test "eye 3x3: E2E jit vs Nx.Defn.Evaluator" do
+      native = Nx.Defn.jit(&eye_3x3_defn/0, compiler: EMLX).()
+      eager = Nx.Defn.jit(&eye_3x3_defn/0, compiler: Nx.Defn.Evaluator).()
+      assert_close(native, eager)
+    end
+
+    @tag :stage07
+    test "eye 2x4 rectangular: E2E jit vs Nx.Defn.Evaluator" do
+      native = Nx.Defn.jit(&eye_2x4_defn/0, compiler: EMLX).()
+      eager = Nx.Defn.jit(&eye_2x4_defn/0, compiler: Nx.Defn.Evaluator).()
+      assert_close(native, eager)
+    end
+  end
+
+  # ── Stage 07 — RNG (Nx.Random via threefry2x32 + iota) ───────────────────
+
+  describe "Stage 07 — Nx.Random" do
+    @tag :stage07
+    test "Nx.Random.uniform: native matches evaluator for fixed key" do
+      key = Nx.Random.key(42) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&rng_uniform_defn/1, compiler: EMLX).(key)
+      eager = Nx.Defn.jit(&rng_uniform_defn/1, compiler: Nx.Defn.Evaluator).(key)
+
+      assert_close(native, eager, 1.0e-5)
+      # Samples should be in [0, 1)
+      assert Nx.all(Nx.greater_equal(native, 0.0)) |> Nx.to_number() == 1
+      assert Nx.all(Nx.less(native, 1.0)) |> Nx.to_number() == 1
+    end
+
+    @tag :stage07
+    test "Nx.Random.uniform: same key → same samples (deterministic)" do
+      key = Nx.Random.key(99) |> Nx.backend_transfer(EMLX.Backend)
+
+      out1 = Nx.Defn.jit(&rng_uniform_defn/1, compiler: EMLX).(key)
+      out2 = Nx.Defn.jit(&rng_uniform_defn/1, compiler: EMLX).(key)
+
+      assert_close(out1, out2)
+    end
+
+    @tag :stage07
+    test "Nx.Random.normal: native matches evaluator for fixed key" do
+      key = Nx.Random.key(7) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&rng_normal_defn/1, compiler: EMLX).(key)
+      eager = Nx.Defn.jit(&rng_normal_defn/1, compiler: Nx.Defn.Evaluator).(key)
+
+      assert_close(native, eager, 1.0e-4)
     end
   end
 

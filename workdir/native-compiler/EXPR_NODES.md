@@ -128,13 +128,13 @@ logical_and, logical_or, logical_xor.
 
 ## I. Creation
 
-- [ ] iota
-- [ ] eye
+- [x] iota (flat + axis-specific; all dtypes)
+- [x] eye (rectangular; all dtypes)
 - [ ] from_binary / constant materialization (boundary handling)
 
 ## J. RNG (Nx.Random primitives)
 
-- [ ] random_uniform / random_normal primitives + key threading
+- [x] random_uniform / random_normal — decompose via threefry2x32 (bitwise + iota); key threading is ordinary tensor operand threading; deterministic vs eager EMLX.Backend verified
 
 ## K. Nx.Block.* (block node, dispatch on struct)
 

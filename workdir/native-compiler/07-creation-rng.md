@@ -1,6 +1,6 @@
 # Stage 07 — Creation + RNG
 
-Status: not started
+Status: done
 
 ## Why this stage exists
 
@@ -32,6 +32,10 @@ sampling / dropout / weight-init paths.
 
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
-| iota / eye | | |
-| RNG primitives | | |
-| key threading deterministic | | |
+| iota (flat + axis-specific) | ✅ | `iattrs = [dtype_int, n_dims, axis_int, d0..dn-1]`; axis_int = −1 encodes nil (flat); C++ uses `arange` + `reshape` (flat) or `arange` + `reshape` + `broadcast_to` (axis); all dtypes tested |
+| eye (rectangular) | ✅ | `iattrs = [dtype_int, m, n]`; C++ calls `mlx::core::eye(m, n, 0, dtype)`; 3×3 and 2×4 tested |
+| RNG primitives | ✅ | `Nx.Random.uniform` and `Nx.Random.normal` work via threefry2x32 decomposition — no special lowering needed; all internal ops (bitwise, add, iota, reshape, slice) already lowered |
+| key threading deterministic | ✅ | Same key → same samples in consecutive JIT calls; native matches `Nx.Defn.Evaluator` to 1e-5 |
+| "does not yet lower" sentinel | updated | Test sentinel changed from `:iota` (now lowered) to custom-fun `:reduce` (still deferred, Stage 08) |
+| Tests | 16/16 ✅ | 16 Stage 07 tests: iota IR shape + interpreter + C++ parity + 3 E2E; eye same; RNG uniform determinism + normal |
+| compile/format clean | ✅ | `mix compile --warnings-as-errors` + `mix format --check-formatted` both clean |

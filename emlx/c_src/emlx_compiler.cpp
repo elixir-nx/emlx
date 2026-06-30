@@ -1163,6 +1163,54 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
                                     mlx::core::fft::FFTNorm::Backward);
      }},
 
+    // ── creation ops ─────────────────────────────────────────────────────────
+    //
+    // iota: attrs = [dtype_int, n_dims, axis_int, d0..dn-1]
+    // No operands.  axis_int = -1 means flat enumeration (no axis).
+    {"iota",
+     [](const auto & /*ops*/, const auto &attrs) {
+       auto dtype = int_to_dtype(attrs[0]);
+       int n = static_cast<int>(attrs[1]);
+       int axis = static_cast<int>(attrs[2]);
+
+       std::vector<int> shape(n);
+       for (int i = 0; i < n; i++)
+         shape[i] = static_cast<int>(attrs[3 + i]);
+
+       if (n == 0) {
+         // scalar iota: always 0
+         return mlx::core::astype(mlx::core::full({}, 0, mlx::core::int32), dtype);
+       }
+
+       if (axis == -1) {
+         // flat enumeration: arange(0, product(shape)) reshaped
+         int total = 1;
+         for (int d : shape)
+           total *= d;
+         auto flat = mlx::core::arange(0, total, 1, mlx::core::int32);
+         auto reshaped = mlx::core::reshape(flat, to_shape(shape));
+         return mlx::core::astype(reshaped, dtype);
+       } else {
+         // axis-specific iota: arange(0, shape[axis]), broadcast to full shape
+         int dim = shape[axis];
+         auto linear = mlx::core::arange(0, dim, 1, mlx::core::int32);
+         std::vector<int> rs(n, 1);
+         rs[axis] = dim;
+         auto r = mlx::core::reshape(linear, to_shape(rs));
+         auto bc = mlx::core::broadcast_to(r, to_shape(shape));
+         return mlx::core::astype(bc, dtype);
+       }
+     }},
+
+    // eye: attrs = [dtype_int, m, n].  No operands.
+    {"eye",
+     [](const auto & /*ops*/, const auto &attrs) {
+       auto dtype = int_to_dtype(attrs[0]);
+       int m = static_cast<int>(attrs[1]);
+       int n = static_cast<int>(attrs[2]);
+       return mlx::core::eye(m, n, 0, dtype);
+     }},
+
     // ── conv_general ─────────────────────────────────────────────────────────
     {"conv_general",
      [](const auto &ops, const auto &attrs) {

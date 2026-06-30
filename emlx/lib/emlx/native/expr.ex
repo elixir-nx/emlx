@@ -56,6 +56,8 @@ defmodule EMLX.Native.Expr do
   | `:cumulative_sum`, `:cumulative_product`, `:cumulative_min`, `:cumulative_max` | `[axis, reverse_int]` — axis (non-negative), 0/1 reverse. Always inclusive. |
   | `:fft`, `:ifft` | `[axis, n]` — axis and FFT length.                                  |
   | `:fft2`, `:ifft2` | `[ax0, ax1, n0, n1]` — two axes and two lengths.                |
+  | `:iota`   | `[dtype_int, n_dims, axis_int, d0..dn-1]` — dtype, rank, axis (−1=flat), shape dims. No operands. |
+  | `:eye`    | `[dtype_int, m, n]` — dtype and the two shape dims. No operands.    |
 
   Non-negative axes: the lowerer normalises negative axis values before encoding
   so C++ handlers can use them directly as 0-based indices.
@@ -63,6 +65,8 @@ defmodule EMLX.Native.Expr do
   `:pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered).
   `:reduce` (custom-fun reduce) raises — deferred to Stage 08 (requires child programs).
   Unrecognized `Nx.Block.*` structs descend into `default_expr` (primitive decomposition).
+  `Nx.Random.*` functions decompose via `threefry2x32` into primitive ops (bitwise, add, iota)
+  and work automatically once `:iota` is lowered.
   """
 
   import Bitwise
@@ -1291,6 +1295,47 @@ defmodule EMLX.Native.Expr do
     expand_block_via_default(id, in_args, default_expr, state)
   end
 
+  # ── creation ops ─────────────────────────────────────────────────────────
+
+  # iota: no tensor operands; all info in iattrs.
+  # iattrs = [dtype_int, n_dims, axis_int, d0..dn-1]
+  # axis_int = -1 encodes nil (flat enumeration across all dims).
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :iota, args: [axis]}} = node,
+         state
+       ) do
+    ref = make_ref()
+    shape = Tuple.to_list(node.shape)
+    n_dims = length(shape)
+    dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(node.type))
+    axis_int = if axis == nil, do: -1, else: axis
+
+    %{
+      state
+      | instructions: [
+          {ref, :iota, [], [dtype_int, n_dims, axis_int | shape]} | state.instructions
+        ],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # eye: no tensor operands; iattrs = [dtype_int, m, n].
+  # Output shape is always {m, n}.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :eye, args: []}} = node,
+         state
+       ) do
+    ref = make_ref()
+    [m, n] = Tuple.to_list(node.shape)
+    dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(node.type))
+
+    %{
+      state
+      | instructions: [{ref, :eye, [], [dtype_int, m, n]} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
@@ -1872,6 +1917,24 @@ defmodule EMLX.Native.Expr.Interpreter do
     axes = Enum.slice(rest, 0, n_axes)
     _ = rest
     Nx.indexed_put(target, indices, updates, axes: axes)
+  end
+
+  # creation ops — no tensor operands
+
+  # iota: attrs = [dtype_int, n_dims, axis_int, d0..dn-1]
+  # axis_int = -1 means nil (flat enumeration).
+  defp dispatch(:iota, [], [dtype_int, n_dims, axis_int | shape_rest]) do
+    shape = shape_rest |> Enum.take(n_dims) |> List.to_tuple()
+    type = Expr.int_to_nx_type(dtype_int)
+    opts = [type: type, backend: EMLX.Backend]
+    opts = if axis_int >= 0, do: Keyword.put(opts, :axis, axis_int), else: opts
+    Nx.iota(shape, opts)
+  end
+
+  # eye: attrs = [dtype_int, m, n]
+  defp dispatch(:eye, [], [dtype_int, m, n]) do
+    type = Expr.int_to_nx_type(dtype_int)
+    Nx.eye({m, n}, type: type, backend: EMLX.Backend)
   end
 
   defp dispatch(op, _args, _attrs),
