@@ -337,6 +337,11 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
                           to_shape(slice_ones));
 }
 
+// MLX linalg primitives are CPU-only.  Pin them to the CPU device so they
+// compose inside a compiled graph regardless of the graph's default (worker)
+// stream — validated to work for both :cpu and :gpu default devices.
+static const mlx::core::Device k_linalg_cpu(mlx::core::Device::DeviceType::cpu, 0);
+
 static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
     {"astype",
@@ -1232,8 +1237,89 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          input_dilation[i] = static_cast<int>(attrs[off++]);
        int fgs = static_cast<int>(attrs[off]);
 
-       return mlx::core::conv_general(ops[0], ops[1], strides, padding_lo, padding_hi,
-                                      kernel_dilation, input_dilation, fgs);
+      return mlx::core::conv_general(ops[0], ops[1], strides, padding_lo, padding_hi,
+                                     kernel_dilation, input_dilation, fgs);
+     }},
+
+    // ── linalg (single-output) ────────────────────────────────────────────
+    //
+    // MLX linalg primitives run on the CPU stream only; we pin them to
+    // k_linalg_cpu so they compose inside the compiled graph on any default
+    // device.  Multi-output factorizations (qr/eigh/svd/lu) live in
+    // multi_op_registry below.
+
+    // cholesky: operands = [a]; no attrs.  Lower-triangular factor (upper=false).
+    {"cholesky",
+     [](const auto &ops, const auto &) {
+       return mlx::core::contiguous(
+           mlx::core::linalg::cholesky(ops[0], /*upper=*/false, k_linalg_cpu),
+           false, k_linalg_cpu);
+     }},
+
+    // solve: operands = [a, b]; no attrs.  Solves A x = b.
+    {"solve",
+     [](const auto &ops, const auto &) {
+       return mlx::core::contiguous(
+           mlx::core::linalg::solve(ops[0], ops[1], k_linalg_cpu), false, k_linalg_cpu);
+     }},
+
+    // solve_triangular: operands = [a, b]; attrs = [upper_int].
+    {"solve_triangular",
+     [](const auto &ops, const auto &attrs) {
+       bool upper = (attrs[0] != 0);
+       return mlx::core::contiguous(
+           mlx::core::linalg::solve_triangular(ops[0], ops[1], upper, k_linalg_cpu),
+           false, k_linalg_cpu);
+     }},
+};
+
+// ── Multi-output op registry ──────────────────────────────────────────────────
+//
+// Ops that produce more than one result array (linalg factorizations).  Their
+// outputs are appended to the flat `results` accumulator in the returned order;
+// the Elixir lowerer assigns consecutive result indices to the matching output
+// refs (see to_wire/1's list-result handling).  Pinned to the CPU device.
+using MultiOpFn = std::function<
+    std::vector<mlx::core::array>(const std::vector<mlx::core::array> &ops,
+                                  const std::vector<int64_t> &attrs)>;
+
+// Force each linalg output to contiguous layout (on the CPU stream).  MLX's
+// factorizations can return strided views; if such a view is a program output
+// (or otherwise materialized directly), MLX tries to JIT a strided fused CPU
+// kernel that can fail to compile.  A plain contiguous Copy avoids that.
+static std::vector<mlx::core::array>
+contiguous_all(std::vector<mlx::core::array> arrs) {
+  for (auto &a : arrs)
+    a = mlx::core::contiguous(a, false, k_linalg_cpu);
+  return arrs;
+}
+
+static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
+    // qr (reduced mode): operands = [a]; outputs = [q, r].
+    {"qr",
+     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+       auto [q, r] = mlx::core::linalg::qr(ops[0], k_linalg_cpu);
+       return contiguous_all({q, r});
+     }},
+
+    // eigh (lower triangle): operands = [a]; outputs = [eigenvalues, eigenvectors].
+    {"eigh",
+     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+       auto [w, v] = mlx::core::linalg::eigh(ops[0], "L", k_linalg_cpu);
+       return contiguous_all({w, v});
+     }},
+
+    // svd (full matrices): operands = [a]; outputs = [u, s, vt].
+    {"svd",
+     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+       return contiguous_all(mlx::core::linalg::svd(ops[0], /*compute_uv=*/true, k_linalg_cpu));
+     }},
+
+    // lu: operands = [a]; outputs = [pivots, l, u] (pivots is a uint32 index
+    // vector; the lowerer rebuilds the permutation matrix via eye + take).
+    {"lu",
+     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+       return contiguous_all(mlx::core::linalg::lu(ops[0], k_linalg_cpu));
      }},
 };
 
@@ -1360,7 +1446,8 @@ ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
     // Validate all op names against the registry at compile time so that any
     // unknown op surfaces here rather than inside the lambda at eval time.
     for (const auto &name : op_names) {
-      if (op_registry.find(name) == op_registry.end())
+      if (op_registry.find(name) == op_registry.end() &&
+          multi_op_registry.find(name) == multi_op_registry.end())
         return nx::nif::error(
             env, ("emlx::native: unknown op \"" + name + "\"").c_str());
     }
@@ -1413,7 +1500,15 @@ ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
         for (int64_t ref : operands[i]) {
           op_inputs.push_back(resolve(ref));
         }
-        results.push_back(op_registry.at(op_names[i])(op_inputs, attrs[i]));
+        auto multi_it = multi_op_registry.find(op_names[i]);
+        if (multi_it != multi_op_registry.end()) {
+          // Multi-output op: append each result in order to the flat accumulator.
+          auto outs = multi_it->second(op_inputs, attrs[i]);
+          for (auto &o : outs)
+            results.push_back(o);
+        } else {
+          results.push_back(op_registry.at(op_names[i])(op_inputs, attrs[i]));
+        }
       }
 
       std::vector<mlx::core::array> outputs;

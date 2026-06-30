@@ -2269,6 +2269,205 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # ── Stage 09 — blocks / linalg ───────────────────────────────────────────
+  #
+  # Native (CPU-pinned) MLX linalg ops vs eager EMLX.Backend. On the CPU CI
+  # default both paths use the same LAPACK routines, so deterministic ops match
+  # element-wise; the factorizations (qr/eigh/svd) also get reconstruction
+  # checks that are robust to sign/order ambiguity across devices/algorithms.
+
+  defn cholesky_defn(x), do: Nx.LinAlg.cholesky(x)
+  defn det_defn(x), do: Nx.LinAlg.determinant(x)
+
+  # A small helper: a well-conditioned SPD matrix t·tᵀ + n·I.
+  defp spd_matrix(n) do
+    t = Nx.iota({n, n}, type: :f32, backend: EMLX.Backend) |> Nx.add(1.0)
+    Nx.add(Nx.dot(t, Nx.transpose(t)), Nx.multiply(Nx.eye(n, backend: EMLX.Backend), n * 1.0))
+  end
+
+  describe "Stage 09 — LinAlg.cholesky (native)" do
+    @tag :stage09
+    test "cholesky of an SPD matrix vs EMLX.Backend — f32" do
+      x = Nx.tensor([[4.0, 2.0], [2.0, 3.0]], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&cholesky_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&cholesky_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage09
+    test "cholesky composed with surrounding ops (in-graph) vs EMLX.Backend" do
+      f = fn t ->
+        spd = Nx.add(Nx.dot(t, Nx.transpose(t)), Nx.multiply(Nx.eye(3), 1.0))
+        Nx.LinAlg.cholesky(spd) |> Nx.add(1.0)
+      end
+
+      t = Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(1.0)
+      native = Nx.Defn.jit(f, compiler: EMLX).(t)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(t)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 09 — LinAlg.solve / triangular_solve (native)" do
+    @tag :stage09
+    test "solve A x = b vs EMLX.Backend" do
+      a = Nx.tensor([[3.0, 1.0], [1.0, 2.0]], type: :f32, backend: EMLX.Backend)
+      b = Nx.tensor([9.0, 8.0], type: :f32, backend: EMLX.Backend)
+
+      f = fn a, b -> Nx.LinAlg.solve(a, b) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
+    end
+
+    @tag :stage09
+    test "triangular_solve (lower, left side) vs EMLX.Backend" do
+      a = Nx.tensor([[2.0, 0.0], [3.0, 1.0]], type: :f32, backend: EMLX.Backend)
+      b = Nx.tensor([4.0, 5.0], type: :f32, backend: EMLX.Backend)
+
+      f = fn a, b -> Nx.LinAlg.triangular_solve(a, b, lower: true) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
+    end
+
+    @tag :stage09
+    test "chained cholesky -> solve composes natively (contiguous across linalg ops)" do
+      spd = Nx.tensor([[4.0, 2.0], [2.0, 3.0]], type: :f32, backend: EMLX.Backend)
+      b = Nx.tensor([1.0, 2.0], type: :f32, backend: EMLX.Backend)
+
+      f = fn s, b -> Nx.LinAlg.solve(Nx.LinAlg.cholesky(s), b) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(spd, b)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(spd, b)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 09 — LinAlg batched" do
+    @tag :stage09
+    test "batched cholesky (rank-3) vs EMLX.Backend" do
+      a =
+        Nx.tensor(
+          [[[4.0, 2.0], [2.0, 3.0]], [[9.0, 3.0], [3.0, 5.0]]],
+          type: :f32,
+          backend: EMLX.Backend
+        )
+
+      native = Nx.Defn.jit(&Nx.LinAlg.cholesky/1, compiler: EMLX).(a)
+      eager = Nx.Defn.jit(&Nx.LinAlg.cholesky/1, compiler: Nx.Defn.Evaluator).(a)
+      assert_close(native, eager)
+    end
+  end
+
+  describe "Stage 09 — LinAlg.qr / eigh / svd (native, reconstruction)" do
+    @tag :stage09
+    test "qr: Q·R reconstructs A and Q is orthonormal" do
+      a = Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
+
+      {q, r} = Nx.Defn.jit(&Nx.LinAlg.qr/1, compiler: EMLX).(a)
+      assert_close(Nx.dot(q, r), a)
+      assert_close(Nx.dot(Nx.transpose(q), q), Nx.eye(3, type: :f32, backend: EMLX.Backend))
+    end
+
+    @tag :stage09
+    test "eigh: V·diag(W)·Vᵀ reconstructs a symmetric A" do
+      a = spd_matrix(3)
+      n = 3
+
+      {w, v} = Nx.Defn.jit(&Nx.LinAlg.eigh/1, compiler: EMLX).(a)
+      recon = Nx.dot(Nx.multiply(v, Nx.reshape(w, {1, n})), Nx.transpose(v))
+      assert_close(recon, a)
+    end
+
+    @tag :stage09
+    test "svd: U·diag(S)·Vᵀ reconstructs A" do
+      a = Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
+      n = 3
+
+      {u, s, vt} = Nx.Defn.jit(&Nx.LinAlg.svd/1, compiler: EMLX).(a)
+      recon = Nx.dot(Nx.multiply(u, Nx.reshape(s, {1, n})), vt)
+      assert_close(recon, a)
+    end
+  end
+
+  describe "Stage 09 — LinAlg.lu (native)" do
+    @tag :stage09
+    test "lu factors vs EMLX.Backend" do
+      a = Nx.tensor([[4.0, 3.0], [6.0, 3.0]], type: :f32, backend: EMLX.Backend)
+
+      {pn, ln, un} = Nx.Defn.jit(&Nx.LinAlg.lu/1, compiler: EMLX).(a)
+      {pe, le, ue} = Nx.Defn.jit(&Nx.LinAlg.lu/1, compiler: Nx.Defn.Evaluator).(a)
+      assert_close(pn, pe)
+      assert_close(ln, le)
+      assert_close(un, ue)
+    end
+
+    @tag :stage09
+    test "lu: P·L·U reconstructs A" do
+      a = Nx.tensor([[4.0, 3.0], [6.0, 3.0]], type: :f32, backend: EMLX.Backend)
+
+      {p, l, u} = Nx.Defn.jit(&Nx.LinAlg.lu/1, compiler: EMLX).(a)
+      assert_close(Nx.dot(p, Nx.dot(l, u)), a)
+    end
+  end
+
+  describe "Stage 09 — LinAlg.determinant (default_expr descent)" do
+    @tag :stage09
+    test "determinant 2x2 (pure primitives) vs EMLX.Backend" do
+      x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], type: :f32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&det_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&det_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage09
+    test "determinant 3x3 (pure primitives) vs EMLX.Backend" do
+      x =
+        Nx.tensor([[1.0, 2.0, 3.0], [1.0, -2.0, 3.0], [7.0, 8.0, 9.0]],
+          type: :f32,
+          backend: EMLX.Backend
+        )
+
+      native = Nx.Defn.jit(&det_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&det_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage09
+    test "determinant 3x3 sign (row-swap permutation) = -1" do
+      # A single row swap permutation has det = -1; exercises the cofactor sign.
+      x =
+        Nx.tensor([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+          type: :f32,
+          backend: EMLX.Backend
+        )
+
+      native = Nx.Defn.jit(&det_defn/1, compiler: EMLX).(x)
+      assert_in_delta(Nx.to_number(native), -1.0, 1.0e-5)
+    end
+
+    @tag :stage09
+    test "determinant 4x4 (descends through native LU) vs BinaryBackend reference" do
+      x = spd_matrix(4)
+      native = Nx.Defn.jit(&det_defn/1, compiler: EMLX).(x)
+
+      # EMLX.Backend's eager N>3 determinant has a pre-existing type bug, so
+      # compute the reference entirely on the BinaryBackend (Nx.LinAlg.determinant
+      # is a defn whose intermediate ops otherwise use the global default backend).
+      prev = Nx.default_backend(Nx.BinaryBackend)
+
+      ref =
+        try do
+          x |> Nx.backend_transfer(Nx.BinaryBackend) |> Nx.LinAlg.determinant()
+        after
+          Nx.default_backend(prev)
+        end
+
+      assert_in_delta(Nx.to_number(native), Nx.to_number(ref), 1.0)
+    end
+  end
+
   defp unwrap!({:ok, v}), do: v
   defp unwrap!({:error, e}), do: raise(EMLX.NIFError, List.to_string(e))
 

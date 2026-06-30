@@ -1325,12 +1325,7 @@ defmodule EMLX do
 
     case try_native_compile(vars, fun, device) do
       {:ok, eval_fn} ->
-        # Native path: wrap with queue if provided.
-        if queue do
-          fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> eval_fn.(inputs) end) end
-        else
-          eval_fn
-        end
+        wrap_with_queue(queue, eval_fn)
 
       :not_supported ->
         # Fallback: delegate to Nx.Defn.Evaluator for ops not yet lowered.
@@ -1342,14 +1337,46 @@ defmodule EMLX do
             Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
           )
 
-        if queue do
-          # Capture the queue ref in a closure so each invocation of the
-          # compiled function routes through the correct CommandQueue.
-          fn inputs -> EMLX.CommandQueue.with_queue(queue, fn -> inner.(inputs) end) end
-        else
-          inner
-        end
+        wrap_with_queue(queue, inner)
     end
+  end
+
+  # Wraps a compiled eval closure so each invocation routes through `queue`.
+  #
+  # A CommandQueue is a *transient* execution scope: it is bound only for the
+  # duration of the call and torn down immediately after. The compiled program
+  # therefore runs on the queue's worker thread, producing a lazy result whose
+  # MLX graph is tied to that thread's stream. We must materialise the outputs
+  # *before* the binding is restored — otherwise a later read (e.g. `to_blob`)
+  # resolves to the device-default worker, whose thread does not own the
+  # queue's stream ("There is no Stream(gpu, N) in current thread").
+  defp wrap_with_queue(nil, eval_fn), do: eval_fn
+
+  defp wrap_with_queue(queue, eval_fn) do
+    fn inputs ->
+      EMLX.CommandQueue.with_queue(queue, fn ->
+        result = eval_fn.(inputs)
+        force_eval_outputs(result)
+        result
+      end)
+    end
+  end
+
+  # Evals every EMLX-backed output tensor on the currently-bound worker so the
+  # result is materialised (not a dangling lazy graph) once the queue unbinds.
+  defp force_eval_outputs(result) do
+    result
+    |> List.wrap()
+    |> Enum.each(fn container ->
+      Nx.Defn.Composite.traverse(container, fn
+        %Nx.Tensor{data: %EMLX.Backend{ref: ref}} = tensor ->
+          eval(ref)
+          tensor
+
+        leaf ->
+          leaf
+      end)
+    end)
   end
 
   # Attempts to lower `fun.(vars)` to an `EMLX.Native.Expr` program and build a compiled

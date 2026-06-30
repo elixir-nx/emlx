@@ -1273,6 +1273,218 @@ defmodule EMLX.Native.Expr do
     }
   end
 
+  # ── Nx.Block.LinAlg.* — recognize-struct native path ─────────────────────
+  #
+  # MLX provides native (CPU-only) linalg primitives. We emit a native op that
+  # mirrors EMLX.Backend's eager path: cast the operand(s) to f32, run the
+  # primitive, cast the result back to the block's output type. The op runs on
+  # the CPU stream in C++ (pinned), so it composes inside the compiled graph.
+  #
+  # cholesky: single-output. operands = [a]; no attrs.
+  defp expand_node(
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.LinAlg.Cholesky{}, [tensor], _default, _fun]
+           }
+         },
+         state
+       ) do
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {f32_ref, state} = emit_cast_if_needed(tensor_ref, tensor.type, {:f, 32}, state)
+
+    ref = make_ref()
+    state = %{state | instructions: [{ref, :cholesky, [f32_ref], []} | state.instructions]}
+
+    {result_ref, state} = emit_cast_if_needed(ref, {:f, 32}, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  # solve: single-output. operands = [a, b]; no attrs. Solves A x = b.
+  defp expand_node(
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.LinAlg.Solve{}, [a, b], _default, _fun]
+           }
+         },
+         state
+       ) do
+    a_ref = Map.fetch!(state.node_to_ref, a.data.id)
+    b_ref = Map.fetch!(state.node_to_ref, b.data.id)
+    {a_f, state} = emit_cast_if_needed(a_ref, a.type, {:f, 32}, state)
+    {b_f, state} = emit_cast_if_needed(b_ref, b.type, {:f, 32}, state)
+
+    ref = make_ref()
+    state = %{state | instructions: [{ref, :solve, [a_f, b_f], []} | state.instructions]}
+
+    {result_ref, state} = emit_cast_if_needed(ref, {:f, 32}, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  # qr (reduced mode): multi-output [q, r]. operands = [a]; no attrs.
+  # :complete mode descends into default_expr (Householder + while) — falls back.
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.LinAlg.QR{mode: :reduced}, [tensor], _default, _fun]
+           }
+         },
+         state
+       ) do
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {f32_ref, state} = emit_cast_if_needed(tensor_ref, tensor.type, {:f, 32}, state)
+
+    q_ref = make_ref()
+    r_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{[q_ref, r_ref], :qr, [f32_ref], []} | state.instructions]
+    }
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, [q_ref, r_ref])}
+  end
+
+  # eigh: multi-output [eigenvalues, eigenvectors]. operands = [a]; lower triangle.
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.LinAlg.Eigh{}, [tensor], _default, _fun]
+           }
+         },
+         state
+       ) do
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {f32_ref, state} = emit_cast_if_needed(tensor_ref, tensor.type, {:f, 32}, state)
+
+    w_ref = make_ref()
+    v_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{[w_ref, v_ref], :eigh, [f32_ref], []} | state.instructions]
+    }
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, [w_ref, v_ref])}
+  end
+
+  # svd (full matrices): multi-output [u, s, vt]. operands = [a]; no attrs.
+  # full_matrices?: false descends into default_expr (Jacobi + while) — falls back.
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.LinAlg.SVD{full_matrices?: true}, [tensor], _default, _fun]
+           }
+         },
+         state
+       ) do
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {f32_ref, state} = emit_cast_if_needed(tensor_ref, tensor.type, {:f, 32}, state)
+
+    u_ref = make_ref()
+    s_ref = make_ref()
+    vt_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{[u_ref, s_ref, vt_ref], :svd, [f32_ref], []} | state.instructions]
+    }
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, [u_ref, s_ref, vt_ref])}
+  end
+
+  # lu: multi-output {P, L, U}. operands = [a]; no attrs.
+  # MLX returns a pivot index vector; we rebuild the permutation matrix in-graph
+  # via eye + take (mirroring EMLX.Backend.block/4 for LU).
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :block,
+             args: [%Nx.Block.LinAlg.LU{}, [tensor], _default, _fun]
+           }
+         },
+         state
+       ) do
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    {f32_ref, state} = emit_cast_if_needed(tensor_ref, tensor.type, {:f, 32}, state)
+
+    piv_ref = make_ref()
+    l_ref = make_ref()
+    u_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{[piv_ref, l_ref, u_ref], :lu, [f32_ref], []} | state.instructions]
+    }
+
+    # P = take(eye(n), pivots, axis: 0). n is the trailing matrix dimension.
+    n = elem(tensor.shape, tuple_size(tensor.shape) - 1)
+    f32_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type({:f, 32}))
+
+    eye_ref = make_ref()
+    p_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [
+          {p_ref, :take, [eye_ref, piv_ref], [0]},
+          {eye_ref, :eye, [], [f32_int, n, n]}
+          | state.instructions
+        ]
+    }
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, [p_ref, l_ref, u_ref])}
+  end
+
+  # triangular_solve: single-output. Direct op node (not a block).
+  # args = [a, b, opts]. Only the common configuration (left_side + no transform)
+  # is lowered natively; other variants raise → Evaluator fallback.
+  defp expand_node(
+         %T{
+           type: out_type,
+           data: %Nx.Defn.Expr{id: id, op: :triangular_solve, args: [a, b, opts]}
+         },
+         state
+       ) do
+    left_side = Keyword.get(opts, :left_side, true)
+    transform_a = Keyword.get(opts, :transform_a, :none)
+    lower = Keyword.get(opts, :lower, true)
+
+    unless left_side and transform_a == :none do
+      raise ArgumentError,
+            "does not yet lower op :triangular_solve with " <>
+              "left_side=#{inspect(left_side)} transform_a=#{inspect(transform_a)}"
+    end
+
+    a_ref = Map.fetch!(state.node_to_ref, a.data.id)
+    b_ref = Map.fetch!(state.node_to_ref, b.data.id)
+    {a_f, state} = emit_cast_if_needed(a_ref, a.type, {:f, 32}, state)
+    {b_f, state} = emit_cast_if_needed(b_ref, b.type, {:f, 32}, state)
+
+    upper_int = if lower, do: 0, else: 1
+    ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{ref, :solve_triangular, [a_f, b_f], [upper_int]} | state.instructions]
+    }
+
+    {result_ref, state} = emit_cast_if_needed(ref, {:f, 32}, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
   # ── block fallback: descend into default_expr ─────────────────────────────
   #
   # For any Nx.Block.* struct not specifically recognized above (e.g. RFFT,
@@ -1635,14 +1847,28 @@ defmodule EMLX.Native.Expr do
     ref_to_packed = Map.merge(input_map, Map.merge(capture_map, constant_map))
 
     # Walk instructions in order, building the wire arrays and extending the map.
-    {op_names, operands, iattrs, ref_to_packed} =
+    # A `result` ref is indexed into the C++ flat results accumulator. Each
+    # instruction contributes one entry (single-output) or several (multi-output
+    # ops whose result field is a list of refs), so the flat index is tracked
+    # separately from the instruction position.
+    {op_names, operands, iattrs, ref_to_packed, _flat} =
       prog.instructions
-      |> Enum.with_index()
-      |> Enum.reduce({[], [], [], ref_to_packed}, fn {{id, op, operand_refs, attrs}, idx},
-                                                     {ops, ors, ias, rmap} ->
+      |> Enum.reduce({[], [], [], ref_to_packed, 0}, fn {id, op, operand_refs, attrs},
+                                                        {ops, ors, ias, rmap, flat} ->
         wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
-        rmap2 = Map.put(rmap, id, @kind_instr <<< @kind_shift ||| idx)
-        {[op | ops], [wire_operands | ors], [attrs | ias], rmap2}
+
+        {rmap2, flat2} =
+          case id do
+            ids when is_list(ids) ->
+              Enum.reduce(ids, {rmap, flat}, fn one, {m, f} ->
+                {Map.put(m, one, @kind_instr <<< @kind_shift ||| f), f + 1}
+              end)
+
+            one ->
+              {Map.put(rmap, one, @kind_instr <<< @kind_shift ||| flat), flat + 1}
+          end
+
+        {[op | ops], [wire_operands | ors], [attrs | ias], rmap2, flat2}
       end)
 
     wire_outputs = Enum.map(prog.outputs, &Map.fetch!(ref_to_packed, &1))
@@ -1700,7 +1926,17 @@ defmodule EMLX.Native.Expr.Interpreter do
     env =
       Enum.reduce(prog.instructions, env, fn {id, op, operand_refs, attrs}, env ->
         args = Enum.map(operand_refs, &Map.fetch!(env, &1))
-        Map.put(env, id, dispatch(op, args, attrs))
+        result = dispatch(op, args, attrs)
+
+        # Multi-output ops carry a list of result refs; bind each to its output.
+        case id do
+          ids when is_list(ids) ->
+            Enum.zip(ids, result)
+            |> Enum.reduce(env, fn {one, val}, e -> Map.put(e, one, val) end)
+
+          one ->
+            Map.put(env, one, result)
+        end
       end)
 
     Enum.map(prog.outputs, &Map.fetch!(env, &1))
@@ -2011,6 +2247,35 @@ defmodule EMLX.Native.Expr.Interpreter do
   defp dispatch(:eye, [], [dtype_int, m, n]) do
     type = Expr.int_to_nx_type(dtype_int)
     Nx.eye({m, n}, type: type, backend: EMLX.Backend)
+  end
+
+  # linalg — operands already f32 (lowerer casts). Mirror the native C++ ops.
+  defp dispatch(:cholesky, [a], []), do: Nx.LinAlg.cholesky(a)
+  defp dispatch(:solve, [a, b], []), do: Nx.LinAlg.solve(a, b)
+
+  defp dispatch(:solve_triangular, [a, b], [upper_int]),
+    do: Nx.LinAlg.triangular_solve(a, b, lower: upper_int == 0)
+
+  defp dispatch(:qr, [a], []) do
+    {q, r} = Nx.LinAlg.qr(a)
+    [q, r]
+  end
+
+  defp dispatch(:eigh, [a], []) do
+    {w, v} = Nx.LinAlg.eigh(a)
+    [w, v]
+  end
+
+  defp dispatch(:svd, [a], []) do
+    {u, s, vt} = Nx.LinAlg.svd(a)
+    [u, s, vt]
+  end
+
+  # :lu returns the raw MLX outputs [pivots, l, u]; the lowered program rebuilds
+  # the permutation matrix from `pivots` via separate :eye / :take instructions.
+  defp dispatch(:lu, [a], []) do
+    [piv, l, u] = EMLX.linalg_lu(EMLX.Backend.from_nx(a))
+    [EMLX.Backend.to_nx(piv), EMLX.Backend.to_nx(l), EMLX.Backend.to_nx(u)]
   end
 
   defp dispatch(op, _args, _attrs),

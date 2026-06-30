@@ -114,7 +114,7 @@ each independently shippable. Run with
 - [x] [`06-sort-window-cumulative-fft`](06-sort-window-cumulative-fft.md) — sort/argsort, window reductions, cumulative, fft family. **`expand_block_via_default` fallback enables rfft/irfft and future unrecognized blocks.**
 - [x] [`07-creation-rng`](07-creation-rng.md) — iota, eye, `Nx.Random` primitives (via threefry2x32 decomposition).
 - [x] [`08-control-flow`](08-control-flow.md) — `cond`, `while`. **`cond` = inline `:select` ops; `while` = `Nx.Defn.Graph.split` + recursive `Graph.run(compiler: EMLX)`, Elixir host loop for each isolated while. Non-tail/nested/while-as-input compile natively.**
-- [ ] [`09-blocks-linalg`](09-blocks-linalg.md) — `Nx.Block.LinAlg.*` recognize-struct path + `default_expr` descent.
+- [x] [`09-blocks-linalg`](09-blocks-linalg.md) — `Nx.Block.LinAlg.*` recognize-struct path + `default_expr` descent. **Native CPU-pinned `mlx::linalg` opcodes (cholesky/solve/triangular_solve + multi-output qr/eigh/svd/lu via new multi-output IR); determinant via `default_expr` descent (N>3 through recognized native LU). cpu-pin composes in compiled graph on both `:cpu`/`:gpu`; linalg outputs `contiguous`-wrapped to avoid a strided CPU `Compiled`-kernel JIT failure.**
 - [ ] [`10-fast-kernels`](10-fast-kernels.md) — pattern-route to `EMLX.Fast`.
 
 ## Decision gates

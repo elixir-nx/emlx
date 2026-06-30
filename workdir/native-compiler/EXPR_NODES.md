@@ -148,7 +148,11 @@ logical_and, logical_or, logical_xor.
 
 ## K. Nx.Block.* (block node, dispatch on struct)
 
-- [ ] LinAlg: cholesky, triangular_solve, solve, qr, eigh, lu, svd, determinant
+- [x] LinAlg: cholesky, triangular_solve, solve, qr, eigh, lu, svd (native CPU-pinned MLX ops); determinant (default_expr descent — 2×2/3×3 pure primitives, N>3 descends through the recognized native LU block)
+  - Native multi-output ops (qr/eigh/svd/lu) use the new multi-output IR (instruction result is a list of refs; `to_wire/1` flat-indexes outputs; C++ `multi_op_registry`).
+  - Linalg outputs are `mlx::core::contiguous`-wrapped: MLX can otherwise emit a strided fused CPU `Compiled` kernel for the factorization tails (e.g. solve permutation, LU L/U masks) that fails to JIT (`pclose()`).
+  - Unsupported variants (QR `:complete`, SVD `full_matrices?: false`, `triangular_solve` with `left_side: false` or `transform_a != :none`) descend into `default_expr`; while-containing decompositions raise `does not yet lower op` → Evaluator fallback.
+  - Batched (rank>2) and chained linalg→linalg are **correct** (verified: batched `cholesky` on CPU; batched `lu` `P·L·U` reconstruction + chained `cholesky→solve` on GPU default — the LU pivot→`P` rebuild via `:eye`/`:take` broadcasts over batch dims). Known env limitation: batched `lu`/`solve` can still hit the CPU `pclose()` JIT failure for the rank-3 strided permutation/mask kernels even with the `contiguous`-wrap, so those batched variants are not exercised in the CPU CI suite.
 - [ ] all_close, phase, and other Nx.Block.* helpers
 
 ## L. EMLX.Fast fused kernels (optimization, not correctness)

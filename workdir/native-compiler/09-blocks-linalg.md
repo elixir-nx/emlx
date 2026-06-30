@@ -1,6 +1,6 @@
 # Stage 09 — Blocks / LinAlg
 
-Status: not started
+Status: done
 
 ## Why this stage exists
 
@@ -34,8 +34,54 @@ recognize the block struct for a native path, else lower its `default_expr`.
 
 ## Results
 
+### Design decision (advisor-reviewed)
+
+Realized LinAlg as **native C++ opcodes inside the compiled program** (not
+host-split points), per the advisor's recommendation, gated on a spike. The
+spike proved that pinning `mlx::core::linalg::*` to the **CPU device**
+(`k_linalg_cpu`) lets the primitive compose inside a `detail::compile`d graph
+**regardless of the graph's default device** — validated on both `:cpu` and
+`:gpu` defaults. This removed the need for the device-gated / `while`-splice
+fallback that was originally feared (user point 3): the same cpu-pinned opcode
+works on GPU graphs too, so no descent into the `while`-containing default
+decomposition is required for the supported variants.
+
+### Multi-output IR
+
+`qr`/`eigh`/`svd`/`lu` are multi-output. Extended the IR minimally: an
+instruction's result field may be a **list of refs**; `to_wire/1` assigns each
+output a consecutive **flat** result index (single-output programs unchanged);
+C++ gained a `multi_op_registry` whose outputs are appended to the flat results
+accumulator; the interpreter binds each output ref in order. Hand-rolled
+recognize clauses (no block protocol yet — deferred, per user point 2).
+
+### CPU strided-kernel pitfall (resolved)
+
+Under `detail::compile`, MLX fuses a factorization's elementwise tail (solve's
+permutation; LU's triangular L/U masks) into a **strided** `Compiled` CPU
+kernel that fails to JIT in some environments (`[Compile::eval_cpu] … pclose()
+failed`). Fix: wrap every linalg output in `mlx::core::contiguous` (a plain Copy
+primitive). cholesky/qr/eigh/svd were unaffected; solve/lu needed it.
+
+For **batched** (rank-3) `lu`/`solve` the strided kernel becomes rank-3 and can
+still trip `pclose()` on CPU even with the `contiguous`-wrap — an MLX/env
+limitation, not a correctness bug (see below). Those batched variants are kept
+out of the CPU CI suite; the 2-D paths and batched `cholesky` are exercised.
+
+### Determinant
+
+No MLX determinant primitive: lowers via **`default_expr` descent**. 2×2/3×3 are
+pure primitives (no `while`); N>3 descends through the **recognized native LU
+block** (so no `while` is ever materialized). Note: EMLX.Backend's *eager* N>3
+determinant has a pre-existing `{:u,32}`/`{:s,64}` type bug, so the 4×4 test uses
+a `Nx.BinaryBackend` reference oracle.
+
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
-| LinAlg blocks (native vs default) | | |
-| Other Nx.Block.* | | |
-| tolerance-sensitive goldens | | |
+| cholesky / solve / triangular_solve | native (CPU-pinned) | `expr.ex` recognize clauses + C++ `op_registry`; element-wise vs eager `EMLX.Backend` |
+| qr / eigh / svd | native (CPU-pinned, multi-output) | reconstruction tests (Q·R, V·diag(W)·Vᵀ, U·diag(S)·Vᵀ) — robust to sign/order ambiguity |
+| lu | native (multi-output) + in-graph eye/take for P | factors vs eager + P·L·U reconstruction |
+| determinant | `default_expr` descent | 2×2/3×3 pure primitives; 4×4 via recognized native LU; vs `Nx.BinaryBackend` |
+| triangular_solve variants | `left_side` + `transform_a: :none` native; others fall back | raises `does not yet lower op` → Evaluator |
+| batched / chained | correct (verified) | batched `cholesky` (CPU) + batched `lu` `P·L·U` & chained `cholesky→solve` (GPU); LU pivot→`P` rebuild broadcasts over batch dims. Batched `lu`/`solve` may still hit CPU `pclose()` (env limit) |
+| tests | 15 Stage 09 tests green on `:cpu` and `:gpu` defaults (added chained, batched cholesky, det-sign); full suite passing, no regressions | `test/emlx/native/expr_test.exs` |
