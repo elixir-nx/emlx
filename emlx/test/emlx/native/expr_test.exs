@@ -2199,6 +2199,56 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # ── Stage 11 regression helpers (validate_qwen3 bench regression) ──────────
+  #
+  # These three defns exercise the three splitter bugs surfaced by the Qwen3
+  # generation graph and fixed in Nx.Defn.Graph:
+  #   A) exponential rewrite_subtree (DAG walked as a tree) — needs id-memoization
+  #   B) runtime_call operand under-collection in the before-`while` stage
+  #   C) Graph.run/3 returning a non-tuple (map) container from the final stage
+
+  # A) A `while` followed by a deeply-shared post-DAG. `add(acc, acc)` references
+  # `acc` twice, so after N levels the graph is N nodes but 2^N tree paths. The
+  # split's rewrite pass must be id-memoized or this never terminates.
+  deftransformp deep_shared(v) do
+    Enum.reduce(1..28, v, fn _, acc -> Nx.add(acc, acc) end)
+  end
+
+  defn while_then_shared(x) do
+    {acc, _} =
+      while {a = x, k = x}, Nx.less(Nx.sum(a), 5.0) do
+        {Nx.add(a, k), k}
+      end
+
+    deep_shared(acc)
+  end
+
+  # B) A `while` whose initial carry is computed through a runtime_call
+  # (EMLX.Fast.rms_norm packs its operands in a `{x, weight}` tuple). The before
+  # stage must collect the runtime_call's operand parameters, or it under-counts
+  # its args and the remapped param indices overflow the stage input list.
+  defn while_after_runtime_call(x, w, k) do
+    s = Nx.add(EMLX.Fast.rms_norm(x, w, 1.0e-6), k)
+
+    {acc, _} =
+      while {a = s, kk = k}, Nx.less(Nx.sum(a), 10.0) do
+        {Nx.add(a, kk), kk}
+      end
+
+    acc
+  end
+
+  # C) A while-chain whose output is a MAP container; Graph.run/3 must return the
+  # non-tuple container from the final stage instead of trying to Tuple.to_list it.
+  defn while_then_map(x) do
+    {acc, _} =
+      while {a = x, k = x}, Nx.less(Nx.sum(a), 10.0) do
+        {Nx.add(a, k), k}
+      end
+
+    %{value: Nx.add(acc, 1.0), doubled: Nx.multiply(acc, 2.0)}
+  end
+
   # ── Stage 08 — cond ──────────────────────────────────────────────────────
 
   describe "Stage 08 — cond" do
@@ -2266,6 +2316,47 @@ defmodule EMLX.Native.ExprTest do
       {ea, eb} = eager
       assert Nx.to_number(na) == Nx.to_number(ea)
       assert Nx.to_number(nb) == Nx.to_number(eb)
+    end
+  end
+
+  # ── Stage 11 — splitter regressions (validate_qwen3 bench) ────────────────
+  #
+  # Guards against the three Nx.Defn.Graph.split regressions that broke the
+  # Qwen3 generation graph: see workdir/native-compiler/11-bench-regression.md.
+
+  describe "Stage 11 — splitter regressions" do
+    # A) Without id-memoization in rewrite_subtree this hangs (2^28 tree walk),
+    # so a generous-but-bounded timeout turns the hang into a test failure.
+    @tag :stage11
+    @tag timeout: 30_000
+    test "while + deeply-shared post-DAG compiles without exponential blowup" do
+      x = Nx.tensor([1.0, 1.0], type: :f32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&while_then_shared/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&while_then_shared/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    # B) runtime_call (rms_norm) feeding a while carry: the before stage must
+    # collect the runtime_call's tuple operands or param indices overflow.
+    @tag :stage11
+    test "runtime_call operands feeding a while carry are fully collected" do
+      x = Nx.tensor([[1.0, 2.0, 3.0, 4.0]], type: :f32, backend: EMLX.Backend)
+      w = Nx.tensor([1.0, 1.0, 1.0, 1.0], type: :f32, backend: EMLX.Backend)
+      k = Nx.tensor([[0.1, 0.1, 0.1, 0.1]], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&while_after_runtime_call/3, compiler: EMLX).(x, w, k)
+      eager = Nx.Defn.jit(&while_after_runtime_call/3, compiler: Nx.Defn.Evaluator).(x, w, k)
+      assert_close(native, eager)
+    end
+
+    # C) Map container as the final stage output of a while-chain.
+    @tag :stage11
+    test "while-chain returning a map container runs end-to-end" do
+      x = Nx.tensor([1.0, 1.0], type: :f32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&while_then_map/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&while_then_map/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native.value, eager.value)
+      assert_close(native.doubled, eager.doubled)
     end
   end
 

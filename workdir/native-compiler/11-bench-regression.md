@@ -1,8 +1,9 @@
 # Stage 11 — Investigation: `validate_qwen3` benchmark regression
 
-Status: in progress — **BLOCKING**. Do this before Stage 12+. The end-to-end
-benchmark is the perf oracle for the whole compiler effort (README decision
-gate "After 01"); while it is broken we cannot validate any further stage.
+Status: done. Root cause was three bugs in the `Nx.Defn.Graph` splitter (not in
+`emlx.ex` as the suspects below guessed); see **Results** at the bottom. The
+end-to-end benchmark is the perf oracle for the whole compiler effort (README
+decision gate "After 01").
 
 ## Symptom
 
@@ -79,3 +80,58 @@ the wrong `vars`/scope being threaded into a sub-expression (while body / block
   `native` (no hang, no crash); numbers recorded.
 - Root cause documented here (which commit, which seam, why).
 - Regression test(s) added; full native + EMLX suites green.
+
+## Results
+
+All three acceptance items met. The benchmark runs end-to-end:
+
+| path        | throughput   |
+| ----------- | ------------ |
+| `bb base`   | 7.3 tok/s    |
+| `bb+rewrite`| 23.4 tok/s   |
+| `native`    | 71.4 tok/s   |
+
+Suites green: `nx` fork 2673 passed, `emlx` 2513 passed. Regression tests added
+in `emlx/test/emlx/native/expr_test.exs` under `describe "Stage 11 — splitter
+regressions"` (tag `:stage11`), one per bug below.
+
+### Root cause — three bugs, all in the splitter (`Nx.Defn.Graph`)
+
+The doc's suspects (`emlx.ex` while/block code) were wrong. The regression lived
+in the **`Nx.Defn.Graph.split` rewrite pass** in the local nx fork
+(`/Users/valente/coding/nx/nx/lib/nx/defn/graph.ex`). The while-chain compilation
+landed in Stage 08 (`ababb5f`) is what first *exercised* `Graph.split` on the
+full Qwen3 graph, exposing latent splitter bugs — hence "broke after the last
+couple commits" even though the broken code is in nx, not emlx.
+
+1. **Symptom A (hang) — exponential `rewrite_subtree`.** The second rewrite pass
+   walked the post-split subgraph as a *tree*, revisiting shared nodes. Qwen3's
+   generation graph is a heavily-shared DAG, so this was effectively `O(2^depth)`
+   — CPU-bound spin (watchdog showed `status=running`, ~2e9 reductions in
+   `rewrite_subtree/3`/`composite_rewrite_subtree/3`), **not** a queue/NIF
+   deadlock. Fixed with per-node-`id` memoization in `rewrite_subtree`.
+
+2. **Symptom B (crash) — `runtime_call` operand under-collection.** A
+   `:runtime_call` node packs its tensor operands in an Nx container tuple
+   (`{x, weight}` for `EMLX.Fast.rms_norm`). The generic rewrite clause's list
+   handling skipped those tuple elements, so the before-`while` stage failed to
+   collect their `:parameter` refs. The stage's args were then remapped/counted
+   short (17 args) while the expression still referenced higher param indices
+   (up to 312) ⇒ `Enum.OutOfBoundsError` at 308 in the Evaluator fallback.
+   Proven via minimal repro that the **native** path also crashes (`KeyError`),
+   so this is a splitter bug, not a fallback-only or missing-lowering issue.
+   Fixed with a dedicated `do_rewrite_subtree` clause for `:runtime_call` that
+   traverses the operand tuple (mirrors `Nx.Defn.Tree.apply_args/4`).
+
+3. **Secondary — `Graph.run/3` non-tuple final-stage output.** Bumblebee's
+   generation defn returns a **map** container; `run/3` assumed tuple/tensor and
+   tried to `Tuple.to_list` it. Fixed by passing map/struct outputs through for
+   the final stage (intermediate stages are still guaranteed tuples of tensors).
+
+### Deviation from the plan worth flagging
+
+Step 5 of the Procedure proposed a regression test "that forces the Evaluator
+fallback for B". That framing was based on the wrong hypothesis (a
+fallback/lowering bug). B is a **splitter** bug that corrupts the stage for the
+native path too, so the regression test exercises the native compile path
+directly rather than forcing a fallback.

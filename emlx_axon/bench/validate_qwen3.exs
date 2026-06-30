@@ -167,8 +167,8 @@ bb_extract = fn %{results: [%{text: text, token_summary: summary}]} ->
   {text, summary.output}
 end
 
-# Bench.warmup("bb base", serving_base, prompt, bb_extract, warmup_runs)
-# base_bb_results = Bench.bench("bb base", serving_base, prompt, bb_extract, bench_runs)
+Bench.warmup("bb base", serving_base, prompt, bb_extract, warmup_runs)
+base_bb_results = Bench.bench("bb base", serving_base, prompt, bb_extract, bench_runs)
 
 Bench.warmup("bb+rewrite", serving_rewrite, prompt, bb_extract, warmup_runs)
 bb_results = Bench.bench("bb+rewrite", serving_rewrite, prompt, bb_extract, bench_runs)
