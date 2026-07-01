@@ -187,14 +187,32 @@ defmodule EMLX.Native.Expr do
     }
   end
 
+  # The wire format's `constants` list only carries scalars (one Elixir
+  # number per constant, see `to_wire/1`). A non-scalar `:constant` node
+  # shows up when Nx's tracer folds `Nx.broadcast(scalar, shape)` into a
+  # single wider constant (e.g. under a `revectorize` wrapper in
+  # Nx.LinAlg.SVD's default_expr) — emit the scalar and broadcast it out.
   defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :constant, args: [number]}} = node, state) do
     ref = make_ref()
 
-    %{
+    state = %{
       state
-      | constants: [{ref, number, node.type} | state.constants],
-        node_to_ref: Map.put(state.node_to_ref, id, ref)
+      | constants: [{ref, number, node.type} | state.constants]
     }
+
+    if node.shape == {} do
+      %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
+    else
+      broadcast_ref = make_ref()
+      shape_list = Tuple.to_list(node.shape)
+      iattrs = [length(shape_list) | shape_list] ++ [0]
+
+      %{
+        state
+        | instructions: [{broadcast_ref, :broadcast, [ref], iattrs} | state.instructions],
+          node_to_ref: Map.put(state.node_to_ref, id, broadcast_ref)
+      }
+    end
   end
 
   defp expand_node(
@@ -210,11 +228,22 @@ defmodule EMLX.Native.Expr do
     }
   end
 
+  # `inner` is a tuple (not a single %T{}) when `Nx.Defn.Expr.metadata/2` is
+  # called on a container expr (e.g. a `cond`'s tuple result) — the metadata
+  # node itself carries a `tuple_out` placeholder type and wraps the raw
+  # tuple of tensors. Mirror the multi-output convention: store a list of
+  # refs so `:elem` can index into it.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :metadata, args: [inner, _meta]}},
          state
        ) do
-    inner_ref = Map.fetch!(state.node_to_ref, inner.data.id)
+    inner_ref =
+      if is_tuple(inner) do
+        inner |> Tuple.to_list() |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
+      else
+        Map.fetch!(state.node_to_ref, inner.data.id)
+      end
+
     %{state | node_to_ref: Map.put(state.node_to_ref, id, inner_ref)}
   end
 
@@ -1716,21 +1745,40 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # eye: no tensor operands; iattrs = [dtype_int, m, n].
-  # Output shape is always {m, n}.
+  # eye: no tensor operands; iattrs = [dtype_int, m, n]. The native `:eye`
+  # opcode (mlx::core::eye) is always rank-2 — callers under a `revectorize`
+  # wrapper (e.g. Nx.LinAlg.qr/svd's default_expr, which unconditionally
+  # collapses vectorized axes into a leading batch dim, even a size-1 one for
+  # non-batched input) request a shape like {b0, .., m, n}. Emit the rank-2
+  # eye and broadcast it across the leading dims.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :eye, args: []}} = node,
          state
        ) do
     ref = make_ref()
-    [m, n] = Tuple.to_list(node.shape)
+    shape_list = Tuple.to_list(node.shape)
+    n_dims = length(shape_list)
+    [m, n] = Enum.take(shape_list, -2)
     dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(node.type))
 
-    %{
+    state = %{
       state
-      | instructions: [{ref, :eye, [], [dtype_int, m, n]} | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, ref)
+      | instructions: [{ref, :eye, [], [dtype_int, m, n]} | state.instructions]
     }
+
+    if n_dims == 2 do
+      %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
+    else
+      broadcast_ref = make_ref()
+      axes = [n_dims - 2, n_dims - 1]
+      iattrs = [n_dims | shape_list] ++ [length(axes) | axes]
+
+      %{
+        state
+        | instructions: [{broadcast_ref, :broadcast, [ref], iattrs} | state.instructions],
+          node_to_ref: Map.put(state.node_to_ref, id, broadcast_ref)
+      }
+    end
   end
 
   # ── runtime_call: route EMLX.Fast.* fused kernels to native opcodes ────────
@@ -1766,6 +1814,27 @@ defmodule EMLX.Native.Expr do
   # (e.g. :reduce) reaches into `fun.data.args` and lowers the body itself — so
   # the leaf is a no-op here.
   defp expand_node(%T{data: %Nx.Defn.Expr{op: :fun}}, state), do: state
+
+  # while (statically-counted range loop, unrolled) — see block-descent helper
+  # section below. `:while` only ever reaches `expand_node` when nested inside
+  # a block's default_expr (a top-level parent-scope `:while` is intercepted
+  # earlier by `EMLX.build_eval_fn`'s host-driven chain, never lowered here).
+  # `Nx.Defn.Kernel.while`'s range-generator form (used e.g. by Nx.LinAlg.qr's
+  # Householder loop) always produces a real `:while` node — even for a range
+  # with a compile-time-known trip count — because `unroll:` defaults to
+  # `false`. Detect that shape (integer index counted against a constant
+  # bound by a constant step) and statically unroll; anything else raises, so
+  # a genuinely data-dependent nested loop still surfaces a clear "not yet
+  # lowered" error instead of a silently wrong result.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :while, args: [initial, arg, condition, body]}},
+         state
+       ) do
+    case detect_static_while_trip_count(initial, arg, condition, body) do
+      {:ok, count} -> expand_while_unroll(id, initial, arg, body, count, state)
+      :error -> raise ArgumentError, "does not yet lower op :while"
+    end
+  end
 
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
@@ -1879,6 +1948,128 @@ defmodule EMLX.Native.Expr do
       end
 
     %{inner_state | node_to_ref: Map.put(inner_state.node_to_ref, id, result_ref)}
+  end
+
+  # ── while (static unroll for counted range loops — Stage 17) ──────────────
+  #
+  # Matches the exact shape `Nx.Defn.Expr.while_range/7` (`unroll: false`,
+  # the default for `while acc, i <- first..last//step do ... end`) always
+  # produces: `initial[0]` is a constant start index, `arg[0]` is the
+  # scalar-integer index parameter, `condition` is `index <=/>= constant_bound`,
+  # and `body[0]` is `add(index, constant_step)` (in either operand order).
+  # All four are known at trace time, so the trip count is too.
+  defp detect_static_while_trip_count(initial, arg, condition, body) when is_tuple(arg) do
+    index_param = elem(arg, 0)
+
+    with {:ok, start} <- constant_value(elem(initial, 0)),
+         {:ok, bound, le?} <- while_condition_bound(condition, index_param),
+         {:ok, step} <- while_body_step(elem(body, 0), index_param),
+         {:ok, count} <- static_trip_count(start, bound, step, le?) do
+      {:ok, count}
+    else
+      _ -> :error
+    end
+  end
+
+  defp detect_static_while_trip_count(_initial, _arg, _condition, _body), do: :error
+
+  # `le?` (condition is `<=`) implies an ascending loop (step > 0); a `>=`
+  # condition implies a descending loop (step < 0). Anything else either
+  # never iterates as traced or isn't the mechanical `while_range` shape.
+  defp static_trip_count(start, bound, step, true) when step > 0 and bound >= start,
+    do: {:ok, div(bound - start, step) + 1}
+
+  defp static_trip_count(start, bound, step, false) when step < 0 and bound <= start,
+    do: {:ok, div(start - bound, -step) + 1}
+
+  defp static_trip_count(_start, _bound, _step, _le?), do: :error
+
+  defp while_condition_bound(
+         %T{data: %Nx.Defn.Expr{op: op, args: [%T{data: %Nx.Defn.Expr{id: pid}}, bound_node]}},
+         %T{data: %Nx.Defn.Expr{id: pid}}
+       )
+       when op in [:less_equal, :greater_equal] do
+    case constant_value(bound_node) do
+      {:ok, bound} -> {:ok, bound, op == :less_equal}
+      :error -> :error
+    end
+  end
+
+  defp while_condition_bound(_condition, _index_param), do: :error
+
+  defp while_body_step(
+         %T{data: %Nx.Defn.Expr{op: :add, args: [a, b]}},
+         %T{data: %Nx.Defn.Expr{id: pid}}
+       ) do
+    case {a, b} do
+      {%T{data: %Nx.Defn.Expr{id: ^pid}}, step_node} -> constant_value(step_node)
+      {step_node, %T{data: %Nx.Defn.Expr{id: ^pid}}} -> constant_value(step_node)
+      _ -> :error
+    end
+  end
+
+  defp while_body_step(_next_index, _index_param), do: :error
+
+  defp constant_value(%T{data: %Nx.Defn.Expr{op: :constant, args: [n]}}) when is_integer(n),
+    do: {:ok, n}
+
+  defp constant_value(_node), do: :error
+
+  # Unrolls a counted `:while` `count` times. Each iteration re-lowers `body`
+  # (a tuple of expr roots) with its `arg` parameters bound to the previous
+  # iteration's output refs (the first iteration binds to `initial`'s refs,
+  # already expanded as parent-scope deps before this node was reached). The
+  # node's own ref becomes the list of the final iteration's output refs, one
+  # per loop-carried slot — same multi-output convention `:elem` reads from.
+  defp expand_while_unroll(id, initial, arg, body, count, state) do
+    initial_list = Tuple.to_list(initial)
+    arg_list = Tuple.to_list(arg)
+    body_list = Tuple.to_list(body)
+
+    init_refs = Enum.map(initial_list, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    {final_refs, state} =
+      Enum.reduce(1..count//1, {init_refs, state}, fn _iteration, {carry_refs, acc_state} ->
+        param_ref_by_pos =
+          arg_list
+          |> Enum.zip(carry_refs)
+          |> Map.new(fn {param, ref} -> {hd(param.data.args), ref} end)
+
+        lower_tuple_body(body_list, param_ref_by_pos, acc_state)
+      end)
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, final_refs)}
+  end
+
+  # Like `lower_fun_body/3`, but for a tuple of body roots (a `:while` body's
+  # loop-carried tuple) instead of a single tensor — returns a list of refs,
+  # one per tuple element, instead of a single ref.
+  defp lower_tuple_body(body_list, param_ref_by_pos, state) do
+    inner_ordered = EMLX.Defn.Tree.post_order(List.to_tuple(body_list))
+
+    param_id_to_ref =
+      inner_ordered
+      |> Enum.filter(&(&1.data.op == :parameter))
+      |> Map.new(fn p -> {p.data.id, Map.fetch!(param_ref_by_pos, hd(p.data.args))} end)
+
+    param_id_set = MapSet.new(Map.keys(param_id_to_ref))
+    local_base = Map.merge(state.node_to_ref, param_id_to_ref)
+
+    inner_state =
+      Enum.reduce(inner_ordered, %{state | node_to_ref: local_base}, fn node, st ->
+        if MapSet.member?(param_id_set, node.data.id), do: st, else: expand_node(node, st)
+      end)
+
+    result_refs = Enum.map(body_list, &Map.fetch!(inner_state.node_to_ref, &1.data.id))
+
+    {result_refs,
+     %{
+       state
+       | instructions: inner_state.instructions,
+         captures: inner_state.captures,
+         constants: inner_state.constants,
+         inputs: inner_state.inputs
+     }}
   end
 
   # ── custom-fun reduce (static unroll — Stage 12 spike) ────────────────────

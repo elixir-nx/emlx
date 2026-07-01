@@ -33,8 +33,8 @@ Source of truth:
 | `elem` | `(tuple, pos)` | index into list of refs stored for tuple-output op | [x] |
 | `fun` | `(params, expr, mfa)` | inline at call site / child program | [x] (unreachable / already-subsumed — Stage 16) |
 | `cond` | `(clauses, last)` | right-folded nested `:select` ops (all branches in parent scope) | [x] |
-| `while` | `(initial, arg, pred, body)` | `Nx.Defn.Graph.split` on `:while`; cond/body recompiled via `compiler: EMLX`; Elixir host loop | [x] |
-| `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [~] (Stage 17 — while-in-`default_expr` boundary) |
+| `while` | `(initial, arg, pred, body)` | parent scope: `Nx.Defn.Graph.split` + host loop. Nested in a block's `default_expr`: statically-counted loops (fixed trip count at trace time) unroll in place in `expand_node` (Stage 17); a genuinely data-dependent nested `while` still raises | [x] |
+| `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [x] |
 | `optional` | `(name, args, default)` | lower default expr, or route to native | [x] (already-subsumed — dead node type in current Nx fork, Stage 16; re-audit on Nx version bump) |
 | `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] (Stage 18 — contingent spike) |
 | `runtime_call` | `(expr, cb, out, opts)` | recognize `EMLX.Fast.*` callback → fused opcode (see L); else raises | [x] |
@@ -55,14 +55,36 @@ Notes:
   natively without an Evaluator fallback.
 - `block` is the lowering-control lever (PLAN.md §6): recognize the
   `Nx.Block.*` struct for a native/fused path, else lower `default_expr`.
-  Remaining structural boundary (Stage 15 Part A): a `while` reached *inside*
-  a block's `default_expr` still raises, because `while` is handled at
-  `build_eval_fn` level (splits the top-level expression on `:while` nodes),
-  not inside `expand_node`'s per-node dispatch — a `default_expr` descent
-  never re-enters that split. Custom-fun `reduce`/`window_reduce` inside a
-  block's `default_expr` do *not* hit this boundary (Stage 13's static
-  trace-time unroll is ordinary node expansion, not a `build_eval_fn`-level
-  split), so `block` is `[~]` only for the `while`-inside-`default_expr` case.
+- **Stage 17 (while-in-`default_expr` descent):** a top-level parent-scope
+  `while` is handled at `build_eval_fn` level (splits the expression on
+  `:while` nodes, Stage 08) before `default_expr` descent ever runs — that
+  split never sees a `while` nested inside a block's `default_expr`. Instead
+  of extending the split to recurse into blocks, `expand_node` now has a
+  `:while` clause that fires only in that nested position: it recognizes the
+  exact shape `Nx.Defn.Expr.while_range/7` emits for a range-generator loop
+  with `unroll: false` (the default) — start index, bound, and step are all
+  compile-time constants — and statically unrolls the body that many times,
+  chaining each iteration's carried refs into the next (same idiom as the
+  Stage 12/13 custom-fun static unroll, generalized from a single accumulator
+  to a loop-carried tuple). A nested `while` that doesn't match this shape
+  (genuinely data-dependent trip count) still raises `does not yet lower op
+  :while`, deliberately — no silent wrong answer. This closes QR `mode:
+  :complete` (Householder loop) and, transitively, three unrelated
+  pre-existing gaps that blocked reaching the `while` node at all: `:eye` and
+  `:constant` both assumed no leading batch/vectorized dim (broke under
+  `Nx.revectorize`'s `collapsed_axes` wrapping, used unconditionally by both
+  `Nx.LinAlg.qr` and `Nx.LinAlg.svd`), and `:metadata` assumed a single-tensor
+  inner expr (broke when wrapping a tuple, as `Nx.LinAlg.svd`'s Gram-matrix
+  path does around its `cond`). SVD `full_matrices?: false` needed only the
+  latter two fixes — its default_expr no longer contains a `while` at all in
+  the current Nx fork (rewritten to a non-iterative Gram-matrix/`eigh`
+  decomposition instead of the old QDWH iteration). `triangular_solve` with
+  `left_side: false` or `transform_a != :none` is a *different* gap not
+  addressed here: those opts land directly on a `:triangular_solve` op node
+  (not a block whose `default_expr` contains a `while`), and the raise is a
+  deliberate "not yet implemented" for that native op's unsupported operand
+  layout — orthogonal to this stage's structural-boundary charter, left
+  raising.
 - `token`/hooks imply host side effects → not lowerable to a pure replay; they
   raise (no silent fallback in single mode). `runtime_call` is fully lowered
   within its designed scope: `EMLX.Fast.*` callbacks (incl. per-token prefill
@@ -176,7 +198,7 @@ logical_and, logical_or, logical_xor.
 - [x] LinAlg: cholesky, triangular_solve, solve, qr, eigh, lu, svd (native CPU-pinned MLX ops); determinant (default_expr descent — 2×2/3×3 pure primitives, N>3 descends through the recognized native LU block)
   - Native multi-output ops (qr/eigh/svd/lu) use the new multi-output IR (instruction result is a list of refs; `to_wire/1` flat-indexes outputs; C++ `multi_op_registry`).
   - Linalg outputs are `mlx::core::contiguous`-wrapped: MLX can otherwise emit a strided fused CPU `Compiled` kernel for the factorization tails (e.g. solve permutation, LU L/U masks) that fails to JIT (`pclose()`).
-  - Unsupported variants (QR `:complete`, SVD `full_matrices?: false`, `triangular_solve` with `left_side: false` or `transform_a != :none`) descend into `default_expr`; while-containing decompositions raise `does not yet lower op` → Evaluator fallback.
+  - QR `:complete` and SVD `full_matrices?: false` descend into `default_expr`; both lower natively (Stage 17 — see the `while`-in-`default_expr` note above). `triangular_solve` with `left_side: false` or `transform_a != :none` is a direct op-node gap (not a `default_expr` descent) and still raises `does not yet lower op :triangular_solve` → Evaluator fallback (out of Stage 17's scope).
   - Batched (rank>2) and chained linalg→linalg are **correct** (verified: batched `cholesky` on CPU; batched `lu` `P·L·U` reconstruction + chained `cholesky→solve` on GPU default — the LU pivot→`P` rebuild via `:eye`/`:take` broadcasts over batch dims). Known env limitation: batched `lu`/`solve` can still hit the CPU `pclose()` JIT failure for the rank-3 strided permutation/mask kernels even with the `contiguous`-wrap, so those batched variants are not exercised in the CPU CI suite.
 - [x] all_close, phase, top_k (tuple-output `default_expr`, via `flat_refs`), and unrecognized-struct `default_expr` descent — equivalence-tested (Stage 15 Part A)
 

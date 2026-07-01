@@ -3325,6 +3325,141 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  describe "Stage 17 — while-in-default_expr descent (static unroll)" do
+    # QR `mode: :complete` and SVD `full_matrices?: false` both fall through
+    # to `expand_block_via_default`; QR's Householder decomposition carries a
+    # statically-counted `while` (trip count fixed by the input shape at
+    # trace time) that previously raised "does not yet lower op :while" and
+    # fired the Evaluator fallback. `expand_node`'s new `:while` clause
+    # detects that shape and unrolls it in place.
+    @tag :stage17
+    test "qr :complete lowers natively — Q orthonormal, Q·R reconstructs A (square)" do
+      a =
+        Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend)
+        |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
+
+      {q, r} = Nx.Defn.jit(fn t -> Nx.LinAlg.qr(t, mode: :complete) end, compiler: EMLX).(a)
+
+      assert q.shape == {3, 3}
+      assert r.shape == {3, 3}
+      assert_close(Nx.dot(q, r), a)
+      assert_close(Nx.dot(Nx.transpose(q), q), Nx.eye(3, type: :f32, backend: EMLX.Backend))
+    end
+
+    @tag :stage17
+    test "qr :complete lowers natively — tall input, Q is m×m (not m×n)" do
+      a = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(1)
+
+      {q, r} = Nx.Defn.jit(fn t -> Nx.LinAlg.qr(t, mode: :complete) end, compiler: EMLX).(a)
+
+      assert q.shape == {4, 4}
+      assert r.shape == {4, 3}
+      assert_close(Nx.dot(q, r), a)
+      assert_close(Nx.dot(Nx.transpose(q), q), Nx.eye(4, type: :f32, backend: EMLX.Backend))
+    end
+
+    @tag :stage17
+    test "qr :complete matches eager EMLX.Backend (Evaluator) on Q·R and orthonormality" do
+      a = Nx.iota({5, 2}, type: :f32, backend: EMLX.Backend) |> Nx.add(1)
+
+      {q_native, r_native} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.qr(t, mode: :complete) end, compiler: EMLX).(a)
+
+      {q_eager, r_eager} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.qr(t, mode: :complete) end, compiler: Nx.Defn.Evaluator).(a)
+
+      assert_close(Nx.dot(q_native, r_native), Nx.dot(q_eager, r_eager))
+      assert_close(Nx.dot(Nx.transpose(q_native), q_native), Nx.eye(5, type: :f32, backend: EMLX.Backend))
+    end
+
+    @tag :stage17
+    test "svd full_matrices?: false lowers natively — U·diag(S)·Vᵗ reconstructs A (tall)" do
+      a = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(1)
+
+      {u, s, vt} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end, compiler: EMLX).(a)
+
+      assert u.shape == {4, 3}
+      assert s.shape == {3}
+      assert vt.shape == {3, 3}
+      recon = Nx.dot(Nx.multiply(u, Nx.reshape(s, {1, 3})), vt)
+      assert_close(recon, a)
+    end
+
+    @tag :stage17
+    test "svd full_matrices?: false lowers natively — wide and square inputs" do
+      wide = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend) |> Nx.add(1)
+
+      {u, s, vt} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end, compiler: EMLX).(wide)
+
+      assert u.shape == {3, 3}
+      assert s.shape == {3}
+      assert vt.shape == {3, 4}
+      assert_close(Nx.dot(Nx.multiply(u, Nx.reshape(s, {1, 3})), vt), wide)
+
+      square =
+        Nx.iota({3, 3}, type: :f32, backend: EMLX.Backend)
+        |> Nx.add(Nx.eye(3, backend: EMLX.Backend))
+
+      {u2, s2, vt2} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end, compiler: EMLX).(square)
+
+      assert_close(Nx.dot(Nx.multiply(u2, Nx.reshape(s2, {1, 3})), vt2), square)
+    end
+
+    @tag :stage17
+    test "svd full_matrices?: false matches eager EMLX.Backend singular values" do
+      a = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend) |> Nx.add(1)
+
+      {_u, s_native, _vt} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end, compiler: EMLX).(a)
+
+      {_u, s_eager, _vt} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end, compiler: Nx.Defn.Evaluator).(a)
+
+      assert_close(s_native, s_eager)
+    end
+
+    @tag :stage17
+    test "qr :complete lowers with no :while instruction in the compiled program" do
+      templates = [Nx.template({4, 3}, :f32)]
+
+      expr =
+        Nx.Defn.debug_expr_apply(
+          fn t -> Nx.LinAlg.qr(t, mode: :complete) end,
+          templates
+        )
+
+      prog = Expr.lower(expr, 1)
+
+      assert Enum.all?(prog.instructions, fn {_id, op, _operands, _attrs} -> op != :while end)
+    end
+
+    # triangular_solve's non-default variants are a *different* gap: the
+    # opts land directly on a `:triangular_solve` op node (not a `:block` with
+    # a `while`-bearing `default_expr`), and the raise is deliberate
+    # (`left_side`/`transform_a` unimplemented in the native op, not a
+    # structural boundary). Left out of Stage 17's scope; still raises.
+    @tag :stage17
+    test "triangular_solve left_side: false is unaffected (still raises — separate gap)" do
+      a = Nx.tensor([[3.0, 0.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]], backend: EMLX.Backend)
+      b = Nx.tensor([[1.0, 2.0, 3.0]], backend: EMLX.Backend)
+
+      templates = [Nx.template(a.shape, :f32), Nx.template(b.shape, :f32)]
+
+      expr =
+        Nx.Defn.debug_expr_apply(
+          fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end,
+          templates
+        )
+
+      assert_raise ArgumentError, ~r/does not yet lower op :triangular_solve/, fn ->
+        Expr.lower(expr, 2)
+      end
+    end
+  end
+
   # Softmax normalisation over the last axis (primitive SDPA oracle helper).
   defp normalize_rows(t) do
     Nx.divide(t, Nx.sum(t, axes: [-1], keep_axes: true))
