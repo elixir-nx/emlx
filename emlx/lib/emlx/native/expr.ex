@@ -121,15 +121,27 @@ defmodule EMLX.Native.Expr do
 
   `output` is any `Nx.Container.t()` — the result of `fun.(vars)`.
 
+  `num_inputs`, when given, is the true parameter arity of the call that
+  produced `output` (e.g. `length(Composite.flatten_list(vars))`). It exists
+  because `output` need not reference every parameter position — e.g. a
+  `while` condition sub-expression commonly ignores carry slots it doesn't
+  read. Without a hint, the wire input list is built only from *referenced*
+  positions, compacted/renumbered by ascending position; a caller that still
+  supplies the full, dense argument list (as `EMLX.__compile__`'s runtime
+  dispatch does) would then bind values to the wrong wire slots. Passing
+  `num_inputs` pads `inputs_list` to that arity, with unreferenced positions
+  filled by placeholder refs that no instruction ever reads, so wire index
+  == original parameter position always.
+
   Raises `ArgumentError` with message `"does not yet lower op :foo"` for any
   op not yet implemented. The compiler seam in `EMLX.__compile__/4` catches
   this message and falls back to `Nx.Defn.Evaluator`.
   """
-  @spec lower(Nx.Container.t()) :: t()
-  def lower(output) do
+  @spec lower(Nx.Container.t(), non_neg_integer() | nil) :: t()
+  def lower(output, num_inputs \\ nil) do
     ordered = EMLX.Defn.Tree.post_order(output)
 
-    # inputs is a map of pos → ref during lowering; sorted to a list at the end.
+    # inputs is a map of pos → ref during lowering; densified to a list at the end.
     state = %{
       inputs: %{},
       captures: [],
@@ -140,10 +152,16 @@ defmodule EMLX.Native.Expr do
 
     state = Enum.reduce(ordered, state, &expand_node/2)
 
+    max_referenced_pos = state.inputs |> Map.keys() |> Enum.max(fn -> -1 end)
+    arity = max(num_inputs || 0, max_referenced_pos + 1)
+
+    # Dense 0..arity-1: a position not referenced by `output` (e.g. a
+    # while-cond ignoring a carry slot) gets a fresh, never-instruction-
+    # referenced placeholder ref, so it still occupies its wire slot.
     inputs_list =
-      state.inputs
-      |> Enum.sort_by(fn {pos, _ref} -> pos end)
-      |> Enum.map(fn {_pos, ref} -> ref end)
+      for pos <- 0..(arity - 1)//1 do
+        Map.get_lazy(state.inputs, pos, &make_ref/0)
+      end
 
     flat_outputs = Composite.flatten_list([output])
     output_refs = Enum.map(flat_outputs, &Map.fetch!(state.node_to_ref, &1.data.id))

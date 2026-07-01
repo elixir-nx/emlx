@@ -1,8 +1,21 @@
 # Stage 14 — `while` via C++ child program (contingent)
 
-Status: **dropped (gated no-go by Stage 12).** Not pursued now; re-open only on a
-concrete triggering workload (see "Revisit triggers" below). The Stage-08
-`Graph.split` host loop is retained.
+Status: **dropped — no-go RE-AFFIRMED by measurement (2026-06-30 revisit).** The
+user re-opened this on a `while`-prevalence argument; a zero-C++ benchmark
+(`emlx/bench/while_dispatch_bench.exs`) refuted it (see "Revisit measurement"
+below): a C++ in-worker `while` saves ≤30 % per iteration for convergent loops
+(shrinking with body weight) and is a **regression** for counted loops (the host
+loop already fuses). The Stage-08 host loop is retained. A separate correctness
+bug in the counter-only bare-while path was found and filed as follow-up.
+
+> **Correction (advisor, 2026-06-30):** the original framing below ("recompiling
+> stages by re-entering this compiler … pays BEAM↔NIF crossings per iteration")
+> overstated the per-iteration cost. `build_while_base_eval_fn` jits `cond_fn`/
+> `body_fn` **once** at compile time; `run_while_loop` only *replays* per
+> iteration. The `Graph.split` + re-jit is a **per-invocation fixed cost**, not a
+> per-iteration one. The only per-iteration removable cost is: 2 jit-dispatched
+> `eval_program` NIF calls (cond + body) + 1 `Nx.to_number` scalar pull. That is
+> the load-bearing quantity being measured.
 
 ## Why this stage might exist
 
@@ -34,6 +47,127 @@ is staying off the BEAM — this must be measured, not assumed.
 - C++ `while` matches the host-loop path on all Stage 08 cases and shows a
   measured improvement, **or** the stage is explicitly dropped with the host
   loop retained and the decision recorded here.
+
+## Revisit measurement (2026-06-30) — decision: RE-AFFIRM no-go
+
+Advisor gated the revisit on measuring the **removable-overhead fraction** per
+iteration before writing any C++. Built `emlx/bench/while_dispatch_bench.exs`
+(zero C++) which decomposes the real Stage-08 host-loop path. Key insight that
+reframed everything: `Nx.to_number(cond)` in `run_while_loop` only forces what
+the **condition** reads, so there are two structurally different regimes the
+original analysis conflated:
+
+- **counted** — cond reads only a loop counter. The body's lazy MLX graph
+  accumulates across iterations and **fuses**; only the tiny counter is forced
+  each step. Models fixed trip-count loops.
+- **convergent** — cond reads the carry (Newton/fixed-point). Every iteration
+  forces a full worker eval barrier. Models data-dependent loops.
+
+### Numbers (median, N=500 iters/run)
+
+Removable per iter = `2·jit_dispatch_floor + to_number_floor` — the max a C++
+in-worker `while` can save (it collapses the loop into one NIF call, removing
+the per-iteration BEAM↔NIF crossings + scalar pull; it CANNOT remove the worker
+eval barrier under MLX 0.31.2).
+
+| device | dispatch floor | to_number floor | removable/iter |
+|--------|---------------:|----------------:|---------------:|
+| CPU    | ~40 µs         | ~25 µs          | ~106 µs        |
+| GPU    | ~51 µs         | ~27 µs          | ~130 µs        |
+
+**Convergent regime — removable fraction shrinks as body grows** (GPU):
+
+| body            | µs/iter | removable % |
+|-----------------|--------:|------------:|
+| cos scalar `{}` | 434     | 29.9 %      |
+| cos vec `{1024}`| 460     | 28.2 %      |
+| cos `{256,256}` | 514     | 25.3 %      |
+| dot `{64,64}`   | 541     | 24.0 %      |
+| dot `{256,256}` | 538     | 24.1 %      |
+| dot `{512,512}` | 748     | 17.3 %      |
+
+CPU is worse for C++ (14–22 %). Even the lightest possible real body caps the
+C++ win at ~30 % (GPU) / ~22 % (CPU), and it falls as the body gets heavier —
+the exact opposite of what a "prevalence" argument needs.
+
+**Counted regime — the host loop already fuses; a C++ `while` would be SLOWER.**
+Lazy (host counted-while) vs forced (what a C++ eval-per-iteration while pays,
+minus one crossing) per iter, GPU:
+
+| body            | lazy µs/it | C++-while ceiling µs/it | verdict          |
+|-----------------|-----------:|------------------------:|------------------|
+| cos vec `{1024}`| 150        | 181                     | host **beats** C++|
+| cos `{256,256}` | 149        | 177                     | host **beats** C++|
+| dot `{64,64}`   | 214        | 216                     | host **beats** C++|
+| dot `{256,256}` | 255        | 262                     | host **beats** C++|
+| dot `{512,512}` | 396        | 414                     | host **beats** C++|
+
+For **every** body weight the fused host loop beats the C++-while ceiling,
+because a C++ eval-per-iteration loop breaks the cross-iteration fusion the
+host loop gets for free. So for the very common fixed-trip-count case, a C++
+`while` is a **regression**, not a win.
+
+**`Graph.split` fragmentation (#2)** is a per-invocation fixed cost (~0–0.75 ms,
+within noise at 20 iters), independent of trip count → amortized to near-zero for
+real loops. Not a per-iteration cost; does not move the decision.
+
+### Decision
+
+**RE-AFFIRM no-go.** The revisit trigger (`while` prevalence ⇒ avoid round-trips
+& nested compilations) does not survive measurement:
+1. Convergent loops: C++ saves ≤30 % (GPU) and shrinks with body weight —
+   marginal, and the eval barrier (the real cost) is irreducible under MLX
+   0.31.2.
+2. Counted loops: the host loop already fuses; C++ would be **slower**.
+3. "Nested compilations" is a fixed per-invocation cost (advisor-corrected: the
+   loop does **not** recompile per iteration), amortized to noise.
+
+The host loop stays. Revisit triggers below unchanged, plus the new hard datum:
+a C++ `while` only helps convergent loops, only marginally, and never counted
+ones — so it needs a specific profiled convergent workload dominated by BEAM
+crossings to justify the full subprogram-channel build.
+
+### Follow-up bug found (separate from this gate) — FIXED
+
+The measurement surfaced a **real correctness bug** in the existing Stage-08
+host-loop path (`build_while_base_eval_fn`): a bare-tail `while` whose condition
+does **not** reference every carry element (e.g. a counter-only `Nx.less(i, n)`
+with the payload carried but unread by the cond) either ran **0 iterations**
+(scalar carry) or **crashed** with a shape mismatch (non-scalar carry) —
+`EMLX.Backend.check_shape_and_type!/3` via `run_while_loop/3`. Reproduced for
+`{}`, `{1024}`, `{256,256}`, matmul carries. The tested cases (`count_to_10`,
+`while_two_carry`) all have carry-reading conditions, which is why this slipped
+through.
+
+**Root cause:** `EMLX.Native.Expr.lower/1` built its wire input list only from
+parameter positions actually *referenced* inside the given sub-expression,
+sorted-then-compacted (dropping unreferenced positions rather than reserving
+their slot). This is safe for a fresh top-level `defn` trace or a
+`Graph.split` stage (both are dense by construction — every position crossing
+that boundary is, by definition, used downstream). It is **not** safe for
+`while`'s `cond_fn`/`body_fn`, which reuse a pre-built sub-scope expression
+standalone: a `while` condition legitimately ignores carry slots it doesn't
+read (the body still threads them through), so its embedded parameter
+positions can be sparse — while the host loop's runtime dispatch
+(`run_while_loop/3`) always supplies the *full*, dense carry tuple. The
+compaction silently shifted every position after a gap, binding wrong values
+(or, for shape-incompatible neighbors, crashing).
+
+**Fix:** `EMLX.Native.Expr.lower/2` now takes an optional `num_inputs` arity
+hint and densifies the wire input list to `0..max(num_inputs, max_referenced_pos)`,
+filling any gap with a placeholder ref no instruction ever reads (so wire
+index == original parameter position, always). `EMLX.__compile__` threads the
+true call arity (`length(Composite.flatten_list(vars))`, already on hand in
+`try_native_compile/3`) into the one call site that needed it — the flat/no-while
+branch of `build_eval_fn/4` (used by `cond_fn`/`body_fn` when they re-enter the
+compiler). No other call site needed a change (`bare_while?`/`Graph.split`
+branches don't lower directly and are dense by construction). Zero-cost: the
+extra wire slots are unreferenced by any instruction, so no data crosses the
+NIF boundary for them beyond what the caller already sends.
+
+Regression tests added (`while_counter_only_cond/3`, Stage 08 describe block,
+`emlx/test/emlx/native/expr_test.exs`): scalar and non-scalar payload, both vs
+the Evaluator oracle. Full suite green (2532 tests).
 
 ## Stage 12 gate outcome + analysis (decision: dropped)
 

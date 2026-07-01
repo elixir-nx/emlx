@@ -2376,6 +2376,21 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # while: cond reads only the counter (`i`, `n`), never the payload `x`. `x`'s
+  # carry-sub-scope parameter is unreferenced by the cond sub-expression, which
+  # exercises the sparse-parameter-position bug (see Stage 14 revisit,
+  # workdir/native-compiler/14-while-childprogram.md): `EMLX.Native.Expr.lower/1`
+  # used to compact its wire input list to only *referenced* positions, silently
+  # shifting every position after the unreferenced one — while the runtime
+  # dispatch still supplied the full, dense carry. Regression covers both a
+  # scalar payload (previously silently wrong: 0 iterations) and a non-scalar
+  # payload (previously a hard crash: shape mismatch).
+  defn while_counter_only_cond(x, i, n) do
+    while {x, i, n}, Nx.less(i, n) do
+      {Nx.add(x, 1), Nx.add(i, 1), n}
+    end
+  end
+
   # ── Stage 11 regression helpers (validate_qwen3 bench regression) ──────────
   #
   # These three defns exercise the three splitter bugs surfaced by the Qwen3
@@ -2493,6 +2508,36 @@ defmodule EMLX.Native.ExprTest do
       {ea, eb} = eager
       assert Nx.to_number(na) == Nx.to_number(ea)
       assert Nx.to_number(nb) == Nx.to_number(eb)
+    end
+
+    @tag :stage08
+    test "while: counter-only cond ignores a scalar carry slot" do
+      x = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      i0 = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      n = Nx.tensor(5, type: :s32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&while_counter_only_cond/3, compiler: EMLX).(x, i0, n)
+      eager = Nx.Defn.jit(&while_counter_only_cond/3, compiler: Nx.Defn.Evaluator).(x, i0, n)
+      {nx, ni, _} = native
+      {ex, ei, _} = eager
+      assert Nx.to_number(nx) == Nx.to_number(ex)
+      assert Nx.to_number(ni) == Nx.to_number(ei)
+      assert Nx.to_number(ni) == 5
+    end
+
+    @tag :stage08
+    test "while: counter-only cond ignores a non-scalar carry slot" do
+      x = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
+      i0 = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      n = Nx.tensor(4, type: :s32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&while_counter_only_cond/3, compiler: EMLX).(x, i0, n)
+      eager = Nx.Defn.jit(&while_counter_only_cond/3, compiler: Nx.Defn.Evaluator).(x, i0, n)
+      {nx, ni, _} = native
+      {ex, ei, _} = eager
+      assert_close(nx, ex)
+      assert Nx.to_number(ni) == Nx.to_number(ei)
+      assert Nx.to_number(ni) == 4
     end
   end
 

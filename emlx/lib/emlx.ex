@@ -1389,7 +1389,11 @@ defmodule EMLX do
   defp try_native_compile(vars, fun, device) do
     output_expr = fun.(vars)
     {worker, effective_device} = resolve_worker(device)
-    eval_fn = build_eval_fn(output_expr, worker, effective_device)
+    # `vars`' flattened leaf count is the true call arity — passed through so
+    # `lower/2` can densify its input list even when `output_expr` doesn't
+    # reference every parameter position (see EMLX.Native.Expr.lower/2 doc).
+    num_inputs = vars |> Nx.Defn.Composite.flatten_list() |> length()
+    eval_fn = build_eval_fn(output_expr, worker, effective_device, num_inputs)
     {:ok, eval_fn}
   rescue
     e in ArgumentError ->
@@ -1413,13 +1417,13 @@ defmodule EMLX do
   #     `while` nodes, replayed by `Nx.Defn.Graph.run/3` with `compiler: EMLX`;
   #     each stage re-enters this compiler (flat stages compile flat, isolated
   #     `while` stages hit the base case above).
-  defp build_eval_fn(output_expr, worker, effective_device) do
+  defp build_eval_fn(output_expr, worker, effective_device, num_inputs) do
     cond do
       bare_while?(output_expr) ->
         build_while_base_eval_fn(output_expr, effective_device)
 
       not contains_while?(output_expr) ->
-        program = EMLX.Native.Expr.lower(output_expr)
+        program = EMLX.Native.Expr.lower(output_expr, num_inputs)
         resource = compile_native_program(worker, effective_device, program)
         build_native_eval_fn(resource, output_expr, effective_device)
 
