@@ -18,6 +18,8 @@ defmodule EMLX.Native.Expr do
                        in dependency order. The integer-attr list is opcode-specific;
                        for `:astype` it carries a single dtype integer (see `@mlx_type_to_int`).
   - `outputs`  — list of refs identifying the return values.
+  - `hooks`    — `[%{name, callback, template, refs}]` for `Nx.Defn.Kernel.hook/2,3`
+                 observers reached from the top-level scope (see "Hooks" below).
 
   ## iattrs encoding per opcode
 
@@ -69,6 +71,48 @@ defmodule EMLX.Native.Expr do
   Unrecognized `Nx.Block.*` structs descend into `default_expr` (primitive decomposition).
   `Nx.Random.*` functions decompose via `threefry2x32` into primitive ops (bitwise, add, iota)
   and work automatically once `:iota` is lowered.
+
+  ## Hooks (`token` / `attach_token`, Stage 18)
+
+  `Nx.Defn.Kernel.hook/2,3` is fire-and-forget, not control flow:
+  `attach_token(token, expr)`'s runtime value is `expr` unchanged (the token's
+  own eval result is discarded — see `Nx.Defn.Evaluator.eval_apply/5`'s
+  `:attach_token` clause), and a hook's callback return value is never read
+  back into the graph. So no host round-trip is needed (unlike `while`):
+  `:attach_token` lowers as a pure passthrough (zero instructions, its ref
+  aliases its wrapped expr's), and `:token` contributes zero instructions but
+  records each hook's already-lowered ref(s) + callback into the program's
+  `hooks` field. `EMLX.__compile__` fires each callback host-side, once, right
+  after the single `eval_program` NIF call returns — still one NIF call per
+  `defn` invocation. A hook with neither a trace-time callback nor a runtime
+  override (`hooks:` jit option, not yet threaded through the native path —
+  descoped) is skipped, mirroring the Evaluator's skip-if-unhandled rule.
+
+  A hook reachable only from inside a `cond` branch — not the shared/parent
+  scope, per `Nx.Defn.Tree.scope_ids/1` — raises instead of lowering: EMLX's
+  `cond` lowers by unconditionally evaluating every branch and `:select`-ing
+  the result, so such a hook would fire on every call regardless of which
+  branch was actually taken, a genuine behavior divergence from
+  `Nx.Defn.Evaluator` (which only fires the selected branch's hook). A hook
+  inside a bare `while` body needs no such guard: the body is always
+  recompiled by re-entering this same compiler as its own top-level scope
+  (Stage 08), so it fires once per host loop iteration exactly like the
+  Evaluator — and `lower/2`'s `top_scope_ids` (computed once, from
+  `Nx.Defn.Tree.scope_ids/1` over the pristine top-level tree) correctly
+  reflects that fresh scope.
+
+  A custom-fun `reduce`/`window_reduce` body (Stage 12/13 static unroll) and a
+  statically-unrolled nested `while` under a `:block` (Stage 17) are the same
+  "always executes in full, not conditionally" shape as a `while` body, but
+  are lowered *inline* within the same `lower/2` call (`lower_fun_body/3` /
+  `lower_tuple_body/3`) rather than by re-entering `lower/2` fresh — so a hook
+  in one of these would wrongly look cond-branch-local to the top-level
+  `top_scope_ids` set (`Nx.Defn.Tree.scope_ids/1`'s `:scope`-mode traversal
+  deliberately never walks into a `:fun`/`:while` body — that's the scope
+  boundary). Both helpers extend `top_scope_ids` with a fresh `scope_ids` pass
+  over just that body before lowering it (`merge_scope_ids/2`) — which still
+  correctly excludes any `cond` nested *inside* that body, so a genuinely
+  cond-branch-local hook a level deeper still raises.
   """
 
   import Bitwise
@@ -103,15 +147,22 @@ defmodule EMLX.Native.Expr do
   }
 
   @enforce_keys [:inputs, :captures, :constants, :instructions, :outputs]
-  defstruct [:inputs, :captures, :constants, :instructions, :outputs]
+  defstruct [:inputs, :captures, :constants, :instructions, :outputs, hooks: []]
 
   @type node_ref :: reference()
+  @type hook :: %{
+          name: atom(),
+          callback: (Nx.Container.t() -> term()),
+          template: Nx.Container.t(),
+          refs: [node_ref()]
+        }
   @type t :: %__MODULE__{
           inputs: [node_ref()],
           captures: [{node_ref(), Nx.Tensor.t()}],
           constants: [{node_ref(), number(), Nx.Type.t()}],
           instructions: [{node_ref(), atom(), [node_ref()], [integer()]}],
-          outputs: [node_ref()]
+          outputs: [node_ref()],
+          hooks: [hook()]
         }
 
   # ── lowering ──────────────────────────────────────────────────────────────
@@ -147,7 +198,12 @@ defmodule EMLX.Native.Expr do
       captures: [],
       constants: [],
       instructions: [],
-      node_to_ref: %{}
+      node_to_ref: %{},
+      hooks: [],
+      # A hook (`:token`/`:attach_token`) is only lowerable from the shared/
+      # parent scope — see the moduledoc's "Hooks" section for why a
+      # cond-branch-local hook must raise instead.
+      top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new()
     }
 
     state = Enum.reduce(ordered, state, &expand_node/2)
@@ -171,7 +227,8 @@ defmodule EMLX.Native.Expr do
       captures: Enum.reverse(state.captures),
       constants: Enum.reverse(state.constants),
       instructions: Enum.reverse(state.instructions),
-      outputs: output_refs
+      outputs: output_refs,
+      hooks: Enum.reverse(state.hooks)
     }
   end
 
@@ -1815,6 +1872,54 @@ defmodule EMLX.Native.Expr do
   # the leaf is a no-op here.
   defp expand_node(%T{data: %Nx.Defn.Expr{op: :fun}}, state), do: state
 
+  # Hooks (Stage 18) — see the moduledoc's "Hooks" section. `:token` never
+  # produces a value anything else reads (only `attach_token`'s wrapped expr
+  # is used downstream), so this clause contributes zero instructions; it
+  # only records each hook's already-lowered ref(s) as an extra program
+  # output for `EMLX.__compile__` to fire host-side after the single NIF
+  # call returns. A `nil` callback (no trace-time fn, and no runtime `hooks:`
+  # override — not yet threaded through the native path) is a no-op, mirroring
+  # `Nx.Defn.Evaluator`'s skip-if-unhandled rule.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}},
+         state
+       ) do
+    unless MapSet.member?(state.top_scope_ids, id) do
+      raise ArgumentError,
+            "cannot lower a hook nested inside a cond branch: EMLX's cond compiles by " <>
+              "evaluating every branch unconditionally (:select), which would fire this " <>
+              "hook on every call regardless of which branch is actually taken -- a " <>
+              "behavior divergence from Nx.Defn.Evaluator (which only fires the selected " <>
+              "branch's hook). Move the hook outside the cond."
+    end
+
+    Enum.reduce(hooks, state, fn
+      %{callback: nil}, state ->
+        state
+
+      %{callback: callback, expr: expr, name: name}, state ->
+        refs =
+          [expr]
+          |> Composite.flatten_list()
+          |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
+
+        template = Composite.traverse(expr, &Nx.to_template/1)
+        hook = %{name: name, callback: callback, template: template, refs: refs}
+        %{state | hooks: [hook | state.hooks]}
+    end)
+  end
+
+  # `attach_token(token, expr)`'s runtime value is `expr` unchanged (see the
+  # moduledoc); the token's side effect is fully handled by the `:token`
+  # clause above, already visited as this node's dependency.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :attach_token, args: [_token, expr]}},
+         state
+       ) do
+    ref = Map.fetch!(state.node_to_ref, expr.data.id)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
+  end
+
   # while (statically-counted range loop, unrolled) — see block-descent helper
   # section below. `:while` only ever reaches `expand_node` when nested inside
   # a block's default_expr (a top-level parent-scope `:while` is intercepted
@@ -2045,7 +2150,9 @@ defmodule EMLX.Native.Expr do
   # loop-carried tuple) instead of a single tensor — returns a list of refs,
   # one per tuple element, instead of a single ref.
   defp lower_tuple_body(body_list, param_ref_by_pos, state) do
-    inner_ordered = EMLX.Defn.Tree.post_order(List.to_tuple(body_list))
+    body_tuple = List.to_tuple(body_list)
+    state = merge_scope_ids(state, body_tuple)
+    inner_ordered = EMLX.Defn.Tree.post_order(body_tuple)
 
     param_id_to_ref =
       inner_ordered
@@ -2068,7 +2175,8 @@ defmodule EMLX.Native.Expr do
        | instructions: inner_state.instructions,
          captures: inner_state.captures,
          constants: inner_state.constants,
-         inputs: inner_state.inputs
+         inputs: inner_state.inputs,
+         hooks: inner_state.hooks
      }}
   end
 
@@ -2138,6 +2246,22 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, out_ref)}
   end
 
+  # `state.top_scope_ids` (computed once, in `lower/2`, over the pristine
+  # top-level `output`) never sees inside a `:fun`/`:while` body — `apply_args`
+  # walks those in `:scope` mode precisely to skip them (they're separate
+  # lowering scopes, like `while`). So a hook nested directly in a reducer or
+  # statically-unrolled-while body — never itself inside a `cond` — would
+  # wrongly look cond-branch-local to the `:token` clause's membership check
+  # and raise. Reducer/while-unroll bodies always execute in full (no
+  # conditional skipping, unlike `cond`'s branches), so before lowering such a
+  # body inline, we extend `top_scope_ids` with a fresh `scope_ids` pass over
+  # just that body — which still correctly excludes any `cond` nested *inside*
+  # the body, so a genuinely cond-branch-local hook in there still raises.
+  defp merge_scope_ids(state, body) do
+    extra = body |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new()
+    %{state | top_scope_ids: MapSet.union(state.top_scope_ids, extra)}
+  end
+
   # Lower a reducer `:fun` body inline, binding its scalar parameters (by
   # position) to the given refs.  Each call expands the body afresh — body node
   # ids are constant across fold iterations, so the body-local `node_to_ref`
@@ -2145,6 +2269,7 @@ defmodule EMLX.Native.Expr do
   # iteration 0's results instead of re-lowering with the new acc/element refs.
   # Returns {result_ref, state} with the body's instructions appended.
   defp lower_fun_body(body, param_ref_by_pos, state) do
+    state = merge_scope_ids(state, body)
     inner_ordered = EMLX.Defn.Tree.post_order(body)
 
     param_id_to_ref =
@@ -2169,7 +2294,8 @@ defmodule EMLX.Native.Expr do
        | instructions: inner_state.instructions,
          captures: inner_state.captures,
          constants: inner_state.constants,
-         inputs: inner_state.inputs
+         inputs: inner_state.inputs,
+         hooks: inner_state.hooks
      }}
   end
 
@@ -2236,8 +2362,7 @@ defmodule EMLX.Native.Expr do
     n_dims = length(input_shape)
     iattrs = [n_dims, 0] ++ input_shape ++ lengths ++ strides ++ starts
 
-    {new_ref,
-     %{state | instructions: [{new_ref, :slice, [ref], iattrs} | state.instructions]}}
+    {new_ref, %{state | instructions: [{new_ref, :slice, [ref], iattrs} | state.instructions]}}
   end
 
   # Decompose a flat window index `k` into per-dim offsets in row-major order
@@ -2463,6 +2588,9 @@ defmodule EMLX.Native.Expr do
   `{num_inputs, capture_nif_refs, constant_values, constant_types,
     op_names, operands, iattrs, output_packed_refs}`
 
+  `output_packed_refs` is `prog.outputs` followed by every hook's refs
+  (flattened, in `prog.hooks` order) — see the moduledoc "Hooks" section.
+
   `op_names` is a list of strings (e.g. `"add"`) that map directly to entries
   in the C++ `op_registry`; no integer opcode table is required.
 
@@ -2515,7 +2643,11 @@ defmodule EMLX.Native.Expr do
         {[op | ops], [wire_operands | ors], [attrs | ias], rmap2, flat2}
       end)
 
-    wire_outputs = Enum.map(prog.outputs, &Map.fetch!(ref_to_packed, &1))
+    # Hook refs ride along as extra outputs (see moduledoc "Hooks"), appended
+    # after the real outputs; `EMLX.__compile__` knows the split point from
+    # `length(prog.outputs)` and slices them back apart post-`eval_program`.
+    hook_refs = Enum.flat_map(prog.hooks, & &1.refs)
+    wire_outputs = Enum.map(prog.outputs ++ hook_refs, &Map.fetch!(ref_to_packed, &1))
 
     capture_nif_refs =
       Enum.map(prog.captures, fn {_ref, %Nx.Tensor{data: %EMLX.Backend{ref: {_, nif_ref}}}} ->

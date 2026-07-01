@@ -1425,7 +1425,7 @@ defmodule EMLX do
       not contains_while?(output_expr) ->
         program = EMLX.Native.Expr.lower(output_expr, num_inputs)
         resource = compile_native_program(worker, effective_device, program)
-        build_native_eval_fn(resource, output_expr, effective_device)
+        build_native_eval_fn(resource, output_expr, program.hooks, effective_device)
 
       true ->
         build_while_chain_eval_fn(output_expr, effective_device)
@@ -1499,8 +1499,13 @@ defmodule EMLX do
   # Builds the per-call eval closure for the flat (no-while) native path.
   # `output_expr` is the traced expression (used as a type/shape template for
   # reconstructing output tensors after the NIF returns raw resource refs).
-  defp build_native_eval_fn(program_resource, output_expr, effective_device) do
+  # `hooks` (from `EMLX.Native.Expr.lower/2`'s `hooks` field, see its
+  # moduledoc "Hooks" section) ride along as extra outputs after the real
+  # ones; the corresponding Elixir callbacks fire here, once, right after the
+  # single NIF call returns.
+  defp build_native_eval_fn(program_resource, output_expr, hooks, effective_device) do
     output_expr = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
+    real_output_count = [output_expr] |> Nx.Defn.Composite.flatten_list() |> length()
 
     fn [params] ->
       {worker, dev} = resolve_worker(effective_device)
@@ -1510,7 +1515,7 @@ defmodule EMLX do
         EMLX.NIF.eval_program(worker, program_resource, input_refs)
         |> unwrap!()
 
-      out_refs = await_worker(job_ref)
+      {out_refs, hook_refs} = await_worker(job_ref) |> Enum.split(real_output_count)
 
       # Reconstruct output tensors: traverse the output expression template
       # (provides type/shape/names) and attach each returned resource ref as
@@ -1521,8 +1526,28 @@ defmodule EMLX do
           {emlx_tensor, rest}
         end)
 
+      fire_hooks(hooks, hook_refs, dev)
+
       [output_container]
     end
+  end
+
+  # Reconstructs each hook's value from its slice of `hook_refs` (in
+  # `hooks` order, matching `EMLX.Native.Expr.to_wire/1`'s flattening) and
+  # invokes its callback for the side effect. Return value is discarded,
+  # matching `Nx.Defn.Evaluator`'s hook semantics.
+  defp fire_hooks([], [], _dev), do: :ok
+
+  defp fire_hooks([%{template: template, refs: refs, callback: callback} | rest], hook_refs, dev) do
+    {consumed, remaining} = Enum.split(hook_refs, length(refs))
+
+    {value, []} =
+      Nx.Defn.Composite.traverse(template, consumed, fn leaf, [ref | more] ->
+        {EMLX.Backend.to_nx({dev, ref}, leaf), more}
+      end)
+
+    callback.(value)
+    fire_hooks(rest, remaining, dev)
   end
 
   # Builds the eval closure for a `while` surrounded by other computation. The
@@ -1624,7 +1649,10 @@ defmodule EMLX do
           [id]
 
         %Nx.Tensor{
-          data: %Nx.Defn.Expr{op: :elem, args: [%Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}}, _]}
+          data: %Nx.Defn.Expr{
+            op: :elem,
+            args: [%Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}}, _]
+          }
         } ->
           [id]
 

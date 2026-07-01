@@ -34,6 +34,91 @@ defmodule EMLX.Native.ExprTest do
   defn broadcast_23(x), do: Nx.broadcast(x, {2, 3})
   defn concat_axis0(a, b), do: Nx.concatenate([a, b], axis: 0)
 
+  # Stage 18 helpers — hook (`token`/`attach_token`) lowering.
+  defn hook_top_level(a, b) do
+    hooked = hook(Nx.multiply(Nx.add(a, b), 2), :mid, fn t -> send(self(), {:mid, t}) end)
+    Nx.subtract(hooked, 1)
+  end
+
+  defn hook_unused_value(a, b) do
+    _ = hook(Nx.multiply(a, b), :dbg, fn t -> send(self(), {:dbg, t}) end)
+    Nx.add(a, b)
+  end
+
+  defn hook_name_only(a, b) do
+    _ = hook(Nx.multiply(a, b), :no_fn)
+    Nx.add(a, b)
+  end
+
+  defn hook_tuple_payload(a, b) do
+    hook({Nx.add(a, b), Nx.subtract(a, b)}, :pair, fn {s, d} -> send(self(), {:pair, s, d}) end)
+  end
+
+  defn hook_in_cond_branch(a, b) do
+    pred = Nx.any(Nx.greater(a, 0))
+
+    cond do
+      pred -> hook(Nx.add(a, b), :branch_true, fn t -> send(self(), {:branch_true, t}) end)
+      true -> Nx.subtract(a, b)
+    end
+  end
+
+  defn hook_in_while_body(a) do
+    {result, _} =
+      while {acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
+        acc = hook(Nx.add(acc, i), :iter, fn t -> send(self(), {:iter, t}) end)
+        {acc, i - 1}
+      end
+
+    result
+  end
+
+  # Exercises the Nx.Defn.Graph.split-chain path (hook before AND after a
+  # non-bare `while`, i.e. the while has surrounding work on both sides) --
+  # this is the shape that surfaced the `Nx.Defn.Graph` `:token` rewrite gap
+  # (see Results).
+  defn hook_around_while(a) do
+    seed = hook(Nx.multiply(a, 2), :seed, fn t -> send(self(), {:seed, t}) end)
+
+    {result, _} =
+      while {acc = Nx.tensor(0), i = seed}, Nx.less(0, i) do
+        {Nx.add(acc, i), i - 1}
+      end
+
+    hook(Nx.add(result, 1), :final, fn t -> send(self(), {:final, t}) end)
+  end
+
+  # Regression: a hook nested inside a custom-fun `reduce`/`window_reduce`
+  # body (Stage 12/13 static unroll) is a `while`-like always-executes body,
+  # NOT a `cond` branch -- but it's lowered inline within the same `lower/2`
+  # call (via `lower_fun_body/3`), never re-entering `lower/2` as a fresh
+  # top-level scope the way a bare `while` body does. `scope_ids/1`'s
+  # `:scope`-mode traversal deliberately never walks into a `:fun` body
+  # (that's *why* it's a separate scope), so this hook's node id is invisible
+  # to the outer `top_scope_ids` set computed once at the top of `lower/2` --
+  # this previously made the cond-branch guard fire a false positive here
+  # (see Results / EXPR_NODES.md).
+  defn hook_in_reduce_body(t) do
+    Nx.reduce(t, Nx.tensor(0), fn x, acc ->
+      hook(Nx.add(acc, x), :step, fn v -> send(self(), {:step, v}) end)
+    end)
+  end
+
+  # A hook genuinely nested inside a `cond` that is itself inside a reduce
+  # body must still raise -- the always-executes exemption above must not
+  # blanket-exempt a real cond-branch hook one level deeper.
+  defn hook_in_cond_in_reduce_body(t) do
+    Nx.reduce(t, Nx.tensor(0), fn x, acc ->
+      cond do
+        Nx.any(Nx.greater(x, 0)) ->
+          hook(Nx.add(acc, x), :pos, fn v -> send(self(), {:pos, v}) end)
+
+        true ->
+          acc
+      end
+    end)
+  end
+
   # ── IR shape ─────────────────────────────────────────────────────────────
 
   describe "program shape" do
@@ -1203,7 +1288,10 @@ defmodule EMLX.Native.ExprTest do
     @tag :stage13
     test "1d window sum reducer (valid, default strides)" do
       x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0], backend: EMLX.Backend)
-      check_reduce_equiv(fn t -> Nx.window_reduce(t, 0.0, {2}, fn a, b -> Nx.add(a, b) end) end, [x])
+
+      check_reduce_equiv(fn t -> Nx.window_reduce(t, 0.0, {2}, fn a, b -> Nx.add(a, b) end) end, [
+        x
+      ])
     end
 
     @tag :stage13
@@ -1211,7 +1299,9 @@ defmodule EMLX.Native.ExprTest do
       x = Nx.tensor([1.0, 5.0, 2.0, 4.0, 3.0], backend: EMLX.Backend)
 
       check_reduce_equiv(
-        fn t -> Nx.window_reduce(t, -100.0, {3}, [padding: :same], fn a, b -> Nx.max(a, b) end) end,
+        fn t ->
+          Nx.window_reduce(t, -100.0, {3}, [padding: :same], fn a, b -> Nx.max(a, b) end)
+        end,
         [x]
       )
     end
@@ -1221,7 +1311,9 @@ defmodule EMLX.Native.ExprTest do
       x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
 
       check_reduce_equiv(
-        fn t -> Nx.window_reduce(t, 0.0, {2, 2}, [strides: [2, 2]], fn a, b -> Nx.add(a, b) end) end,
+        fn t ->
+          Nx.window_reduce(t, 0.0, {2, 2}, [strides: [2, 2]], fn a, b -> Nx.add(a, b) end)
+        end,
         [x]
       )
     end
@@ -1265,6 +1357,7 @@ defmodule EMLX.Native.ExprTest do
       # window_reduce output dtype tracks the input tensor (not the acc), so the
       # dtype coverage here is the integer path; acc casts to the s32 out type.
       x = Nx.tensor([1, 2, 3, 4, 5], type: :s32, backend: EMLX.Backend)
+
       check_reduce_equiv(fn t -> Nx.window_reduce(t, 0, {2}, fn a, b -> Nx.add(a, b) end) end, [x])
     end
 
@@ -2941,7 +3034,9 @@ defmodule EMLX.Native.ExprTest do
         ])
 
       prog = Expr.lower(expr)
-      assert [{_, :fast_rope_with_freqs_positions, [_a, _pos, _freqs], _attrs}] = prog.instructions
+
+      assert [{_, :fast_rope_with_freqs_positions, [_a, _pos, _freqs], _attrs}] =
+               prog.instructions
     end
   end
 
@@ -3369,7 +3464,11 @@ defmodule EMLX.Native.ExprTest do
         Nx.Defn.jit(fn t -> Nx.LinAlg.qr(t, mode: :complete) end, compiler: Nx.Defn.Evaluator).(a)
 
       assert_close(Nx.dot(q_native, r_native), Nx.dot(q_eager, r_eager))
-      assert_close(Nx.dot(Nx.transpose(q_native), q_native), Nx.eye(5, type: :f32, backend: EMLX.Backend))
+
+      assert_close(
+        Nx.dot(Nx.transpose(q_native), q_native),
+        Nx.eye(5, type: :f32, backend: EMLX.Backend)
+      )
     end
 
     @tag :stage17
@@ -3416,7 +3515,9 @@ defmodule EMLX.Native.ExprTest do
         Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end, compiler: EMLX).(a)
 
       {_u, s_eager, _vt} =
-        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end, compiler: Nx.Defn.Evaluator).(a)
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: false) end,
+          compiler: Nx.Defn.Evaluator
+        ).(a)
 
       assert_close(s_native, s_eager)
     end
@@ -3460,6 +3561,184 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  describe "Stage 18 — hooks (token/attach_token, extra-output design)" do
+    # `Nx.Defn.Kernel.hook/2,3` is fire-and-forget, not control flow (see
+    # `EMLX.Native.Expr`'s moduledoc "Hooks" section): `attach_token`'s value
+    # is its wrapped expr unchanged, so the hook is lowered in the *same*
+    # single NIF-call program as everything else -- the hooked value(s) ride
+    # along as extra outputs, and the callback fires host-side right after
+    # `eval_program` returns. No `Nx.Defn.Graph.split` host round-trip needed.
+    @tag :stage18
+    test "top-level hook fires once with the correct value; result unaffected" do
+      a = Nx.tensor(1, backend: EMLX.Backend)
+      b = Nx.tensor(2, backend: EMLX.Backend)
+
+      result = Nx.Defn.jit(&hook_top_level/2, compiler: EMLX).(a, b)
+      assert Nx.to_number(result) == 5
+
+      assert_receive {:mid, hooked_value}
+      assert Nx.to_number(hooked_value) == 6
+      refute_receive {:mid, _}
+    end
+
+    @tag :stage18
+    test "a hook whose value is unreferenced by the output never fires (matches Evaluator's dead-code elimination)" do
+      a = Nx.tensor(4, backend: EMLX.Backend)
+      b = Nx.tensor(3, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&hook_unused_value/2, compiler: EMLX).(a, b)
+      assert Nx.to_number(native) == 7
+      refute_receive {:dbg, _}
+
+      eager = Nx.Defn.jit(&hook_unused_value/2, compiler: Nx.Defn.Evaluator).(a, b)
+      assert Nx.to_number(eager) == 7
+      refute_receive {:dbg, _}
+    end
+
+    @tag :stage18
+    test "a name-only hook (no trace-time callback, no runtime override) is a silent no-op" do
+      a = Nx.tensor(4, backend: EMLX.Backend)
+      b = Nx.tensor(3, backend: EMLX.Backend)
+
+      result = Nx.Defn.jit(&hook_name_only/2, compiler: EMLX).(a, b)
+      assert Nx.to_number(result) == 7
+    end
+
+    @tag :stage18
+    test "a hook on a tuple payload fires with the matching container shape" do
+      a = Nx.tensor(4, backend: EMLX.Backend)
+      b = Nx.tensor(3, backend: EMLX.Backend)
+
+      {s, d} = Nx.Defn.jit(&hook_tuple_payload/2, compiler: EMLX).(a, b)
+      assert Nx.to_number(s) == 7
+      assert Nx.to_number(d) == 1
+
+      assert_receive {:pair, sum, diff}
+      assert Nx.to_number(sum) == 7
+      assert Nx.to_number(diff) == 1
+    end
+
+    @tag :stage18
+    test "a hook nested inside a cond branch raises instead of silently double-firing" do
+      a = Nx.tensor(1, backend: EMLX.Backend)
+      b = Nx.tensor(2, backend: EMLX.Backend)
+      templates = [Nx.template(a.shape, a.type), Nx.template(b.shape, b.type)]
+
+      expr = Nx.Defn.debug_expr_apply(&hook_in_cond_branch/2, templates)
+
+      assert_raise ArgumentError, ~r/cannot lower a hook nested inside a cond branch/, fn ->
+        Expr.lower(expr, 2)
+      end
+    end
+
+    @tag :stage18
+    test "a hook inside a while body fires once per iteration, matching Evaluator" do
+      a = Nx.tensor(3, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&hook_in_while_body/1, compiler: EMLX).(a)
+      assert Nx.to_number(native) == 6
+      assert_receive {:iter, v1}
+      assert_receive {:iter, v2}
+      assert_receive {:iter, v3}
+      native_values = Enum.map([v1, v2, v3], &Nx.to_number/1)
+      refute_receive {:iter, _}
+
+      eager = Nx.Defn.jit(&hook_in_while_body/1, compiler: Nx.Defn.Evaluator).(a)
+      assert Nx.to_number(eager) == 6
+      assert_receive {:iter, e1}
+      assert_receive {:iter, e2}
+      assert_receive {:iter, e3}
+      eager_values = Enum.map([e1, e2, e3], &Nx.to_number/1)
+      refute_receive {:iter, _}
+
+      assert native_values == eager_values
+    end
+
+    # Regression: hooks straddling a non-bare `while` (surrounding work on
+    # both sides) route through `Nx.Defn.Graph.split`'s multi-stage chain
+    # (`EMLX.build_while_chain_eval_fn`). This previously crashed the NIF
+    # with a wire-arity mismatch ("vector in NIF.eval_program/2") because
+    # `Nx.Defn.Graph`'s `do_rewrite_subtree/3` had no `:token` clause, so a
+    # hook payload depending on a stage-boundary-hoisted value kept its
+    # stale, pre-remap parameter position. Fixed upstream in the `nx` fork
+    # (see Results); this test pins the fix from the EMLX side.
+    @tag :stage18
+    test "a hook before AND after a while (Graph.split chain) matches Evaluator" do
+      a = Nx.tensor(2, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&hook_around_while/1, compiler: EMLX).(a)
+      assert Nx.to_number(native) == 11
+      assert_receive {:seed, seed_v}
+      assert_receive {:final, final_v}
+      assert Nx.to_number(seed_v) == 4
+      assert Nx.to_number(final_v) == 11
+
+      eager = Nx.Defn.jit(&hook_around_while/1, compiler: Nx.Defn.Evaluator).(a)
+      assert Nx.to_number(eager) == 11
+      assert_receive {:seed, seed_v2}
+      assert_receive {:final, final_v2}
+      assert Nx.to_number(seed_v2) == 4
+      assert Nx.to_number(final_v2) == 11
+    end
+
+    # Regression for a bug the reviewer subagent caught: a hook inside a
+    # custom-fun `reduce` body was wrongly rejected by the cond-branch guard
+    # (false positive -- `scope_ids/1` never walks into a `:fun` body, so the
+    # hook's id looked "not top-scope" even though it isn't cond-branch-local
+    # either), AND separately, `lower_fun_body/3` was dropping any hooks
+    # registered while lowering the body (only `instructions`/`captures`/
+    # `constants`/`inputs` were carried out of its local `state`, not `hooks`).
+    @tag :stage18
+    test "a hook inside a custom-fun reduce body fires once per fold step, matching Evaluator" do
+      t = Nx.tensor([1, 2, 3], backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&hook_in_reduce_body/1, compiler: EMLX).(t)
+      assert Nx.to_number(native) == 6
+      assert_receive {:step, v1}
+      assert_receive {:step, v2}
+      assert_receive {:step, v3}
+      native_values = Enum.map([v1, v2, v3], &Nx.to_number/1)
+      refute_receive {:step, _}
+      assert native_values == [1, 3, 6]
+
+      # Reduce oracle: eager EMLX has no `reduce`, so compare against the
+      # Evaluator on BinaryBackend (same convention as `check_reduce_equiv/3`,
+      # Stage 12 -- the reducer's own `Nx.tensor(0)` initial acc also needs
+      # `default_backend` swapped, not just the input, since it's a literal
+      # materialized at Evaluator-run time).
+      bin_t = Nx.backend_copy(Nx.tensor([1, 2, 3]), Nx.BinaryBackend)
+      prev = Nx.default_backend(Nx.BinaryBackend)
+
+      eager =
+        try do
+          Nx.Defn.jit(&hook_in_reduce_body/1, compiler: Nx.Defn.Evaluator).(bin_t)
+        after
+          Nx.default_backend(prev)
+        end
+
+      assert Nx.to_number(eager) == 6
+      assert_receive {:step, e1}
+      assert_receive {:step, e2}
+      assert_receive {:step, e3}
+      eager_values = Enum.map([e1, e2, e3], &Nx.to_number/1)
+      refute_receive {:step, _}
+
+      assert native_values == eager_values
+    end
+
+    @tag :stage18
+    test "a hook inside a cond that's nested inside a reduce body still raises" do
+      t = Nx.tensor(1, backend: EMLX.Backend)
+      template = Nx.template({3}, t.type)
+
+      expr = Nx.Defn.debug_expr_apply(&hook_in_cond_in_reduce_body/1, [template])
+
+      assert_raise ArgumentError, ~r/cannot lower a hook nested inside a cond branch/, fn ->
+        Expr.lower(expr, 1)
+      end
+    end
+  end
+
   # Softmax normalisation over the last axis (primitive SDPA oracle helper).
   defp normalize_rows(t) do
     Nx.divide(t, Nx.sum(t, axes: [-1], keep_axes: true))
@@ -3480,8 +3759,11 @@ defmodule EMLX.Native.ExprTest do
     pos_bt1 = Nx.as_type(pos, :f32) |> Nx.reshape({b, t, 1})
     angles = Nx.multiply(Nx.multiply(pos_bt1, inv_freq), scale)
 
-    cos_full = Nx.cos(angles) |> Nx.reshape({b, t, 1, half}) |> then(&Nx.concatenate([&1, &1], axis: 3))
-    sin_full = Nx.sin(angles) |> Nx.reshape({b, t, 1, half}) |> then(&Nx.concatenate([&1, &1], axis: 3))
+    cos_full =
+      Nx.cos(angles) |> Nx.reshape({b, t, 1, half}) |> then(&Nx.concatenate([&1, &1], axis: 3))
+
+    sin_full =
+      Nx.sin(angles) |> Nx.reshape({b, t, 1, half}) |> then(&Nx.concatenate([&1, &1], axis: 3))
 
     x1 = a[[.., .., .., 0..(half - 1)]]
     x2 = a[[.., .., .., half..(dims - 1)]]

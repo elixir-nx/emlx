@@ -140,7 +140,7 @@ each independently shippable. Run with
 
 - [x] [`16-expr-nodes-doc-audit`](16-expr-nodes-doc-audit.md) — audit stale `EXPR_NODES.md` `[ ]` boxes (`fun`/`optional`/`from_binary`); confirmed all three are unreachable/subsumed (not real gaps) via re-grep against the vendored Nx fork; flipped the doc; two regression tests pin the `:fun` no-op invariant. No `expr.ex` code changes needed.
 - [x] [`17-block-while-descent`](17-block-while-descent.md) — close the `while`-nested-inside-a-block's-`default_expr` structural boundary. Statically unrolls counted `while` loops reached via block descent (fixes `Nx.Block.LinAlg.QR :complete`); `SVD full_matrices?: false` turned out to have no `while` at all in the current Nx fork (rewritten to a Gram-matrix decomposition) — needed only prerequisite `:eye`/`:constant`/`:metadata` fixes for non-scalar/vectorized shapes hit via the same descent path. `triangular_solve`'s non-default variants are a separate, unrelated gap (direct op-node, not a `default_expr` `while`) — descoped, still raises.
-- [ ] [`18-hooks-token-splitting`](18-hooks-token-splitting.md) — contingent spike: can `token`/`attach_token` hooks be lowered via a `while`-style structural split, or is a documented permanent hard-raise (or a narrowly-scoped hook-only fallback) the honest answer?
+- [x] [`18-hooks-token-splitting`](18-hooks-token-splitting.md) — answered "no" to the `while`-style split question: hooks are fire-and-forget, not control flow, so they lower in the *same* single NIF-call program via an extra-output design (no `Graph.split`, no host round-trip) — `:attach_token` is a zero-instruction passthrough, `:token` rides its hook(s) as extra program outputs fired host-side after the one `eval_program` call returns. **Cond-branch-local hooks hard-raise** (EMLX's `cond` evaluates every branch unconditionally, which would double-fire such a hook — a correctness carve-out, not a coverage gap); while-body hooks need no such guard (equivalence-tested vs Evaluator). **Found and fixed a real `Nx.Defn.Graph.split` bug** (`do_rewrite_subtree/3` had no `:token` clause, silently dropping hook-payload parameter remapping across a `while`'s stage boundary) — same "found via testing" pattern as Stages 11/17.
 - [ ] [`19-retire-evaluator-fallback`](19-retire-evaluator-fallback.md) — once 16–18 land, delete `try_native_compile`'s `Nx.Defn.Evaluator` delegation branch from `emlx.ex` entirely; unsupported ops hard-raise, no silent whole-defn fallback, matching this README's single-mode claim in code.
 
 ### Emily backend-parity (expanded charter — see the note above "Resolved decisions")
@@ -162,9 +162,12 @@ each independently shippable. Run with
   **Status:** Hard-pass as of Stage 02. The Stage 01 benchmark used `Nx.add(x, 1)` chained 10×; Nx.Defn constant-folds repeated scalar additions into a single op, so the "10-add chain" was a 1-op graph. Stage 02 switched to `Nx.add(x, y)` with a runtime `y` — a genuine 10-instruction program. Native path is dramatically faster. `eval_program` no longer calls `mlx::core::eval` eagerly (lazy outputs since Stage 02).
 - **Ongoing**: every op added must pass an equivalence test vs eager
   `EMLX.Backend` (within tolerance) before its `EXPR_NODES.md` box flips.
-- **After 18**: decide how to treat `token`/`attach_token` if the structural
-  split turns out infeasible — permanent hard-raise vs a narrowly-scoped
-  hook-only fallback. This decision gates Stage 19's exact scope.
+- **After 18**: decided — hooks lower natively via an extra-output design
+  (no structural split needed; they aren't control flow), except a
+  cond-branch-local hook, which raises permanently and deliberately (a
+  correctness carve-out `Nx.Defn.Evaluator` doesn't have to make, since it
+  evaluates only the taken branch). Stage 19 should name this one construct
+  explicitly as the sole intentional hard-raise, distinct from a coverage gap.
 
 ## Testing philosophy (per-layer oracle)
 

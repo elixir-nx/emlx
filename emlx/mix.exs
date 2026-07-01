@@ -65,8 +65,7 @@ defmodule EMLX.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      # {:nx, "~> 0.12"},
-      {:nx, path: "../../nx/nx"},
+      {:nx, github: "elixir-nx/nx", branch: "main", sparse: "nx"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
   end

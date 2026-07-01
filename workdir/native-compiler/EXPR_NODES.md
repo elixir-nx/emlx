@@ -36,7 +36,7 @@ Source of truth:
 | `while` | `(initial, arg, pred, body)` | parent scope: `Nx.Defn.Graph.split` + host loop. Nested in a block's `default_expr`: statically-counted loops (fixed trip count at trace time) unroll in place in `expand_node` (Stage 17); a genuinely data-dependent nested `while` still raises | [x] |
 | `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [x] |
 | `optional` | `(name, args, default)` | lower default expr, or route to native | [x] (already-subsumed — dead node type in current Nx fork, Stage 16; re-audit on Nx version bump) |
-| `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] (Stage 18 — contingent spike) |
+| `attach_token` / `token` | hooks | fire-and-forget passthrough; hooked value(s) ride as extra program outputs, host fires the callback after the one NIF call returns (see K note) | [x] (Stage 18; cond-branch-local hooks raise deliberately) |
 | `runtime_call` | `(expr, cb, out, opts)` | recognize `EMLX.Fast.*` callback → fused opcode (see L); else raises | [x] |
 
 Notes:
@@ -85,11 +85,49 @@ Notes:
   deliberate "not yet implemented" for that native op's unsupported operand
   layout — orthogonal to this stage's structural-boundary charter, left
   raising.
-- `token`/hooks imply host side effects → not lowerable to a pure replay; they
-  raise (no silent fallback in single mode). `runtime_call` is fully lowered
-  within its designed scope: `EMLX.Fast.*` callbacks (incl. per-token prefill
-  RoPE, Stage 15 Part B) recognize to a fused opcode; any other callback is a
-  genuine host side effect and raises deliberately (not a gap).
+- **Stage 18 (hooks):** `token`/`attach_token` (`Nx.Defn.Kernel.hook/2,3`) turned
+  out **not** to be control flow — `attach_token`'s runtime value is its
+  wrapped expr unchanged, and a hook's callback return value is never read
+  back into the graph (verified against `Nx.Defn.Evaluator.eval_apply/5`).
+  So the `while`-style `Nx.Defn.Graph.split` host-round-trip the stage doc
+  proposed buys nothing: `:attach_token` lowers as a zero-instruction
+  passthrough, and `:token` records each hook's already-lowered ref(s) +
+  callback as extra program outputs (`EMLX.Native.Expr.t/0`'s new `hooks`
+  field); `EMLX.__compile__` fires each callback host-side once, right after
+  the single `eval_program` NIF call returns — still one NIF call per `defn`
+  invocation, strictly better than `while`'s N-calls-per-loop. A hook
+  reachable only from inside a `cond` branch (per `Nx.Defn.Tree.scope_ids/1`)
+  raises deliberately: EMLX's `cond` evaluates every branch unconditionally
+  (`:select`), which would fire such a hook on every call regardless of which
+  branch is taken — a genuine correctness divergence from `Evaluator`, not a
+  coverage gap to silently paper over. A hook inside a `while` body,
+  reduce/window_reduce custom-fun body, or a statically-unrolled nested
+  `while` needs no such guard — all three always execute in full (never
+  conditionally, unlike `cond`), so each fires once per iteration exactly
+  like `Evaluator` (equivalence-tested). This required care: a reviewer
+  subagent caught a false positive where a hook in a plain reduce body (no
+  `cond` involved) wrongly raised the cond-branch message, because
+  `Nx.Defn.Tree.scope_ids/1`'s `:scope`-mode walk never sees inside a
+  `:fun`/`:while` body by design — fixed by extending the top-scope id set
+  with a fresh `scope_ids` pass over each such body right before lowering it
+  inline, which still correctly excludes a `cond` nested deeper inside.
+  Chasing that also surfaced an independent, silent-wrong-answer bug (found
+  by executing, not reading): the reducer/unroll body lowering helpers
+  reconstructed their returned state from an explicit field list that
+  predated hooks and never included the new `hooks` field, so any hook fired
+  from inside such a body was dropped with no error. Descoped: a
+  runtime `hooks:` jit-option override (only trace-time callbacks are
+  supported); `EMLX.__compile__` doesn't thread `opts` into the native path
+  for this at all today. **Found and fixed a real `Nx.Defn.Graph` bug along
+  the way** (see the stage doc's Results): `do_rewrite_subtree/3` had no
+  `:token` clause, so a hook's payload was silently skipped during
+  `Graph.split`'s per-stage parameter renumbering whenever a `while` had
+  surrounding work on both sides — same "found via testing, not static
+  reading" pattern as Stages 11/17.
+  `runtime_call` is fully lowered within its designed scope: `EMLX.Fast.*`
+  callbacks (incl. per-token prefill RoPE, Stage 15 Part B) recognize to a
+  fused opcode; any other callback is a genuine host side effect and raises
+  deliberately (not a gap).
 - **Stage 16 doc audit (confirmed, not real gaps):** `fun` is only ever
   produced as a `reduce`/`window_reduce` operand (`nx/lib/nx/defn/expr.ex:
   996,1017`, single producer verified fork-wide via `apply_fun/4` at
