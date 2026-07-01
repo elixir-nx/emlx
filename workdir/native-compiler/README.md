@@ -29,12 +29,14 @@ The `EMLX` compiler is **single-mode**: it always lowers via this structure.
 There is no `:native` flag and no eager-Evaluator fallback lane; lowering
 control is structural, via `Nx.Defn.Block` (see "Lowering control" below).
 
-> **Known discrepancy (as of Stage 15), closed by Stages 16–19:** the code
-> today (`emlx.ex`'s `try_native_compile/3`) still catches unsupported-op
-> errors and silently delegates the whole `defn` to `Nx.Defn.Evaluator` — a
-> leftover incremental-development safety net that contradicts this
-> paragraph. Stages 16–19 close every reachable raise path and delete that
-> lane so the claim above is true in the code, not just here.
+> **Known discrepancy (as of Stage 15), closed by Stages 16–19.** Until
+> Stage 19, `emlx.ex`'s `try_native_compile/3` still caught unsupported-op
+> errors and silently delegated the whole `defn` to `Nx.Defn.Evaluator` — a
+> leftover incremental-development safety net that contradicted this
+> paragraph. Stages 16–18 closed every reachable raise path (except two
+> permanent, by-design hard-raises — see Resolved decision #1 below) and
+> Stage 19 deleted that lane, so the claim above is now true in the code,
+> not just here.
 
 Stages 20–23 extend this plan's charter beyond the compiler itself: EMLX's
 sibling/successor project `~/coding/emily` has shipped a materially larger
@@ -48,6 +50,16 @@ name — see Stage 20).
 1. **Single-mode compiler.** One execution path: the new lowering structure.
    Lowering is total over the primitive op set; control over native-vs-default
    lowering is expressed through `Nx.Defn.Block`, not compiler options.
+   **Enforced in code, not just here, as of Stage 19**: `emlx.ex`'s
+   `__compile__/4` no longer catches a `does not yet lower op` raise and
+   delegates to `Nx.Defn.Evaluator` — an unsupported construct now raises
+   straight through to the caller. Permanent, by-design hard-raises:
+   `triangular_solve`'s non-default variants (`left_side: false` /
+   `transform_a != :none` — a direct op-node gap, Stage 17), a hook nested
+   inside a `cond` branch (a correctness carve-out, Stage 18), and a
+   quantized `Nx.dot` operand (invisible-at-trace-time runtime dispatch, not
+   a missing-coverage gap — Stage 24; interim raise only, full fix
+   deferred/unscoped).
 2. **Topo-sort vendored as `EMLX.Defn.Tree.post_order/1`** —
    `emlx/lib/emlx/defn/tree.ex`, namespaced to mirror `Nx.Defn.Tree` so the
    eventual upstream move is a rename.
@@ -129,7 +141,7 @@ each independently shippable. Run with
 - [x] [`07-creation-rng`](07-creation-rng.md) — iota, eye, `Nx.Random` primitives (via threefry2x32 decomposition).
 - [x] [`08-control-flow`](08-control-flow.md) — `cond`, `while`. **`cond` = inline `:select` ops; `while` = `Nx.Defn.Graph.split` + recursive `Graph.run(compiler: EMLX)`, Elixir host loop for each isolated while. Non-tail/nested/while-as-input compile natively.**
 - [x] [`09-blocks-linalg`](09-blocks-linalg.md) — `Nx.Block.LinAlg.*` recognize-struct path + `default_expr` descent. **Native CPU-pinned `mlx::linalg` opcodes (cholesky/solve/triangular_solve + multi-output qr/eigh/svd/lu via new multi-output IR); determinant via `default_expr` descent (N>3 through recognized native LU). cpu-pin composes in compiled graph on both `:cpu`/`:gpu`; linalg outputs `contiguous`-wrapped to avoid a strided CPU `Compiled`-kernel JIT failure.**
-- [x] [`10-fast-kernels`](10-fast-kernels.md) — pattern-route to `EMLX.Fast`. **`EMLX.Fast.*` surface as `:runtime_call` nodes (not blocks); recognize the callback (module+name+arity) → single fused `mlx::core::fast::*` opcode in the compiled graph. Float opts ride the int64 attr channel as IEEE-754 bits. Decode/T=1 callbacks fused; prefill RoPE raises → Evaluator fallback. ~1.3–1.4× over primitive replay on a decode block.**
+- [x] [`10-fast-kernels`](10-fast-kernels.md) — pattern-route to `EMLX.Fast`. **`EMLX.Fast.*` surface as `:runtime_call` nodes (not blocks); recognize the callback (module+name+arity) → single fused `mlx::core::fast::*` opcode in the compiled graph. Float opts ride the int64 attr channel as IEEE-754 bits. Decode/T=1 callbacks fused; prefill RoPE raised at the time (closed by Stage 15's in-graph cos/sin/rotate composition). ~1.3–1.4× over primitive replay on a decode block.**
 - [x] [`11-bench-regression`](11-bench-regression.md) — **investigation, resolved.** `validate_qwen3.exs` regression root-caused to three `Nx.Defn.Graph.split` bugs (not `emlx.ex`): exponential `rewrite_subtree` (hang), `runtime_call` operand under-collection (param-index crash), and non-tuple final-stage output in `run/3`. Fixed in the nx fork; bench runs end-to-end (`bb base` 7.3 / `bb+rewrite` 23.4 / `native` 71.4 tok/s); regression tests added; suites green.
 - [x] [`12-childprogram-spike`](12-childprogram-spike.md) — spike resolved. **No-go on the C++ child-program path.** Static fold is graph-equivalent to a pure-Elixir inline-unroll, so the C++ `:fold` buys nothing measurable (payload/build savings negligible; replay identical). `:reduce` now lowers via static trace-time unroll (Elixir, reuses existing opcodes, zero C++ change), validated vs the Evaluator. Stage 13 = Elixir unroll; Stage 14 C++ `while` dropped (MLX has no in-trace control flow → eval-per-iteration matches the proven Stage-08 host loop).
 - [x] [`13-custom-fun-reductions`](13-custom-fun-reductions.md) — full `reduce` / `window_reduce` custom-fun lowering via Elixir static unroll (Stage-12-blessed). `window_reduce` = pad-with-acc + fold reducer body over the prod(window_dims) within-window offsets via strided per-offset slices. Flipped `EXPR_NODES.md` 109/131; suite 236 passed. Associative-reducer→native-`window_*` perf routing deferred.
@@ -141,14 +153,18 @@ each independently shippable. Run with
 - [x] [`16-expr-nodes-doc-audit`](16-expr-nodes-doc-audit.md) — audit stale `EXPR_NODES.md` `[ ]` boxes (`fun`/`optional`/`from_binary`); confirmed all three are unreachable/subsumed (not real gaps) via re-grep against the vendored Nx fork; flipped the doc; two regression tests pin the `:fun` no-op invariant. No `expr.ex` code changes needed.
 - [x] [`17-block-while-descent`](17-block-while-descent.md) — close the `while`-nested-inside-a-block's-`default_expr` structural boundary. Statically unrolls counted `while` loops reached via block descent (fixes `Nx.Block.LinAlg.QR :complete`); `SVD full_matrices?: false` turned out to have no `while` at all in the current Nx fork (rewritten to a Gram-matrix decomposition) — needed only prerequisite `:eye`/`:constant`/`:metadata` fixes for non-scalar/vectorized shapes hit via the same descent path. `triangular_solve`'s non-default variants are a separate, unrelated gap (direct op-node, not a `default_expr` `while`) — descoped, still raises.
 - [x] [`18-hooks-token-splitting`](18-hooks-token-splitting.md) — answered "no" to the `while`-style split question: hooks are fire-and-forget, not control flow, so they lower in the *same* single NIF-call program via an extra-output design (no `Graph.split`, no host round-trip) — `:attach_token` is a zero-instruction passthrough, `:token` rides its hook(s) as extra program outputs fired host-side after the one `eval_program` call returns. **Cond-branch-local hooks hard-raise** (EMLX's `cond` evaluates every branch unconditionally, which would double-fire such a hook — a correctness carve-out, not a coverage gap); while-body hooks need no such guard (equivalence-tested vs Evaluator). **Found and fixed a real `Nx.Defn.Graph.split` bug** (`do_rewrite_subtree/3` had no `:token` clause, silently dropping hook-payload parameter remapping across a `while`'s stage boundary) — same "found via testing" pattern as Stages 11/17.
-- [ ] [`19-retire-evaluator-fallback`](19-retire-evaluator-fallback.md) — once 16–18 land, delete `try_native_compile`'s `Nx.Defn.Evaluator` delegation branch from `emlx.ex` entirely; unsupported ops hard-raise, no silent whole-defn fallback, matching this README's single-mode claim in code.
+- [x] [`19-retire-evaluator-fallback`](19-retire-evaluator-fallback.md) — deleted `try_native_compile`'s `Nx.Defn.Evaluator` delegation branch (and the now-dead `split_compiler_opts/1` helper) from `emlx.ex`; unsupported ops hard-raise, no silent whole-defn fallback, matching this README's single-mode claim in code. `triangular_solve`'s non-default variants (Stage 17) accepted as the sole coverage-gap permanent hard-raise, alongside the cond-branch-hook correctness carve-out (Stage 18).
 
 ### Emily backend-parity (expanded charter — see the note above "Resolved decisions")
 
-- [ ] [`20-emily-parity-audit`](20-emily-parity-audit.md) — docs-only gap audit against `~/coding/emily`'s PLAN.md/ROADMAP.md (M0–M27); marks already-at-parity items closed and scopes Stages 21–23.
-- [ ] [`21-observability`](21-observability.md) — `:telemetry` spans (eval/to_binary/memory-stats) + compile-time `:debug_bounds_check`/`:debug_detect_nan_inf` flags (Emily M18/M22 parity).
+- [x] [`20-emily-parity-audit`](20-emily-parity-audit.md) — docs-only gap audit, verified against both repos' actual code (not just Emily's docs). Confirmed telemetry/SDPA-sinks/microscaled-quant/public-einsum/grad-training-conformance gaps as seeded; found several already-ahead items (quantized-dot dispatch, concurrency model, SDPA variant breadth); **corrected the seed list**: EMLX already ships M22-equivalent compile-time debug flags (`@enable_bounds_check` fully covers its op list; `@detect_non_finites` covers `dot` only, needs extending to `conv`/`EMLX.Fast`) — Stage 21 rescoped accordingly. M6-vs-Layer-C "contradiction" resolved as a non-issue (different optimization axes). Stages 21–23 scope finalized; plan file's stale todo list (missing 20–24) reconciled.
+- [ ] [`21-observability`](21-observability.md) — `:telemetry` spans (eval/to_binary/memory-stats) (Emily M18 parity) + extend EMLX's existing `:enable_bounds_check`/`:detect_non_finites` compile-time flags (already cover Emily M22's target ops except `conv`/`EMLX.Fast`, per Stage 20's correction).
 - [ ] [`22-fast-kernel-quant-parity`](22-fast-kernel-quant-parity.md) — SDPA attention sinks, microscaled quantization modes (mxfp4/mxfp8/nvfp4), public `einsum` helper (Emily M25/M26/M27 parity).
 - [ ] [`23-gradient-training-conformance`](23-gradient-training-conformance.md) — scoping-only epic: triage grad/training behavior under `compiler: EMLX` (currently untested), name follow-on stages for real gaps (Emily M9/M13/M16/M17 parity).
+
+### Found post-Stage-19 (not on the original plan)
+
+- [x] [`24-quantized-dot-compiler-gap`](24-quantized-dot-compiler-gap.md) — investigation: a quantized `Nx.dot` right-operand is invisible to the native compiler (quantization dispatch is eager-per-op-callback-only metadata on the runtime tensor, never present in the traced `Expr`), so a quantized weight bound to a `compiler: EMLX` defn used to crash deep in the NIF (`[tensordot] a and b must have the same shape on the contracted axes`). Root-caused, confirmed unrelated to Stage 19; shipped a clear pre-flight `ArgumentError` + regression test as an interim. The full fix (call-time program specialization, new `quantized_matmul` opcode) is scoped in the stage doc but **not implemented** — needs a scoping decision on whether "stock Bumblebee graph + quantized weights + `compiler: EMLX`" is a configuration worth supporting, given the hand-written `native` path already covers real deployment.
 
 ## Decision gates
 

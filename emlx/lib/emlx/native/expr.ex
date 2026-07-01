@@ -185,8 +185,9 @@ defmodule EMLX.Native.Expr do
   == original parameter position always.
 
   Raises `ArgumentError` with message `"does not yet lower op :foo"` for any
-  op not yet implemented. The compiler seam in `EMLX.__compile__/4` catches
-  this message and falls back to `Nx.Defn.Evaluator`.
+  op not yet implemented. Single-mode: the compiler seam in
+  `EMLX.__compile__/4` does not catch this — it propagates straight to the
+  caller. There is no whole-`defn` `Nx.Defn.Evaluator` fallback lane.
   """
   @spec lower(Nx.Container.t(), non_neg_integer() | nil) :: t()
   def lower(output, num_inputs \\ nil) do
@@ -1648,7 +1649,8 @@ defmodule EMLX.Native.Expr do
 
   # triangular_solve: single-output. Direct op node (not a block).
   # args = [a, b, opts]. Only the common configuration (left_side + no transform)
-  # is lowered natively; other variants raise → Evaluator fallback.
+  # is lowered natively; other variants are a permanent hard-raise (Stage 17
+  # descoped, Stage 19 accepted — see workdir/native-compiler/19-retire-evaluator-fallback.md).
   defp expand_node(
          %T{
            type: out_type,

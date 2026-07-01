@@ -74,7 +74,7 @@ Evaluator. No host-split (option b) built.
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
 | rms_norm / layer_norm | native fused (`:fast_rms_norm`, `:fast_layer_norm`, `:fast_layer_norm_no_bias`) | vs eager + hand-written primitive within 1e-3 |
-| rope variants | native fused for decode/T=1 (`:fast_rope`, `:fast_rope_ids`, `:fast_rope_with_freqs`) | prefill T>1 callbacks raise → Evaluator fallback |
+| rope variants | native fused for decode/T=1 (`:fast_rope`, `:fast_rope_ids`, `:fast_rope_with_freqs`); prefill T>1 lowers via an in-graph cos/sin/rotate composition (Stage 15) | vs eager |
 | sdpa variants | native fused (`:fast_sdpa`, `:fast_sdpa_masked`, `:fast_sdpa_causal`, `:fast_sdpa_causal_key_masked`) | causal-key-masked builds mask in-graph (no `.item()`); vs eager + softmax(QKᵀ)·V primitive |
 | swiglu | native fused (`:fast_swiglu`) | vs hand-written `silu(gate)*up` |
 | fused vs primitive benchmark | fused faster | decode block (causal SDPA → reshape → RMSNorm): ~300 µs/call fused vs ~400 µs/call primitive replay (~1.3–1.4× on this machine) |

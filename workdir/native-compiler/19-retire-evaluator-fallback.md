@@ -1,6 +1,6 @@
 # Stage 19 — retire the `Nx.Defn.Evaluator` fallback lane
 
-Status: not started. Depends on Stages 16–18.
+Status: done. Depends on Stages 16–18.
 
 ## Why this stage exists
 
@@ -61,3 +61,110 @@ question was already settled and this stage enforces it.)
   silently falling back.
 - `README.md`'s single-mode claim has zero remaining discrepancy between docs
   and code.
+
+## Results
+
+**Advisor sign-off (before starting).** Confirmed proceeding was safe despite
+`triangular_solve`'s non-default variants still raising `does not yet lower
+op` (a real, Stage-17-descoped gap, not closed by Stages 16–18): the deletion
+itself, gated by a green full-suite run before and after, is the correct
+oracle for whether anything still silently depended on the fallback lane —
+no a-priori decision was needed. Advisor also flagged a stale docstring
+(`expr.ex:187-189`, still describing the fallback) that the original
+Procedure's sweep list (step 6, scoped to Stage 09/10/15/`EXPR_NODES.md`)
+would have missed, and recommended `triangular_solve left_side: false` as
+the regression-test sentinel (a genuine permanent gap, not a maintenance
+trap) rather than an arbitrary "not implemented" stand-in.
+
+**Baseline (before deletion).** `mix test` in `emlx/`: 2564 passed (825
+doctests, 1739 tests), 0 failures, 1 excluded (`:large_memory`). `mix test`
+in `emlx_axon/`: 7 passed, 2 excluded (`:bumblebee`, `:metal`) — this
+includes `test/emlx/qwen3_quantized_test.exs`'s 2 tests (a local-checkpoint,
+`compiler: EMLX`-driven Qwen3-0.6B-MLX-4bit greedy-decode conformance test,
+tagged `:quantized_inference`, not excluded by `test_helper.exs`; it runs as
+part of the standard `mix test` in this environment since the checkpoint is
+present at `~/models/Qwen3-0.6B-MLX-4bit` — reviewer-caught correction: an
+earlier draft of this doc incorrectly described it as separately-targeted
+and excluded by default).
+
+**Change.** Deleted `try_native_compile/3`'s `rescue`/`:not_supported`
+branch and folded its body into `__compile__/4` (renamed `native_compile/3`
+— the rescue-isolation reason for the split no longer applies, since there's
+nothing left to isolate: an `ArgumentError` now simply propagates). Removed
+the now-dead `split_compiler_opts/1` helper and its `rest_opts` half — with
+`Keyword.validate!/2` already restricting `opts` to `@valid_compiler_keys`
+before the split ran, `rest_opts` (opts *outside* that list, forwarded to
+`Nx.Defn.Evaluator.__compile__/4`) was always `[]` in practice once the
+Evaluator branch was gone, so keeping the split would have left dead code
+behind it. `__compile__/4`'s unused `key` param is now `_key` (was only
+threaded through to the deleted `Nx.Defn.Evaluator.__compile__/4` call).
+Fixed the stale docstring at `expr.ex:187-189` (flagged by the advisor) that
+described `EMLX.__compile__/4` as catching the `"does not yet lower op"`
+message.
+
+**Regression test (Acceptance bullet 3).** Replaced
+`test/emlx/native/expr_test.exs`'s `"unsupported op falls back to Evaluator
+transparently"` test — which asserted the now-deleted behavior, and was
+already misleadingly named even before this stage since `Nx.sum/1` (its
+example "unsupported" op) has lowered natively since Stage 04 — with `@tag
+:stage19 test "unsupported op raises through the compiler seam (no
+Evaluator fallback)"`, which drives `triangular_solve left_side: false`
+through `Nx.Defn.jit(f, compiler: EMLX)` (the actual `__compile__/4` seam,
+not the lower-level `Expr.lower/2` call the existing Stage 17 test at
+`expr_test.exs:3546` already covers) and asserts it raises `ArgumentError`
+matching `"does not yet lower op :triangular_solve"`.
+
+**Post-deletion verification.** `mix test` in `emlx/`: 2564 passed (825
+doctests, 1739 tests), 0 failures, 1 excluded — identical count to baseline
+(net zero: one stale test replaced by one new test). `mix test` in
+`emlx_axon/`: 7 passed, 2 excluded — identical to baseline, including the
+Qwen3 e2e conformance tests above (the closest thing this repo has to a
+"Bumblebee conformance suite" — reviewer-confirmed there is no literal
+`:bumblebee`-tagged test anywhere in the repo, i.e. `test_helper.exs`'s
+`exclude: [:bumblebee]` is currently a no-op; and no
+`scripts/expr_op_coverage.exs` op-coverage probe exists yet either, despite
+both being referenced aspirationally in `README.md`/`EXPR_NODES.md`; neither
+gap is closed by this stage, they're pre-existing "to be written" items, not
+something Stage 19 regressed) still passing end-to-end with the fallback
+lane gone. No hidden dependency on the deleted lane surfaced.
+
+**`triangular_solve` accepted as a permanent hard-raise (Acceptance bullet
+1, decided per advisor sign-off).** It joins the cond-branch-local hook
+(Stage 18) as the second and only other permanent, by-design "does not yet
+lower op"-style raise. Documented explicitly in `README.md` (Resolved
+decision #1) and `EXPR_NODES.md` (section K) so it reads as an accepted,
+named gap rather than an implicit "still raises."
+
+**Doc sweep (Procedure step 6).** `README.md`: Resolved decision #1 now
+states the enforcement is real in code, naming both permanent hard-raises;
+the "Known discrepancy" callout above it is updated to past tense
+("closed"); Stage 19's checklist box flips to `[x]`; Stage 10's summary line
+("prefill RoPE raises → Evaluator fallback") is corrected — that was already
+stale by Stage 15's fix, not by this stage, and predates the fallback
+deletion. `EXPR_NODES.md` section K's `triangular_solve` line and
+`09-blocks-linalg.md`'s results table drop the "→ Evaluator" phrasing.
+`10-fast-kernels.md`'s results-table row for RoPE now reflects Stage 15's
+fix instead of the pre-Stage-15 state (a doc bug unrelated to this stage,
+caught during the sweep). Historical narrative prose in `09-blocks-linalg.md`
+/`10-fast-kernels.md`/`14-while-childprogram.md`/`11-bench-regression.md`
+describing what the Evaluator fallback *was* at the time those stages ran is
+left alone — it's accurate history, not a live claim.
+
+**Full suite, final.** `mix test` in `emlx/`: 2564 passed (825 doctests,
+1739 tests), 0 failures. `mix test` in `emlx_axon/`: 7 passed, 2 excluded.
+All acceptance bullets met.
+
+**Reviewer sign-off (clean, no blockers).** A fresh reviewer subagent (fed
+only the Acceptance criteria + diffs + test output, no reasoning)
+independently re-verified against the live repo (re-ran `mix test` in both
+`emlx/` and `emlx_axon/`, `mix test --only stage19`, `mix compile
+--warnings-as-errors`, `mix format --check-formatted`) and confirmed: the
+success path is behaviorally unchanged; `split_compiler_opts`/`rest_opts`
+was genuinely dead code once `Keyword.validate!/2` ran first; the new
+regression test is a real guard (cross-referenced `EMLX.Backend`'s eager
+`triangular_solve` to confirm a reintroduced fallback would silently compute
+a wrong-looking-right answer instead of raising, so `assert_raise` would
+catch it); and there is no live "→ Evaluator fallback" claim left in the
+docs. Flagged two non-blocking doc issues (a "see ... above" pointer that
+should have read "below", and this doc's Qwen3-test framing) — both fixed
+above.

@@ -422,12 +422,21 @@ defmodule EMLX.Native.ExprTest do
       assert_all_close(compiled.(a, b), Nx.tensor([5.0, 7.0, 9.0]))
     end
 
-    test "unsupported op falls back to Evaluator transparently" do
-      jitted = Nx.Defn.jit(&Nx.sum/1, compiler: EMLX)
+    # Stage 19: single-mode, no whole-defn Evaluator fallback lane. A
+    # genuinely unsupported construct (triangular_solve's non-default
+    # variants — see the "Stage 09/17" describe block below) must raise
+    # straight through `EMLX.__compile__/4`, not silently re-run the whole
+    # `defn` on `Nx.Defn.Evaluator`.
+    @tag :stage19
+    test "unsupported op raises through the compiler seam (no Evaluator fallback)" do
+      f = fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end
 
-      a = Nx.tensor([3.0, 4.0, 5.0], backend: EMLX.Backend)
+      a = Nx.tensor([[3.0, 0.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]], backend: EMLX.Backend)
+      b = Nx.tensor([[1.0, 2.0, 3.0]], backend: EMLX.Backend)
 
-      assert_in_delta Nx.to_number(jitted.(a)), 12.0, 1.0e-6
+      assert_raise ArgumentError, ~r/does not yet lower op :triangular_solve/, fn ->
+        Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      end
     end
 
     test "result matches eager EMLX.Backend within tolerance" do
@@ -3736,6 +3745,41 @@ defmodule EMLX.Native.ExprTest do
       assert_raise ArgumentError, ~r/cannot lower a hook nested inside a cond branch/, fn ->
         Expr.lower(expr, 1)
       end
+    end
+  end
+
+  describe "Stage 24 — quantized Nx.dot input is a documented, permanent hard-raise (no fix yet)" do
+    # See workdir/native-compiler/24-quantized-dot-compiler-gap.md. A quantized
+    # weight's Nx-visible shape/type deliberately mirror its logical dense
+    # shape so eager `Nx.dot` can transparently reroute to
+    # `EMLX.quantized_matmul` inside `EMLX.Backend.dot/7` -- invisible to a
+    # compile-once/replay-many compiler, since only a plain `:parameter`
+    # template exists at lowering time. This pins the pre-flight
+    # `ArgumentError` (clear message) in place of the opaque NIF
+    # `[tensordot] a and b must have the same shape on the contracted axes`
+    # crash the missing check used to let through.
+    @tag :stage24
+    test "a quantized weight bound to a native-compiled defn raises a clear ArgumentError" do
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x = Nx.iota({4, 128}, type: :f32) |> Nx.backend_transfer(EMLX.Backend)
+
+      assert_raise ArgumentError, ~r/does not support a quantized input tensor/, fn ->
+        Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(x, qw)
+      end
+    end
+
+    test "the same defn runs correctly under Nx.Defn.Evaluator (not a model/graph bug)" do
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x = Nx.iota({4, 128}, type: :f32) |> Nx.backend_transfer(EMLX.Backend)
+
+      result = Nx.Defn.jit(&Nx.dot/2, compiler: Nx.Defn.Evaluator).(x, qw)
+      assert Nx.shape(result) == {4, 64}
     end
   end
 

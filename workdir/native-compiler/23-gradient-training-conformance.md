@@ -32,7 +32,12 @@ triaged, the same way Stage 12's spike fanned into Stages 13/14)
    what breaks. Likely candidates: `while`-in-backward (backprop through a
    training loop), multi-output `elem` handling under grad, any op whose
    *backward* pass composes ops not yet native-lowered even though the
-   *forward* op is.
+   *forward* op is. **From Stage 20's audit**: explicitly include a windowed
+   op (`window_sum`/`window_max`/etc.) in the zoo — `window_sum` and friends
+   are native only inside the compiler's IR (Stage 06/13), while the eager
+   `EMLX.Backend.window_reduce/6` hard-raises, so grad-of-windowed-op under
+   `compiler: EMLX` is untested territory distinct from the other candidates
+   above.
 2. **If the native compiler already handles grad'd expressions cleanly**:
    this becomes "just add the test suite" — a materially smaller task than
    Emily's M9 was for them (they built the compiler and the backend

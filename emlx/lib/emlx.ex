@@ -1317,28 +1317,26 @@ defmodule EMLX do
   end
 
   @impl Nx.Defn.Compiler
-  def __compile__(key, vars, fun, opts) do
+  def __compile__(_key, vars, fun, opts) do
     Keyword.validate!(opts, @valid_compiler_keys)
-    {compiler_opts, rest_opts} = split_compiler_opts(opts)
-    queue = Keyword.get(compiler_opts, :command_queue)
-    device = Keyword.get(compiler_opts, :device, default_device())
+    queue = Keyword.get(opts, :command_queue)
+    device = Keyword.get(opts, :device, default_device())
 
-    case try_native_compile(vars, fun, device) do
-      {:ok, eval_fn} ->
-        wrap_with_queue(queue, eval_fn)
+    wrap_with_queue(queue, native_compile(vars, fun, device))
+  end
 
-      :not_supported ->
-        # Fallback: delegate to Nx.Defn.Evaluator for ops not yet lowered.
-        inner =
-          Nx.Defn.Evaluator.__compile__(
-            key,
-            vars,
-            fun,
-            Keyword.put(rest_opts, :compiler, Nx.Defn.Evaluator)
-          )
-
-        wrap_with_queue(queue, inner)
-    end
+  # Attempts to lower `fun.(vars)` to an `EMLX.Native.Expr` program and build a
+  # compiled program resource, returning the resulting eval closure. Single-mode:
+  # any op not yet implemented raises `ArgumentError` ("does not yet lower op
+  # ...") straight through to the caller — there is no whole-`defn` fallback lane.
+  defp native_compile(vars, fun, device) do
+    output_expr = fun.(vars)
+    {worker, effective_device} = resolve_worker(device)
+    # `vars`' flattened leaf count is the true call arity — passed through so
+    # `lower/2` can densify its input list even when `output_expr` doesn't
+    # reference every parameter position (see EMLX.Native.Expr.lower/2 doc).
+    num_inputs = vars |> Nx.Defn.Composite.flatten_list() |> length()
+    build_eval_fn(output_expr, worker, effective_device, num_inputs)
   end
 
   # Wraps a compiled eval closure so each invocation routes through `queue`.
@@ -1377,31 +1375,6 @@ defmodule EMLX do
           leaf
       end)
     end)
-  end
-
-  # Attempts to lower `fun.(vars)` to an `EMLX.Native.Expr` program and build a compiled
-  # program resource. Returns `{:ok, eval_fn}` on success, or `:not_supported`
-  # if `lower/1` encounters an op not yet implemented (fires the Evaluator
-  # fallback). Any other error is re-raised.
-  #
-  # This is intentionally a separate function so the rescue clause does not
-  # accidentally swallow unrelated errors from the outer __compile__ body.
-  defp try_native_compile(vars, fun, device) do
-    output_expr = fun.(vars)
-    {worker, effective_device} = resolve_worker(device)
-    # `vars`' flattened leaf count is the true call arity — passed through so
-    # `lower/2` can densify its input list even when `output_expr` doesn't
-    # reference every parameter position (see EMLX.Native.Expr.lower/2 doc).
-    num_inputs = vars |> Nx.Defn.Composite.flatten_list() |> length()
-    eval_fn = build_eval_fn(output_expr, worker, effective_device, num_inputs)
-    {:ok, eval_fn}
-  rescue
-    e in ArgumentError ->
-      if String.starts_with?(Exception.message(e), "does not yet lower op") do
-        :not_supported
-      else
-        reraise e, __STACKTRACE__
-      end
   end
 
   # Routes a traced expression to the right eval-closure builder. `while` is
@@ -1481,10 +1454,22 @@ defmodule EMLX do
   end
 
   # Materialises defn input lazy refs to NIF resource refs on `dev`.
+  #
+  # Known limitation (no fix yet — see workdir/native-compiler/24-quantized-dot-compiler-gap.md):
+  # a quantized weight's Nx-visible `.shape`/`.type` deliberately mirror its
+  # logical dense shape (so eager `Nx.dot` can transparently reroute to
+  # `EMLX.quantized_matmul` via `EMLX.Backend.dot/7`'s runtime dispatch) — but
+  # that means `EMLX.Native.Expr.lower/2` sees only an ordinary-looking
+  # `:parameter` template and always emits a plain `:dot` opcode, which then
+  # fails deep inside the NIF (`[tensordot] a and b must have the same shape
+  # on the contracted axes`) once replayed against the real packed tensor.
+  # Raise here instead, with a clear, actionable message, rather than let
+  # that opaque NIF crash surface.
   defp materialise_input_refs(params, dev) do
     Enum.map(params, fn lazy ->
       case lazy.() do
-        %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, ref}}} ->
+        %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, ref}}} = t ->
+          reject_quantized_native_input!(t)
           ref
 
         %Nx.Tensor{} = t ->
@@ -1494,6 +1479,22 @@ defmodule EMLX do
           ref
       end
     end)
+  end
+
+  defp reject_quantized_native_input!(tensor) do
+    if EMLX.Quantization.quantized?(tensor) do
+      raise ArgumentError,
+            "compiler: EMLX does not support a quantized input tensor (shape " <>
+              "#{inspect(tensor.shape)}, type #{inspect(tensor.type)}). Quantized-weight " <>
+              "matmul dispatch (EMLX.Backend.dot/7 -> EMLX.quantized_matmul) only happens " <>
+              "in the eager per-op backend path; the native single-NIF-replay compiler " <>
+              "traces and compiles the graph once, before any real tensor (and its " <>
+              "quantization metadata) is bound, so it cannot see or lower this dispatch " <>
+              "(see workdir/native-compiler/24-quantized-dot-compiler-gap.md). Use " <>
+              "compiler: Nx.Defn.Evaluator, or dequantize the tensor first with " <>
+              "EMLX.dequantize/1, or use a hand-written eager pipeline " <>
+              "(e.g. EMLXAxon.Qwen3.Generate) instead."
+    end
   end
 
   # Builds the per-call eval closure for the flat (no-while) native path.
@@ -1742,12 +1743,6 @@ defmodule EMLX do
   """
   def default_device do
     Application.get_env(:emlx, :default_device, :gpu)
-  end
-
-  # Splits opts into {emlx_compiler_opts, rest_opts}. The rest_opts are
-  # forwarded to Nx.Defn.Evaluator; EMLX-specific keys are consumed here.
-  defp split_compiler_opts(opts) do
-    Enum.split_with(opts, fn {k, _v} -> k in @valid_compiler_keys end)
   end
 
   @doc """

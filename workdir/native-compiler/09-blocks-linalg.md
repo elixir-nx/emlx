@@ -82,6 +82,6 @@ a `Nx.BinaryBackend` reference oracle.
 | qr / eigh / svd | native (CPU-pinned, multi-output) | reconstruction tests (Q·R, V·diag(W)·Vᵀ, U·diag(S)·Vᵀ) — robust to sign/order ambiguity |
 | lu | native (multi-output) + in-graph eye/take for P | factors vs eager + P·L·U reconstruction |
 | determinant | `default_expr` descent | 2×2/3×3 pure primitives; 4×4 via recognized native LU; vs `Nx.BinaryBackend` |
-| triangular_solve variants | `left_side` + `transform_a: :none` native; others fall back | raises `does not yet lower op` → Evaluator |
+| triangular_solve variants | `left_side` + `transform_a: :none` native; others raise | permanent hard-raise `does not yet lower op` (accepted by Stage 19, no Evaluator fallback exists) |
 | batched / chained | correct (verified) | batched `cholesky` (CPU) + batched `lu` `P·L·U` & chained `cholesky→solve` (GPU); LU pivot→`P` rebuild broadcasts over batch dims. Batched `lu`/`solve` may still hit CPU `pclose()` (env limit) |
 | tests | 15 Stage 09 tests green on `:cpu` and `:gpu` defaults (added chained, batched cholesky, det-sign); full suite passing, no regressions | `test/emlx/native/expr_test.exs` |
