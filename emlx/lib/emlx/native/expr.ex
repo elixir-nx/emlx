@@ -1865,7 +1865,19 @@ defmodule EMLX.Native.Expr do
         end
       end)
 
-    result_ref = Map.fetch!(inner_state.node_to_ref, default_expr.data.id)
+    # Tuple-output blocks (e.g. Nx.Block.TopK's {values, indices}) carry
+    # default_expr as a raw Elixir tuple of %T{} nodes (see Nx.Defn.Expr.expr_block/3),
+    # not a single tensor with a `.data.id`. Mirror the multi-output linalg
+    # convention: store a list of refs, one per tuple element, so the :elem
+    # node handler (which already supports list-valued node_to_ref entries)
+    # can index into it.
+    result_ref =
+      if is_tuple(default_expr) do
+        flat_refs(default_expr, inner_state)
+      else
+        Map.fetch!(inner_state.node_to_ref, default_expr.data.id)
+      end
+
     %{inner_state | node_to_ref: Map.put(inner_state.node_to_ref, id, result_ref)}
   end
 
@@ -2051,9 +2063,11 @@ defmodule EMLX.Native.Expr do
   # ── EMLX.Fast runtime_call recognition ─────────────────────────────────────
   #
   # Maps a recognized `&EMLX.Fast.*_callback/2` capture to a fused opcode and its
-  # integer-attr list. Only the single-NIF (decode / T=1) callbacks are routable
-  # to a single fused opcode; the per-token prefill RoPE callbacks are Elixir
-  # compositions over eager NIFs (not a single kernel) and raise here — deferred.
+  # integer-attr list. The decode/T=1 callbacks route to a single
+  # `mlx::core::fast::*` opcode; the per-token prefill RoPE callbacks
+  # (`rope_with_positions_callback` / `rope_with_freqs_callback`, T>1) route to
+  # an in-graph cos/sin/rotate primitive composition instead (Stage 15 Part B —
+  # `mlx::fast::rope`'s offset can't express arbitrary per-token positions).
   defp fast_kernel_dispatch(fun, opts) when is_function(fun, 2) do
     info = Function.info(fun)
     module = info[:module]
@@ -2113,10 +2127,24 @@ defmodule EMLX.Native.Expr do
         {:fast_rope_with_freqs,
          [opts[:dims], bool_int(opts[:traditional]), f64_bits(opts[:scale])]}
 
-      name when name in [:rope_with_positions_callback, :rope_with_freqs_callback] ->
-        raise ArgumentError,
-              "does not yet lower op :runtime_call for EMLX.Fast.#{name}/2 " <>
-                "(per-token prefill RoPE path; only the T=1 decode fast path is lowered)"
+      # Prefill RoPE (T>1) / high-base decode — arbitrary per-token position_ids,
+      # inv_freq derived from `base`. Composed via primitive cos/sin/rotate ops
+      # in-graph (no new C++ kernel); matches the eager fast_rope_positions NIF.
+      :rope_with_positions_callback ->
+        {:fast_rope_positions,
+         [
+           opts[:dims],
+           bool_int(opts[:traditional]),
+           f64_bits(opts[:base]),
+           f64_bits(opts[:scale])
+         ]}
+
+      # Prefill RoPE (T>1) with a precomputed freqs tensor (e.g. :llama3 scaling).
+      # Same primitive composition, inv_freq = reciprocal(freqs) (matches
+      # mlx::fast::rope's freqs overload) instead of deriving it from `base`.
+      :rope_with_freqs_callback ->
+        {:fast_rope_with_freqs_positions,
+         [opts[:dims], bool_int(opts[:traditional]), f64_bits(opts[:scale])]}
 
       other ->
         raise ArgumentError, "does not yet lower op :runtime_call for EMLX.Fast.#{other}/2"

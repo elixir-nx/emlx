@@ -37,7 +37,7 @@ Source of truth:
 | `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [~] |
 | `optional` | `(name, args, default)` | lower default expr, or route to native | [ ] |
 | `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] |
-| `runtime_call` | `(expr, cb, out, opts)` | recognize `EMLX.Fast.*` callback → fused opcode (see L); else raises | [~] |
+| `runtime_call` | `(expr, cb, out, opts)` | recognize `EMLX.Fast.*` callback → fused opcode (see L); else raises | [x] |
 
 Notes:
 - `cond`: all predicate and body tensors are in the **parent scope** (`apply_args`
@@ -55,8 +55,19 @@ Notes:
   natively without an Evaluator fallback.
 - `block` is the lowering-control lever (PLAN.md §6): recognize the
   `Nx.Block.*` struct for a native/fused path, else lower `default_expr`.
-- `token`/`runtime_call`/hooks imply host side effects → not lowerable to a
-  pure replay; they raise (no silent fallback in single mode).
+  Remaining structural boundary (Stage 15 Part A): a `while` reached *inside*
+  a block's `default_expr` still raises, because `while` is handled at
+  `build_eval_fn` level (splits the top-level expression on `:while` nodes),
+  not inside `expand_node`'s per-node dispatch — a `default_expr` descent
+  never re-enters that split. Custom-fun `reduce`/`window_reduce` inside a
+  block's `default_expr` do *not* hit this boundary (Stage 13's static
+  trace-time unroll is ordinary node expansion, not a `build_eval_fn`-level
+  split), so `block` is `[~]` only for the `while`-inside-`default_expr` case.
+- `token`/hooks imply host side effects → not lowerable to a pure replay; they
+  raise (no silent fallback in single mode). `runtime_call` is fully lowered
+  within its designed scope: `EMLX.Fast.*` callbacks (incl. per-token prefill
+  RoPE, Stage 15 Part B) recognize to a fused opcode; any other callback is a
+  genuine host side effect and raises deliberately (not a gap).
 
 ## B. Unary elementwise (Nx.Backend unary_ops)
 
@@ -153,7 +164,7 @@ logical_and, logical_or, logical_xor.
   - Linalg outputs are `mlx::core::contiguous`-wrapped: MLX can otherwise emit a strided fused CPU `Compiled` kernel for the factorization tails (e.g. solve permutation, LU L/U masks) that fails to JIT (`pclose()`).
   - Unsupported variants (QR `:complete`, SVD `full_matrices?: false`, `triangular_solve` with `left_side: false` or `transform_a != :none`) descend into `default_expr`; while-containing decompositions raise `does not yet lower op` → Evaluator fallback.
   - Batched (rank>2) and chained linalg→linalg are **correct** (verified: batched `cholesky` on CPU; batched `lu` `P·L·U` reconstruction + chained `cholesky→solve` on GPU default — the LU pivot→`P` rebuild via `:eye`/`:take` broadcasts over batch dims). Known env limitation: batched `lu`/`solve` can still hit the CPU `pclose()` JIT failure for the rank-3 strided permutation/mask kernels even with the `contiguous`-wrap, so those batched variants are not exercised in the CPU CI suite.
-- [ ] all_close, phase, and other Nx.Block.* helpers
+- [x] all_close, phase, top_k (tuple-output `default_expr`, via `flat_refs`), and unrecognized-struct `default_expr` descent — equivalence-tested (Stage 15 Part A)
 
 ## L. EMLX.Fast fused kernels (optimization, not correctness)
 
@@ -166,7 +177,7 @@ Metal-only kernels → E2E tests run on a GPU worker (`device: :gpu`, `:metal`).
 
 - [x] rms_norm
 - [x] layer_norm (+ no-bias variant)
-- [x] rope / rope_with_positions / rope_with_freqs (decode/T=1 fast callbacks; per-token prefill paths raise → Evaluator fallback)
+- [x] rope / rope_with_positions / rope_with_freqs (decode/T=1 fast callbacks call `mlx::core::fast::*`; per-token prefill T>1 callbacks lower to an in-graph cos/sin/rotate primitive composition, no new C++ kernel — Stage 15 Part B). **Known issue (out of scope, filed):** `mlx::core::fast::rope` itself miscomputes non-head-0 rotations for multi-head (H>1) input in EMLX's non-transposed layout — see `mlx-fast-rope-multihead-bugreport.md`. Affects the decode/T=1 fast callbacks (both eager and compiled call the same buggy primitive, so they agree with each other while both disagree with the textbook formula); does not affect the new prefill composition, which never calls `fast::rope`.
 - [x] scaled_dot_product_attention (+ causal / additive-mask / causal-key-masked variants)
 - [x] swiglu
 

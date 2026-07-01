@@ -12,6 +12,7 @@
 #include "emlx_compiler.hpp"
 #include "mlx/compile_impl.h"
 #include <atomic>
+#include <cmath>
 #include <mutex>
 #include <numeric>
 #include <unordered_map>
@@ -63,6 +64,53 @@ static inline float attr_to_float(int64_t bits) {
   double d;
   std::memcpy(&d, &bits, sizeof(double));
   return static_cast<float>(d);
+}
+
+// ── Prefill-RoPE helper (Stage 15 Part B) ──────────────────────────────────
+//
+// mlx::fast::rope's offset argument is either a scalar or one starting
+// position per batch example (sequential from there) — it cannot express
+// arbitrary per-token positions (e.g. left-padded prefill). For that case we
+// compose the same split-half rotation from precomputed per-token `angles`
+// directly with primitive ops, matching mlx::fast::rope's non-traditional
+// (traditional=false) formula bit-for-bit:
+//   out[..half] = a[..half]*cos(angles) - a[half..dims]*sin(angles)
+//   out[half..] = a[half..dims]*cos(angles) + a[..half]*sin(angles)
+// (equivalently: rotate_half = concat(-a[half..dims], a[..half]); out =
+// a[..dims]*cos_full + rotate_half*sin_full — the form used here, matching
+// emlx_fast.cpp's fast_rope_positions eager NIF body).
+// `a` is {B, T, H, D}; `angles` is {B, T, half} (already position*inv_freq*scale).
+// No new Metal kernel: this is the existing fast_rope_positions composition,
+// exposed as a compiled-graph opcode so prefill RoPE stays in one NIF replay.
+static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
+                                                const mlx::core::array &angles,
+                                                int dims) {
+  using namespace mlx::core;
+
+  int B = a.shape(0);
+  int T = a.shape(1);
+  int H = a.shape(2);
+  int D = a.shape(3);
+  int half = dims / 2;
+
+  auto cos_bt1h = astype(reshape(cos(angles), to_shape({B, T, 1, half})), a.dtype());
+  auto sin_bt1h = astype(reshape(sin(angles), to_shape({B, T, 1, half})), a.dtype());
+
+  auto cos_full = concatenate(std::vector<array>{cos_bt1h, cos_bt1h}, 3);
+  auto sin_full = concatenate(std::vector<array>{sin_bt1h, sin_bt1h}, 3);
+
+  auto x1 = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, half}));
+  auto x2 = slice(a, to_shape({0, 0, 0, half}), to_shape({B, T, H, dims}));
+  auto rotated = concatenate(std::vector<array>{negative(x2), x1}, 3);
+
+  auto a_head = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, dims}));
+  auto rope_head = add(multiply(a_head, cos_full), multiply(rotated, sin_full));
+
+  if (dims == D) {
+    return rope_head;
+  }
+  auto tail = slice(a, to_shape({0, 0, 0, dims}), to_shape({B, T, H, D}));
+  return concatenate(std::vector<array>{rope_head, tail}, 3);
 }
 
 // ── Window-op helpers ─────────────────────────────────────────────────────
@@ -1413,6 +1461,79 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        return mlx::core::fast::rope(
            ops[0], static_cast<int>(attrs[0]), attrs[1] != 0, std::nullopt,
            attr_to_float(attrs[2]), offsets, ops[2]);
+     }},
+
+    // rope (arbitrary per-token position_ids, base-derived inv_freq):
+    // operands = [a, position_ids]; attrs = [dims, traditional, base_bits,
+    // scale_bits]. Prefill path (T>1) / high-base decode — mirrors
+    // emlx_fast.cpp's fast_rope_positions eager NIF (Stage 15 Part B).
+    {"fast_rope_positions",
+     [](const auto &ops, const auto &attrs) {
+       int dims = static_cast<int>(attrs[0]);
+       bool traditional = attrs[1] != 0;
+       if (traditional) {
+         throw std::invalid_argument(
+             "fast_rope_positions: traditional=true not supported");
+       }
+       float base = attr_to_float(attrs[2]);
+       float scale = attr_to_float(attrs[3]);
+       const auto &a = ops[0];
+       const auto &pos = ops[1];
+       int half = dims / 2;
+
+       std::vector<float> inv_freq_host(half);
+       for (int i = 0; i < half; ++i) {
+         float expo = (2.0f * static_cast<float>(i)) / static_cast<float>(dims);
+         inv_freq_host[i] = 1.0f / std::pow(base, expo);
+       }
+       auto inv_freq =
+           mlx::core::array(inv_freq_host.begin(), {half}, mlx::core::float32);
+
+       int B = pos.shape(0);
+       int T = pos.shape(1);
+       auto pos_f = mlx::core::astype(pos, mlx::core::float32);
+       auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}));
+       auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}));
+       auto angles = mlx::core::multiply(
+           mlx::core::multiply(pos_bt1, inv_11h),
+           mlx::core::array(scale, mlx::core::float32));
+
+       return rope_rotate_from_angles(a, angles, dims);
+     }},
+
+    // rope (arbitrary per-token position_ids, precomputed freqs):
+    // operands = [a, position_ids, freqs]; attrs = [dims, traditional,
+    // scale_bits]. Prefill path (T>1) for RoPE-scaling strategies that bake a
+    // freqs tensor (e.g. :llama3) — mlx::fast::rope's freqs overload takes
+    // `inv_freqs = reciprocal(freqs)` (see mlx/fast.cpp default_inv_freqs vs
+    // the inputs.size()==3 branch), so we replicate that reciprocal here
+    // rather than using `freqs` directly, to stay bit-for-bit with the eager
+    // EMLX.Fast.rope_with_freqs_callback path this replaces (Stage 15 Part B).
+    {"fast_rope_with_freqs_positions",
+     [](const auto &ops, const auto &attrs) {
+       int dims = static_cast<int>(attrs[0]);
+       bool traditional = attrs[1] != 0;
+       if (traditional) {
+         throw std::invalid_argument(
+             "fast_rope_with_freqs_positions: traditional=true not supported");
+       }
+       float scale = attr_to_float(attrs[2]);
+       const auto &a = ops[0];
+       const auto &pos = ops[1];
+       const auto &freqs = ops[2];
+       int half = dims / 2;
+
+       int B = pos.shape(0);
+       int T = pos.shape(1);
+       auto pos_f = mlx::core::astype(pos, mlx::core::float32);
+       auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}));
+       auto inv_freq = mlx::core::reciprocal(mlx::core::astype(freqs, mlx::core::float32));
+       auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}));
+       auto angles = mlx::core::multiply(
+           mlx::core::multiply(pos_bt1, inv_11h),
+           mlx::core::array(scale, mlx::core::float32));
+
+       return rope_rotate_from_angles(a, angles, dims);
      }},
 };
 

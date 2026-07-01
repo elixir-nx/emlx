@@ -2592,6 +2592,11 @@ defmodule EMLX.Native.ExprTest do
   defn cholesky_defn(x), do: Nx.LinAlg.cholesky(x)
   defn det_defn(x), do: Nx.LinAlg.determinant(x)
 
+  # Stage 15 Part A block-descent helpers.
+  defn all_close_defn(a, b), do: Nx.all_close(a, b)
+  defn phase_defn(x), do: Nx.phase(x)
+  defn top_k_defn(x), do: Nx.top_k(x, k: 3)
+
   # A small helper: a well-conditioned SPD matrix t·tᵀ + n·I.
   defp spd_matrix(n) do
     t = Nx.iota({n, n}, type: :f32, backend: EMLX.Backend) |> Nx.add(1.0)
@@ -2786,6 +2791,79 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # ── Stage 15 Part A — block-descent completeness ─────────────────────────
+  #
+  # AllClose/Phase are single-tensor-output blocks — flow through the generic
+  # expand_block_via_default fallback unchanged. TopK is a tuple-output block
+  # (default_expr = {values, indices}), which exercises the fix for
+  # expand_block_via_default's tuple case (stores a list of refs, consumed by
+  # the existing :elem handler — mirrors the multi-output linalg convention).
+  # Determinant's default_expr descent already has dedicated coverage above
+  # (Stage 09 describe block).
+
+  describe "Stage 15 — block-descent completeness (AllClose/Phase/TopK)" do
+    @tag :stage15
+    test "all_close: close tensors vs EMLX.Backend" do
+      a = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
+      b = Nx.tensor([1.0, 2.0, 3.0 + 1.0e-7], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&all_close_defn/2, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(&all_close_defn/2, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
+      assert Nx.to_number(native) == 1
+    end
+
+    @tag :stage15
+    test "all_close: not-close tensors vs EMLX.Backend" do
+      a = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
+      b = Nx.tensor([1.0, 2.0, 4.0], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&all_close_defn/2, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(&all_close_defn/2, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
+      assert Nx.to_number(native) == 0
+    end
+
+    @tag :stage15
+    test "phase: complex tensor vs EMLX.Backend" do
+      x =
+        Nx.complex(
+          Nx.tensor([1.0, -2.0, 0.0], type: :f32, backend: EMLX.Backend),
+          Nx.tensor([2.0, 1.0, -3.0], type: :f32, backend: EMLX.Backend)
+        )
+
+      native = Nx.Defn.jit(&phase_defn/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&phase_defn/1, compiler: Nx.Defn.Evaluator).(x)
+      assert_close(native, eager)
+    end
+
+    @tag :stage15
+    test "top_k (tuple-output block): values + indices vs EMLX.Backend" do
+      x = Nx.tensor([3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0], type: :f32, backend: EMLX.Backend)
+
+      {native_values, native_indices} = Nx.Defn.jit(&top_k_defn/1, compiler: EMLX).(x)
+      {eager_values, eager_indices} = Nx.Defn.jit(&top_k_defn/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native_values, eager_values)
+      assert Nx.to_flat_list(native_indices) == Nx.to_flat_list(eager_indices)
+    end
+
+    @tag :stage15
+    test "top_k on a batched input (rank 2) vs EMLX.Backend" do
+      x =
+        Nx.tensor([[3.0, 1.0, 4.0, 1.0, 5.0], [9.0, 2.0, 6.0, 5.0, 3.0]],
+          type: :f32,
+          backend: EMLX.Backend
+        )
+
+      {native_values, native_indices} = Nx.Defn.jit(&top_k_defn/1, compiler: EMLX).(x)
+      {eager_values, eager_indices} = Nx.Defn.jit(&top_k_defn/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native_values, eager_values)
+      assert Nx.to_flat_list(native_indices) == Nx.to_flat_list(eager_indices)
+    end
+  end
+
   # ── Stage 10 — EMLX.Fast fused kernels (recognize-and-route) ──────────────
   #
   # EMLX.Fast.* functions surface as :runtime_call nodes; the lowerer recognizes
@@ -2837,8 +2915,8 @@ defmodule EMLX.Native.ExprTest do
       end
     end
 
-    @tag :stage10
-    test "prefill RoPE (T>1) raises a fallback-eligible error" do
+    @tag :stage15
+    test "prefill RoPE with positions (T>1) lowers to a single :fast_rope_positions instruction" do
       fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 64, false, 10_000.0, 1.0) end
 
       expr =
@@ -2847,11 +2925,23 @@ defmodule EMLX.Native.ExprTest do
           Nx.template({2, 4}, :s32)
         ])
 
-      assert_raise ArgumentError,
-                   ~r/^does not yet lower op :runtime_call.*rope_with_positions_callback/,
-                   fn ->
-                     Expr.lower(expr)
-                   end
+      prog = Expr.lower(expr)
+      assert [{_, :fast_rope_positions, [_a, _pos], _attrs}] = prog.instructions
+    end
+
+    @tag :stage15
+    test "prefill RoPE with freqs (T>1) lowers to a single :fast_rope_with_freqs_positions instruction" do
+      fun = fn a, pos, freqs -> EMLX.Fast.rope_with_freqs(a, pos, 64, false, 1.0, freqs) end
+
+      expr =
+        Nx.Defn.debug_expr_apply(fun, [
+          Nx.template({2, 4, 2, 64}, :f32),
+          Nx.template({2, 4}, :s32),
+          Nx.template({32}, :f32)
+        ])
+
+      prog = Expr.lower(expr)
+      assert [{_, :fast_rope_with_freqs_positions, [_a, _pos, _freqs], _attrs}] = prog.instructions
     end
   end
 
@@ -3084,9 +3174,154 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # ── Stage 15 Part B — prefill RoPE (arbitrary per-token positions, Metal) ──
+  #
+  # T>1 (and left-padded / non-sequential position_ids, which mlx::fast::rope's
+  # offset argument cannot express) now lowers to a single in-graph
+  # cos/sin/rotate composition (:fast_rope_positions / :fast_rope_with_freqs_positions)
+  # instead of raising. Oracle: the eager EMLX.Fast per-token-loop callback
+  # (via Nx.Defn.Evaluator), on left-padded positions specifically — the case
+  # the eager implementation's own comment warns a hand-written formula could
+  # diverge on.
+  #
+  # rope_with_freqs exception: its eager T>1 loop calls EMLX.fast_rope_with_freqs
+  # per token, which calls mlx::core::fast::rope directly — a primitive that
+  # (independently of this stage) miscomputes non-head-0 rotations for any
+  # H>1 input (see mlx-fast-rope-multihead-bugreport.md). The new
+  # :fast_rope_with_freqs_positions opcode does *not* call fast::rope (same
+  # hand-written composition as :fast_rope_positions), so it disagrees with
+  # that broken eager oracle on H>1. H=1 still validates cleanly against
+  # eager below; H>1 is validated against a pure-Nx primitive formula instead.
+  describe "Stage 15 — prefill RoPE (Metal)" do
+    @describetag :metal
+    @describetag :stage15
+
+    test "rope_with_positions (T>1, sequential positions): native matches eager" do
+      fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 64, false, 10_000.0, 1.0) end
+      a = Nx.iota({2, 4, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[3, 4, 5, 6], [10, 11, 12, 13]], type: :s32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "rope_with_positions (T>1, left-padded/non-sequential positions): native matches eager" do
+      fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 64, false, 10_000.0, 1.0) end
+      a = Nx.iota({2, 5, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      # Left-padded batch: row 0 has 2 pad tokens (position 0 repeated), row 1 has none.
+      pos = Nx.tensor([[0, 0, 1, 2, 3], [8, 9, 10, 11, 12]], type: :s32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "rope_with_positions (T>1, dims < D): native matches eager on the pass-through tail" do
+      fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 32, false, 10_000.0, 1.0) end
+      a = Nx.iota({2, 3, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[0, 1, 2], [4, 5, 6]], type: :s32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    # `mlx::fast::rope`'s freqs overload reciprocates internally (both the CPU
+    # fallback and the Metal kernel compute `inv_freq = 1/freqs[i]` — see
+    # mlx/fast.cpp's default_inv_freqs-vs-freqs branch and
+    # backend/metal/kernels/rope.metal's `1.0 / freqs[...]`), so `freqs` here is
+    # a *raw frequency* tensor, not an inv_freq tensor: realistic magnitudes
+    # are ~1..base (reciprocal lands back in the usual ~1e-4..1 inv_freq
+    # range). Using inv_freq-scale values directly as `freqs` (as one might
+    # naively expect from the name) reciprocates into huge angles and makes
+    # native-vs-eager float32 cos/sin agreement numerically meaningless — a
+    # test-data pitfall, not a lowering bug.
+    test "rope_with_freqs (T>1, H=1, sequential positions): native matches eager" do
+      fun = fn a, pos, freqs -> EMLX.Fast.rope_with_freqs(a, pos, 64, false, 1.0, freqs) end
+      a = Nx.iota({2, 4, 1, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[3, 4, 5, 6], [10, 11, 12, 13]], type: :s32) |> gpu_t()
+      freqs = Nx.pow(10_000.0, Nx.divide(Nx.iota({32}, type: :f32), 32)) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos, freqs)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "rope_with_freqs (T>1, H=2, sequential positions): native matches pure-Nx primitive" do
+      fun = fn a, pos, freqs -> EMLX.Fast.rope_with_freqs(a, pos, 64, false, 1.0, freqs) end
+      a = Nx.iota({2, 4, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[3, 4, 5, 6], [10, 11, 12, 13]], type: :s32) |> gpu_t()
+      freqs = Nx.pow(10_000.0, Nx.divide(Nx.iota({32}, type: :f32), 32)) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      prim_fun = fn a, pos, freqs -> rope_freqs_prim(a, pos, freqs, 64, 1.0) end
+      prim = Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      assert_all_close(native, prim, tol: 1.0e-3)
+    end
+
+    test "rope_with_freqs (T>1, H=2, left-padded/non-sequential positions): native matches pure-Nx primitive" do
+      fun = fn a, pos, freqs -> EMLX.Fast.rope_with_freqs(a, pos, 64, false, 1.0, freqs) end
+      a = Nx.iota({2, 5, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[0, 0, 1, 2, 3], [8, 9, 10, 11, 12]], type: :s32) |> gpu_t()
+      freqs = Nx.pow(10_000.0, Nx.divide(Nx.iota({32}, type: :f32), 32)) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      prim_fun = fn a, pos, freqs -> rope_freqs_prim(a, pos, freqs, 64, 1.0) end
+      prim = Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      assert_all_close(native, prim, tol: 1.0e-3)
+    end
+
+    test "rope_with_freqs (T>1, H=2, dims < D): native matches pure-Nx primitive on the pass-through tail" do
+      fun = fn a, pos, freqs -> EMLX.Fast.rope_with_freqs(a, pos, 32, false, 1.0, freqs) end
+      a = Nx.iota({2, 6, 2, 64}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[0, 0, 0, 1, 2, 3], [20, 21, 22, 23, 24, 25]], type: :s32) |> gpu_t()
+      # dims=32 → freqs shape {dims/2} = {16}.
+      freqs = Nx.pow(10_000.0, Nx.divide(Nx.iota({16}, type: :f32), 16)) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      prim_fun = fn a, pos, freqs -> rope_freqs_prim(a, pos, freqs, 32, 1.0) end
+      prim = Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      assert_all_close(native, prim, tol: 1.0e-3)
+    end
+  end
+
   # Softmax normalisation over the last axis (primitive SDPA oracle helper).
   defp normalize_rows(t) do
     Nx.divide(t, Nx.sum(t, axes: [-1], keep_axes: true))
+  end
+
+  # Pure-Nx primitive oracle for prefill RoPE against a precomputed `freqs`
+  # tensor (mirrors emlx_compiler.cpp's fast_rope_with_freqs_positions lambda:
+  # inv_freq = reciprocal(freqs), half-rotate cos/sin blend). Needed for H>1
+  # cases because the eager EMLX.Fast.rope_with_freqs oracle calls
+  # mlx::core::fast::rope directly, which miscomputes non-head-0 rotations for
+  # multi-head input — see mlx-fast-rope-multihead-bugreport.md. `a` is
+  # {B, T, H, D}; `pos` is {B, T}; `freqs` is {dims/2}.
+  defp rope_freqs_prim(a, pos, freqs, dims, scale) do
+    {b, t, _h, d} = Nx.shape(a)
+    half = div(dims, 2)
+
+    inv_freq = Nx.divide(1.0, freqs) |> Nx.reshape({1, 1, half})
+    pos_bt1 = Nx.as_type(pos, :f32) |> Nx.reshape({b, t, 1})
+    angles = Nx.multiply(Nx.multiply(pos_bt1, inv_freq), scale)
+
+    cos_full = Nx.cos(angles) |> Nx.reshape({b, t, 1, half}) |> then(&Nx.concatenate([&1, &1], axis: 3))
+    sin_full = Nx.sin(angles) |> Nx.reshape({b, t, 1, half}) |> then(&Nx.concatenate([&1, &1], axis: 3))
+
+    x1 = a[[.., .., .., 0..(half - 1)]]
+    x2 = a[[.., .., .., half..(dims - 1)]]
+    rotated = Nx.concatenate([Nx.negate(x2), x1], axis: 3)
+
+    a_head = a[[.., .., .., 0..(dims - 1)]]
+    rope_head = Nx.add(Nx.multiply(a_head, cos_full), Nx.multiply(rotated, sin_full))
+
+    if dims == d do
+      rope_head
+    else
+      tail = a[[.., .., .., dims..(d - 1)]]
+      Nx.concatenate([rope_head, tail], axis: 3)
+    end
   end
 
   defp gpu_t(t), do: Nx.backend_transfer(t, {EMLX.Backend, device: :gpu})
