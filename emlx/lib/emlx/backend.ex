@@ -4,13 +4,15 @@ defmodule EMLX.Backend do
   alias Nx.Tensor, as: T
   alias EMLX.Backend, as: Backend
 
-  # Compile-time debug flags. Both default to false (zero runtime cost when off).
+  require EMLX.Debug
+  import EMLX.Debug, only: [assert_no_nan_inf!: 2]
+
+  # Compile-time debug flag. Defaults to false (zero runtime cost when off).
   # Enable only in development via config/dev.exs:
   #   config :emlx, enable_bounds_check: true
-  #   config :emlx, detect_non_finites: true
-  # After flipping a flag run: mix compile --force
+  # After flipping run: mix compile --force
+  # (:detect_non_finites lives in EMLX.Debug, shared with EMLX.Fast.)
   @enable_bounds_check Application.compile_env(:emlx, :enable_bounds_check, false)
-  @detect_non_finites Application.compile_env(:emlx, :detect_non_finites, false)
 
   # Each macro expands to the assertion body when its flag is true, or to nil
   # when false — leaving no trace in the BEAM opcodes (no call instruction,
@@ -70,25 +72,6 @@ defmodule EMLX.Backend do
           raise ArgumentError,
                 "index out of bounds on axis #{unquote(axis)}: all values must be in [0, #{limit}). " <>
                   "Tensor shape: #{inspect(unquote(tensor).shape)}"
-        end
-      end
-    else
-      quote do: nil
-    end
-  end
-
-  # Checks a raw MLX ref for NaN or Inf. Forces two eval syncs — development only.
-  defmacrop assert_no_nan_inf!(tensor_ref, op) do
-    if @detect_non_finites do
-      quote do
-        has_nan = unquote(tensor_ref) |> EMLX.is_nan() |> EMLX.any([], false)
-        has_inf = unquote(tensor_ref) |> EMLX.is_infinity() |> EMLX.any([], false)
-        EMLX.eval(has_nan)
-        EMLX.eval(has_inf)
-
-        if EMLX.item(has_nan) == 1 or EMLX.item(has_inf) == 1 do
-          raise ArgumentError,
-                "#{unquote(op)} produced NaN or Inf. Disable :detect_non_finites for production."
         end
       end
     else
@@ -379,8 +362,10 @@ defmodule EMLX.Backend do
 
   @impl true
   def to_binary(tensor, limit) do
-    EMLX.to_blob(from_nx(tensor), limit)
-    |> maybe_modify_binary(to_nx_type(to_mlx_type(tensor.type)), tensor.type)
+    EMLX.Telemetry.span_to_binary(tensor, fn ->
+      EMLX.to_blob(from_nx(tensor), limit)
+      |> maybe_modify_binary(to_nx_type(to_mlx_type(tensor.type)), tensor.type)
+    end)
   end
 
   @impl true
@@ -1104,19 +1089,23 @@ defmodule EMLX.Backend do
       |> Enum.sort()
       |> Enum.map(&elem(&1, 1))
 
-    input_mx
-    |> EMLX.conv_general(
-      kernel_mx,
-      strides,
-      padding_low,
-      padding_high,
-      kernel_dilation,
-      input_dilation,
-      feature_group_count
-    )
-    |> EMLX.transpose(permute_channels_first)
-    |> EMLX.transpose(output_permutation)
-    |> to_nx(out)
+    result_ref =
+      input_mx
+      |> EMLX.conv_general(
+        kernel_mx,
+        strides,
+        padding_low,
+        padding_high,
+        kernel_dilation,
+        input_dilation,
+        feature_group_count
+      )
+      |> EMLX.transpose(permute_channels_first)
+      |> EMLX.transpose(output_permutation)
+
+    assert_no_nan_inf!(result_ref, :conv)
+
+    to_nx(result_ref, out)
   end
 
   defp dot_spec_to_einsum_spec(

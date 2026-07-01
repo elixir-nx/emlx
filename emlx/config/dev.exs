@@ -14,7 +14,6 @@ import Config
 # indexed_add, and indexed_put before the NIF call.
 # config :emlx, enable_bounds_check: true
 
-# Raises ArgumentError if dot (matmul / einsum) produces NaN or Inf.
-# When EMLX.Fast is implemented (task 05), rms_norm, layer_norm, and
-# scaled_dot_product_attention will also be checked.
+# Raises ArgumentError if dot (matmul / einsum), conv, or EMLX.Fast's
+# rms_norm/layer_norm/scaled_dot_product_attention kernels produce NaN or Inf.
 # config :emlx, detect_non_finites: true

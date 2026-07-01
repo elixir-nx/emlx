@@ -31,6 +31,9 @@ defmodule EMLX.Fast do
 
   import Nx.Defn
 
+  require EMLX.Debug
+  import EMLX.Debug, only: [assert_no_nan_inf!: 2]
+
   # ── RMS Norm ────────────────────────────────────────────────────────────────
 
   @doc """
@@ -49,8 +52,11 @@ defmodule EMLX.Fast do
 
   @doc false
   def rms_norm_callback({%Nx.Tensor{} = x, %Nx.Tensor{} = weight}, opts) do
-    EMLX.fast_rms_norm(EMLX.Backend.from_nx(x), EMLX.Backend.from_nx(weight), opts[:eps])
-    |> EMLX.Backend.to_nx()
+    result_ref =
+      EMLX.fast_rms_norm(EMLX.Backend.from_nx(x), EMLX.Backend.from_nx(weight), opts[:eps])
+
+    assert_no_nan_inf!(result_ref, :rms_norm)
+    EMLX.Backend.to_nx(result_ref)
   end
 
   # ── Layer Norm ───────────────────────────────────────────────────────────────
@@ -72,13 +78,16 @@ defmodule EMLX.Fast do
 
   @doc false
   def layer_norm_callback({%Nx.Tensor{} = x, %Nx.Tensor{} = weight, %Nx.Tensor{} = bias}, opts) do
-    EMLX.fast_layer_norm(
-      EMLX.Backend.from_nx(x),
-      EMLX.Backend.from_nx(weight),
-      EMLX.Backend.from_nx(bias),
-      opts[:eps]
-    )
-    |> EMLX.Backend.to_nx()
+    result_ref =
+      EMLX.fast_layer_norm(
+        EMLX.Backend.from_nx(x),
+        EMLX.Backend.from_nx(weight),
+        EMLX.Backend.from_nx(bias),
+        opts[:eps]
+      )
+
+    assert_no_nan_inf!(result_ref, :layer_norm)
+    EMLX.Backend.to_nx(result_ref)
   end
 
   @doc """
@@ -97,12 +106,15 @@ defmodule EMLX.Fast do
 
   @doc false
   def layer_norm_no_bias_callback({%Nx.Tensor{} = x, %Nx.Tensor{} = weight}, opts) do
-    EMLX.fast_layer_norm_no_bias(
-      EMLX.Backend.from_nx(x),
-      EMLX.Backend.from_nx(weight),
-      opts[:eps]
-    )
-    |> EMLX.Backend.to_nx()
+    result_ref =
+      EMLX.fast_layer_norm_no_bias(
+        EMLX.Backend.from_nx(x),
+        EMLX.Backend.from_nx(weight),
+        opts[:eps]
+      )
+
+    assert_no_nan_inf!(result_ref, :layer_norm)
+    EMLX.Backend.to_nx(result_ref)
   end
 
   @doc """
@@ -157,7 +169,7 @@ defmodule EMLX.Fast do
     scale = opts[:scale]
     kv_offset = opts[:kv_offset]
 
-    out =
+    result_ref =
       EMLX.fast_sdpa_causal_key_masked(
         EMLX.Backend.from_nx(q),
         EMLX.Backend.from_nx(k),
@@ -166,7 +178,9 @@ defmodule EMLX.Fast do
         EMLX.Backend.from_nx(key_mask),
         kv_offset
       )
-      |> EMLX.Backend.to_nx()
+
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
 
     dtype = Nx.type(q)
     if Nx.type(out) != dtype, do: Nx.as_type(out, dtype), else: out
@@ -436,14 +450,16 @@ defmodule EMLX.Fast do
 
   @doc false
   def sdpa_callback({%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v}, opts) do
-    out =
+    result_ref =
       EMLX.fast_sdpa(
         EMLX.Backend.from_nx(q),
         EMLX.Backend.from_nx(k),
         EMLX.Backend.from_nx(v),
         opts[:scale]
       )
-      |> EMLX.Backend.to_nx()
+
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
 
     # mlx::fast::sdpa may upcast to f32 internally; cast back to q's dtype
     if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
@@ -469,7 +485,7 @@ defmodule EMLX.Fast do
         {%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v, %Nx.Tensor{} = mask},
         opts
       ) do
-    out =
+    result_ref =
       EMLX.fast_sdpa_masked(
         EMLX.Backend.from_nx(q),
         EMLX.Backend.from_nx(k),
@@ -477,7 +493,9 @@ defmodule EMLX.Fast do
         EMLX.Backend.from_nx(mask),
         opts[:scale]
       )
-      |> EMLX.Backend.to_nx()
+
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
 
     if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
   end
@@ -506,14 +524,16 @@ defmodule EMLX.Fast do
 
   @doc false
   def sdpa_causal_callback({%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v}, opts) do
-    out =
+    result_ref =
       EMLX.fast_sdpa_causal(
         EMLX.Backend.from_nx(q),
         EMLX.Backend.from_nx(k),
         EMLX.Backend.from_nx(v),
         opts[:scale]
       )
-      |> EMLX.Backend.to_nx()
+
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
 
     if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
   end

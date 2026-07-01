@@ -1191,9 +1191,12 @@ defmodule EMLX do
   """
   def eval({device, ref}) when is_tensor(device, ref) do
     maybe_profile(EMLX.Profiling.inc_eval())
-    {worker, _effective_device} = resolve_worker(device)
-    job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
-    await_worker(job_ref)
+
+    EMLX.Telemetry.span_eval(fn ->
+      {worker, _effective_device} = resolve_worker(device)
+      job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
+      await_worker(job_ref)
+    end)
   end
 
   @doc """

@@ -55,4 +55,11 @@ gpu_exclude =
     {:error, _} -> [:metal]
   end
 
-ExUnit.start(exclude: distributed_exclude ++ gpu_exclude)
+# debug_flags_functional_test.exs needs EMLX compiled with :detect_non_finites
+# on (compile_env, baked in at compile time) — excluded unless that build was
+# requested, so a normal `mix test` (flags off, per production defaults)
+# doesn't fail on it.
+debug_flags_exclude =
+  if System.get_env("EMLX_DEBUG_FLAGS") == "1", do: [], else: [:debug_flags_functional]
+
+ExUnit.start(exclude: distributed_exclude ++ gpu_exclude ++ debug_flags_exclude)
