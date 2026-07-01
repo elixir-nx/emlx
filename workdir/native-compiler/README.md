@@ -29,6 +29,20 @@ The `EMLX` compiler is **single-mode**: it always lowers via this structure.
 There is no `:native` flag and no eager-Evaluator fallback lane; lowering
 control is structural, via `Nx.Defn.Block` (see "Lowering control" below).
 
+> **Known discrepancy (as of Stage 15), closed by Stages 16–19:** the code
+> today (`emlx.ex`'s `try_native_compile/3`) still catches unsupported-op
+> errors and silently delegates the whole `defn` to `Nx.Defn.Evaluator` — a
+> leftover incremental-development safety net that contradicts this
+> paragraph. Stages 16–19 close every reachable raise path and delete that
+> lane so the claim above is true in the code, not just here.
+
+Stages 20–23 extend this plan's charter beyond the compiler itself: EMLX's
+sibling/successor project `~/coding/emily` has shipped a materially larger
+feature set (native-lane observability, SDPA attention sinks, microscaled
+quantization, mixed-precision training, …). Those stages audit and close the
+gap where it's real (several items already exist in EMLX under a different
+name — see Stage 20).
+
 ## Resolved decisions (drive everything)
 
 1. **Single-mode compiler.** One execution path: the new lowering structure.
@@ -122,6 +136,20 @@ each independently shippable. Run with
 - [~] [`14-while-childprogram`](14-while-childprogram.md) — **dropped; no-go re-affirmed by measurement (2026-06-30 revisit).** MLX 0.31.2 has no lazy control flow, so a C++ `while` still hits an `eval` barrier per iteration (no cross-iteration fusion). Benchmark (`emlx/bench/while_dispatch_bench.exs`): C++ saves ≤30 % (GPU) per iter for **convergent** loops, shrinking with body weight; for **counted** loops the host loop already fuses the body lazily, so a C++ eval-per-iteration `while` is a **regression**. `Graph.split` fragmentation is a fixed per-invocation cost, amortized to noise. Host loop retained. **Side finding, fixed:** counter-only bare-while (cond doesn't read the full carry) had a correctness bug — `EMLX.Native.Expr.lower/2` now densifies its wire input list by arity hint instead of compacting to referenced positions only; regression tests added.
 - [x] [`15-block-completeness-rope-prefill`](15-block-completeness-rope-prefill.md) — (a) AllClose/Phase/TopK block descent equivalence-tested (TopK needed a `default_expr`-is-a-tuple fix in `expand_block_via_default`, via `flat_refs`) → `EXPR_NODES.md` line 156 flipped. (b) Prefill RoPE (`rope_with_positions_callback`/`rope_with_freqs_callback`, T>1) lowers to an in-graph cos/sin/rotate primitive composition (no new C++ kernel) → `runtime_call` flipped to `[x]`. **Side finding, filed not fixed:** `mlx::core::fast::rope` itself miscomputes non-head-0 rotations for multi-head (H>1) input in EMLX's non-transposed layout, affecting the existing decode/T=1 fast callbacks (out of scope here) — see `mlx-fast-rope-multihead-bugreport.md`.
 
+### Zero evaluator-fallback (closes the single-mode gap left open since Stage 01)
+
+- [x] [`16-expr-nodes-doc-audit`](16-expr-nodes-doc-audit.md) — audit stale `EXPR_NODES.md` `[ ]` boxes (`fun`/`optional`/`from_binary`); confirmed all three are unreachable/subsumed (not real gaps) via re-grep against the vendored Nx fork; flipped the doc; two regression tests pin the `:fun` no-op invariant. No `expr.ex` code changes needed.
+- [ ] [`17-block-while-descent`](17-block-while-descent.md) — close the `while`-nested-inside-a-block's-`default_expr` structural boundary (affects `Nx.Block.LinAlg.QR :complete`, `SVD full_matrices?: false`, non-default `triangular_solve`).
+- [ ] [`18-hooks-token-splitting`](18-hooks-token-splitting.md) — contingent spike: can `token`/`attach_token` hooks be lowered via a `while`-style structural split, or is a documented permanent hard-raise (or a narrowly-scoped hook-only fallback) the honest answer?
+- [ ] [`19-retire-evaluator-fallback`](19-retire-evaluator-fallback.md) — once 16–18 land, delete `try_native_compile`'s `Nx.Defn.Evaluator` delegation branch from `emlx.ex` entirely; unsupported ops hard-raise, no silent whole-defn fallback, matching this README's single-mode claim in code.
+
+### Emily backend-parity (expanded charter — see the note above "Resolved decisions")
+
+- [ ] [`20-emily-parity-audit`](20-emily-parity-audit.md) — docs-only gap audit against `~/coding/emily`'s PLAN.md/ROADMAP.md (M0–M27); marks already-at-parity items closed and scopes Stages 21–23.
+- [ ] [`21-observability`](21-observability.md) — `:telemetry` spans (eval/to_binary/memory-stats) + compile-time `:debug_bounds_check`/`:debug_detect_nan_inf` flags (Emily M18/M22 parity).
+- [ ] [`22-fast-kernel-quant-parity`](22-fast-kernel-quant-parity.md) — SDPA attention sinks, microscaled quantization modes (mxfp4/mxfp8/nvfp4), public `einsum` helper (Emily M25/M26/M27 parity).
+- [ ] [`23-gradient-training-conformance`](23-gradient-training-conformance.md) — scoping-only epic: triage grad/training behavior under `compiler: EMLX` (currently untested), name follow-on stages for real gaps (Emily M9/M13/M16/M17 parity).
+
 ## Decision gates
 
 - **After 00**: confirm the `post_order/1` shape — minimal (lowerer recurses
@@ -134,6 +162,9 @@ each independently shippable. Run with
   **Status:** Hard-pass as of Stage 02. The Stage 01 benchmark used `Nx.add(x, 1)` chained 10×; Nx.Defn constant-folds repeated scalar additions into a single op, so the "10-add chain" was a 1-op graph. Stage 02 switched to `Nx.add(x, y)` with a runtime `y` — a genuine 10-instruction program. Native path is dramatically faster. `eval_program` no longer calls `mlx::core::eval` eagerly (lazy outputs since Stage 02).
 - **Ongoing**: every op added must pass an equivalence test vs eager
   `EMLX.Backend` (within tolerance) before its `EXPR_NODES.md` box flips.
+- **After 18**: decide how to treat `token`/`attach_token` if the structural
+  split turns out infeasible — permanent hard-raise vs a narrowly-scoped
+  hook-only fallback. This decision gates Stage 19's exact scope.
 
 ## Testing philosophy (per-layer oracle)
 

@@ -3286,6 +3286,45 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  # Stage 16 (doc audit): `EXPR_NODES.md` claimed `fun` was `[ ]` (not
+  # lowered), but a standalone `:fun` node never reaches `expand_node`'s
+  # generic dispatch — the only two producers (`reduce`/`window_reduce`)
+  # already extract `fun.data.args` and re-lower the body inline (Stages
+  # 12-13's static unroll) before the operand is ever expanded on its own.
+  # These tests pin that invariant: lowering succeeds (no raise) and the
+  # `:fun` no-op `expand_node` clause contributes zero instructions.
+  describe "Stage 16 — :fun node unreachability (doc audit)" do
+    @tag :stage16
+    test "custom-fun reduce: :fun never becomes an instruction" do
+      templates = [Nx.template({5}, :f32)]
+
+      expr =
+        Nx.Defn.debug_expr_apply(
+          fn t -> Nx.reduce(t, 0.0, fn a, b -> Nx.add(a, b) end) end,
+          templates
+        )
+
+      prog = Expr.lower(expr)
+
+      assert Enum.all?(prog.instructions, fn {_id, op, _operands, _attrs} -> op != :fun end)
+    end
+
+    @tag :stage16
+    test "custom-fun window_reduce: :fun never becomes an instruction" do
+      templates = [Nx.template({6}, :f32)]
+
+      expr =
+        Nx.Defn.debug_expr_apply(
+          fn t -> Nx.window_reduce(t, 0.0, {2}, fn a, b -> Nx.add(a, b) end) end,
+          templates
+        )
+
+      prog = Expr.lower(expr)
+
+      assert Enum.all?(prog.instructions, fn {_id, op, _operands, _attrs} -> op != :fun end)
+    end
+  end
+
   # Softmax normalisation over the last axis (primitive SDPA oracle helper).
   defp normalize_rows(t) do
     Nx.divide(t, Nx.sum(t, axes: [-1], keep_axes: true))

@@ -31,12 +31,12 @@ Source of truth:
 | `tensor` | `(tensor)` | bake weight → `{:capture, i}` | [x] |
 | `metadata` | `(expr, meta)` | passthrough to inner expr | [x] |
 | `elem` | `(tuple, pos)` | index into list of refs stored for tuple-output op | [x] |
-| `fun` | `(params, expr, mfa)` | inline at call site / child program | [ ] |
+| `fun` | `(params, expr, mfa)` | inline at call site / child program | [x] (unreachable / already-subsumed — Stage 16) |
 | `cond` | `(clauses, last)` | right-folded nested `:select` ops (all branches in parent scope) | [x] |
 | `while` | `(initial, arg, pred, body)` | `Nx.Defn.Graph.split` on `:while`; cond/body recompiled via `compiler: EMLX`; Elixir host loop | [x] |
-| `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [~] |
-| `optional` | `(name, args, default)` | lower default expr, or route to native | [ ] |
-| `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] |
+| `block` | `(struct, args, default, fun)` | dispatch on `Nx.Block.*` (see F) | [~] (Stage 17 — while-in-`default_expr` boundary) |
+| `optional` | `(name, args, default)` | lower default expr, or route to native | [x] (already-subsumed — dead node type in current Nx fork, Stage 16; re-audit on Nx version bump) |
+| `attach_token` / `token` | hooks | unsupported → raises (side effects) | [ ] (Stage 18 — contingent spike) |
 | `runtime_call` | `(expr, cb, out, opts)` | recognize `EMLX.Fast.*` callback → fused opcode (see L); else raises | [x] |
 
 Notes:
@@ -68,6 +68,20 @@ Notes:
   within its designed scope: `EMLX.Fast.*` callbacks (incl. per-token prefill
   RoPE, Stage 15 Part B) recognize to a fused opcode; any other callback is a
   genuine host side effect and raises deliberately (not a gap).
+- **Stage 16 doc audit (confirmed, not real gaps):** `fun` is only ever
+  produced as a `reduce`/`window_reduce` operand (`nx/lib/nx/defn/expr.ex:
+  996,1017`, single producer verified fork-wide via `apply_fun/4` at
+  `expr.ex:1376`), which already extracts and re-lowers its body directly
+  (Stages 12–13) — `expand_node`'s `op: :fun` clause (`expr.ex:1768`) is a
+  documented no-op because a standalone `:fun` node is unreachable; pinned by
+  a regression test (`expr_test.exs`, "Stage 16 — :fun node unreachability")
+  asserting no `:fun` instruction is ever emitted. `optional` has no op tag
+  anywhere in the vendored Nx fork at all (dead node type from an older Nx).
+  Section I's "`from_binary` / constant materialization" line is similarly
+  moot: `Nx.Defn.Expr.from_binary/3` resolves to a `constant`/`tensor` node
+  during tracing, not a distinct op. `optional`/`from_binary` are properties
+  of the vendored Nx fork's node set, not of anything EMLX owns — **re-audit
+  on Nx version bump.**
 
 ## B. Unary elementwise (Nx.Backend unary_ops)
 
@@ -151,7 +165,7 @@ logical_and, logical_or, logical_xor.
 
 - [x] iota (flat + axis-specific; all dtypes)
 - [x] eye (rectangular; all dtypes)
-- [ ] from_binary / constant materialization (boundary handling)
+- [x] from_binary / constant materialization (boundary handling) — unreachable / already-subsumed (Stage 16): `from_binary` resolves to `constant`/`tensor` during tracing, no distinct op reaches the lowerer; re-audit on Nx version bump
 
 ## J. RNG (Nx.Random primitives)
 
@@ -178,7 +192,7 @@ Metal-only kernels → E2E tests run on a GPU worker (`device: :gpu`, `:metal`).
 - [x] rms_norm
 - [x] layer_norm (+ no-bias variant)
 - [x] rope / rope_with_positions / rope_with_freqs (decode/T=1 fast callbacks call `mlx::core::fast::*`; per-token prefill T>1 callbacks lower to an in-graph cos/sin/rotate primitive composition, no new C++ kernel — Stage 15 Part B). **Known issue (out of scope, filed):** `mlx::core::fast::rope` itself miscomputes non-head-0 rotations for multi-head (H>1) input in EMLX's non-transposed layout — see `mlx-fast-rope-multihead-bugreport.md`. Affects the decode/T=1 fast callbacks (both eager and compiled call the same buggy primitive, so they agree with each other while both disagree with the textbook formula); does not affect the new prefill composition, which never calls `fast::rope`.
-- [x] scaled_dot_product_attention (+ causal / additive-mask / causal-key-masked variants)
+- [x] scaled_dot_product_attention (+ causal / additive-mask / causal-key-masked variants); attention **sinks** (`mlx::core::fast::sdpa`'s `sinks` param) not yet plumbed — Stage 22 (Emily M26 parity)
 - [x] swiglu
 
 ---
