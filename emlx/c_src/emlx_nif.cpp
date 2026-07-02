@@ -1,4 +1,5 @@
 #include "emlx_nif_shared.hpp"
+#include "emlx_fast/qwen3.hpp"
 
 #include <iostream>
 #include <map>
@@ -1435,6 +1436,9 @@ ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
 // fast_* and kv_cache_* NIFs are defined in emlx_fast.cpp.
+// Qwen3 model accelerators are defined in emlx_fast/qwen3.cpp. They are still
+// registered by emlx for now, but kept isolated because the user facing
+// loading and generation path lives in emlx_axon.
 
 // Forward declarations for the async wrappers defined in emlx_fast.cpp.
 ERL_NIF_TERM fast_rms_norm_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
@@ -1452,7 +1456,6 @@ ERL_NIF_TERM fast_swiglu_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_masked_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_sdpa_update_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-
 // ─── Async wrappers ────────────────────────────────────────────────────────
 
 // Build a sliding window view of a padded tensor.
@@ -1985,6 +1988,16 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
-    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
+    {"qwen3_kv_cache_attention", 11, qwen3_kv_cache_attention_async},
+    {"qwen3_mlp", 8, qwen3_mlp_async},
+    {"qwen3_layer", 21, qwen3_layer_async},
+    {"qwen3_forward_greedy_ids", 13, qwen3_forward_greedy_ids_async},
+    {"qwen3_forward_greedy_ids_chunk", 14, qwen3_forward_greedy_ids_chunk_async},
+    {"qwen3_forward_greedy_ids_token_id", 13, qwen3_forward_greedy_ids_token_id_async},
+    {"qwen3_forward_greedy_token_id", 13, qwen3_forward_greedy_token_id_async},
+    {"qwen3_final_greedy", 6, qwen3_final_greedy_async},
+    {"qwen3_attention_residual", 5, qwen3_attention_residual_async},
+    {"qwen3_attention_block", 17, qwen3_attention_block_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
