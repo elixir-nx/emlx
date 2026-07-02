@@ -1,10 +1,14 @@
-# Stage 26 — public `einsum` helper (variadic operands)
+# Stage 27 — public `einsum` helper (variadic operands)
 
 Status: not started. Emily M27 parity (see Stage 20). Split out of
 [`22-fast-kernel-quant-parity`](22-fast-kernel-quant-parity.md) by advisor
 sign-off before that stage started (see its "Scope correction" note).
-Numbered 26 (not 25) because Stage 25 (`25-fine-nif-refactor`) was claimed
-concurrently by another session while this split was in flight.
+Originally numbered 26 (not 25) because Stage 25 (`25-fine-nif-refactor`, at
+the time) was claimed concurrently by another session while this split was in
+flight; renumbered to 27 when Stage 25 was inserted as
+`25-quantized-dot-full-fix` and the rest of the burndown shifted down one
+(`25-fine-nif-refactor` → `26-fine-nif-refactor`, this stage 26 → 27, and so
+on through Stage 30).
 
 ## Why this stage exists
 

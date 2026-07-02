@@ -1,4 +1,4 @@
-# Stage 27 — grad-equivalence regression suite
+# Stage 28 — grad-equivalence regression suite
 
 Status: not started. Emily M9 (testing half) parity, sized by Stage 23's
 triage.

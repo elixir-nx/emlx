@@ -1,3 +1,4 @@
+#include "emlx_compiler.hpp"
 #include "emlx_nif_shared.hpp"
 
 #include <iostream>
@@ -1998,6 +1999,10 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
-    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
+
+    // ── Native compiler NIFs.
+    {"compile_program", 9, compile_program_async},
+    {"eval_program", 3, eval_program_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

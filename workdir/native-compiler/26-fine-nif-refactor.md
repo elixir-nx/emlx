@@ -1,4 +1,4 @@
-# Stage 25 — refactor NIF plumbing onto `fine` (scoping + spike)
+# Stage 26 — refactor NIF plumbing onto `fine` (scoping + spike)
 
 Status: not started. Not an Emily-parity item — a maintainability investment
 in EMLX's own `c_src/` tree.

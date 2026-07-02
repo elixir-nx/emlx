@@ -1,4 +1,4 @@
-# Stage 29 — conv-pool training curve-matching canary
+# Stage 30 — conv-pool training curve-matching canary
 
 Status: not started. Emily M17 parity, rescoped by Stage 23's triage.
 

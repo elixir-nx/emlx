@@ -1,10 +1,10 @@
-# Stage 28 — `EMLX.MixedPrecision` module
+# Stage 29 — `EMLX.MixedPrecision` module
 
 Status: not started. Emily M16 parity, named by Stage 23's triage.
 
 ## Why this stage exists
 
-Unlike Stage 27 (a testing-breadth stage — the mechanism it tests already
+Unlike Stage 28 (a testing-breadth stage — the mechanism it tests already
 works), this is a genuinely missing feature: `EMLX.MixedPrecision` does not
 exist in any form (zero `MixedPrecision`/`mixed_precision`/`loss_scal` hits
 anywhere in `emlx/lib`, confirmed directly during Stage 23's triage). Emily's

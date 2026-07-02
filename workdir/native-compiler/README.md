@@ -58,8 +58,8 @@ name — see Stage 20).
    `transform_a != :none` — a direct op-node gap, Stage 17), a hook nested
    inside a `cond` branch (a correctness carve-out, Stage 18), and a
    quantized `Nx.dot` operand (invisible-at-trace-time runtime dispatch, not
-   a missing-coverage gap — Stage 24; interim raise only, full fix
-   deferred/unscoped).
+   a missing-coverage gap — Stage 24; interim raise only, full fix scoped as
+   Stage 25).
 2. **Topo-sort vendored as `EMLX.Defn.Tree.post_order/1`** —
    `emlx/lib/emlx/defn/tree.ex`, namespaced to mirror `Nx.Defn.Tree` so the
    eventual upstream move is a rename.
@@ -165,11 +165,12 @@ each independently shippable. Run with
 ### Found post-Stage-19 (not on the original plan)
 
 - [x] [`24-quantized-dot-compiler-gap`](24-quantized-dot-compiler-gap.md) — investigation: a quantized `Nx.dot` right-operand is invisible to the native compiler (quantization dispatch is eager-per-op-callback-only metadata on the runtime tensor, never present in the traced `Expr`), so a quantized weight bound to a `compiler: EMLX` defn used to crash deep in the NIF (`[tensordot] a and b must have the same shape on the contracted axes`). Root-caused, confirmed unrelated to Stage 19; shipped a clear pre-flight `ArgumentError` + regression test as an interim. The full fix (call-time program specialization, new `quantized_matmul` opcode) is scoped in the stage doc but **not implemented** — needs a scoping decision on whether "stock Bumblebee graph + quantized weights + `compiler: EMLX`" is a configuration worth supporting, given the hand-written `native` path already covers real deployment.
-- [ ] [`25-fine-nif-refactor`](25-fine-nif-refactor.md) — maintainability, not Emily-parity: scoping + spike to migrate `c_src/`'s hand-rolled `erl_nif.h` boilerplate onto the [`fine`](https://github.com/elixir-nx/fine) C++ NIF-ergonomics library, starting with `emlx_fast.cpp` as a pilot; open questions are whether `fine::ResourcePtr` composes with EMLX's custom atomic-refcounted `TensorP` and the `EMLX.CommandQueue` async-dispatch model before fanning out to `emlx_nif.cpp`/`emlx_compiler.cpp`.
-- [ ] [`26-public-einsum-helper`](26-public-einsum-helper.md) — public eager `einsum` helper (Emily M27 parity), split out of Stage 22: the existing internal `EMLX.einsum` NIF is fixed arity-2, so supporting the 3-operand-contraction acceptance case needs a variadic-tensor NIF signature change.
-- [ ] [`27-grad-equivalence-suite`](27-grad-equivalence-suite.md) — named by Stage 23: widen its 8-scenario grad triage into a permanent `StreamData` property + finite-difference-oracle regression suite (Emily M9 testing-half parity). No new compiler code expected — breadth, not a bug fix.
-- [ ] [`28-mixed-precision`](28-mixed-precision.md) — named by Stage 23: build `EMLX.MixedPrecision` from scratch (bf16 forward + f32 master weights + dynamic loss scaling, Emily M16 parity) — a genuinely missing feature, independent of the (clean) grad-triage result.
-- [ ] [`29-conv-pool-training-curve-canary`](29-conv-pool-training-curve-canary.md) — Emily M17 parity, rescoped smaller by Stage 23: the primitive lift (window ops off `via_binary`) is already done in EMLX; remaining scope is a training-curve-matching canary.
+- [ ] [`25-quantized-dot-full-fix`](25-quantized-dot-full-fix.md) — implements Stage 24's deferred full fix: call-time program specialization (quantization-signature detection + a new `quantized_matmul` IR opcode) so a stock Bumblebee Axon graph with MLX-4bit-quantized weights (`bb base`, no `EMLXAxon.rewrite/2`) runs end-to-end under `compiler: EMLX`, closing the gap Stage 24 only pre-flight-raised on.
+- [ ] [`26-fine-nif-refactor`](26-fine-nif-refactor.md) — maintainability, not Emily-parity: scoping + spike to migrate `c_src/`'s hand-rolled `erl_nif.h` boilerplate onto the [`fine`](https://github.com/elixir-nx/fine) C++ NIF-ergonomics library, starting with `emlx_fast.cpp` as a pilot; open questions are whether `fine::ResourcePtr` composes with EMLX's custom atomic-refcounted `TensorP` and the `EMLX.CommandQueue` async-dispatch model before fanning out to `emlx_nif.cpp`/`emlx_compiler.cpp`.
+- [ ] [`27-public-einsum-helper`](27-public-einsum-helper.md) — public eager `einsum` helper (Emily M27 parity), split out of Stage 22: the existing internal `EMLX.einsum` NIF is fixed arity-2, so supporting the 3-operand-contraction acceptance case needs a variadic-tensor NIF signature change.
+- [ ] [`28-grad-equivalence-suite`](28-grad-equivalence-suite.md) — named by Stage 23: widen its 8-scenario grad triage into a permanent `StreamData` property + finite-difference-oracle regression suite (Emily M9 testing-half parity). No new compiler code expected — breadth, not a bug fix.
+- [ ] [`29-mixed-precision`](29-mixed-precision.md) — named by Stage 23: build `EMLX.MixedPrecision` from scratch (bf16 forward + f32 master weights + dynamic loss scaling, Emily M16 parity) — a genuinely missing feature, independent of the (clean) grad-triage result.
+- [ ] [`30-conv-pool-training-curve-canary`](30-conv-pool-training-curve-canary.md) — Emily M17 parity, rescoped smaller by Stage 23: the primitive lift (window ops off `via_binary`) is already done in EMLX; remaining scope is a training-curve-matching canary.
 
 ## Decision gates
 

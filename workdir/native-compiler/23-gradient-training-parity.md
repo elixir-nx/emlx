@@ -144,20 +144,22 @@ a feature that must be built regardless, mirroring Emily's
 `unscale/2` / `update/2` / `has_overflow?/1` surface (M16).
 
 **Follow-on stages named and sized** (stubbed as new docs in this directory,
-starting at 27 per advisor guidance — 24/25/26 already taken):
+originally starting at 27 per advisor guidance — 24/25/26 already taken;
+renumbered to 28/29/30 when Stage 25 was inserted as
+`25-quantized-dot-full-fix` and the burndown shifted down one):
 
-- [`27-grad-equivalence-suite`](27-grad-equivalence-suite.md) — formalize
+- [`28-grad-equivalence-suite`](28-grad-equivalence-suite.md) — formalize
   this stage's triage zoo into a permanent property-based grad-equivalence
   regression suite (StreamData harness, mirroring Emily's M9 design), run
   under `compiler: EMLX`. Small — the zoo above already proves the mechanism
   works; this stage is breadth (more ops, more shapes, a finite-difference
   oracle for the differentiable-op subset), not new compiler code.
-- [`28-mixed-precision`](28-mixed-precision.md) — build `EMLX.MixedPrecision`
+- [`29-mixed-precision`](29-mixed-precision.md) — build `EMLX.MixedPrecision`
   (Emily M16 parity) from scratch: bf16-forward + f32-master-weights +
   dynamic loss scaling, with its own bf16-tolerance grad-equivalence suite
   and an MNIST-style bf16 convergence canary. Medium — genuinely new module,
   not gap-closing.
-- [`29-conv-pool-training-curve-canary`](29-conv-pool-training-curve-canary.md)
+- [`30-conv-pool-training-curve-canary`](30-conv-pool-training-curve-canary.md)
   — Emily M17 parity, rescoped per the finding above: primitives are already
   native, so this is a training-curve-matching canary (small CNN/pool model
   trains and converges under `compiler: EMLX`), not a primitive port. Small.

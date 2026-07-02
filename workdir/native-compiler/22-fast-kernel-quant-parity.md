@@ -17,10 +17,10 @@ surfaces rather than introduce new architecture.
 > — bigger than "expose an existing NIF," per this doc's own escape valve
 > ("split into separate PRs/tackle-steps if any turns out bigger than
 > expected"). Split out to
-> [`26-public-einsum-helper`](26-public-einsum-helper.md) (numbered 26, not
-> 25 — Stage 25 was claimed concurrently by another session for an unrelated
-> `fine` NIF-library refactor while this split was in flight). This stage
-> now covers only items 1 and 2 below.
+> [`27-public-einsum-helper`](27-public-einsum-helper.md) (renumbered from
+> its original 26 when Stage 25 was inserted as `25-quantized-dot-full-fix`
+> and the burndown shifted down one — see that stage doc's header for the
+> numbering history). This stage now covers only items 1 and 2 below.
 
 ## Procedure
 
