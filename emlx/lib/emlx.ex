@@ -221,7 +221,7 @@ defmodule EMLX do
   deftensor isclose(tensorA, tensorB, rtol, atol, equal_nan)
 
   deftensor tensordot(tensorA, tensorB, axesA, axesB)
-  deftensor einsum(tensorA, tensorB, spec_string)
+  deftensor einsum(tensors, spec_string)
   deftensor transpose(tensor, axes)
   deftensor pad(tensor, axes, low_pad_size, high_pad_size, tensor_pad_value)
   deftensor sort(tensor, axis)

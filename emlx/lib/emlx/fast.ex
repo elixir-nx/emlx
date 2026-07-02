@@ -4,7 +4,8 @@ defmodule EMLX.Fast do
   functions backed by `Nx.runtime_call`.
 
   Every function is defn-safe: call inside `defn`, `Nx.Defn.jit`, or from
-  `Axon.rewrite_nodes/2` rewrite callbacks without restriction.
+  `Axon.rewrite_nodes/2` rewrite callbacks without restriction — **except
+  `einsum/2`**, which is eager-only (see its docs).
 
   ## Functions
 
@@ -23,6 +24,8 @@ defmodule EMLX.Fast do
   - `scaled_dot_product_attention_causal_key_masked/5` — causal SDPA; checks key_mask at C++ level, fast-paths to pure causal when all-ones
   - `scaled_dot_product_attention_causal_key_masked/6` — same, plus `opts` (`:sinks`)
   - `swiglu/2` — fused SwiGLU: `silu(gate) * up`
+  - `einsum/2` — variadic-operand Einstein summation (`mlx::core::einsum`);
+    **eager-only, not defn-safe** (see its docs)
 
   ## Axon graph rewrite example
 
@@ -701,5 +704,49 @@ defmodule EMLX.Fast do
     out = EMLX.Backend.to_nx(result_ref)
 
     if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
+  end
+
+  # ── Einsum ────────────────────────────────────────────────────────────────
+
+  @doc """
+  Variadic-operand einsum computed by MLX's path-optimised
+  `mlx::core::einsum` kernel (Emily `Emily.Fast.einsum/2` parity).
+
+  `subscripts` is a standard Einstein-summation equation (e.g.
+  `"ij,jk->ik"`, `"bij,bjk->bik"`, `"bhid,bhjd->bhij"`,
+  `"ij,jk,kl->il"`). `operands` is the corresponding list of 2+ tensors.
+
+  ## Eager-only, not defn-callable
+
+  Unlike the other helpers in this module, `einsum/2` does **not** emit an
+  `Nx.Defn.Expr` node — it takes refs directly off `EMLX.Backend`-backed
+  tensors and calls the NIF eagerly, in the same "direct-call helper" style
+  as `EMLX.quantized_matmul/2`. Every operand must live on `EMLX.Backend`;
+  anything else raises `ArgumentError`.
+
+  ## Examples
+
+      iex> a = Nx.iota({2, 3}, backend: EMLX.Backend, type: :f32)
+      iex> b = Nx.iota({3, 4}, backend: EMLX.Backend, type: :f32)
+      iex> y = EMLX.Fast.einsum("ij,jk->ik", [a, b])
+      iex> Nx.shape(y)
+      {2, 4}
+
+  """
+  @spec einsum(String.t(), [Nx.Tensor.t()]) :: Nx.Tensor.t()
+  def einsum(subscripts, operands) when is_binary(subscripts) and is_list(operands) do
+    refs = Enum.map(operands, &einsum_operand_ref!/1)
+
+    EMLX.einsum(refs, subscripts)
+    |> EMLX.Backend.to_nx()
+  end
+
+  defp einsum_operand_ref!(%Nx.Tensor{data: %EMLX.Backend{ref: ref}}), do: ref
+
+  defp einsum_operand_ref!(%Nx.Tensor{data: %other_backend{}}) do
+    raise ArgumentError,
+          "EMLX.Fast.einsum/2: every operand must live on EMLX.Backend, got a " <>
+            "#{inspect(other_backend)}-backed tensor. Transfer with " <>
+            "Nx.backend_transfer/2 first."
   end
 end

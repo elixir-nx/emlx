@@ -307,18 +307,19 @@ NIF(tensordot) {
 }
 
 NIF(einsum) {
-  TENSOR_PARAM(0, a);
-  TENSOR_PARAM(1, b);
+  // Variadic operand count (2+), e.g. for a 3-operand contraction like
+  // "ij,jk,kl->il" — see stack/concatenate above for the same
+  // list-of-tensor-resources decode pattern.
+  LIST_PARAM(0, std::vector<mlx::core::array>, arrays);
 
   std::string spec_string;
-  if (!nx::nif::get(env, argv[2], spec_string)) {
+  if (!nx::nif::get(env, argv[1], spec_string)) {
     return nx::nif::error(env, "Unable to get spec_string param.");
   }
 
-  DEVICE_PARAM(3, device);
+  DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::einsum(spec_string, std::vector<mlx::core::array>({*a, *b}),
-                           device));
+  TENSOR(mlx::core::einsum(spec_string, arrays, device));
 }
 
 NIF(tri_inv) {
@@ -1956,7 +1957,7 @@ static ErlNifFunc nif_funcs[] = {
     {"linalg_solve", 4, linalg_solve_async},
     {"linalg_solve_triangular", 5, linalg_solve_triangular_async},
     {"conv_general", 10, conv_general_async},
-    {"einsum", 5, einsum_async},
+    {"einsum", 4, einsum_async},
     {"tensordot", 6, tensordot_async},
 
     {"window_scatter_max", 9, window_scatter_max_async},

@@ -1294,8 +1294,10 @@ defmodule EMLX.Backend do
           )
 
         EMLX.einsum(
-          to_typed_ref(left_mx, left_type, computation_out_type),
-          to_typed_ref(right_mx, right_type, computation_out_type),
+          [
+            to_typed_ref(left_mx, left_type, computation_out_type),
+            to_typed_ref(right_mx, right_type, computation_out_type)
+          ],
           einsum_spec
         )
         |> to_typed_ref(computation_out_type, out_type)
