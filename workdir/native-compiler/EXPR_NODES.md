@@ -252,7 +252,7 @@ Metal-only kernels → E2E tests run on a GPU worker (`device: :gpu`, `:metal`).
 - [x] rms_norm
 - [x] layer_norm (+ no-bias variant)
 - [x] rope / rope_with_positions / rope_with_freqs (decode/T=1 fast callbacks call `mlx::core::fast::*`; per-token prefill T>1 callbacks lower to an in-graph cos/sin/rotate primitive composition, no new C++ kernel — Stage 15 Part B). **Known issue (out of scope, filed):** `mlx::core::fast::rope` itself miscomputes non-head-0 rotations for multi-head (H>1) input in EMLX's non-transposed layout — see `mlx-fast-rope-multihead-bugreport.md`. Affects the decode/T=1 fast callbacks (both eager and compiled call the same buggy primitive, so they agree with each other while both disagree with the textbook formula); does not affect the new prefill composition, which never calls `fast::rope`.
-- [x] scaled_dot_product_attention (+ causal / additive-mask / causal-key-masked variants); attention **sinks** (`mlx::core::fast::sdpa`'s `sinks` param) not yet plumbed — Stage 22 (Emily M26 parity)
+- [x] scaled_dot_product_attention (+ causal / additive-mask / causal-key-masked variants), incl. attention **sinks** (`mlx::core::fast::sdpa`'s `sinks` param) — `_sinks`-suffixed opcode variants (`fast_sdpa_sinks`, `fast_sdpa_masked_sinks`, `fast_sdpa_causal_sinks`, `fast_sdpa_causal_key_masked_sinks`), eager + compiled parity (Stage 22, Emily M26)
 - [x] swiglu
 
 ---

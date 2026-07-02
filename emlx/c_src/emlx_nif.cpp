@@ -1360,52 +1360,76 @@ NIF(as_strided) {
 // quantized_matmul - Multiplies x with a quantized weight matrix w
 // This is the key operation for efficient 4-bit inference
 // MLX API: quantized_matmul(x, w, scales, biases, transpose, group_size, bits, stream)
+// mode: "affine" (default, real biases) or a microscaled variant
+// ("mxfp4"/"mxfp8"/"nvfp4" — no biases; mx::fp_quantize returns only
+// (wq, scales)). biases is `nil` from Elixir for microscaled modes.
 NIF(quantized_matmul) {
   TENSOR_PARAM(0, x);       // Input tensor [batch, seq, hidden]
   TENSOR_PARAM(1, w);       // Quantized weights [out/8, in] (uint32 packed)
-  TENSOR_PARAM(2, scales);  // Scales [out/group_size, in] (bfloat16)
-  TENSOR_PARAM(3, biases);  // Biases [out/group_size, in] (bfloat16)
+  TENSOR_PARAM(2, scales);  // Scales [out/group_size, in] (bfloat16, or u8 for microscaled)
+  OPTIONAL_TENSOR_PARAM(3, biases); // Biases (bfloat16); nil for microscaled modes
   PARAM(4, bool, transpose);
   PARAM(5, int, group_size);
   PARAM(6, int, bits);
-  DEVICE_PARAM(7, device);
+  std::string mode;
+  if (!nx::nif::get(env, argv[7], mode)) {
+    return nx::nif::error(env, "Unable to get mode param.");
+  }
+  DEVICE_PARAM(8, device);
+
+  std::optional<mlx::core::array> biases_opt =
+      biases ? std::make_optional(*biases) : std::nullopt;
 
   TENSOR(mlx::core::quantized_matmul(
-      *x, *w, *scales, *biases, transpose, group_size, bits, "affine", device));
+      *x, *w, *scales, biases_opt, transpose, group_size, bits, mode, device));
 }
 
 // dequantize - Converts quantized weights back to float
 // Useful for debugging and verification
-// MLX API: dequantize(w, scales, biases, group_size, bits, stream)
+// MLX API: dequantize(w, scales, biases, group_size, bits, mode, stream)
 NIF(dequantize) {
   TENSOR_PARAM(0, w);       // Quantized weights (uint32 packed)
-  TENSOR_PARAM(1, scales);  // Scales (bfloat16)
-  TENSOR_PARAM(2, biases);  // Biases (bfloat16)
+  TENSOR_PARAM(1, scales);  // Scales (bfloat16, or u8 for microscaled)
+  OPTIONAL_TENSOR_PARAM(2, biases); // Biases (bfloat16); nil for microscaled modes
   PARAM(3, int, group_size);
   PARAM(4, int, bits);
-  DEVICE_PARAM(5, device);
+  std::string mode;
+  if (!nx::nif::get(env, argv[5], mode)) {
+    return nx::nif::error(env, "Unable to get mode param.");
+  }
+  DEVICE_PARAM(6, device);
 
-  TENSOR(mlx::core::dequantize(*w, *scales, *biases, group_size, bits, "affine", std::nullopt, std::nullopt, device));
+  std::optional<mlx::core::array> biases_opt =
+      biases ? std::make_optional(*biases) : std::nullopt;
+
+  TENSOR(mlx::core::dequantize(*w, *scales, biases_opt, group_size, bits, mode, std::nullopt, std::nullopt, device));
 }
 
 // quantize - Quantizes a float tensor to packed format
-// Returns tuple of {weights, scales, biases}
-// MLX API: quantize(w, group_size, bits, stream) -> tuple<array, array, array>
+// Returns a 3-tuple {weights, scales, biases}; biases is the atom `nil` for
+// microscaled modes ("mxfp4"/"mxfp8"/"nvfp4"), which don't produce a biases
+// array (mx::quantize's `result` vector has 2 elements instead of 3 there).
+// MLX API: quantize(w, group_size, bits, mode, stream) -> vector<array>
 NIF(quantize) {
   TENSOR_PARAM(0, w);       // Float weights to quantize
   PARAM(1, int, group_size);
   PARAM(2, int, bits);
-  DEVICE_PARAM(3, device);
+  std::string mode;
+  if (!nx::nif::get(env, argv[3], mode)) {
+    return nx::nif::error(env, "Unable to get mode param.");
+  }
+  DEVICE_PARAM(4, device);
 
   try {
-    auto result = mlx::core::quantize(*w, group_size, bits, "affine", std::nullopt, device);
+    auto result = mlx::core::quantize(*w, group_size, bits, mode, std::nullopt, device);
 
-    ERL_NIF_TERM result_tuple[3];
-    result_tuple[0] = create_tensor_resource(env, result[0]);
-    result_tuple[1] = create_tensor_resource(env, result[1]);
-    result_tuple[2] = create_tensor_resource(env, result[2]);
+    ERL_NIF_TERM weights_term = create_tensor_resource(env, result[0]);
+    ERL_NIF_TERM scales_term = create_tensor_resource(env, result[1]);
+    ERL_NIF_TERM biases_term = result.size() > 2
+        ? create_tensor_resource(env, result[2])
+        : enif_make_atom(env, "nil");
 
-    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+    return nx::nif::ok(env, enif_make_tuple3(env, weights_term, scales_term, biases_term));
   }
   CATCH()
 }
@@ -1954,20 +1978,20 @@ static ErlNifFunc nif_funcs[] = {
     {"command_queue_new", 1, command_queue_new},
     {"command_queue_synchronize", 1, command_queue_synchronize},
     // Quantization operations (async — must run on a worker thread)
-    {"quantized_matmul", 9, quantized_matmul_async},
-    {"dequantize", 7, dequantize_async},
-    {"quantize", 5, quantize_async},
+    {"quantized_matmul", 10, quantized_matmul_async},
+    {"dequantize", 8, dequantize_async},
+    {"quantize", 6, quantize_async},
 
     // mlx::fast ops (worker arity includes queue ref as argv[0])
     {"fast_rms_norm", 5, fast_rms_norm_async},
     {"fast_rope", 8, fast_rope_async},
-    {"fast_sdpa", 6, fast_sdpa_async},
-    {"fast_sdpa_masked", 7, fast_sdpa_masked_async},
+    {"fast_sdpa", 7, fast_sdpa_async},
+    {"fast_sdpa_masked", 8, fast_sdpa_masked_async},
     {"fast_rope_ids", 8, fast_rope_ids_async},
     {"fast_rope_with_freqs", 8, fast_rope_with_freqs_async},
     {"fast_rope_positions", 8, fast_rope_positions_async},
-    {"fast_sdpa_causal_key_masked", 8, fast_sdpa_causal_key_masked_async},
-    {"fast_sdpa_causal", 6, fast_sdpa_causal_async},
+    {"fast_sdpa_causal_key_masked", 9, fast_sdpa_causal_key_masked_async},
+    {"fast_sdpa_causal", 7, fast_sdpa_causal_async},
     {"fast_layer_norm", 6, fast_layer_norm_async},
     {"fast_layer_norm_no_bias", 5, fast_layer_norm_no_bias_async},
     {"fast_swiglu", 4, fast_swiglu_async},

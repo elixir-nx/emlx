@@ -1224,8 +1224,13 @@ defmodule EMLX.Backend do
   defp quantized_dot(out, activation, qw_tensor, right_axes) do
     %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
 
-    %EMLX.Quantization.Config{scales: scales_nx, biases: biases_nx, group_size: gs, bits: bits} =
-      cfg
+    %EMLX.Quantization.Config{
+      scales: scales_nx,
+      biases: biases_nx,
+      group_size: gs,
+      bits: bits,
+      mode: mode
+    } = cfg
 
     weight_rank = tuple_size(qw_tensor.shape)
     last_dim = weight_rank - 1
@@ -1239,15 +1244,20 @@ defmodule EMLX.Backend do
         explicit -> explicit
       end
 
+    # biases_nx is nil for microscaled modes (mxfp4/mxfp8/nvfp4) — mx::fp_quantize
+    # doesn't emit them.
+    biases_ref = biases_nx && from_nx(biases_nx)
+
     result =
       EMLX.quantized_matmul(
         from_nx(activation),
         weight_ref,
         from_nx(scales_nx),
-        from_nx(biases_nx),
+        biases_ref,
         transpose,
         gs,
-        bits
+        bits,
+        mode
       )
 
     to_nx(result, out)

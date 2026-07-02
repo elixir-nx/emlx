@@ -20,7 +20,7 @@ literally true in the code, not just the docs.
 (Contrast with Emily's own design: Emily deliberately *keeps* an
 `Nx.Defn.Evaluator` fallback as a permanent safety net, with a
 `native_fallback: :eval | :raise` option and `[:emily, :compiler, :fallback]`
-telemetry — `:raise` is opt-in, used only by their conformance gates. EMLX's
+telemetry — `:raise` is opt-in, used only by their parity gates. EMLX's
 resolved decision #1 is stricter than that by design: no fallback lane at
 all, ever. Do not import Emily's fallback-with-telemetry model here; that
 question was already settled and this stage enforces it.)
@@ -44,7 +44,7 @@ question was already settled and this stage enforces it.)
    genuinely unsupported construct raises `ArgumentError` (not a silent
    evaluator run) — guards against reintroduction of a fallback lane.
 5. Run the full op-coverage probe (`scripts/expr_op_coverage.exs`) and the
-   full Bumblebee conformance suite once more post-deletion to confirm
+   full Bumblebee parity suite once more post-deletion to confirm
    nothing was silently relying on the deleted path.
 6. Update `README.md`: Resolved decision #1 currently states only the
    aspiration ("There is no `:native` flag and no eager-Evaluator fallback
@@ -56,7 +56,7 @@ question was already settled and this stage enforces it.)
 
 - `try_native_compile`'s Evaluator-delegation branch is deleted from
   `emlx.ex`.
-- `mix test` (full suite, including Bumblebee conformance) is green.
+- `mix test` (full suite, including Bumblebee parity) is green.
 - A regression test proves an unsupported construct raises rather than
   silently falling back.
 - `README.md`'s single-mode claim has zero remaining discrepancy between docs
@@ -80,7 +80,7 @@ trap) rather than an arbitrary "not implemented" stand-in.
 doctests, 1739 tests), 0 failures, 1 excluded (`:large_memory`). `mix test`
 in `emlx_axon/`: 7 passed, 2 excluded (`:bumblebee`, `:metal`) — this
 includes `test/emlx/qwen3_quantized_test.exs`'s 2 tests (a local-checkpoint,
-`compiler: EMLX`-driven Qwen3-0.6B-MLX-4bit greedy-decode conformance test,
+`compiler: EMLX`-driven Qwen3-0.6B-MLX-4bit greedy-decode parity test,
 tagged `:quantized_inference`, not excluded by `test_helper.exs`; it runs as
 part of the standard `mix test` in this environment since the checkpoint is
 present at `~/models/Qwen3-0.6B-MLX-4bit` — reviewer-caught correction: an
@@ -118,8 +118,8 @@ matching `"does not yet lower op :triangular_solve"`.
 doctests, 1739 tests), 0 failures, 1 excluded — identical count to baseline
 (net zero: one stale test replaced by one new test). `mix test` in
 `emlx_axon/`: 7 passed, 2 excluded — identical to baseline, including the
-Qwen3 e2e conformance tests above (the closest thing this repo has to a
-"Bumblebee conformance suite" — reviewer-confirmed there is no literal
+Qwen3 e2e parity tests above (the closest thing this repo has to a
+"Bumblebee parity suite" — reviewer-confirmed there is no literal
 `:bumblebee`-tagged test anywhere in the repo, i.e. `test_helper.exs`'s
 `exclude: [:bumblebee]` is currently a no-op; and no
 `scripts/expr_op_coverage.exs` op-coverage probe exists yet either, despite

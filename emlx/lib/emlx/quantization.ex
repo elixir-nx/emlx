@@ -1,11 +1,15 @@
 defmodule EMLX.Quantization do
   @moduledoc """
-  Affine group-wise int2/int4/int8 quantization for Apple Silicon inference.
+  Affine group-wise int2/int4/int8 quantization for Apple Silicon inference,
+  plus microscaled floating-point modes (`"mxfp4"`/`"mxfp8"`/`"nvfp4"`, via
+  `:mode` on `quantize/2` — see `EMLX.quantize/2`).
 
   Quantized weights are represented as annotated `Nx.Tensor` values — the
   tensor carries the original logical shape and type (e.g. `{:s, 4}` for
   4-bit), while the `EMLX.Backend` struct stores the packed uint32 data and
-  a `EMLX.Quantization.Config` with scales, biases, group_size, and bits.
+  a `EMLX.Quantization.Config` with scales, biases, group_size, bits, and
+  mode. Microscaled modes have no biases (`Config.biases` is `nil` — MLX's
+  `fp_quantize` returns only `(wq, scales)` for them).
 
   `Nx.dot` automatically dispatches to `mx::quantized_matmul` when it detects
   a quantized operand on `EMLX.Backend` — no explicit call site changes needed.
@@ -57,6 +61,8 @@ defmodule EMLX.Quantization do
   * `:type` — Nx storage type: `{:s, 2}`, `{:s, 4}` (default), or `{:s, 8}`.
   * `:group_size` — 32, 64, or 128 (default 64). Must evenly divide the last
     dimension of `tensor`.
+  * `:mode` — `"affine"` (default), or a microscaled mode (`"mxfp4"`,
+    `"mxfp8"`, `"nvfp4"`) — see `EMLX.quantize/2`.
   """
   deftransform quantize(tensor, opts \\ []) do
     type = Keyword.get(opts, :type, {:s, 4})
@@ -112,15 +118,27 @@ defmodule EMLX.Quantization do
   `Nx.Defn.jit`-traced forward passes.
 
   The output has the same shape as the input (the quantized tensor's logical
-  shape equals the dense shape).
+  shape equals the dense shape). Supports every mode `EMLX.quantize/2`
+  accepts.
   """
   deftransform dequantize(qw) do
     # Infer float type from scales when we have the real backend (eager / evaluator).
     # Falls back to :f32 during JIT tracing where qw.data is Nx.Defn.Expr.
+    # Microscaled modes store scales as :u8 (a packed exponent byte, not a
+    # float dtype), so `Nx.type(s)` doesn't apply there — MLX's `dequantize`
+    # reconstructs a float array regardless of mode; :bf16 matches the
+    # convention used elsewhere for microscaled outputs (e.g. Emily's
+    # `QuantizedWeight.to_dense/1`).
     out_type =
       case qw do
-        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{scales: s}}} -> Nx.type(s)
-        _ -> :f32
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{mode: "affine", scales: s}}} ->
+          Nx.type(s)
+
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{}}} ->
+          {:bf, 16}
+
+        _ ->
+          :f32
       end
 
     out = Nx.template(Nx.shape(qw), out_type)
@@ -140,7 +158,10 @@ defmodule EMLX.Quantization do
   forward passes.
 
   Output shape is `{batch_dims..., out_features}` where `out_features` is the
-  first dimension of `qw`. Output type is `:bf16`.
+  first dimension of `qw`. Output type matches the scales dtype for
+  `"affine"` (historically the activation's own float type); for microscaled
+  modes scales are `:u8` (a packed exponent byte), so the output type
+  follows the activation's dtype instead.
   """
   deftransform quantized_matmul(activation, qw) do
     {out_features, _} = Nx.shape(qw)
@@ -149,8 +170,14 @@ defmodule EMLX.Quantization do
 
     out_type =
       case qw do
-        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{scales: s}}} -> Nx.type(s)
-        _ -> Nx.Type.merge(Nx.type(activation), Nx.type(qw))
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{mode: "affine", scales: s}}} ->
+          Nx.type(s)
+
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{}}} ->
+          Nx.type(activation)
+
+        _ ->
+          Nx.Type.merge(Nx.type(activation), Nx.type(qw))
       end
 
     out = Nx.template(out_shape, out_type)

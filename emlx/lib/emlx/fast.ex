@@ -15,9 +15,13 @@ defmodule EMLX.Fast do
   - `rope_with_positions/6` — fused RoPE accepting a `position_ids` tensor
   - `rope_with_freqs/6` — fused RoPE with precomputed inv-frequency tensor (for `:llama3` scaling)
   - `scaled_dot_product_attention/4` — flash-attention SDPA (no mask)
-  - `scaled_dot_product_attention/5` — flash-attention SDPA (additive/bool mask)
+  - `scaled_dot_product_attention/5` — flash-attention SDPA, either an additive/bool
+    `mask` tensor, or an `opts` keyword list (`:sinks`) when there's no mask
+  - `scaled_dot_product_attention/6` — flash-attention SDPA with `mask` and `opts` (`:sinks`)
   - `scaled_dot_product_attention_causal/4` — flash-attention SDPA with built-in causal mask
+  - `scaled_dot_product_attention_causal/5` — same, plus `opts` (`:sinks`)
   - `scaled_dot_product_attention_causal_key_masked/5` — causal SDPA; checks key_mask at C++ level, fast-paths to pure causal when all-ones
+  - `scaled_dot_product_attention_causal_key_masked/6` — same, plus `opts` (`:sinks`)
   - `swiglu/2` — fused SwiGLU: `silu(gate) * up`
 
   ## Axon graph rewrite example
@@ -136,8 +140,16 @@ defmodule EMLX.Fast do
   - `scale`    — pre-computed scalar
   - `key_mask` — `{B, T_kv}` boolean/int tensor (1 = attend, 0 = masked)
   - Output     — `{B, N_q, T_q, D}`, same dtype as `q`
+
+  An optional 6th `opts` keyword list accepts `:sinks` (see
+  `scaled_dot_product_attention/5`).
   """
   deftransform scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask) do
+    scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask, [])
+  end
+
+  @doc false
+  deftransform scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask, opts) do
     # Compute kv_offset at JIT/deftransform time: shapes are compile-time constants here.
     #  - Decode  (T_q = 1): single query attends to all prior positions;
     #    key_mask filters which positions are valid.  kv_offset = T_kv - 1.
@@ -146,15 +158,25 @@ defmodule EMLX.Fast do
     t_q = elem(Nx.shape(q), 2)
     t_kv = elem(Nx.shape(k), 2)
     kv_offset = if t_q == 1, do: t_kv - 1, else: 0
+    sinks = Keyword.get(opts, :sinks)
 
     out = Nx.template(Nx.shape(q), Nx.type(q))
 
-    Nx.runtime_call(
-      out,
-      {q, k, v, key_mask},
-      [scale: scale, kv_offset: kv_offset],
-      &__MODULE__.sdpa_causal_key_masked_callback/2
-    )
+    if sinks do
+      Nx.runtime_call(
+        out,
+        {q, k, v, key_mask, sinks},
+        [scale: scale, kv_offset: kv_offset],
+        &__MODULE__.sdpa_causal_key_masked_sinks_callback/2
+      )
+    else
+      Nx.runtime_call(
+        out,
+        {q, k, v, key_mask},
+        [scale: scale, kv_offset: kv_offset],
+        &__MODULE__.sdpa_causal_key_masked_callback/2
+      )
+    end
   end
 
   @doc false
@@ -177,6 +199,33 @@ defmodule EMLX.Fast do
         scale,
         EMLX.Backend.from_nx(key_mask),
         kv_offset
+      )
+
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
+
+    dtype = Nx.type(q)
+    if Nx.type(out) != dtype, do: Nx.as_type(out, dtype), else: out
+  end
+
+  @doc false
+  def sdpa_causal_key_masked_sinks_callback(
+        {%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v, %Nx.Tensor{} = key_mask,
+         %Nx.Tensor{} = sinks},
+        opts
+      ) do
+    scale = opts[:scale]
+    kv_offset = opts[:kv_offset]
+
+    result_ref =
+      EMLX.fast_sdpa_causal_key_masked(
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
+        scale,
+        EMLX.Backend.from_nx(key_mask),
+        kv_offset,
+        EMLX.Backend.from_nx(sinks)
       )
 
     assert_no_nan_inf!(result_ref, :sdpa)
@@ -444,8 +493,58 @@ defmodule EMLX.Fast do
   Softmax accumulates in float32 internally regardless of input dtype.
   """
   deftransform scaled_dot_product_attention(q, k, v, scale) do
+    scaled_dot_product_attention(q, k, v, scale, [])
+  end
+
+  @doc """
+  Flash-attention SDPA — either an additive/boolean `mask` tensor (5th arg),
+  or, with no mask, an `opts` keyword list (disambiguated by `is_list/1`):
+
+  * `:sinks` — optional learned per-head attention-sink logits tensor,
+    appended as an extra key/value pair the softmax normalises against (see
+    `mlx::fast::scaled_dot_product_attention`'s `sinks` parameter). Shape
+    must broadcast against `{B, N_q}` (typically `{N_q}`).
+
+  `mask` must be broadcast-compatible with `{B, N_q, T_q, T_kv}`.
+  Boolean `false` entries are masked out (`-∞`); float entries are added to
+  the pre-softmax scores.
+
+  For causal masking in decode (single query token), prefer the no-mask arity
+  since `T_q=1` is always trivially causal.
+  """
+  deftransform scaled_dot_product_attention(q, k, v, scale, opts) when is_list(opts) do
+    sinks = Keyword.get(opts, :sinks)
     out = Nx.template(Nx.shape(q), Nx.type(q))
-    Nx.runtime_call(out, {q, k, v}, [scale: scale], &__MODULE__.sdpa_callback/2)
+
+    if sinks do
+      Nx.runtime_call(out, {q, k, v, sinks}, [scale: scale], &__MODULE__.sdpa_sinks_callback/2)
+    else
+      Nx.runtime_call(out, {q, k, v}, [scale: scale], &__MODULE__.sdpa_callback/2)
+    end
+  end
+
+  deftransform scaled_dot_product_attention(q, k, v, scale, mask) do
+    scaled_dot_product_attention(q, k, v, scale, mask, [])
+  end
+
+  @doc """
+  Flash-attention SDPA with an additive/boolean `mask` and `opts` (`:sinks`
+  — see `scaled_dot_product_attention/5`).
+  """
+  deftransform scaled_dot_product_attention(q, k, v, scale, mask, opts) when is_list(opts) do
+    sinks = Keyword.get(opts, :sinks)
+    out = Nx.template(Nx.shape(q), Nx.type(q))
+
+    if sinks do
+      Nx.runtime_call(
+        out,
+        {q, k, v, mask, sinks},
+        [scale: scale],
+        &__MODULE__.sdpa_masked_sinks_callback/2
+      )
+    else
+      Nx.runtime_call(out, {q, k, v, mask}, [scale: scale], &__MODULE__.sdpa_masked_callback/2)
+    end
   end
 
   @doc false
@@ -465,19 +564,24 @@ defmodule EMLX.Fast do
     if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
   end
 
-  @doc """
-  Flash-attention SDPA with an additive or boolean `mask`.
+  @doc false
+  def sdpa_sinks_callback(
+        {%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v, %Nx.Tensor{} = sinks},
+        opts
+      ) do
+    result_ref =
+      EMLX.fast_sdpa(
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
+        opts[:scale],
+        EMLX.Backend.from_nx(sinks)
+      )
 
-  `mask` must be broadcast-compatible with `{B, N_q, T_q, T_kv}`.
-  Boolean `false` entries are masked out (`-∞`); float entries are added to
-  the pre-softmax scores.
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
 
-  For causal masking in decode (single query token), prefer the no-mask arity
-  since `T_q=1` is always trivially causal.
-  """
-  deftransform scaled_dot_product_attention(q, k, v, scale, mask) do
-    out = Nx.template(Nx.shape(q), Nx.type(q))
-    Nx.runtime_call(out, {q, k, v, mask}, [scale: scale], &__MODULE__.sdpa_masked_callback/2)
+    if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
   end
 
   @doc false
@@ -492,6 +596,28 @@ defmodule EMLX.Fast do
         EMLX.Backend.from_nx(v),
         EMLX.Backend.from_nx(mask),
         opts[:scale]
+      )
+
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
+
+    if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
+  end
+
+  @doc false
+  def sdpa_masked_sinks_callback(
+        {%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v, %Nx.Tensor{} = mask,
+         %Nx.Tensor{} = sinks},
+        opts
+      ) do
+    result_ref =
+      EMLX.fast_sdpa_masked(
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
+        EMLX.Backend.from_nx(mask),
+        opts[:scale],
+        EMLX.Backend.from_nx(sinks)
       )
 
     assert_no_nan_inf!(result_ref, :sdpa)
@@ -518,8 +644,27 @@ defmodule EMLX.Fast do
   - Output  — `{B, N_q, T_q, D}`, same dtype as `q`
   """
   deftransform scaled_dot_product_attention_causal(q, k, v, scale) do
+    scaled_dot_product_attention_causal(q, k, v, scale, [])
+  end
+
+  @doc """
+  Causal flash-attention SDPA with `opts` (`:sinks` — see
+  `scaled_dot_product_attention/5`).
+  """
+  deftransform scaled_dot_product_attention_causal(q, k, v, scale, opts) when is_list(opts) do
+    sinks = Keyword.get(opts, :sinks)
     out = Nx.template(Nx.shape(q), Nx.type(q))
-    Nx.runtime_call(out, {q, k, v}, [scale: scale], &__MODULE__.sdpa_causal_callback/2)
+
+    if sinks do
+      Nx.runtime_call(
+        out,
+        {q, k, v, sinks},
+        [scale: scale],
+        &__MODULE__.sdpa_causal_sinks_callback/2
+      )
+    else
+      Nx.runtime_call(out, {q, k, v}, [scale: scale], &__MODULE__.sdpa_causal_callback/2)
+    end
   end
 
   @doc false
@@ -530,6 +675,26 @@ defmodule EMLX.Fast do
         EMLX.Backend.from_nx(k),
         EMLX.Backend.from_nx(v),
         opts[:scale]
+      )
+
+    assert_no_nan_inf!(result_ref, :sdpa)
+    out = EMLX.Backend.to_nx(result_ref)
+
+    if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
+  end
+
+  @doc false
+  def sdpa_causal_sinks_callback(
+        {%Nx.Tensor{} = q, %Nx.Tensor{} = k, %Nx.Tensor{} = v, %Nx.Tensor{} = sinks},
+        opts
+      ) do
+    result_ref =
+      EMLX.fast_sdpa_causal(
+        EMLX.Backend.from_nx(q),
+        EMLX.Backend.from_nx(k),
+        EMLX.Backend.from_nx(v),
+        opts[:scale],
+        EMLX.Backend.from_nx(sinks)
       )
 
     assert_no_nan_inf!(result_ref, :sdpa)

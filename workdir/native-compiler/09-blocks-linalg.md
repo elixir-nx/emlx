@@ -20,7 +20,7 @@ recognize the block struct for a native path, else lower its `default_expr`.
    in Stages 02–07.
 3. Add any new opcodes + C++ replay; parity test.
 4. Equivalence tests vs eager `EMLX.Backend` and, where tolerance is delicate
-   (svd/eigh), against an EXLA/`Nx.BinaryBackend` golden with documented
+   (svd/eigh), against an EXLA/`Nx.BinaryBackend` reference with documented
    tolerances; flip `EXPR_NODES.md` §K boxes.
 
 ## Acceptance

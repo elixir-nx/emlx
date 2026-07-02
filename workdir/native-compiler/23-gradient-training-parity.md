@@ -1,4 +1,4 @@
-# Stage 23 — gradient & training conformance epic (scoping only)
+# Stage 23 — gradient & training parity epic (scoping only)
 
 Status: not started — largest, least-scoped item. This doc defines the
 triage/sub-plan, not the implementation. Emily M9/M13/M16/M17 parity (see
@@ -7,10 +7,10 @@ Stage 20).
 ## Why this stage exists
 
 Emily's M9/M13/M16/M17 collectively represent a substantial grad/training
-conformance investment: grad-equivalence property tests vs `Nx.BinaryBackend`
-grad + EXLA golden, `Emily.MixedPrecision` (bf16 forward + f32 master weights
+parity investment: grad-equivalence property tests vs `Nx.BinaryBackend`
+grad + EXLA reference, `Emily.MixedPrecision` (bf16 forward + f32 master weights
 + dynamic loss scaling), MNIST convergence canaries, and conv-pool training
-conformance. EMLX has **zero** grad-specific tests today (no `*grad*` files
+parity. EMLX has **zero** grad-specific tests today (no `*grad*` files
 anywhere in `emlx/test`).
 
 `Nx.Defn.grad` differentiates the *traced expression* before the EMLX
@@ -48,12 +48,12 @@ triaged, the same way Stage 12's spike fanned into Stages 13/14)
 3. **If real gaps surface**, split into dedicated follow-on stages, each
    sized only after step 1's findings are in hand:
    - Grad-equivalence test suite (vs `Nx.BinaryBackend` grad + finite
-     differences + EXLA golden, per Emily M9/M13's harness design).
+     differences + EXLA reference, per Emily M9/M13's harness design).
    - `EMLX.MixedPrecision` module mirroring Emily M16's
      `cast_params/2` / `accumulate_grad/2` / `loss_scale/1` / `scale_loss/2`
      / `unscale/2` / `update/2` / `has_overflow?/1`, with a bf16-tolerance
      grad-equivalence suite and an MNIST-style bf16 convergence canary.
-   - Conv-pool training conformance (Emily M17).
+   - Conv-pool training parity (Emily M17).
 4. Do not block Stages 16–22 on this epic — they ship independently. This
    stage's only deliverable right now is the triage report and named,
    sized follow-on stages.

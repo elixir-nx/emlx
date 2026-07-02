@@ -38,15 +38,21 @@ ASYNC_NIF(fast_rope)
 // fast_sdpa — flash-attention SDPA, no mask
 // MLX: mlx::fast::scaled_dot_product_attention(q, k, v, scale, mask_mode, mask_arr, sinks, stream)
 // GQA-native: k/v may have fewer heads than q.
+// sinks (optional, {N_q} or {N_q, ...} learned per-head attention-sink logits)
+// is `nil` from Elixir when absent — see OPTIONAL_TENSOR_PARAM.
 NIF(fast_sdpa) {
   TENSOR_PARAM(0, q);
   TENSOR_PARAM(1, k);
   TENSOR_PARAM(2, v);
   PARAM(3, double, scale);
-  DEVICE_PARAM(4, device);
+  OPTIONAL_TENSOR_PARAM(4, sinks);
+  DEVICE_PARAM(5, device);
+
+  std::optional<mlx::core::array> sinks_opt =
+      sinks ? std::make_optional(*sinks) : std::nullopt;
 
   TENSOR(fast::scaled_dot_product_attention(
-      *q, *k, *v, (float)scale, "", std::nullopt, std::nullopt, device));
+      *q, *k, *v, (float)scale, "", std::nullopt, sinks_opt, device));
 }
 ASYNC_NIF(fast_sdpa)
 
@@ -58,10 +64,14 @@ NIF(fast_sdpa_masked) {
   TENSOR_PARAM(2, v);
   PARAM(3, double, scale);
   TENSOR_PARAM(4, mask);
-  DEVICE_PARAM(5, device);
+  OPTIONAL_TENSOR_PARAM(5, sinks);
+  DEVICE_PARAM(6, device);
+
+  std::optional<mlx::core::array> sinks_opt =
+      sinks ? std::make_optional(*sinks) : std::nullopt;
 
   TENSOR(fast::scaled_dot_product_attention(
-      *q, *k, *v, (float)scale, "array", *mask, std::nullopt, device));
+      *q, *k, *v, (float)scale, "array", *mask, sinks_opt, device));
 }
 ASYNC_NIF(fast_sdpa_masked)
 
@@ -219,6 +229,7 @@ ASYNC_NIF(fast_rope_positions)
 // If all values are 1 (no padding), dispatches to fast causal SDPA (no mask alloc).
 // Otherwise builds a combined causal + key_mask additive float mask and uses
 // masked SDPA. The all-ones check forces eval of only the small key_mask subgraph.
+// sinks (optional) — see fast_sdpa's comment above.
 NIF(fast_sdpa_causal_key_masked) {
   TENSOR_PARAM(0, q);        // {B, N_q,  T_q,  D}
   TENSOR_PARAM(1, k);        // {B, N_kv, T_kv, D}
@@ -226,14 +237,18 @@ NIF(fast_sdpa_causal_key_masked) {
   PARAM(3, double, scale);
   TENSOR_PARAM(4, key_mask); // {B, T_kv} boolean / int
   PARAM(5, int, kv_offset);  // caller-controlled: decode → T_kv-1, prefill → 0
-  DEVICE_PARAM(6, device);
+  OPTIONAL_TENSOR_PARAM(6, sinks);
+  DEVICE_PARAM(7, device);
+
+  std::optional<mlx::core::array> sinks_opt =
+      sinks ? std::make_optional(*sinks) : std::nullopt;
 
   // key_mask values are 0/1 (int or bool); astype→bool_ then all() checks all non-zero.
   bool trivial = all(astype(*key_mask, bool_)).item<bool>();
 
   if (trivial) {
     TENSOR(fast::scaled_dot_product_attention(
-        *q, *k, *v, (float)scale, "causal", std::nullopt, std::nullopt, device));
+        *q, *k, *v, (float)scale, "causal", std::nullopt, sinks_opt, device));
   } else {
     // Expand key_mask {B, T_kv} → {B, 1, 1, T_kv} for broadcasting.
     auto km = reshape(*key_mask, {key_mask->shape(0), 1, 1, key_mask->shape(1)});
@@ -257,7 +272,7 @@ NIF(fast_sdpa_causal_key_masked) {
     auto additive = where(keep, zero_val, neginf_val);
 
     TENSOR(fast::scaled_dot_product_attention(
-        *q, *k, *v, (float)scale, "array", additive, std::nullopt, device));
+        *q, *k, *v, (float)scale, "array", additive, sinks_opt, device));
   }
 }
 ASYNC_NIF(fast_sdpa_causal_key_masked)
@@ -276,15 +291,20 @@ NIF(fast_swiglu) {
 }
 ASYNC_NIF(fast_swiglu)
 
+// sinks (optional) — see fast_sdpa's comment above.
 NIF(fast_sdpa_causal) {
   TENSOR_PARAM(0, q);
   TENSOR_PARAM(1, k);
   TENSOR_PARAM(2, v);
   PARAM(3, double, scale);
-  DEVICE_PARAM(4, device);
+  OPTIONAL_TENSOR_PARAM(4, sinks);
+  DEVICE_PARAM(5, device);
+
+  std::optional<mlx::core::array> sinks_opt =
+      sinks ? std::make_optional(*sinks) : std::nullopt;
 
   TENSOR(fast::scaled_dot_product_attention(
-      *q, *k, *v, (float)scale, "causal", std::nullopt, std::nullopt, device));
+      *q, *k, *v, (float)scale, "causal", std::nullopt, sinks_opt, device));
 }
 ASYNC_NIF(fast_sdpa_causal)
 

@@ -3008,7 +3008,23 @@ defmodule EMLX.Native.ExprTest do
            Nx.template({1, 2, 4, 8}, :f32),
            Nx.template({1, 2, 4, 8}, :f32),
            Nx.template({1, 2, 4, 8}, :f32)
-         ], :fast_sdpa_causal}
+         ], :fast_sdpa_causal},
+        {fn q, k, v, s -> EMLX.Fast.scaled_dot_product_attention(q, k, v, 0.125, sinks: s) end,
+         [
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({2}, :f32)
+         ], :fast_sdpa_sinks},
+        {fn q, k, v, s ->
+           EMLX.Fast.scaled_dot_product_attention_causal(q, k, v, 0.125, sinks: s)
+         end,
+         [
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({1, 2, 4, 8}, :f32),
+           Nx.template({2}, :f32)
+         ], :fast_sdpa_causal_sinks}
       ]
 
       for {fun, templates, opcode} <- cases do
@@ -3199,6 +3215,84 @@ defmodule EMLX.Native.ExprTest do
       all_present = Nx.broadcast(Nx.tensor(1, type: :s32), {2, 4}) |> gpu_t()
       native_ap = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, all_present)
       eager_ap = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, all_present)
+      assert_all_close(native_ap, eager_ap, tol: 1.0e-3)
+    end
+
+    # Stage 22 (fast-kernel-quant-parity): the `:sinks` opt on each SDPA
+    # variant lowers to a distinct `_sinks`-suffixed opcode (see
+    # `fast_kernel_dispatch/2` and `emlx_compiler.cpp`'s op_registry). Each
+    # case below compares the compiled replay against the eager path (which
+    # calls the very same underlying NIF), matching the no-sinks tests above.
+    test "sdpa (no mask, + sinks): fused replay matches eager" do
+      scale = 0.125
+      fun = fn q, k, v, s -> EMLX.Fast.scaled_dot_product_attention(q, k, v, scale, sinks: s) end
+      q = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      sinks = Nx.tensor([0.1, -0.2], type: :f32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, sinks)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, sinks)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "sdpa (additive mask, + sinks): fused replay matches eager" do
+      scale = 0.125
+      fun = fn q, k, v, m, s ->
+        EMLX.Fast.scaled_dot_product_attention(q, k, v, scale, m, sinks: s)
+      end
+
+      q = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+
+      mask =
+        Nx.tensor([[[[0.0, 0.0, 0.0, -1.0e9]]]], type: :f32)
+        |> Nx.broadcast({1, 1, 4, 4})
+        |> gpu_t()
+
+      sinks = Nx.tensor([0.1, -0.2], type: :f32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, mask, sinks)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, mask, sinks)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "sdpa (causal, + sinks): fused replay matches eager" do
+      scale = 0.125
+
+      fun = fn q, k, v, s ->
+        EMLX.Fast.scaled_dot_product_attention_causal(q, k, v, scale, sinks: s)
+      end
+
+      q = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      sinks = Nx.tensor([0.1, -0.2], type: :f32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, sinks)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, sinks)
+      assert_all_close(native, eager, tol: 1.0e-3)
+    end
+
+    test "sdpa (causal + key_mask, decode, + sinks): fused replay matches eager (padded and all-present)" do
+      fun = fn q, k, v, km, s ->
+        EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q, k, v, 0.125, km, sinks: s)
+      end
+
+      q = Nx.iota({2, 2, 1, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k = Nx.iota({2, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v = Nx.iota({2, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      sinks = Nx.tensor([0.1, -0.2], type: :f32) |> gpu_t()
+
+      padded = Nx.tensor([[1, 1, 1, 0], [1, 1, 0, 0]], type: :s32) |> gpu_t()
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, padded, sinks)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, padded, sinks)
+      assert_all_close(native, eager, tol: 1.0e-3)
+
+      all_present = Nx.broadcast(Nx.tensor(1, type: :s32), {2, 4}) |> gpu_t()
+      native_ap = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, all_present, sinks)
+      eager_ap = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, all_present, sinks)
       assert_all_close(native_ap, eager_ap, tol: 1.0e-3)
     end
 

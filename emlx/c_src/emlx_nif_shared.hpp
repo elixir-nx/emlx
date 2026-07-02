@@ -137,6 +137,26 @@ private:
     VAR = VAR##_tp.data();                                                     \
   }
 
+// Optional tensor argument: the Elixir caller passes the atom `nil` when the
+// tensor is absent (e.g. biases for a microscaled quantization mode, or
+// sinks for a plain SDPA call); any other term is decoded as a tensor
+// resource. VAR is `nullptr` when absent.
+#define OPTIONAL_TENSOR_PARAM(ARGN, VAR)                                       \
+  std::optional<TensorP> VAR##_tp;                                            \
+  mlx::core::array *VAR = nullptr;                                            \
+  {                                                                           \
+    std::string VAR##_nil_check;                                             \
+    bool VAR##_is_nil = nx::nif::get_atom(env, argv[ARGN], VAR##_nil_check) &&\
+                        VAR##_nil_check == "nil";                             \
+    if (!VAR##_is_nil) {                                                     \
+      VAR##_tp.emplace(env, argv[ARGN]);                                     \
+      if (!VAR##_tp->is_valid()) {                                           \
+        return VAR##_tp->error();                                            \
+      }                                                                      \
+      VAR = VAR##_tp->data();                                                \
+    }                                                                        \
+  }
+
 // Forward declaration — defined in emlx_nif.cpp, used in emlx_fast.cpp and
 // emlx_compiler.cpp.
 ERL_NIF_TERM create_tensor_resource(ErlNifEnv *env, mlx::core::array tensor);

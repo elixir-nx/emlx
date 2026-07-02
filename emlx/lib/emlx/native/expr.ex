@@ -2413,14 +2413,26 @@ defmodule EMLX.Native.Expr do
       :sdpa_callback ->
         {:fast_sdpa, [f64_bits(opts[:scale])]}
 
+      :sdpa_sinks_callback ->
+        {:fast_sdpa_sinks, [f64_bits(opts[:scale])]}
+
       :sdpa_masked_callback ->
         {:fast_sdpa_masked, [f64_bits(opts[:scale])]}
+
+      :sdpa_masked_sinks_callback ->
+        {:fast_sdpa_masked_sinks, [f64_bits(opts[:scale])]}
 
       :sdpa_causal_callback ->
         {:fast_sdpa_causal, [f64_bits(opts[:scale])]}
 
+      :sdpa_causal_sinks_callback ->
+        {:fast_sdpa_causal_sinks, [f64_bits(opts[:scale])]}
+
       :sdpa_causal_key_masked_callback ->
         {:fast_sdpa_causal_key_masked, [f64_bits(opts[:scale]), opts[:kv_offset]]}
+
+      :sdpa_causal_key_masked_sinks_callback ->
+        {:fast_sdpa_causal_key_masked_sinks, [f64_bits(opts[:scale]), opts[:kv_offset]]}
 
       :rope_callback ->
         {:fast_rope,
@@ -3081,6 +3093,17 @@ defmodule EMLX.Native.Expr.Interpreter do
     EMLX.fast_sdpa(from_nx(q), from_nx(k), from_nx(v), Expr.bits_to_f64(scale_bits)) |> to_nx()
   end
 
+  defp dispatch(:fast_sdpa_sinks, [q, k, v, sinks], [scale_bits]) do
+    EMLX.fast_sdpa(
+      from_nx(q),
+      from_nx(k),
+      from_nx(v),
+      Expr.bits_to_f64(scale_bits),
+      from_nx(sinks)
+    )
+    |> to_nx()
+  end
+
   defp dispatch(:fast_sdpa_masked, [q, k, v, mask], [scale_bits]) do
     EMLX.fast_sdpa_masked(
       from_nx(q),
@@ -3092,8 +3115,31 @@ defmodule EMLX.Native.Expr.Interpreter do
     |> to_nx()
   end
 
+  defp dispatch(:fast_sdpa_masked_sinks, [q, k, v, mask, sinks], [scale_bits]) do
+    EMLX.fast_sdpa_masked(
+      from_nx(q),
+      from_nx(k),
+      from_nx(v),
+      from_nx(mask),
+      Expr.bits_to_f64(scale_bits),
+      from_nx(sinks)
+    )
+    |> to_nx()
+  end
+
   defp dispatch(:fast_sdpa_causal, [q, k, v], [scale_bits]) do
     EMLX.fast_sdpa_causal(from_nx(q), from_nx(k), from_nx(v), Expr.bits_to_f64(scale_bits))
+    |> to_nx()
+  end
+
+  defp dispatch(:fast_sdpa_causal_sinks, [q, k, v, sinks], [scale_bits]) do
+    EMLX.fast_sdpa_causal(
+      from_nx(q),
+      from_nx(k),
+      from_nx(v),
+      Expr.bits_to_f64(scale_bits),
+      from_nx(sinks)
+    )
     |> to_nx()
   end
 
@@ -3105,6 +3151,22 @@ defmodule EMLX.Native.Expr.Interpreter do
       Expr.bits_to_f64(scale_bits),
       from_nx(key_mask),
       kv_offset
+    )
+    |> to_nx()
+  end
+
+  defp dispatch(:fast_sdpa_causal_key_masked_sinks, [q, k, v, key_mask, sinks], [
+         scale_bits,
+         kv_offset
+       ]) do
+    EMLX.fast_sdpa_causal_key_masked(
+      from_nx(q),
+      from_nx(k),
+      from_nx(v),
+      Expr.bits_to_f64(scale_bits),
+      from_nx(key_mask),
+      kv_offset,
+      from_nx(sinks)
     )
     |> to_nx()
   end

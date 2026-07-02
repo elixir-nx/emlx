@@ -1369,6 +1369,14 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            std::nullopt);
      }},
 
+    // sdpa (no mask, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
+    {"fast_sdpa_sinks",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::scaled_dot_product_attention(
+           ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
+           ops[3]);
+     }},
+
     // sdpa (array mask): operands = [q, k, v, mask]; attrs = [scale_bits].
     {"fast_sdpa_masked",
      [](const auto &ops, const auto &attrs) {
@@ -1377,12 +1385,29 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            std::nullopt);
      }},
 
+    // sdpa (array mask, + sinks): operands = [q, k, v, mask, sinks];
+    // attrs = [scale_bits].
+    {"fast_sdpa_masked_sinks",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::scaled_dot_product_attention(
+           ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
+           ops[4]);
+     }},
+
     // sdpa (causal): operands = [q, k, v]; attrs = [scale_bits].
     {"fast_sdpa_causal",
      [](const auto &ops, const auto &attrs) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
            std::nullopt, std::nullopt);
+     }},
+
+    // sdpa (causal, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
+    {"fast_sdpa_causal_sinks",
+     [](const auto &ops, const auto &attrs) {
+       return mlx::core::fast::scaled_dot_product_attention(
+           ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
+           std::nullopt, ops[3]);
      }},
 
     // sdpa (causal + key_mask): operands = [q, k, v, key_mask];
@@ -1419,6 +1444,42 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
        return mlx::core::fast::scaled_dot_product_attention(
            q, k, v, scale, "array", additive, std::nullopt);
+     }},
+
+    // sdpa (causal + key_mask, + sinks): operands = [q, k, v, key_mask,
+    // sinks]; attrs = [scale_bits, kv_offset]. Same in-graph combined mask as
+    // "fast_sdpa_causal_key_masked" above, plus the sinks operand.
+    {"fast_sdpa_causal_key_masked_sinks",
+     [](const auto &ops, const auto &attrs) {
+       const auto &q = ops[0];
+       const auto &k = ops[1];
+       const auto &v = ops[2];
+       const auto &key_mask = ops[3];
+       const auto &sinks = ops[4];
+       float scale = attr_to_float(attrs[0]);
+       int kv_offset = static_cast<int>(attrs[1]);
+
+       auto km = mlx::core::reshape(
+           key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)});
+       int T_q = q.shape(2);
+       int T_kv = k.shape(2);
+
+       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32),
+                                     {1, 1, T_q, 1});
+       auto col = mlx::core::reshape(mlx::core::arange(T_kv, mlx::core::int32),
+                                     {1, 1, 1, T_kv});
+       auto causal_bool = mlx::core::less_equal(
+           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32)));
+       auto keep = mlx::core::logical_and(km, causal_bool);
+
+       auto mask_dtype = q.dtype();
+       auto zero_val = mlx::core::zeros({}, mask_dtype);
+       auto neginf_val = mlx::core::full(
+           {}, -std::numeric_limits<float>::infinity(), mask_dtype);
+       auto additive = mlx::core::where(keep, zero_val, neginf_val);
+
+       return mlx::core::fast::scaled_dot_product_attention(
+           q, k, v, scale, "array", additive, sinks);
      }},
 
     // rope (scalar offset): operands = [a];

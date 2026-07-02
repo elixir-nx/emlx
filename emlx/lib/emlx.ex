@@ -341,31 +341,33 @@ defmodule EMLX do
   Performs quantized matrix multiplication.
 
   This is the key operation for efficient 4-bit inference. It multiplies `x` with
-  quantized weights `w` (packed as uint32), using scales and biases for
-  dequantization during the computation.
+  quantized weights `w` (packed as uint32), using scales and (for `"affine"`)
+  biases for dequantization during the computation.
 
   ## Parameters
     - `x` - Input tensor (e.g., {batch, seq, hidden})
     - `w` - Quantized weights as uint32 (8 int4 values packed per uint32)
-    - `scales` - Per-group scale factors (bfloat16)
-    - `biases` - Per-group zero points (bfloat16)
+    - `scales` - Per-group scale factors (bfloat16, or u8 for microscaled modes)
+    - `biases` - Per-group zero points (bfloat16), or `nil` for microscaled modes
     - `transpose` - Whether to transpose weights (default: true)
     - `group_size` - Number of weights per scale/bias group (default: 64)
     - `bits` - Quantization bits (default: 4)
+    - `mode` - `"affine"` (default), `"mxfp4"`, `"mxfp8"`, or `"nvfp4"`
   """
-  @mlx_function {:quantized_matmul, 9}
+  @mlx_function {:quantized_matmul, 10}
   def quantized_matmul(
         {dev_x, ref_x} = _tensor_x,
         {dev_w, ref_w} = _tensor_w,
         {dev_s, ref_s} = _tensor_scales,
-        {dev_b, ref_b} = _tensor_biases,
+        biases,
         transpose \\ true,
         group_size \\ 64,
-        bits \\ 4
+        bits \\ 4,
+        mode \\ "affine"
       )
-      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and
-             is_tensor(dev_s, ref_s) and is_tensor(dev_b, ref_b) do
-    device = merge_device(merge_device(dev_x, dev_w), merge_device(dev_s, dev_b))
+      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) do
+    {ref_b, biases_device} = unwrap_optional_tensor(biases)
+    device = merge_device(merge_device(dev_x, dev_w), merge_device(dev_s, biases_device))
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -378,6 +380,7 @@ defmodule EMLX do
         transpose,
         group_size,
         bits,
+        mode,
         effective_device
       )
       |> unwrap!()
@@ -393,25 +396,28 @@ defmodule EMLX do
 
   ## Parameters
     - `w` - Quantized weights as uint32 (packed int4 values)
-    - `scales` - Per-group scale factors
-    - `biases` - Per-group zero points
+    - `scales` - Per-group scale factors (or u8 for microscaled modes)
+    - `biases` - Per-group zero points, or `nil` for microscaled modes
     - `group_size` - Number of weights per group (default: 64)
     - `bits` - Quantization bits (default: 4)
+    - `mode` - `"affine"` (default), `"mxfp4"`, `"mxfp8"`, or `"nvfp4"`
   """
-  @mlx_function {:dequantize, 7}
+  @mlx_function {:dequantize, 8}
   def dequantize(
         {dev_w, ref_w} = _tensor_w,
         {dev_s, ref_s} = _tensor_scales,
-        {dev_b, ref_b} = _tensor_biases,
+        biases,
         group_size,
-        bits
+        bits,
+        mode \\ "affine"
       )
-      when is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) and is_tensor(dev_b, ref_b) do
-    device = merge_device(dev_w, merge_device(dev_s, dev_b))
+      when is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) do
+    {ref_b, biases_device} = unwrap_optional_tensor(biases)
+    device = merge_device(dev_w, merge_device(dev_s, biases_device))
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
-      EMLX.NIF.dequantize(worker, ref_w, ref_s, ref_b, group_size, bits, effective_device)
+      EMLX.NIF.dequantize(worker, ref_w, ref_s, ref_b, group_size, bits, mode, effective_device)
       |> unwrap!()
 
     await_worker(job_ref) |> wrap_tensor(effective_device)
@@ -422,28 +428,38 @@ defmodule EMLX do
 
   Returns a tuple of `{quantized_weights, scales, biases}` where:
     - `quantized_weights` - Packed uint32 tensor (8 int4 values per uint32)
-    - `scales` - Per-group scale factors
-    - `biases` - Per-group zero points
+    - `scales` - Per-group scale factors (or u8 for microscaled modes)
+    - `biases` - Per-group zero points, or `nil` for microscaled modes
+      (`"mxfp4"`/`"mxfp8"`/`"nvfp4"` — `mx::fp_quantize` doesn't emit biases)
 
   ## Parameters
     - `w` - Float tensor to quantize
     - `group_size` - Number of weights per group (default: 64)
     - `bits` - Quantization bits (default: 4)
+    - `mode` - `"affine"` (default), `"mxfp4"`, `"mxfp8"`, or `"nvfp4"`
   """
-  @mlx_function {:quantize, 5}
-  def quantize({dev_w, ref_w}, group_size, bits)
+  @mlx_function {:quantize, 6}
+  def quantize({dev_w, ref_w}, group_size, bits, mode \\ "affine")
       when is_tensor(dev_w, ref_w) do
     device = dev_w
     {worker, effective_device} = resolve_worker(device)
 
     {weights_ref, scales_ref, biases_ref} =
-      EMLX.NIF.quantize(worker, ref_w, group_size, bits, effective_device)
+      EMLX.NIF.quantize(worker, ref_w, group_size, bits, mode, effective_device)
       |> unwrap!()
       |> await_worker()
 
     {{effective_device, weights_ref}, {effective_device, scales_ref},
-     {effective_device, biases_ref}}
+     wrap_optional_tensor(biases_ref, effective_device)}
   end
+
+  # `nil` (microscaled modes have no biases) passes through as the atom `nil`
+  # to the NIF layer; a real tensor unwraps to its raw ref for device merging.
+  defp unwrap_optional_tensor(nil), do: {nil, nil}
+  defp unwrap_optional_tensor({device, ref}), do: {ref, device}
+
+  defp wrap_optional_tensor(nil, _device), do: nil
+  defp wrap_optional_tensor(ref, device), do: {device, ref}
 
   # ── mlx::fast ops ───────────────────────────────────────────────────────────
 
@@ -513,17 +529,19 @@ defmodule EMLX do
   - `k`     — `{B, N_kv, T_kv, D}`
   - `v`     — `{B, N_kv, T_kv, D}`
   - `scale` — scalar (typically `1 / sqrt(D)`)
+  - `sinks` — optional learned per-head attention-sink logits tensor, or `nil`
 
   Prefer `EMLX.Fast.scaled_dot_product_attention/4` inside `defn`.
   """
-  @mlx_function {:fast_sdpa, 6}
-  def fast_sdpa({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale)
+  @mlx_function {:fast_sdpa, 7}
+  def fast_sdpa({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale, sinks \\ nil)
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and is_tensor(dev_v, ref_v) do
-    device = merge_device(dev_q, merge_device(dev_k, dev_v))
+    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
+    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, sinks_device)))
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
-      EMLX.NIF.fast_sdpa(worker, ref_q, ref_k, ref_v, scale * 1.0, effective_device)
+      EMLX.NIF.fast_sdpa(worker, ref_q, ref_k, ref_v, scale * 1.0, ref_s, effective_device)
       |> unwrap!()
 
     await_worker(job_ref) |> wrap_tensor(effective_device)
@@ -535,23 +553,36 @@ defmodule EMLX do
   `mask` must be broadcast-compatible with `{B, N_q, T_q, T_kv}`.
   Boolean `false` entries are treated as `-∞`.
 
+  `sinks` — optional learned per-head attention-sink logits tensor, or `nil`.
+
   Prefer `EMLX.Fast.scaled_dot_product_attention/5` inside `defn`.
   """
-  @mlx_function {:fast_sdpa_masked, 7}
+  @mlx_function {:fast_sdpa_masked, 8}
   def fast_sdpa_masked(
         {dev_q, ref_q},
         {dev_k, ref_k},
         {dev_v, ref_v},
         {dev_m, ref_m},
-        scale
+        scale,
+        sinks \\ nil
       )
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
              is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) do
-    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, dev_m)))
+    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
+    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device))))
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
-      EMLX.NIF.fast_sdpa_masked(worker, ref_q, ref_k, ref_v, scale * 1.0, ref_m, effective_device)
+      EMLX.NIF.fast_sdpa_masked(
+        worker,
+        ref_q,
+        ref_k,
+        ref_v,
+        scale * 1.0,
+        ref_m,
+        ref_s,
+        effective_device
+      )
       |> unwrap!()
 
     await_worker(job_ref) |> wrap_tensor(effective_device)
@@ -728,16 +759,19 @@ defmodule EMLX do
   - `v`     — `{B, N_kv, T_kv, D}`
   - `scale` — scalar (typically `1 / sqrt(D)`)
 
+  `sinks` — optional learned per-head attention-sink logits tensor, or `nil`.
+
   Prefer `EMLX.Fast.scaled_dot_product_attention_causal/4` inside `defn`.
   """
-  @mlx_function {:fast_sdpa_causal, 6}
-  def fast_sdpa_causal({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale)
+  @mlx_function {:fast_sdpa_causal, 7}
+  def fast_sdpa_causal({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale, sinks \\ nil)
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and is_tensor(dev_v, ref_v) do
-    device = merge_device(dev_q, merge_device(dev_k, dev_v))
+    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
+    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, sinks_device)))
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
-      EMLX.NIF.fast_sdpa_causal(worker, ref_q, ref_k, ref_v, scale * 1.0, effective_device)
+      EMLX.NIF.fast_sdpa_causal(worker, ref_q, ref_k, ref_v, scale * 1.0, ref_s, effective_device)
       |> unwrap!()
 
     await_worker(job_ref) |> wrap_tensor(effective_device)
@@ -756,21 +790,27 @@ defmodule EMLX do
   - `v`        — `{B, N_kv, T_kv, D}`
   - `scale`    — scalar (typically `1 / sqrt(D)`)
   - `key_mask` — `{B, T_kv}` boolean/int tensor (1 = attend, 0 = padding)
+  - `sinks`    — optional learned per-head attention-sink logits tensor, or `nil`
 
   Prefer `EMLX.Fast.scaled_dot_product_attention_causal_key_masked/5` inside `defn`.
   """
-  @mlx_function {:fast_sdpa_causal_key_masked, 8}
+  @mlx_function {:fast_sdpa_causal_key_masked, 9}
   def fast_sdpa_causal_key_masked(
         {dev_q, ref_q},
         {dev_k, ref_k},
         {dev_v, ref_v},
         scale,
         {dev_m, ref_m},
-        kv_offset
+        kv_offset,
+        sinks \\ nil
       )
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
              is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) and is_integer(kv_offset) do
-    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, dev_m)))
+    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
+
+    device =
+      merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device))))
+
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -782,6 +822,7 @@ defmodule EMLX do
         scale * 1.0,
         ref_m,
         kv_offset,
+        ref_s,
         effective_device
       )
       |> unwrap!()
@@ -952,6 +993,42 @@ defmodule EMLX do
     {{effective_device, attn_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
   end
 
+  # Microscaled modes pin an exact {group_size, bits} pair (MLX's
+  # `fp_quantize` — see `mlx::core::quantize` in `mlx/ops.h`). Mirrors
+  # `Emily.QuantizedWeight`'s `@microscaled_constraints`, which was checked
+  # directly against the same MLX version this repo vendors.
+  @microscaled_constraints %{"mxfp4" => {32, 4}, "mxfp8" => {32, 8}, "nvfp4" => {16, 4}}
+  @valid_quantization_modes ~w(affine mxfp4 mxfp8 nvfp4)
+
+  defp validate_quantization_mode!(mode) when mode in @valid_quantization_modes, do: :ok
+
+  defp validate_quantization_mode!(mode) do
+    raise ArgumentError,
+          "EMLX.quantize/2: :mode must be one of #{inspect(@valid_quantization_modes)}, " <>
+            "got: #{inspect(mode)}"
+  end
+
+  defp validate_microscaled_constraints!("affine", _group_size, _bits), do: :ok
+
+  defp validate_microscaled_constraints!(mode, group_size, bits) do
+    {expected_gs, expected_bits} = Map.fetch!(@microscaled_constraints, mode)
+
+    cond do
+      group_size != expected_gs ->
+        raise ArgumentError,
+              "EMLX.quantize/2: mode #{inspect(mode)} requires group_size=#{expected_gs}, " <>
+                "got: #{inspect(group_size)}"
+
+      bits != expected_bits ->
+        raise ArgumentError,
+              "EMLX.quantize/2: mode #{inspect(mode)} requires bits=#{expected_bits}, " <>
+                "got: #{inspect(bits)}"
+
+      true ->
+        :ok
+    end
+  end
+
   @doc """
   Quantize a dense 2-D `Nx.Tensor` and return an annotated quantized tensor.
 
@@ -963,13 +1040,23 @@ defmodule EMLX do
 
   * `:type` — storage type: `{:s, 2}`, `{:s, 4}` (default), or `{:s, 8}`.
   * `:group_size` — 32, 64, or 128 (default 64). Must evenly divide the last
-    dimension of `tensor`.
+    dimension of `tensor`. Microscaled modes pin this to a specific value
+    (see `:mode` below).
+  * `:mode` — `"affine"` (default, real biases), or a microscaled mode —
+    `"mxfp4"` (group_size 32, bits 4), `"mxfp8"` (group_size 32, bits 8), or
+    `"nvfp4"` (group_size 16, bits 4). Microscaled modes have no biases
+    (`mx::fp_quantize` returns only `(wq, scales)`); the returned tensor's
+    `EMLX.Quantization.Config.biases` is `nil`.
   """
   @spec quantize(Nx.Tensor.t(), keyword()) :: Nx.Tensor.t()
   def quantize(%Nx.Tensor{} = tensor, opts) when is_list(opts) do
     type = Keyword.get(opts, :type, {:s, 4})
     {_, bits} = type
     group_size = Keyword.get(opts, :group_size, 64)
+    mode = Keyword.get(opts, :mode, "affine")
+
+    validate_quantization_mode!(mode)
+    validate_microscaled_constraints!(mode, group_size, bits)
 
     unless Nx.rank(tensor) == 2 do
       raise ArgumentError,
@@ -985,16 +1072,17 @@ defmodule EMLX do
     end
 
     device_ref = EMLX.Backend.from_nx(tensor)
-    {weight_ref, scales_ref, biases_ref} = EMLX.quantize(device_ref, group_size, bits)
+    {weight_ref, scales_ref, biases_ref} = EMLX.quantize(device_ref, group_size, bits, mode)
 
     scales = EMLX.Backend.to_nx(scales_ref)
-    biases = EMLX.Backend.to_nx(biases_ref)
+    biases = biases_ref && EMLX.Backend.to_nx(biases_ref)
 
     config = %EMLX.Quantization.Config{
       scales: scales,
       biases: biases,
       group_size: group_size,
-      bits: bits
+      bits: bits,
+      mode: mode
     }
 
     weight_shape = EMLX.shape(weight_ref)
@@ -1013,7 +1101,8 @@ defmodule EMLX do
 
   @doc """
   Dequantize a quantized `Nx.Tensor` (created by `EMLX.quantize/2`) to a
-  dense float tensor by calling `mx::dequantize`.
+  dense float tensor by calling `mx::dequantize`. Supports every mode
+  `EMLX.quantize/2` accepts (`"affine"` and the microscaled variants).
   """
   @spec dequantize(Nx.Tensor.t()) :: Nx.Tensor.t()
   def dequantize(
@@ -1022,12 +1111,15 @@ defmodule EMLX do
         } = _qw
       )
       when not is_nil(cfg) do
+    biases_ref = cfg.biases && EMLX.Backend.from_nx(cfg.biases)
+
     EMLX.dequantize(
       weight_ref,
       EMLX.Backend.from_nx(cfg.scales),
-      EMLX.Backend.from_nx(cfg.biases),
+      biases_ref,
       cfg.group_size,
-      cfg.bits
+      cfg.bits,
+      cfg.mode
     )
     |> EMLX.Backend.to_nx()
   end
@@ -1053,15 +1145,18 @@ defmodule EMLX do
               "argument; got two quantized tensors. Dequantize one of them first."
     end
 
+    biases_ref = cfg.biases && EMLX.Backend.from_nx(cfg.biases)
+
     result =
       EMLX.quantized_matmul(
         EMLX.Backend.from_nx(activation),
         qw.data.ref,
         EMLX.Backend.from_nx(cfg.scales),
-        EMLX.Backend.from_nx(cfg.biases),
+        biases_ref,
         true,
         cfg.group_size,
-        cfg.bits
+        cfg.bits,
+        cfg.mode
       )
 
     EMLX.Backend.to_nx(result)
