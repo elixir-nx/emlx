@@ -60,6 +60,7 @@ defmodule EMLX.Native.Expr do
   | `:fft2`, `:ifft2` | `[ax0, ax1, n0, n1]` — two axes and two lengths.                |
   | `:iota`   | `[dtype_int, n_dims, axis_int, d0..dn-1]` — dtype, rank, axis (−1=flat), shape dims. No operands. |
   | `:eye`    | `[dtype_int, m, n]` — dtype and the two shape dims. No operands.    |
+  | `:quantized_matmul` | `[group_size, bits, transpose_int, mode_int, has_bias_int]` — see "Quantized dot specialization" below. Operands: `[activation, weight, scales, biases?]` (biases omitted when `has_bias_int` is 0). |
 
   Non-negative axes: the lowerer normalises negative axis values before encoding
   so C++ handlers can use them directly as 0-based indices.
@@ -109,10 +110,32 @@ defmodule EMLX.Native.Expr do
   in one of these would wrongly look cond-branch-local to the top-level
   `top_scope_ids` set (`Nx.Defn.Tree.scope_ids/1`'s `:scope`-mode traversal
   deliberately never walks into a `:fun`/`:while` body — that's the scope
-  boundary). Both helpers extend `top_scope_ids` with a fresh `scope_ids` pass
+  boundary).   Both helpers extend `top_scope_ids` with a fresh `scope_ids` pass
   over just that body before lowering it (`merge_scope_ids/2`) — which still
   correctly excludes any `cond` nested *inside* that body, so a genuinely
   cond-branch-local hook a level deeper still raises.
+
+  ## Quantized dot specialization (Stage 25)
+
+  A quantized `Nx.dot` right-operand is invisible at trace time (Stage 24):
+  the bound tensor's `quantization_config` only exists once a real tensor is
+  materialized, after tracing/lowering has already produced a plain
+  `:parameter` template. `lower/3`'s optional `quant_signature` — a
+  `%{param_position => EMLX.Quantization.Config.t()}` map built at call time
+  from the actually-bound inputs (see `EMLX.build_native_eval_fn/3`) — lets
+  the caller request a *specialized* program: a `:dot` node whose `right`
+  operand is exactly a `:parameter` at a signature position lowers to
+  `:quantized_matmul` instead of plain `:dot`, mirroring
+  `EMLX.Backend.quantized_dot/4`'s runtime dispatch exactly. `scales`/
+  `biases` are not part of the traced `Expr` at all (they're metadata on the
+  bound tensor, not graph nodes) — they become ordinary compile-time
+  `captures`, since a specialized program is itself only built once real
+  values (and hence real scale/bias tensors) are known; `group_size`/`bits`/
+  `transpose`/`mode` ride the int64 iattr channel. A quantized position used
+  as `left` (either operand) raises, matching `EMLX.Backend.dot/7`'s
+  quantized-left-operand raise. A quantized position never reached by a
+  `:dot` node at all (used by some other op) is not specially validated —
+  same gap the eager `EMLX.Backend` path has always had; out of scope here.
   """
 
   import Bitwise
@@ -144,6 +167,16 @@ defmodule EMLX.Native.Expr do
     bfloat16: 10,
     float32: 11,
     complex64: 12
+  }
+
+  # Stable integer encoding for EMLX.Quantization.Config's mode strings, used
+  # in :quantized_matmul iattrs. Must stay in sync with int_to_quant_mode()
+  # in emlx_compiler.cpp.
+  @quant_mode_to_int %{
+    "affine" => 0,
+    "mxfp4" => 1,
+    "mxfp8" => 2,
+    "nvfp4" => 3
   }
 
   @enforce_keys [:inputs, :captures, :constants, :instructions, :outputs]
@@ -188,9 +221,17 @@ defmodule EMLX.Native.Expr do
   op not yet implemented. Single-mode: the compiler seam in
   `EMLX.__compile__/4` does not catch this — it propagates straight to the
   caller. There is no whole-`defn` `Nx.Defn.Evaluator` fallback lane.
+
+  `quant_signature`, when non-empty, requests a specialization for quantized
+  `Nx.dot` operands — see the moduledoc's "Quantized dot specialization"
+  section.
   """
-  @spec lower(Nx.Container.t(), non_neg_integer() | nil) :: t()
-  def lower(output, num_inputs \\ nil) do
+  @spec lower(
+          Nx.Container.t(),
+          non_neg_integer() | nil,
+          %{non_neg_integer() => EMLX.Quantization.Config.t()}
+        ) :: t()
+  def lower(output, num_inputs \\ nil, quant_signature \\ %{}) do
     ordered = EMLX.Defn.Tree.post_order(output)
 
     # inputs is a map of pos → ref during lowering; densified to a list at the end.
@@ -204,7 +245,8 @@ defmodule EMLX.Native.Expr do
       # A hook (`:token`/`:attach_token`) is only lowerable from the shared/
       # parent scope — see the moduledoc's "Hooks" section for why a
       # cond-branch-local hook must raise instead.
-      top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new()
+      top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new(),
+      quant_signature: quant_signature
     }
 
     state = Enum.reduce(ordered, state, &expand_node/2)
@@ -722,9 +764,11 @@ defmodule EMLX.Native.Expr do
 
   # ── dot ─────────────────────────────────────────────────────────────────────
 
-  # dot: args = [left, c_left, b_left, right, c_right, b_right]
-  # Cast both operands to computation_type in Elixir; emit :dot with 4-axis-list
-  # iattrs; cast result to out_type.
+  # dot: args = [left, c_left, b_left, right, c_right, b_right]. A `right`
+  # operand bound to a quantized parameter position (per `state.quant_signature`
+  # — see the moduledoc's "Quantized dot specialization" section) specializes
+  # to `:quantized_matmul`; otherwise cast both operands to computation_type,
+  # emit plain `:dot` with 4-axis-list iattrs, cast result to out_type.
   defp expand_node(
          %T{
            type: out_type,
@@ -736,30 +780,19 @@ defmodule EMLX.Native.Expr do
          },
          state
        ) do
-    left_ref0 = Map.fetch!(state.node_to_ref, left.data.id)
-    right_ref0 = Map.fetch!(state.node_to_ref, right.data.id)
+    if quantized_param_config(left, state.quant_signature) do
+      raise ArgumentError,
+            "does not yet lower op :dot with a quantized left operand. " <>
+              "Dequantize it first with EMLX.dequantize/1."
+    end
 
-    computation_type =
-      if Nx.Type.integer?(out_type), do: Nx.Type.to_floating(out_type), else: out_type
+    case quantized_param_config(right, state.quant_signature) do
+      nil ->
+        expand_plain_dot(id, out_type, left, c_left, right, c_right, b_left, b_right, state)
 
-    {left_ref, state} = emit_cast_if_needed(left_ref0, left.type, computation_type, state)
-    {right_ref, state} = emit_cast_if_needed(right_ref0, right.type, computation_type, state)
-
-    iattrs =
-      [length(c_left) | c_left] ++
-        [length(c_right) | c_right] ++
-        [length(b_left) | b_left] ++
-        [length(b_right) | b_right]
-
-    dot_ref = make_ref()
-
-    state = %{
-      state
-      | instructions: [{dot_ref, :dot, [left_ref, right_ref], iattrs} | state.instructions]
-    }
-
-    {result_ref, state} = emit_cast_if_needed(dot_ref, computation_type, out_type, state)
-    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+      cfg ->
+        expand_quantized_dot(id, out_type, left, c_left, b_left, right, c_right, cfg, state)
+    end
   end
 
   # ── conv ─────────────────────────────────────────────────────────────────────
@@ -1947,6 +1980,118 @@ defmodule EMLX.Native.Expr do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
 
+  # ── dot helpers ────────────────────────────────────────────────────────────
+
+  defp quantized_param_config(
+         %T{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}},
+         quant_signature
+       ),
+       do: Map.get(quant_signature, pos)
+
+  defp quantized_param_config(_node, _quant_signature), do: nil
+
+  defp expand_plain_dot(id, out_type, left, c_left, right, c_right, b_left, b_right, state) do
+    left_ref0 = Map.fetch!(state.node_to_ref, left.data.id)
+    right_ref0 = Map.fetch!(state.node_to_ref, right.data.id)
+
+    computation_type =
+      if Nx.Type.integer?(out_type), do: Nx.Type.to_floating(out_type), else: out_type
+
+    {left_ref, state} = emit_cast_if_needed(left_ref0, left.type, computation_type, state)
+    {right_ref, state} = emit_cast_if_needed(right_ref0, right.type, computation_type, state)
+
+    iattrs =
+      [length(c_left) | c_left] ++
+        [length(c_right) | c_right] ++
+        [length(b_left) | b_left] ++
+        [length(b_right) | b_right]
+
+    dot_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{dot_ref, :dot, [left_ref, right_ref], iattrs} | state.instructions]
+    }
+
+    {result_ref, state} = emit_cast_if_needed(dot_ref, computation_type, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  # Quantized right operand: mirrors EMLX.Backend.quantized_dot/4's runtime
+  # dispatch. `scales`/`biases` become compile-time captures (see the
+  # moduledoc); group_size/bits/transpose/mode ride the iattr channel.
+  defp expand_quantized_dot(
+         id,
+         out_type,
+         left,
+         c_left,
+         b_left,
+         right,
+         c_right,
+         %EMLX.Quantization.Config{} = cfg,
+         state
+       ) do
+    unless b_left == [] do
+      raise ArgumentError,
+            "does not yet lower op :dot with a quantized right operand and batch axes " <>
+              "(mx::quantized_matmul does not support batching)"
+    end
+
+    unless c_left == [tuple_size(left.shape) - 1] do
+      raise ArgumentError,
+            "does not yet lower op :dot with a quantized right operand contracted " <>
+              "on a non-last left axis"
+    end
+
+    unless match?([_], c_right) do
+      raise ArgumentError,
+            "does not yet lower op :dot with a quantized right operand contracted " <>
+              "on more than one axis"
+    end
+
+    last_dim = tuple_size(right.shape) - 1
+
+    transpose =
+      case cfg.transpose do
+        nil -> c_right == [last_dim]
+        explicit -> explicit
+      end
+
+    left_ref = Map.fetch!(state.node_to_ref, left.data.id)
+    right_ref = Map.fetch!(state.node_to_ref, right.data.id)
+
+    {scales_ref, state} = emit_capture(cfg.scales, state)
+
+    {operands, has_bias, state} =
+      if cfg.biases do
+        {biases_ref, state} = emit_capture(cfg.biases, state)
+        {[left_ref, right_ref, scales_ref, biases_ref], 1, state}
+      else
+        {[left_ref, right_ref, scales_ref], 0, state}
+      end
+
+    mode_int = Map.fetch!(@quant_mode_to_int, cfg.mode)
+    transpose_int = if transpose, do: 1, else: 0
+    iattrs = [cfg.group_size, cfg.bits, transpose_int, mode_int, has_bias]
+
+    qmm_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{qmm_ref, :quantized_matmul, operands, iattrs} | state.instructions]
+    }
+
+    # mx::quantized_matmul returns the activation's dtype (matching the eager
+    # EMLX.Backend.quantized_dot path); cast to out_type if they differ.
+    {result_ref, state} = emit_cast_if_needed(qmm_ref, left.type, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
+  defp emit_capture(%Nx.Tensor{} = tensor, state) do
+    ref = make_ref()
+    {ref, %{state | captures: [{ref, tensor} | state.captures]}}
+  end
+
   # ── indexing helpers ──────────────────────────────────────────────────────
 
   # Shared lowering for indexed_add / indexed_put.
@@ -2386,12 +2531,26 @@ defmodule EMLX.Native.Expr do
   # (`rope_with_positions_callback` / `rope_with_freqs_callback`, T>1) route to
   # an in-graph cos/sin/rotate primitive composition instead (Stage 15 Part B —
   # `mlx::fast::rope`'s offset can't express arbitrary per-token positions).
+  @doc """
+  True when `fun` (a `:runtime_call` node's callback capture) is a recognized
+  `EMLX.Fast.*` fused kernel this compiler can lower in-graph. Used both by
+  `fast_kernel_dispatch/2` below and by `EMLX.`'s while-style graph-splitting
+  for every other `:runtime_call` (see `emlx.ex`'s "Quantization dot
+  specialization"-adjacent `build_eval_fn/4` routing) — an *unrecognized*
+  `:runtime_call` becomes a host-executed split-stage instead of a lowering
+  error.
+  """
+  @spec recognized_runtime_call?((term(), term() -> term())) :: boolean()
+  def recognized_runtime_call?(fun) when is_function(fun, 2) do
+    Function.info(fun)[:module] == EMLX.Fast
+  end
+
   defp fast_kernel_dispatch(fun, opts) when is_function(fun, 2) do
     info = Function.info(fun)
     module = info[:module]
     name = info[:name]
 
-    unless module == EMLX.Fast do
+    unless recognized_runtime_call?(fun) do
       raise ArgumentError,
             "does not yet lower op :runtime_call for #{inspect(module)}.#{name}/2 " <>
               "(only EMLX.Fast.* fused kernels are recognized)"
@@ -2591,6 +2750,18 @@ defmodule EMLX.Native.Expr do
   def int_to_nx_type(10), do: {:bf, 16}
   def int_to_nx_type(11), do: {:f, 32}
   def int_to_nx_type(12), do: {:c, 64}
+
+  @doc """
+  Converts a `:quantized_matmul` mode integer (from `@quant_mode_to_int`)
+  back to its `EMLX.Quantization.Config` mode string. Used by
+  `EMLX.Native.Expr.Interpreter` and `emlx_compiler.cpp`'s
+  `int_to_quant_mode` (keep both in sync).
+  """
+  @spec int_to_quant_mode(integer()) :: String.t()
+  def int_to_quant_mode(0), do: "affine"
+  def int_to_quant_mode(1), do: "mxfp4"
+  def int_to_quant_mode(2), do: "mxfp8"
+  def int_to_quant_mode(3), do: "nvfp4"
 
   # ── wire serialisation ────────────────────────────────────────────────────
 
@@ -2880,6 +3051,31 @@ defmodule EMLX.Native.Expr.Interpreter do
     bb = attrs
     # inputs already cast to computation_type; Nx.dot does its own type promotion
     Nx.dot(left, ca, ba, right, cb, bb)
+  end
+
+  # quantized_matmul — iattrs = [group_size, bits, transpose_int, mode_int, has_bias_int]
+  # operands = [activation, weight, scales, biases?]. Mirrors
+  # EMLX.Backend.quantized_dot/4's runtime dispatch (Stage 25).
+  defp dispatch(:quantized_matmul, operands, [group_size, bits, transpose_int, mode_int, has_bias]) do
+    {activation, weight, scales, biases} =
+      case {has_bias, operands} do
+        {1, [a, w, s, b]} -> {a, w, s, b}
+        {0, [a, w, s]} -> {a, w, s, nil}
+      end
+
+    biases_ref = biases && biases.data.ref
+
+    EMLX.quantized_matmul(
+      activation.data.ref,
+      weight.data.ref,
+      scales.data.ref,
+      biases_ref,
+      transpose_int != 0,
+      group_size,
+      bits,
+      Expr.int_to_quant_mode(mode_int)
+    )
+    |> EMLX.Backend.to_nx()
   end
 
   # conv_general — calls EMLX directly since there is no Nx public API for

@@ -165,3 +165,65 @@ hermetic in `Graph.split` (dedicated `eval_while`/`eval_cond`/`eval_fun` travers
 of a `cond` branch and sub-scope parameter indices never leak into the parent
 scope). Bug 2 (runtime_call operands) was one surface symptom of that missing
 hermeticity. This report is retained as the historical root-cause analysis.
+
+---
+
+## Bug 4 — `split_before`/`split_both` mis-hoist a `runtime_call`'s
+`Nx.TemplateBackend`-backed `out_template` as a stage-boundary parameter
+
+**Found via:** [`31-runtime-call-split-points`](31-runtime-call-split-points.md)
+— routing an *unrecognized* `runtime_call` (`EMLXAxon.native_kv_attn_callback/2`,
+`EMLX.Quantization.dequantize/1`) as a `while`-style graph-split point.
+
+### Symptom
+`Nx.Defn.Graph.split/2` over a graph containing a `runtime_call` whose sole
+operand is a bare parameter (no intermediate computation feeding it — e.g.
+`dequantize(qw)`) raises `FunctionClauseError` on `Expr.parameter/2`, or
+produces a malformed stage that later crashes `Graph.run/3` with `KeyError`
+/ `BadMapError`.
+
+### Root cause
+`split_before/3` and `split_both/3` both scan a node's `args` for
+`%Nx.Tensor{}` values to decide what to hoist as a stage-boundary parameter,
+matching the bare struct: `%T{} = expr`. A `runtime_call`'s `args` are
+`[tensor_expr, callback, out_template, opts]` — `out_template` (built via
+`Nx.template/2`) is *also* a `%Nx.Tensor{}`, but backed by
+`Nx.TemplateBackend`, not `Nx.Defn.Expr`. The generic scan can't distinguish
+it from a real graph node, so it gets fed to `Expr.parameter/2` (which
+requires `data: %Nx.Defn.Expr{}`) and blows up.
+
+### Minimal repro
+```elixir
+# A runtime_call whose operand is a bare parameter — no intermediate
+# computation, so out_template is the *only* %Nx.Tensor{} `split_before`/
+# `split_both` see in `args` besides the parameter itself.
+defn dequant_only(qw), do: EMLX.Quantization.dequantize(qw)
+# Nx.Defn.Graph.split(traced_expr, &split_on_runtime_call/1) raises inside
+# Expr.parameter/2.
+```
+
+### Fix
+Narrow the guard from `%T{} = expr` to `%T{data: %Expr{}} = expr` in both
+`split_before/3` (~line 506) and `split_both/3`'s mirrored
+`has_intermediate_computations` scan (~line 699):
+
+```elixir
+# A bare, non-Expr-backed %Nx.Tensor{} (e.g. a `Nx.template/2` value riding
+# in an op's args, as `:runtime_call`'s `out_template` does) is not a real
+# graph node to hoist as a stage-boundary parameter -- `Expr.parameter/2`
+# requires `data: %Expr{}` and would raise otherwise. Leave it untouched,
+# like any other non-tensor arg.
+%T{data: %Expr{}} = expr, {tensor_args, out_position, state} ->
+  arg = Expr.parameter(expr, map_size(state.args))
+  ...
+
+non_tensor_arg, acc ->
+  {non_tensor_arg, acc}
+```
+
+### Status — fixed locally, not yet upstreamed
+Applied to all three vendored copies of `nx/lib/nx/defn/graph.ex`:
+`~/coding/nx/nx` (canonical fork), `emlx/deps/nx/nx`, `emlx_axon/deps/nx/nx`.
+Unlike bugs 1–3, this one has not yet been pushed upstream as its own PR/
+commit — tracked here so it isn't lost if the vendored checkouts are ever
+refreshed from upstream.

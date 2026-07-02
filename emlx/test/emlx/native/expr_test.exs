@@ -29,6 +29,44 @@ defmodule EMLX.Native.ExprTest do
   defn cmp_mixed(a, b), do: Nx.greater(a, b)
   defn mixed_add(a, b), do: Nx.add(a, b)
 
+  # Stage 25 helper: two independently-quantized weights, each consumed by
+  # its own Nx.dot -- exercises multiple :quantized_matmul specializations
+  # in a single compiled program.
+  defn two_quantized_dots(x, w1, w2) do
+    Nx.concatenate([Nx.dot(x, w1), Nx.dot(x, w2)], axis: 1)
+  end
+
+  # Stage 31 helpers: an unrecognized `:runtime_call` (EMLX.Quantization's
+  # dequantize/quantized_matmul, not an EMLX.Fast.* fused kernel) surrounded
+  # by ordinary ops -- exercises graph-split routing analogous to `while`.
+  defn dequant_surrounded(x, qw) do
+    dense = EMLX.Quantization.dequantize(qw)
+    Nx.add(x, dense) |> Nx.multiply(2.0)
+  end
+
+  defn dequant_only(qw), do: EMLX.Quantization.dequantize(qw)
+
+  defn two_runtime_calls(x, qw1, qw2) do
+    Nx.add(EMLX.Quantization.dequantize(qw1), EMLX.Quantization.dequantize(qw2)) |> Nx.add(x)
+  end
+
+  defn runtime_call_inside_while(x0, n, qw) do
+    {result, _, _, _} =
+      while {acc = x0, i = 0, n, qw}, Nx.less(i, n) do
+        {Nx.add(acc, EMLX.Quantization.dequantize(qw)), i + 1, n, qw}
+      end
+
+    result
+  end
+
+  # Stage 31 helper: EMLX.Quantization.quantized_matmul/2's runtime_call
+  # operand is a *tuple* of two tensors (`{activation, qw}`), unlike
+  # dequantize's single bare tensor above -- exercises the multi-operand
+  # container path through split_before/split_both's arg-hoisting.
+  defn quantized_matmul_surrounded(x, qw) do
+    EMLX.Quantization.quantized_matmul(x, qw) |> Nx.add(1.0) |> Nx.multiply(2.0)
+  end
+
   # Stage 03 helpers for interpreter↔C++ parity tests.
   defn reshape_23(x), do: Nx.reshape(x, {2, 3})
   defn broadcast_23(x), do: Nx.broadcast(x, {2, 3})
@@ -3842,29 +3880,15 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  describe "Stage 24 — quantized Nx.dot input is a documented, permanent hard-raise (no fix yet)" do
+  describe "Stage 24 — quantized Nx.dot input (root-caused; full fix in Stage 25)" do
     # See workdir/native-compiler/24-quantized-dot-compiler-gap.md. A quantized
     # weight's Nx-visible shape/type deliberately mirror its logical dense
     # shape so eager `Nx.dot` can transparently reroute to
     # `EMLX.quantized_matmul` inside `EMLX.Backend.dot/7` -- invisible to a
     # compile-once/replay-many compiler, since only a plain `:parameter`
-    # template exists at lowering time. This pins the pre-flight
-    # `ArgumentError` (clear message) in place of the opaque NIF
-    # `[tensordot] a and b must have the same shape on the contracted axes`
-    # crash the missing check used to let through.
-    @tag :stage24
-    test "a quantized weight bound to a native-compiled defn raises a clear ArgumentError" do
-      weight =
-        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
-
-      qw = EMLX.quantize(weight, [])
-      x = Nx.iota({4, 128}, type: :f32) |> Nx.backend_transfer(EMLX.Backend)
-
-      assert_raise ArgumentError, ~r/does not support a quantized input tensor/, fn ->
-        Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(x, qw)
-      end
-    end
-
+    # template exists at lowering time. Stage 25 closes the gap via call-time
+    # program specialization (see the "Stage 25" describe block below); this
+    # block keeps the cross-check that the Evaluator path was never the bug.
     test "the same defn runs correctly under Nx.Defn.Evaluator (not a model/graph bug)" do
       weight =
         Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
@@ -3874,6 +3898,227 @@ defmodule EMLX.Native.ExprTest do
 
       result = Nx.Defn.jit(&Nx.dot/2, compiler: Nx.Defn.Evaluator).(x, qw)
       assert Nx.shape(result) == {4, 64}
+    end
+  end
+
+  describe "Stage 25 — full fix: quantized Nx.dot via call-time program specialization" do
+    # See workdir/native-compiler/25-quantized-dot-full-fix.md. A quantized
+    # right-operand `Nx.dot` now specializes to a `:quantized_matmul` opcode
+    # once real (call-time) tensors reveal the quantization signature —
+    # equivalence-tested against eager EMLX.Backend.dot/7 and
+    # Nx.Defn.Evaluator, both used as independent oracles.
+    @tag :stage25
+    test "a quantized weight bound to a native-compiled defn now runs end-to-end" do
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x = Nx.iota({4, 128}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(x, qw)
+      eager = EMLX.Backend.dot(Nx.template({4, 64}, native.type), x, [1], [], qw, [0], [])
+
+      assert Nx.shape(native) == {4, 64}
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage25
+    test "repeated calls with the same quantized weight reuse the cached specialized program" do
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x1 = Nx.iota({4, 128}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+      x2 = Nx.iota({4, 128}, type: :f32) |> Nx.divide(11) |> Nx.backend_transfer(EMLX.Backend)
+
+      jitted = Nx.Defn.jit(&Nx.dot/2, compiler: EMLX)
+      r1 = jitted.(x1, qw)
+      r2 = jitted.(x2, qw)
+
+      eager1 = EMLX.Backend.dot(Nx.template({4, 64}, r1.type), x1, [1], [], qw, [0], [])
+      eager2 = EMLX.Backend.dot(Nx.template({4, 64}, r2.type), x2, [1], [], qw, [0], [])
+
+      assert_all_close(r1, eager1)
+      assert_all_close(r2, eager2)
+    end
+
+    @tag :stage25
+    test "a defn with two independently-quantized weights specializes both dots" do
+      w1 =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      w2 =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(50) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw1 = EMLX.quantize(w1, [])
+      qw2 = EMLX.quantize(w2, [])
+      x = Nx.iota({4, 128}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&two_quantized_dots/3, compiler: EMLX).(x, qw1, qw2)
+
+      eager1 = EMLX.Backend.dot(Nx.template({4, 64}, native.type), x, [1], [], qw1, [0], [])
+      eager2 = EMLX.Backend.dot(Nx.template({4, 64}, native.type), x, [1], [], qw2, [0], [])
+      expected = Nx.concatenate([eager1, eager2], axis: 1)
+
+      assert_all_close(native, expected)
+    end
+
+    @tag :stage25
+    test "a microscaled-quantized weight (no biases) specializes correctly" do
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, mode: "mxfp4", group_size: 32)
+      refute qw.data.quantization_config.biases
+
+      x = Nx.iota({4, 128}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(x, qw)
+      eager = EMLX.Backend.dot(Nx.template({4, 64}, native.type), x, [1], [], qw, [0], [])
+
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage25
+    test "a quantized weight threaded through unchanged (pass-through output) round-trips" do
+      # Mirrors the shape a `while`-split stage boundary produces: a
+      # loop-invariant quantized weight carried through without being
+      # consumed by any op in *this* stage — its output leaf is a bare
+      # :parameter node. See build_native_eval_fn/5's output_param_positions.
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x = Nx.iota({4, 128}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+
+      passthrough_and_dot = fn x, qw -> {qw, Nx.dot(x, qw)} end
+
+      {qw_out, native} = Nx.Defn.jit(passthrough_and_dot, compiler: EMLX).(x, qw)
+      eager = EMLX.Backend.dot(Nx.template({4, 64}, native.type), x, [1], [], qw, [0], [])
+
+      assert Nx.shape(qw_out) == Nx.shape(qw)
+      assert qw_out.data.quantization_config
+      assert_all_close(EMLX.dequantize(qw_out), EMLX.dequantize(qw))
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage25
+    test "a quantized left operand still raises a clear ArgumentError (matches EMLX.Backend.dot/7)" do
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      y = Nx.iota({64, 4}, type: :f32) |> Nx.backend_transfer(EMLX.Backend)
+
+      assert_raise ArgumentError, ~r/does not yet lower op :dot with a quantized left operand/, fn ->
+        Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(qw, y)
+      end
+    end
+  end
+
+  describe "Stage 31 — unrecognized :runtime_call as a graph-split point (like while)" do
+    # See workdir/native-compiler/31-runtime-call-graph-split.md. An
+    # unrecognized :runtime_call (e.g. EMLX.Quantization.dequantize's
+    # callback, not an EMLX.Fast.* fused kernel) previously hard-raised
+    # "does not yet lower op :runtime_call". It now becomes a
+    # Nx.Defn.Graph.split point exactly like `while`: the callback runs once,
+    # directly, with real materialised tensors, so ordinary surrounding
+    # `compiler: EMLX` computation still compiles to flat native programs.
+    @tag :stage31
+    test "a bare tail runtime_call (no surrounding work) runs directly" do
+      weight =
+        Nx.iota({4, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+
+      native = Nx.Defn.jit(&dequant_only/1, compiler: EMLX).(qw)
+      eager = EMLX.dequantize(qw)
+
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage31
+    test "a runtime_call surrounded by ordinary ops splits into a native/host/native chain" do
+      weight =
+        Nx.iota({4, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x = Nx.iota({4, 64}, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw)
+      eager = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw)
+
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage31
+    test "two independent runtime_calls in one defn both split correctly" do
+      w1 = Nx.iota({4, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      w2 = Nx.iota({4, 64}, type: :f32) |> Nx.divide(5) |> Nx.backend_transfer(EMLX.Backend)
+      qw1 = EMLX.quantize(w1, [])
+      qw2 = EMLX.quantize(w2, [])
+      x = Nx.iota({4, 64}, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&two_runtime_calls/3, compiler: EMLX).(x, qw1, qw2)
+      eager = Nx.Defn.jit(&two_runtime_calls/3, compiler: Nx.Defn.Evaluator).(x, qw1, qw2)
+
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage31
+    test "a runtime_call inside a while body re-enters the compiler correctly" do
+      weight =
+        Nx.iota({2, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x0 = Nx.broadcast(Nx.tensor(0.0, type: :f32, backend: EMLX.Backend), {2, 64})
+      n = Nx.tensor(3, type: :s32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&runtime_call_inside_while/3, compiler: EMLX).(x0, n, qw)
+      eager = Nx.Defn.jit(&runtime_call_inside_while/3, compiler: Nx.Defn.Evaluator).(x0, n, qw)
+
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage31
+    test "a runtime_call with a tuple (multi-tensor) operand container splits correctly" do
+      # Unlike dequantize's single bare-tensor operand, quantized_matmul's
+      # runtime_call operand is a tuple {activation, qw} -- the same
+      # multi-tensor-container shape as the real target use case
+      # (EMLXAxon.native_kv_attn_callback/2), which no other :stage31 test
+      # exercises.
+      w = Nx.iota({4, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      qw = EMLX.quantize(w, [])
+      x = Nx.iota({2, 64}, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
+
+      native = Nx.Defn.jit(&quantized_matmul_surrounded/2, compiler: EMLX).(x, qw)
+      eager = Nx.Defn.jit(&quantized_matmul_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw)
+
+      assert_all_close(native, eager)
+    end
+
+    @tag :stage31
+    test "a recognized EMLX.Fast.* runtime_call is still lowered in-graph, not split" do
+      # Regression guard: split_point?/1 must not treat every :runtime_call as
+      # a split point, only unrecognized ones -- otherwise every EMLX.Fast.*
+      # fused kernel (rms_norm, sdpa, rope, ...) would silently lose its
+      # single-NIF-replay fusion. A numeric assert_all_close alone can't catch
+      # that regression (Nx.Defn.Graph.split/run is numerically transparent),
+      # so assert the structural IR shape directly, mirroring the Stage 10
+      # "rms_norm runtime_call lowers to a single :fast_rms_norm instruction"
+      # test: a single fused opcode, no host round-trip.
+      fun = fn x, w -> EMLX.Fast.rms_norm(x, w, 1.0e-6) end
+      expr = Nx.Defn.debug_expr_apply(fun, [Nx.template({2, 4}, :f32), Nx.template({4}, :f32)])
+      prog = Expr.lower(expr)
+
+      assert [{_, :fast_rms_norm, [_x, _w], [_eps_bits]}] = prog.instructions
+
+      x = Nx.iota({2, 4}, type: :f32, backend: EMLX.Backend)
+      w = Nx.broadcast(Nx.tensor(1.0, type: :f32, backend: EMLX.Backend), {4})
+      native = Nx.Defn.jit(fun, compiler: EMLX).(x, w)
+      eager = fun.(x, w)
+
+      assert_all_close(native, eager)
     end
   end
 

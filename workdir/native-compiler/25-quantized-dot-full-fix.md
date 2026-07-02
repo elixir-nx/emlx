@@ -1,6 +1,6 @@
 # Stage 25 — full fix: quantized `Nx.dot` under `compiler: EMLX`
 
-Status: not started. Follow-on to
+Status: done. Follow-on to
 [`24-quantized-dot-compiler-gap`](24-quantized-dot-compiler-gap.md)'s interim
 raise; implements that stage's "Deferred: the full fix" section. Numbered 25
 (inserted into the burndown ahead of the then-Stage-25
@@ -115,4 +115,76 @@ program specialization.**
 
 ## Results
 
-_(fill in when tackled)_
+**Status: done.**
+
+Implemented call-time program specialization exactly per the Procedure:
+
+1. **Quantization-signature detection** — `EMLX.quant_signature/1` (`emlx/lib/emlx.ex`)
+   inspects each bound input's `quantization_config` at call time (inside
+   `build_native_eval_fn`'s closure, where real tensors are already
+   materialised) and derives a `%{param_position => Config.t()}` map.
+2. **Specialized program cache** — `EMLX.get_or_compile_program/6` (`emlx.ex`),
+   backed by a per-closure ETS table keyed by `quant_signature`, pre-seeded
+   with the plain (no-quantization) program so the common case never
+   re-lowers. First-compile-wins under races via `:ets.insert_new/2`.
+3. **New C++ opcode** — `quantized_matmul` added to `emlx_compiler.cpp`'s
+   `op_registry`, wrapping `mlx::core::quantized_matmul` with
+   `iattrs = [group_size, bits, transpose, mode, has_bias]`.
+4. **IR support** — `EMLX.Native.Expr.lower/3` gained an optional
+   `quant_signature` parameter; `:dot` dispatches to `expand_plain_dot/8`
+   (unchanged behavior) or `expand_quantized_dot/9` (new), which emits
+   `:quantized_matmul` with `scales`/`biases` threaded as compile-time
+   captures. A quantized left operand still raises the Stage 24
+   `ArgumentError` unchanged.
+5. **Output pass-through fix (found during validation, not in the original
+   procedure)** — a quantized weight's Nx-visible shape/type is a logical
+   fiction that only matches its `EMLX.Backend` physical (packed) ref by
+   coincidence for non-quantized tensors. `validate_qwen3.exs`'s `bb base`
+   path exposed a real gap: Bumblebee's greedy-decode `while` loop threads
+   quantized weights through as loop-invariant carries across
+   `Nx.Defn.Graph.split/2` stage boundaries — a stage whose output leaf is a
+   bare, untouched pass-through of such a parameter (never consumed by a
+   `:dot` in that stage) broke `EMLX.Backend.to_nx/2`'s shape check (logical
+   template shape vs. physical packed array shape). Fixed by tracking
+   `output_param_positions` (static, from `output_expr`'s structure) in
+   `build_native_eval_fn/5` and substituting back the original bound tensor
+   (with its `quantization_config` intact) for any output leaf that is both
+   a bare parameter pass-through and quantized. Regression-tested in
+   `expr_test.exs` (`"a quantized weight threaded through unchanged
+   (pass-through output) round-trips"`).
+6. **Regression tests** — `emlx/test/emlx/native/expr_test.exs`'s `:stage25`
+   describe block (6 tests): single- and dual-quantized-operand dots, cache
+   reuse across calls, microscaled (no-bias) mode, the pass-through case
+   above, and the retained quantized-left-operand raise. All
+   equivalence-tested against eager `EMLX.Backend.dot/7`.
+
+**Validation against `validate_qwen3.exs`** (local `Qwen3-0.6B-MLX-4bit`,
+`EMLX_QWEN3_MAX_NEW=20 EMLX_QWEN3_BENCH_RUNS=1 EMLX_QWEN3_WARMUP_RUNS=1`):
+
+- `bb base` (stock Bumblebee graph, `compiler: EMLX`, quantized weights, no
+  `EMLXAxon.rewrite/2`) now runs end-to-end — warmup + bench loop completes,
+  producing coherent generated text ("Okay, the user is asking for twenty
+  programming lang...") at 26.1 tok/s. The Stage 24 `ArgumentError` no
+  longer reproduces.
+- `bb+rewrite` (`EMLXAxon.rewrite/2` + quantized weights) still raises
+  clearly and immediately — `does not yet lower op :runtime_call for
+  EMLXAxon.native_kv_attn_callback/2` — confirming the out-of-scope
+  configuration remains explicitly unsupported, not silently
+  mis-specialized.
+
+**Test suites:**
+
+- `emlx`: `mix test` → 280/280 in `expr_test.exs`; full suite
+  2623/2641 passed (1797/1815 tests + 826/826 doctests), 18 failures — all
+  pre-existing `nif_not_loaded` failures for the unrelated `qwen3_fast_*`
+  NIFs, confirmed identical on a clean stash of this stage's diff (not a
+  regression).
+- `emlx_axon`: `mix test` → 30/53 passed, 23 failures — confirmed identical
+  (same count, same tests) with and without this stage's changes; all trace
+  to the same pre-existing `nif_not_loaded` root cause, unrelated to
+  `compiler: EMLX`/`Nx.dot` quantization.
+- Perf sanity: `emlx/bench/while_dispatch_bench.exs` (non-quantized
+  `compiler: EMLX` dot/cos bodies) runs clean with numbers in the same
+  ballpark as prior runs — the added `quant_signature`/ETS-lookup overhead
+  on the non-quantized hot path is a single empty-map computation + one ETS
+  read per call, not observable against dispatch-floor noise.

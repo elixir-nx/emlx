@@ -66,6 +66,17 @@ static inline float attr_to_float(int64_t bits) {
   return static_cast<float>(d);
 }
 
+// Maps the quantization mode integer (from EMLX.Native.Expr.@quant_mode_to_int)
+// to its mx::quantized_matmul mode string.  Must stay in sync with
+// int_to_quant_mode/1 in emlx/lib/emlx/native/expr.ex.
+static std::string int_to_quant_mode(int64_t val) {
+  static const char *table[] = {"affine", "mxfp4", "mxfp8", "nvfp4"};
+  if (val < 0 || val > 3)
+    throw std::runtime_error("int_to_quant_mode: invalid mode int " +
+                             std::to_string(val));
+  return table[static_cast<size_t>(val)];
+}
+
 // ── Prefill-RoPE helper (Stage 15 Part B) ──────────────────────────────────
 //
 // mlx::fast::rope's offset argument is either a scalar or one starting
@@ -802,6 +813,28 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        std::string spec = std::string(ll.begin(), ll.end()) + "," +
                           std::string(rl.begin(), rl.end()) + "->" + output;
        return mlx::core::einsum(spec, {ops[0], ops[1]});
+     }},
+
+    // ── quantized_matmul (Stage 25) ──────────────────────────────────────────
+    //
+    // iattrs = [group_size, bits, transpose_int, mode_int, has_bias_int]
+    // Operands: [activation, weight, scales, biases?] — biases present only
+    // when has_bias_int is 1 (mirrors EMLX.Backend.quantized_dot/4: absent
+    // for microscaled modes, since mx::fp_quantize doesn't emit biases).
+    // Emitted only by a call-time-specialized program (see
+    // EMLX.Native.Expr's "Quantized dot specialization" moduledoc section);
+    // `weight` is the untouched physical (packed) parameter ref.
+    {"quantized_matmul",
+     [](const auto &ops, const auto &attrs) {
+       int group_size = static_cast<int>(attrs[0]);
+       int bits = static_cast<int>(attrs[1]);
+       bool transpose = attrs[2] != 0;
+       std::string mode = int_to_quant_mode(attrs[3]);
+       bool has_bias = attrs[4] != 0;
+       std::optional<mlx::core::array> biases_opt =
+           has_bias ? std::make_optional(ops[3]) : std::nullopt;
+       return mlx::core::quantized_matmul(ops[0], ops[1], ops[2], biases_opt,
+                                          transpose, group_size, bits, mode);
      }},
 
     // ── indexing / selection ─────────────────────────────────────────────────
