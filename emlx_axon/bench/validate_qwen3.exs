@@ -18,6 +18,9 @@
 #   EMLX_QWEN3_WARMUP_RUNS         — number of warmup runs before timing (default: 2)
 #   EMLX_QWEN3_SEQUENCE_LENGTH     — sequence_length for Bumblebee compile (default: 1024)
 #   EMLX_QWEN3_NATIVE_PROFILE_TIMING — set to "0" to disable per-token monotonic_time in native decode (default: on)
+#   EMLX_QWEN3_SKIP_BB_REWRITE     — set to "1" to skip the Bumblebee+EMLXAxon.rewrite path
+#                                    entirely (no rewrite/compile/warmup/bench), leaving only
+#                                    "bb base" vs "native" in the comparison (default: off)
 
 Nx.default_backend({EMLX.Backend, device: :gpu})
 
@@ -39,6 +42,7 @@ warmup_runs  = String.to_integer(System.get_env("EMLX_QWEN3_WARMUP_RUNS",     "2
 seq_len      = String.to_integer(System.get_env("EMLX_QWEN3_SEQUENCE_LENGTH", "1024"))
 
 native_profile_timing? = System.get_env("EMLX_QWEN3_NATIVE_PROFILE_TIMING") != "0"
+skip_bb_rewrite?       = System.get_env("EMLX_QWEN3_SKIP_BB_REWRITE") == "1"
 
 # Qwen3 instruct chat template — long enough that EOS won't hit within max_new tokens.
 prompt =
@@ -86,12 +90,6 @@ generation_config = Bumblebee.configure(generation_config,
 
 model_base = model_info.model
 
-IO.puts("==> Applying EMLXAxon.rewrite/2 (all rewrites — best performing path) ...")
-t3 = System.monotonic_time(:millisecond)
-model_rewritten = EMLXAxon.rewrite(model_base)
-t4 = System.monotonic_time(:millisecond)
-IO.puts("    rewrite done in #{t4 - t3} ms")
-
 # ── Build serving ─────────────────────────────────────────────────────────────
 
 IO.puts("==> Building Bumblebee.Text.generation serving (base — no rewrite) ...")
@@ -104,15 +102,26 @@ serving_base =
     defn_options: [compiler: EMLX]
   )
 
-IO.puts("==> Building Bumblebee.Text.generation serving (rewritten) ...")
 serving_rewrite =
-  Bumblebee.Text.generation(
-    %{model_info | model: model_rewritten},
-    tokenizer,
-    generation_config,
-    compile: [batch_size: 1, sequence_length: seq_len],
-    defn_options: [compiler: EMLX]
-  )
+  if skip_bb_rewrite? do
+    IO.puts("==> Skipping EMLXAxon.rewrite/2 (EMLX_QWEN3_SKIP_BB_REWRITE=1) ...")
+    nil
+  else
+    IO.puts("==> Applying EMLXAxon.rewrite/2 (all rewrites — best performing path) ...")
+    t3 = System.monotonic_time(:millisecond)
+    model_rewritten = EMLXAxon.rewrite(model_base)
+    t4 = System.monotonic_time(:millisecond)
+    IO.puts("    rewrite done in #{t4 - t3} ms")
+
+    IO.puts("==> Building Bumblebee.Text.generation serving (rewritten) ...")
+    Bumblebee.Text.generation(
+      %{model_info | model: model_rewritten},
+      tokenizer,
+      generation_config,
+      compile: [batch_size: 1, sequence_length: seq_len],
+      defn_options: [compiler: EMLX]
+    )
+  end
 
 # ── Benchmark helpers ─────────────────────────────────────────────────────────
 
@@ -170,8 +179,11 @@ end
 Bench.warmup("bb base", serving_base, prompt, bb_extract, warmup_runs)
 base_bb_results = Bench.bench("bb base", serving_base, prompt, bb_extract, bench_runs)
 
-# Bench.warmup("bb+rewrite", serving_rewrite, prompt, bb_extract, warmup_runs)
-# bb_results = Bench.bench("bb+rewrite", serving_rewrite, prompt, bb_extract, bench_runs)
+bb_results =
+  unless skip_bb_rewrite? do
+    Bench.warmup("bb+rewrite", serving_rewrite, prompt, bb_extract, warmup_runs)
+    Bench.bench("bb+rewrite", serving_rewrite, prompt, bb_extract, bench_runs)
+  end
 
 # ── Native TextGeneration path ────────────────────────────────────────────────
 
@@ -212,26 +224,32 @@ IO.puts("""
 """)
 
 base_stats   = Bench.stats("bb base    (Bumblebee, no rewrite)           ", base_bb_results)
-bb_stats     = Bench.stats("bb+rewrite (Bumblebee + EMLXAxon.rewrite)   ", bb_results)
+bb_stats     = if bb_results, do: Bench.stats("bb+rewrite (Bumblebee + EMLXAxon.rewrite)   ", bb_results)
 native_stats = Bench.stats("native     (EMLXAxon.TextGeneration)      ", native_results)
-
-rewrite_vs_base =
-  if base_stats.median > 0,
-    do: Float.round(bb_stats.median / base_stats.median, 2),
-    else: :n_a
 
 native_vs_base =
   if base_stats.median > 0,
     do: Float.round(native_stats.median / base_stats.median, 2),
     else: :n_a
 
-native_vs_rewrite =
-  if bb_stats.median > 0,
-    do: Float.round(native_stats.median / bb_stats.median, 2),
-    else: :n_a
+if bb_stats do
+  rewrite_vs_base =
+    if base_stats.median > 0,
+      do: Float.round(bb_stats.median / base_stats.median, 2),
+      else: :n_a
 
-IO.puts("""
-  bb+rewrite / bb base:  #{rewrite_vs_base}×
-  native / bb base:      #{native_vs_base}×
-  native / bb+rewrite:   #{native_vs_rewrite}×
-""")
+  native_vs_rewrite =
+    if bb_stats.median > 0,
+      do: Float.round(native_stats.median / bb_stats.median, 2),
+      else: :n_a
+
+  IO.puts("""
+    bb+rewrite / bb base:  #{rewrite_vs_base}×
+    native / bb base:      #{native_vs_base}×
+    native / bb+rewrite:   #{native_vs_rewrite}×
+  """)
+else
+  IO.puts("""
+    native / bb base:      #{native_vs_base}×
+  """)
+end

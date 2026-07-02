@@ -20,26 +20,30 @@ defmodule EMLX.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       docs: docs(),
-      # elixir_make
-      make_env: %{
-        "MLX_DIR" => libmlx_config.dir,
-        "MLX_VERSION" => libmlx_config.version,
-        "MLX_BUILD" => to_string(libmlx_config.features.build?),
-        "MLX_INCLUDE_DIR" =>
-          Path.join(
-            libmlx_config.dir,
-            if(libmlx_config.features.build?, do: "usr/include", else: "include")
-          ),
-        "MLX_LIB_DIR" =>
-          Path.join(
-            libmlx_config.dir,
-            if(libmlx_config.features.build?, do: "usr/lib", else: "lib")
-          ),
-        "MLX_VARIANT" => libmlx_config.variant,
-        "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
-        "EMLX_VERSION" => @version,
-        "LIBMLX_ENABLE_DEBUG" => to_string(libmlx_config.features.debug?)
-      },
+      # elixir_make — a function ref so Fine.include_dir/0 (needs the :fine
+      # dep compiled) isn't called while this project/0 map is being built.
+      make_env: fn ->
+        %{
+          "MLX_DIR" => libmlx_config.dir,
+          "MLX_VERSION" => libmlx_config.version,
+          "MLX_BUILD" => to_string(libmlx_config.features.build?),
+          "MLX_INCLUDE_DIR" =>
+            Path.join(
+              libmlx_config.dir,
+              if(libmlx_config.features.build?, do: "usr/include", else: "include")
+            ),
+          "MLX_LIB_DIR" =>
+            Path.join(
+              libmlx_config.dir,
+              if(libmlx_config.features.build?, do: "usr/lib", else: "lib")
+            ),
+          "MLX_VARIANT" => libmlx_config.variant,
+          "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
+          "EMLX_VERSION" => @version,
+          "LIBMLX_ENABLE_DEBUG" => to_string(libmlx_config.features.debug?),
+          "FINE_INCLUDE_DIR" => Fine.include_dir()
+        }
+      end,
 
       # Compilers
       compilers: compilers(libmlx_config),
@@ -65,6 +69,7 @@ defmodule EMLX.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
+      {:fine, "~> 0.1", runtime: false},
       {:nx, github: "elixir-nx/nx", branch: "main", sparse: "nx"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :docs}

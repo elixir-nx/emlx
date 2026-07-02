@@ -20,8 +20,8 @@ MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
 
 $(info LIBMLX_ENABLE_DEBUG=$(LIBMLX_ENABLE_DEBUG))
 # Build flags
-CFLAGS = -fPIC -I$(call esc,$(ERTS_INCLUDE_DIR)) -I$(call esc,$(MLX_INCLUDE_DIR)) -Wall \
-         -std=c++20
+CFLAGS = -fPIC -I$(call esc,$(ERTS_INCLUDE_DIR)) -I$(call esc,$(MLX_INCLUDE_DIR)) \
+         -I$(call esc,$(FINE_INCLUDE_DIR)) -Wall -std=c++20
 ifeq ($(LIBMLX_ENABLE_DEBUG),true)
 		CFLAGS += -g
 		CMAKE_BUILD_TYPE = Debug

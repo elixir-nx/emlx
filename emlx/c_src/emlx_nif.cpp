@@ -1,5 +1,6 @@
 #include "emlx_compiler.hpp"
 #include "emlx_nif_shared.hpp"
+#include "emlx_fast/qwen3.hpp"
 
 #include <iostream>
 #include <map>
@@ -2003,6 +2004,18 @@ static ErlNifFunc nif_funcs[] = {
 
     // ── Native compiler NIFs.
     {"compile_program", 9, compile_program_async},
-    {"eval_program", 3, eval_program_async}};
+    {"eval_program", 3, eval_program_async},
+
+    // ── Qwen3 model accelerators (emlx_fast/qwen3.cpp).
+    {"qwen3_kv_cache_attention", 11, qwen3_kv_cache_attention_async},
+    {"qwen3_mlp", 8, qwen3_mlp_async},
+    {"qwen3_layer", 21, qwen3_layer_async},
+    {"qwen3_forward_greedy_ids", 13, qwen3_forward_greedy_ids_async},
+    {"qwen3_forward_greedy_ids_chunk", 14, qwen3_forward_greedy_ids_chunk_async},
+    {"qwen3_forward_greedy_ids_token_id", 13, qwen3_forward_greedy_ids_token_id_async},
+    {"qwen3_forward_greedy_token_id", 13, qwen3_forward_greedy_token_id_async},
+    {"qwen3_final_greedy", 6, qwen3_final_greedy_async},
+    {"qwen3_attention_residual", 5, qwen3_attention_residual_async},
+    {"qwen3_attention_block", 17, qwen3_attention_block_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
