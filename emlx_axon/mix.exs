@@ -24,7 +24,6 @@ defmodule EMLXAxon.MixProject do
 
   defp deps do
     [
-
       {:emlx, path: "../emlx"},
       {:nx, github: "elixir-nx/nx", branch: "main", sparse: "nx", override: true},
       {:axon, "~> 0.7"},

@@ -84,10 +84,18 @@ defmodule EMLXAxon.Qwen3QuantizedTest do
     input_ids = tokenize(tok, "Hello")
 
     {_tokens_g, %{timing: t_greedy}} =
-      Generate.generate(input_ids, state, max_new_tokens: 10, sampler: :greedy)
+      Generate.generate(input_ids, state,
+        max_new_tokens: 10,
+        sampler: :greedy,
+        profile_timing: true
+      )
 
     {_tokens_c, %{timing: t_cpu}} =
-      Generate.generate(input_ids, state, max_new_tokens: 10, sampler: :top_p_cpu)
+      Generate.generate(input_ids, state,
+        max_new_tokens: 10,
+        sampler: :top_p_cpu,
+        profile_timing: true
+      )
 
     greedy_median = median(t_greedy.per_token_ms)
     cpu_median = median(t_cpu.per_token_ms)

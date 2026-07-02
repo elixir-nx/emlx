@@ -47,8 +47,8 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_compiler.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_compiler.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_compiler.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 
 # Main targets
@@ -59,7 +59,7 @@ $(call esc,$(PRIV_DIR)):
 	@ mkdir -p "$(PRIV_DIR)"
 
 $(call esc,$(BUILD_DIR))/%.o: c_src/%.cpp $(HEADERS)
-	@ mkdir -p "$(BUILD_DIR)"
+	@ mkdir -p "$(dir $@)"
 	$(CXX) $(CFLAGS) -c "$<" -o "$@"
 
 $(call esc,$(MLX_SRC_ARCHIVE)):

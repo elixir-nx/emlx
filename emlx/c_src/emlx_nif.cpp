@@ -1,5 +1,4 @@
 #include "emlx_nif_shared.hpp"
-#include "emlx_compiler.hpp"
 
 #include <iostream>
 #include <map>
@@ -1439,6 +1438,9 @@ ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
 // fast_* and kv_cache_* NIFs are defined in emlx_fast.cpp.
+// Qwen3 model accelerators are defined in emlx_fast/qwen3.cpp. They are still
+// registered by emlx for now, but kept isolated because the user facing
+// loading and generation path lives in emlx_axon.
 
 // Forward declarations for the async wrappers defined in emlx_fast.cpp.
 ERL_NIF_TERM fast_rms_norm_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
@@ -1456,7 +1458,6 @@ ERL_NIF_TERM fast_swiglu_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_attention_masked_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM kv_cache_sdpa_update_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-
 // ─── Async wrappers ────────────────────────────────────────────────────────
 
 // Build a sliding window view of a padded tensor.
@@ -1997,12 +1998,6 @@ static ErlNifFunc nif_funcs[] = {
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
-    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
-
-    // ── NativeExpr compiler NIFs ──────────────────────────────────────────
-    // compile_program: 1 (worker) + 8 args = 9 registered.
-    {"compile_program", 9, compile_program_async},
-    // eval_program: 1 (worker) + 2 args = 3 registered.
-    {"eval_program", 3, eval_program_async}};
+    {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
