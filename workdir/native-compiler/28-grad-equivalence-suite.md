@@ -17,7 +17,7 @@ triage.
 >    grad well-defined (typically zero) at these ops, so the real test is
 >    **does EMLX's native backward lowering apply the same stop-gradient rule
 >    as the Evaluator**, not whether grad exists at all. Per advisor guidance,
->    the finite-difference oracle (Procedure item 2) is restricted to the
+>    the finite-difference reference (Procedure item 2) is restricted to the
 >    smooth subset only, and test points for non-diff ops are chosen away
 >    from discontinuities (no exact argmax ties, no `x = 0` for `sign`) since
 >    FD is meaningless exactly at those boundaries — the Evaluator-vs-native
@@ -29,7 +29,7 @@ Stage 23's triage (`emlx/test/emlx/grad_triage_test.exs`) ran an 8-scenario
 zoo of `Nx.Defn.grad`-wrapped functions (elementwise, reduction, dot, both
 `cond` branches, a counted `while`, `window_sum`, `window_max`) through
 `compiler: EMLX` and found all 8 pass unmodified against a
-`Nx.BinaryBackend`/`Nx.Defn.Evaluator` oracle. That triage zoo is deliberately
+`Nx.BinaryBackend`/`Nx.Defn.Evaluator` reference. That triage zoo is deliberately
 narrow (one shape, one dtype, one representative case per op class) — this
 stage widens it into a permanent, broader regression suite, mirroring Emily's
 own M9 harness design (`~/coding/emily/PLAN.md`'s "Testing — Layers 4 (Grad)
@@ -40,7 +40,7 @@ and 5 (Training)" section):
    list — `argmax`, `argmin`, `floor`, `sign`, comparisons), assert
    `Nx.Defn.grad(f)` under `compiler: EMLX` matches the same grad under
    `Nx.BinaryBackend`/`Nx.Defn.Evaluator`, across generated shapes/dtypes.
-2. A numerical finite-difference oracle for the differentiable subset:
+2. A numerical finite-difference reference for the differentiable subset:
    `(f(x+ε) - f(x-ε)) / 2ε ≈ grad(f)(x)`, with per-op documented tolerance
    (f32 central differences bottom out ~1e-3 relative — Emily's own finding,
    re-verify against EMLX's actual float precision, don't just copy the
@@ -57,7 +57,7 @@ untested op-class combination before a real user hits it, not a bug fix.
 
 1. Extend `grad_triage_test.exs` (or promote it to a differently-named
    permanent suite file — naming call is part of this stage, not decided
-   here) with the StreamData property test and finite-difference oracle
+   here) with the StreamData property test and finite-difference reference
    described above.
 2. Run the widened zoo; record any genuine failures (expect none, per Stage
    23's finding, but this stage exists specifically to falsify that
@@ -97,7 +97,7 @@ scenarios:
 9. Non-differentiable ops used as an operand — stop-gradient boundary parity
    for `sign`, `floor`, a comparison feeding `select`, and `argmax` feeding
    `take_along_axis` (max-pooling-style pattern) — 4 shapes × 2 dtypes each.
-10. Finite-difference oracle for the smooth-unary subset (`sin`/`cos`/`exp`/
+10. Finite-difference reference for the smooth-unary subset (`sin`/`cos`/`exp`/
     `tanh`/`sigmoid`/`sqrt`/`log`/`cbrt`/`expm1`/`log1p`) at a fixed
     away-from-discontinuity vector point, `eps = 1.0e-3`, tolerance `5.0e-3`
     (re-verified empirically here, not copied from Emily's number).
@@ -107,20 +107,20 @@ regressions).
 
 **Plan adjustments applied (user directive + advisor sign-off, recorded
 in-file above):** no `StreamData` (table-driven fixed zoo instead); no
-non-differentiable-op exclusion list (included, with the FD oracle correctly
+non-differentiable-op exclusion list (included, with the FD reference correctly
 restricted to the smooth subset per advisor guidance).
 
-**Test-harness bug found and fixed (not a compiler bug):** the `oracle/2`
+**Test-harness bug found and fixed (not a compiler bug):** the `reference/2`
 helper originally didn't isolate itself from `EMLX.Case`'s process-global
 `Nx.default_backend(EMLX.Backend)` setup. `Nx.Defn.Evaluator` uses the
 *current default backend* for any tensor it synthesizes internally (e.g.
 `window_max`'s min-value padding fill) rather than matching the explicit
 backend of the args passed in — so the "pure `Nx.BinaryBackend`/Evaluator"
-oracle was silently mixing in `EMLX.Backend` for exactly the scenario
+reference was silently mixing in `EMLX.Backend` for exactly the scenario
 (`window_max` with explicit `:padding`) that first triggered an internal
 constant synthesis. Fixed by scoping `Nx.default_backend/1` around the
-oracle call (save/restore). This is a latent risk in `grad_triage_test.exs`'s
-identical-pattern oracle helper too, though none of its 8 scenarios happen to
+reference call (save/restore). This is a latent risk in `grad_triage_test.exs`'s
+identical-pattern reference helper too, though none of its 8 scenarios happen to
 trigger it (no explicit non-default padding) — left as-is since that file is
 Stage 23's closed historical record, not touched here.
 
@@ -151,7 +151,7 @@ of a nested `cond` inside the derived backward body), reproducible with zero
 EMLX involvement — filed as
 [`nx-grad-while-cond-bugreport.md`](nx-grad-while-cond-bugreport.md), same
 pattern as this project's prior `Nx`/`Nx.Defn.Graph` bug reports. The test
-scenario is checked against a finite-difference oracle instead of the
+scenario is checked against a finite-difference reference instead of the
 known-broken `Nx.Defn.Evaluator` path, so it still pins EMLX's correctness
 without asserting against a broken reference. No EMLX follow-on stage is
 needed — this is out of scope for this project (upstream `Nx` bug), noted

@@ -2,7 +2,7 @@
 
 Status: done. Root cause was three bugs in the `Nx.Defn.Graph` splitter (not in
 `emlx.ex` as the suspects below guessed); see **Results** at the bottom. The
-end-to-end benchmark is the perf oracle for the whole compiler effort (README
+end-to-end benchmark is the perf reference for the whole compiler effort (README
 decision gate "After 01").
 
 ## Symptom

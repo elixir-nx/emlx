@@ -53,7 +53,7 @@ data-dependent control-flow primitive** (no `while_loop` / `fori_loop` / `scan`
 5. **Elixir lowering (narrow):** generalize `expand_block_via_default/4`'s
    param-remapping (`expr.ex` ~1706–1746) into a "lower a `:fun` sub-expr into a
    sub-IR" helper; emit a `:fold` for `Nx.reduce(t, 0, fn x, acc -> x + acc end)`.
-6. **Validate** vs `Nx.Defn.Evaluator` — there is no eager EMLX `reduce` oracle
+6. **Validate** vs `Nx.Defn.Evaluator` — there is no eager EMLX `reduce` reference
    (`emlx/lib/emlx/backend.ex` only has `reduce_max`/`reduce_min`).
 
 ## Go/no-go gate
@@ -106,8 +106,8 @@ What landed instead (`emlx/lib/emlx/native/expr.ex`):
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|
 | Task 1 — verify MLX 0.31.2 API | ✅ | `compile.h`/`transforms.h`/`ops.h`/`compile_impl.h` confirm **no** `while_loop`/`fori_loop`/`scan`/`cond` in the public core. `eval(std::vector<array>)` + `array::item<T>()` exist ⇒ a dynamic loop can only be eval-per-iteration (trace broken each iter). Confirms the static/dynamic split. |
-| `:reduce` static unroll | ✅ | 12/12 ad-hoc cases + 8/8 committed tests (`describe "Stage 12 …"`) match the Evaluator/BinaryBackend oracle, incl. multi-axis, `keep_axes`, a **non-commutative** affine reducer (validates fold order), int, runtime acc. |
-| Validation oracle | ✅ | Eager EMLX has no `reduce`; oracle is `Nx.Defn.Evaluator` on `BinaryBackend` (`check_reduce_equiv/3`). |
+| `:reduce` static unroll | ✅ | 12/12 ad-hoc cases + 8/8 committed tests (`describe "Stage 12 …"`) match the Evaluator/BinaryBackend reference, incl. multi-axis, `keep_axes`, a **non-commutative** affine reducer (validates fold order), int, runtime acc. |
+| Validation reference | ✅ | Eager EMLX has no `reduce`; reference is `Nx.Defn.Evaluator` on `BinaryBackend` (`check_reduce_equiv/3`). |
 | Suite | ✅ | `mix test test/emlx/native/expr_test.exs` → 227 passed. Old reduce fallback-sentinel test repointed to `window_reduce` (still unlowered). |
 
 ### Benchmark — the decisive axis (trace/payload vs extent, not replay)

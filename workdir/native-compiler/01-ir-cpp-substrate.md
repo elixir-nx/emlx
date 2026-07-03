@@ -24,7 +24,7 @@ the first op — the decision gate that justifies the entire effort.
    `ArgumentError "does not yet lower op :foo"`.
 3. **Elixir IR interpreter** (`EMLX.Native.Expr.Interpreter` or test support):
    walk `instrs`, dispatch each through the eager `EMLX.Backend` NIFs, return
-   output refs. This is the Layer-B oracle and a temporary executor.
+   output refs. This is the Layer-B reference and a temporary executor.
 4. **C++ program** (`emlx/c_src/`): `compile_program` NIF (op_names + packed
    operands + iattrs + captured weight refs → reusable program resource) and
    `eval_program` NIF (call the MLX-compiled function, eval outputs, return refs).

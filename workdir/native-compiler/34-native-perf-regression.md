@@ -1,11 +1,70 @@
 # Stage 34 — Investigation: `native` (`EMLXAxon.TextGeneration`) throughput regression
 
-Status: not started. Named by the user directly off two `validate_qwen3.exs`
-snapshots collected during [`32b-emlx-metadata-custom-grad`](32b-emlx-metadata-custom-grad.md)'s
-work, not (yet) root-caused. `bb+rewrite` is now faster than it has ever
-been, but `native` — historically the fastest path by a wide margin — looks
-regressed, and now sits *behind* `bb+rewrite`, which is backwards from every
-prior benchmark in this plan.
+Status: **mitigated, not closed** — see Update below. Named by the user
+directly off two `validate_qwen3.exs` snapshots collected during
+[`32b-emlx-metadata-custom-grad`](32b-emlx-metadata-custom-grad.md)'s work.
+`bb+rewrite` is now faster than it has ever been, but `native` —
+historically the fastest path by a wide margin — looked regressed, and sat
+*behind* `bb+rewrite`, which is backwards from every prior benchmark in this
+plan. The immediate symptom (a below-`bb+rewrite` `native` number) is
+resolved for benchmarking purposes; the underlying question this stage now
+exists to answer is why `compiler: EMLX` is apparently slower than
+`Nx.Defn.Evaluator` for this exact hand-written workload, given `bb+rewrite`
+proves `compiler: EMLX` itself is not slow on this same model.
+
+## Update — mitigated via the benchmark script, root cause still open
+
+User report: setting `compiler: Nx.Defn.Evaluator` explicitly in
+`emlx_axon/bench/validate_qwen3.exs`'s `EMLXAxon.TextGeneration.from_mlx4bit/3`
+call recovers `native` to **90+ tok/s** (better than the original 81.7
+tok/s baseline), while `bb+rewrite` holds at **88+ tok/s** under
+`compiler: EMLX` — i.e. the two paths are now roughly at parity again, and
+`native` is no longer the slower one. The script has already been updated
+this way (`git diff HEAD~3 -- emlx_axon/bench/validate_qwen3.exs` shows
+exactly one line added: `compiler: Nx.Defn.Evaluator,` in the `from_mlx4bit`
+call, landed in `c514502`).
+
+**Caveat found while writing this up, worth flagging before anyone trusts
+the causal story implied by that diff**: `compiler:` is not currently
+consumed anywhere in `EMLXAxon.TextGeneration`'s call chain. Traced
+`from_mlx4bit/3` → `serving/3` → `Generate.generate/3` →
+`EMLXAxon.Qwen3.{Layers,Attention}`'s `defnp` kernels — grepped every file
+in that chain for `compiler`/`:compiler` and found zero reads of that key
+out of `opts` (only `Keyword.get(opts, :max_len | :sampler | :temperature |
+:top_p | :profile_timing | :host_sync | ...)`-style fetches for *other*
+keys). `serving/3` doesn't raise on unrecognized opts, so
+`compiler: Nx.Defn.Evaluator` is silently accepted and **currently does
+nothing** — the `defnp` kernels were already running under
+`Nx.Defn.Evaluator` before and after this line (Nx's own hardcoded default
+compiler; this repo sets no `:nx, default_defn_options` app config to
+override it). So the *literal mechanism* in the diff doesn't explain the
+recovered throughput. Plausible explanations, not yet distinguished:
+
+1. **Benchmark-run variance** (thermal state, background load, warm MLX
+   kernel-compile cache from a prior run in the same `mix run` session) —
+   the swing size (65→90+) is within the kind of noise already seen between
+   the two original snapshots (81.7→65.4) with no code change implicated at
+   all.
+2. **The option should be wired but isn't** — perhaps the intent was to let
+   `native` opt into `compiler: EMLX` for direct comparison against
+   `Evaluator`, and the option's current no-op status is itself a small bug
+   worth fixing (see Procedure) so this kind of A/B test is actually
+   possible from the benchmark script instead of requiring a code edit.
+3. **A different, uncaptured change** — re-run `git diff` across the full
+   commit (`c514502`), not just this one file, in case a sibling change in
+   the same commit (e.g. to `text_generation.ex`/`generate.ex`) affects
+   `native`'s real behavior and was conflated with the benchmark-script
+   edit when the user summarized the fix.
+
+**This changes the framing of the rest of this stage.** The original
+"restore `native` to its old absolute number" bar is provisionally met
+(90+ tok/s, better than the 81.7 baseline). The more interesting and
+still-open question, now that `bb+rewrite` independently proves
+`compiler: EMLX` hits 88+ tok/s on this exact model: **why would running
+this same Qwen3 forward pass under `compiler: EMLX` (once that option is
+actually wired to do something) be any slower than `Nx.Defn.Evaluator`, if
+it's slower at all?** That's the real remaining scope — see the retitled
+Procedure/Acceptance below.
 
 ## Symptom
 
@@ -119,45 +178,69 @@ starting from the plan's own stage list:
 1. **Control for noise first.** Run `emlx_axon/bench/validate_qwen3.exs`
    with `native` only (comment out `bb base`/`bb+rewrite` or add a
    fast-path flag) 5+ times back-to-back, same machine, same session, to
-   get a real current baseline with a confidence interval — don't compare
-   against the old terminal snapshot's single run directly.
-2. **Bisect.** Identify the actual commit range between whatever state
-   produced 81.7 tok/s and `HEAD`. If that commit isn't identifiable from
-   history/terminal timestamps, treat Stage 19/`ad17016` (last commit
-   touching `EMLXAxon.Qwen3.*` itself) through `HEAD` as the outer bound and
-   bisect within it, re-running the controlled `native`-only benchmark
-   (step 1) at each candidate commit — mirrors Stage 11's bisection
-   procedure exactly (same tool, same rationale: `native`'s own code hasn't
-   changed, so the regression is a dependency, and `git bisect` finds it
-   faster than guessing from a diff).
-3. **Once localized to a commit**, diff it specifically for anything that
-   changes the **eager** (non-`compiler: EMLX`) call path of whatever op(s)
-   `native` calls per decode step: `EMLX.Fast.rms_norm/3`,
-   `EMLX.Fast.swiglu/2`, `EMLX.Fast.scaled_dot_product_attention*`,
-   `EMLX.Fast.rope*`, the quantized `Nx.dot`/`EMLX.Quantization` path, and
-   any shared `EMLX.Backend` primitive all of the above route through.
-4. **Fix + guard.** Land the fix at the identified seam. Add a permanent,
+   get a real current baseline with a confidence interval — confirm the
+   90+ tok/s figure holds up and isn't itself a one-off sample, before
+   trusting it as "mitigated."
+2. **Wire `compiler:` for real.** `EMLXAxon.TextGeneration.serving/3`
+   (`emlx_axon/lib/emlx_axon/text_generation.ex`) and
+   `EMLXAxon.Qwen3.Generate.generate/3` currently drop a `:compiler` opt on
+   the floor — thread it through to whatever `Nx.Defn.Compiler.__jit__`/
+   `Nx.Defn.jit` call sites back the `defnp` kernels in `Layers`/
+   `Attention`, defaulting to today's implicit `Nx.Defn.Evaluator` when
+   unset, so the benchmark script's existing (currently inert)
+   `compiler: Nx.Defn.Evaluator,` line becomes a real, working switch and
+   `compiler: EMLX` becomes an actual option to A/B against for this exact
+   workload — not just for `bb`/`bb+rewrite`.
+3. **A/B the two compilers on `native` directly**, once wired, holding
+   everything else fixed (step 1's controlled-run methodology). If
+   `compiler: EMLX` is genuinely slower than `Evaluator` for this hand-
+   written graph shape, profile *why* — e.g. compare instruction/dispatch
+   counts, check whether `Nx.Defn.Graph.split`/the `dispatch_key` ETS cache
+   (Stage 31/32/32b machinery, `compiler: EMLX`-only) is firing on any
+   `runtime_call` inside this specific graph shape the way it doesn't for
+   `bb+rewrite`'s (since `bb+rewrite`'s 88+ tok/s already proves
+   `compiler: EMLX` isn't inherently slow on this model — the two graphs
+   aren't necessarily structurally identical, e.g. `EMLXAxon.rewrite/2`'s
+   output vs the hand-written `Layers`/`Attention` defnp bodies may differ
+   in exactly the ways that matter here, such as which ops end up as
+   unrecognized `runtime_call`s needing a graph split).
+4. **If `compiler: EMLX` can be brought to parity with (or ahead of)
+   `Evaluator`** for `native`, that's the real fix — `compiler: EMLX`
+   should, in principle, never lose to op-by-op interpretation once its
+   compile/dispatch-cache warms up, so a persistent gap here is itself an
+   optimization opportunity worth chasing independent of this stage's
+   original regression-hunting framing. If it's confirmed structurally
+   equivalent in effort and still slower, document why and consider
+   whether `Evaluator` should just be the documented, permanent choice for
+   this specific hand-written path (i.e. accept the finding rather than
+   force `compiler: EMLX` where it doesn't help).
+5. **Fix + guard.** Land whichever of steps 3/4 applies. Add a permanent,
    CI-sized regression *benchmark* assertion (not just a numeric
    `assert_all_close`, which can't catch a throughput regression) — e.g. a
    documented acceptable floor for `native` tok/s on this model/token-count
    combination, checked manually before merging future stages that touch
-   `EMLX.Fast`/`EMLX.Backend`/`EMLX.Quantization`'s eager paths, since none
-   of Stage 11/22/25/26/32b's own acceptance criteria required re-checking
-   `native` specifically (each focused on the compiled/`bb+rewrite` path
-   instead) — that blind spot is exactly how this regression shipped
-   unnoticed across several stages.
+   `EMLX.Fast`/`EMLX.Backend`/`EMLX.Quantization`'s eager paths or
+   `emlx.ex`'s `compiler: EMLX` dispatch machinery, since none of Stage
+   11/22/25/26/32b's own acceptance criteria required re-checking `native`
+   specifically (each focused on the compiled/`bb+rewrite` path instead) —
+   that blind spot is exactly how the original regression shipped unnoticed
+   across several stages, and is also why the `compiler:` no-op above went
+   unnoticed.
 
 ## Acceptance
 
-- `native` throughput restored to at least its pre-regression level (~80+
-  tok/s on this model/token-count combination, matching the historical
-  Stage 11/30 baseline), confirmed via several controlled back-to-back
-  runs, not a single sample.
-- `native` is once again at least as fast as `bb+rewrite` (it should never
-  be slower — it's the hand-written, no-Axon-graph-overhead path; regressing
-  below `bb+rewrite` is itself a signal something is structurally wrong,
-  independent of the absolute tok/s number).
-- Root cause documented here: which commit/stage, which function, why.
+- `native` throughput confirmed at 90+ tok/s (matching/exceeding the
+  historical Stage 11/30 baseline) via several controlled back-to-back
+  runs, not a single sample — closes the original regression symptom.
+- `:compiler` is a real, working option on `EMLXAxon.TextGeneration.serving/3`
+  (and `from_mlx4bit/3`), not a silently-ignored keyword.
+- A direct `native`-under-`compiler: EMLX` vs `native`-under-`Evaluator`
+  comparison exists and is documented here, with either (a) `compiler:
+  EMLX` brought to parity/ahead via a concrete fix, or (b) a documented,
+  understood reason it's legitimately not worth using for this specific
+  hand-written graph shape.
+- `native` is once again at least as fast as `bb+rewrite` regardless of
+  which compiler it ends up using by default.
 - A repeatable benchmark-floor check added so future stages touching
-  `EMLX.Fast`/`EMLX.Backend`/`EMLX.Quantization` re-verify `native`
-  explicitly, not just `bb base`/`bb+rewrite`.
+  `EMLX.Fast`/`EMLX.Backend`/`EMLX.Quantization`/`emlx.ex`'s compiler
+  dispatch re-verify `native` explicitly, not just `bb base`/`bb+rewrite`.

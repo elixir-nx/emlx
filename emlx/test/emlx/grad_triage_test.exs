@@ -1,7 +1,7 @@
 defmodule EMLX.GradTriageTest do
   @moduledoc """
   Stage 23 (gradient-training-parity, scoping-only): triage of
-  `Nx.Defn.grad`-wrapped functions run through `compiler: EMLX`, oracled
+  `Nx.Defn.grad`-wrapped functions run through `compiler: EMLX`, referenced
   against `Nx.BinaryBackend` via `compiler: Nx.Defn.Evaluator`.
 
   This is the triage instrument the stage doc's Procedure calls for — its
@@ -54,12 +54,12 @@ defmodule EMLX.GradTriageTest do
   defn window_max_loss(x), do: Nx.sum(Nx.window_max(x, {2, 2}))
   defn window_max_grad(x), do: grad(x, &window_max_loss/1)
 
-  # ── oracle helper ──────────────────────────────────────────────────────────
+  # ── reference helper ──────────────────────────────────────────────────────────
 
-  # Oracle runs the same defn through the plain Evaluator on BinaryBackend
+  # Reference runs the same defn through the plain Evaluator on BinaryBackend
   # tensors (no EMLX involved at all) — independent of whatever the process
   # default backend/compiler happens to be.
-  defp oracle(fun, args) do
+  defp reference(fun, args) do
     Nx.Defn.jit_apply(fun, args, compiler: Nx.Defn.Evaluator)
   end
 
@@ -72,86 +72,86 @@ defmodule EMLX.GradTriageTest do
   end
 
   describe "elementwise grad" do
-    test "matches the Evaluator oracle under compiler: EMLX" do
+    test "matches the Evaluator reference under compiler: EMLX" do
       x = bin([0.1, 0.5, -0.3, 1.2])
 
       assert_all_close(
         native(&elementwise_grad/1, [x]),
-        oracle(&elementwise_grad/1, [x])
+        reference(&elementwise_grad/1, [x])
       )
     end
   end
 
   describe "reduction grad" do
-    test "matches the Evaluator oracle under compiler: EMLX" do
+    test "matches the Evaluator reference under compiler: EMLX" do
       x = bin([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
 
       assert_all_close(
         native(&reduction_grad/1, [x]),
-        oracle(&reduction_grad/1, [x])
+        reference(&reduction_grad/1, [x])
       )
     end
   end
 
   describe "dot grad" do
-    test "matches the Evaluator oracle under compiler: EMLX" do
+    test "matches the Evaluator reference under compiler: EMLX" do
       a = bin([[1.0, 2.0], [3.0, 4.0]])
       b = bin([[5.0, 6.0], [7.0, 8.0]])
 
       assert_all_close(
         native(&dot_grad/2, [a, b]),
-        oracle(&dot_grad/2, [a, b])
+        reference(&dot_grad/2, [a, b])
       )
     end
   end
 
   describe "cond grad" do
-    test "matches the Evaluator oracle under compiler: EMLX (branch taken: true)" do
+    test "matches the Evaluator reference under compiler: EMLX (branch taken: true)" do
       x = bin([1.0, 2.0, 3.0])
 
       assert_all_close(
         native(&cond_grad/1, [x]),
-        oracle(&cond_grad/1, [x])
+        reference(&cond_grad/1, [x])
       )
     end
 
-    test "matches the Evaluator oracle under compiler: EMLX (branch taken: false)" do
+    test "matches the Evaluator reference under compiler: EMLX (branch taken: false)" do
       x = bin([-1.0, -2.0, 3.0])
 
       assert_all_close(
         native(&cond_grad/1, [x]),
-        oracle(&cond_grad/1, [x])
+        reference(&cond_grad/1, [x])
       )
     end
   end
 
   describe "while grad (backward pass builds its own :while node — Nx.Defn.Graph splits it same as a forward while)" do
-    test "matches the Evaluator oracle under compiler: EMLX" do
+    test "matches the Evaluator reference under compiler: EMLX" do
       x = bin([0.5, 0.6, 0.7])
 
       assert_all_close(
         native(&while_grad/1, [x]),
-        oracle(&while_grad/1, [x])
+        reference(&while_grad/1, [x])
       )
     end
   end
 
   describe "windowed-reduce grad (eager EMLX.Backend.window_reduce/6 hard-raises; window_sum forward is native-only in the compiler's IR — Stage 20 finding)" do
-    test "window_sum grad matches the Evaluator oracle under compiler: EMLX" do
+    test "window_sum grad matches the Evaluator reference under compiler: EMLX" do
       x = bin([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
 
       assert_all_close(
         native(&window_grad/1, [x]),
-        oracle(&window_grad/1, [x])
+        reference(&window_grad/1, [x])
       )
     end
 
-    test "window_max grad (backward hits :window_scatter_max) matches the Evaluator oracle under compiler: EMLX" do
+    test "window_max grad (backward hits :window_scatter_max) matches the Evaluator reference under compiler: EMLX" do
       x = bin([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
 
       assert_all_close(
         native(&window_max_grad/1, [x]),
-        oracle(&window_max_grad/1, [x])
+        reference(&window_max_grad/1, [x])
       )
     end
   end

@@ -17,7 +17,7 @@ at `expr.ex:1646`).
 The Nx nodes carry a `:fun` `[params, expr, mfa]` over **two scalar parameters**
 (element, acc) returning a scalar (`deps/nx/lib/nx/defn/expr.ex:992`, `:1006`).
 MLX has no arbitrary-fun reduce primitive, and `EMLX.Backend` has no eager
-`reduce` (only `reduce_max`/`reduce_min`), so the equivalence oracle is
+`reduce` (only `reduce_max`/`reduce_min`), so the equivalence reference is
 `Nx.Defn.Evaluator` (+ BinaryBackend), not eager EMLX.
 
 ## Procedure
@@ -71,7 +71,7 @@ slice to a single element).
 
 ### Tests (`describe "Stage 13 …"`, tag `:stage13`)
 
-Oracle = `Nx.Defn.Evaluator` on `BinaryBackend` (eager EMLX has no custom-fun
+Reference = `Nx.Defn.Evaluator` on `BinaryBackend` (eager EMLX has no custom-fun
 `reduce`/`window_reduce`). Cases: dtype-changing `reduce` (s32→f32), 1-D window
 sum (valid), 1-D max with `:same` padding, 2-D sum with strides, dilations,
 **non-commutative affine reducer** (validates fold order), asymmetric explicit

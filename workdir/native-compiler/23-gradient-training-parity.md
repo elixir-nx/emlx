@@ -76,7 +76,7 @@ flagged four adjustments, all applied: (1) new follow-on stage numbers must
 start at 27 (24/25/26 already taken); (2) the triage instrument should be a
 real ExUnit test file (`emlx/test/emlx/grad_triage_test.exs`), not a
 throwaway script, mirroring `sdpa_sinks_test.exs`'s structure, so the Results
-below are reproducible; (3) oracle is `Nx.BinaryBackend` via
+below are reproducible; (3) reference is `Nx.BinaryBackend` via
 `compiler: Nx.Defn.Evaluator` only — no EXLA dependency added just for this
 triage; (4) for `while`, confirm empirically (not assumed) whether
 `Nx.Defn.grad`'s reverse-mode transform reaches the compiler's `while`-lowering
@@ -93,7 +93,7 @@ node. There is only one "direction" to test (grad is a defn-body macro, not
 an outside-compile wrapper) — the doc's premise of "two directions" collapsed
 to this one question, which the triage answers directly below.
 
-**Triage zoo (`emlx/test/emlx/grad_triage_test.exs`, 8 scenarios, oracled
+**Triage zoo (`emlx/test/emlx/grad_triage_test.exs`, 8 scenarios, referenced
 against `Nx.BinaryBackend` via `compiler: Nx.Defn.Evaluator`, `assert_all_close`
 default tolerance):**
 
@@ -153,7 +153,7 @@ renumbered to 28/29/30 when Stage 25 was inserted as
   regression suite (StreamData harness, mirroring Emily's M9 design), run
   under `compiler: EMLX`. Small — the zoo above already proves the mechanism
   works; this stage is breadth (more ops, more shapes, a finite-difference
-  oracle for the differentiable-op subset), not new compiler code.
+  reference for the differentiable-op subset), not new compiler code.
 - [`29-mixed-precision`](29-mixed-precision.md) — build `EMLX.MixedPrecision`
   (Emily M16 parity) from scratch: bf16-forward + f32-master-weights +
   dynamic loss scaling, with its own bf16-tolerance grad-equivalence suite

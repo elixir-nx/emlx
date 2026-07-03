@@ -1,6 +1,6 @@
 # Stage 33 — `:pad` with interior padding (needed for strided `window_sum`/`window_reduce` backward)
 
-Status: not started. Named by
+Status: done. Named by
 [`28-grad-equivalence-suite`](28-grad-equivalence-suite.md)'s Results.
 
 ## Why this stage exists
@@ -63,7 +63,7 @@ correctness bug (the forward ops and unit-stride backward are unaffected).
 3. **Equivalence tests.** Extend `EMLX.GradEquivalenceTest`'s
    `"windowed ops grad with non-default strides/padding"` describe block:
    flip the `window_sum`-with-strides scenario from "asserts the known raise"
-   back to "asserts grad equivalence vs the Evaluator oracle" once `:pad`
+   back to "asserts grad equivalence vs the Evaluator reference" once `:pad`
    supports interior padding, across the shapes already in that test
    (`{4, 4}`, `{3, 5}`) plus at least one 3D case.
 4. **Flip `EXPR_NODES.md`'s `:pad` line** once interior padding (and,
@@ -73,8 +73,8 @@ correctness bug (the forward ops and unit-stride backward are unaffected).
 
 - `Nx.pad` with interior padding (and negative lo/hi, if step 1's audit
   finds a real caller) lowers correctly in the native compiler, validated
-  against eager `EMLX.Backend` directly (Layer B oracle, per this project's
-  per-layer-oracle testing philosophy) and via the widened `window_sum`
+  against eager `EMLX.Backend` directly (Layer B reference, per this project's
+  per-layer-reference testing philosophy) and via the widened `window_sum`
   strided-grad scenario from Stage 28.
 - `EMLX.GradEquivalenceTest`'s `window_sum`-with-strides test no longer
   needs to assert a raise — it asserts grad equivalence like every other
@@ -85,4 +85,68 @@ correctness bug (the forward ops and unit-stride backward are unaffected).
 
 ## Results
 
-(not started)
+**Scope correction (advisor sign-off before starting):** the audit in Procedure
+step 1 needed to be broader than "window backward paths." `grad.ex` has two
+*more common* `:pad`-generating backward paths, neither gated on window ops
+at all:
+
+- `grad(:pad, …)` (`deps/nx/nx/lib/nx/defn/grad.ex:535`) un-pads the cotangent
+  via **negative** lo/hi whenever the forward `Nx.pad` had positive lo/hi —
+  unconditionally, no strides required.
+- `grad(:slice, …)` (`deps/nx/nx/lib/nx/defn/grad.ex:549`) re-inserts
+  **interior** padding into the cotangent whenever the forward `Nx.slice`
+  used non-unit strides — very common, unrelated to window ops.
+- `grad(:window_sum, …)` (the path that originally surfaced the gap, via
+  Stage 28) combines both: `conv_lhs_padding`-derived lo/hi (which can go
+  negative for atypical `padding:` configs) *and* interior (from `strides`)
+  on the same call.
+
+All three are closed by the same general `:pad` decomposition (below) — no
+per-path special-casing was needed.
+
+**Implementation.** Negative lo/hi is *not* a variant of interior padding
+(MLX's pad primitive can only grow a tensor, never crop it) — treating them
+as one mechanism was the advisor's second correction. The general `:pad`
+opcode now decomposes, entirely in Elixir (`EMLX.Native.Expr.expand_pad_general/5`,
+`emit_interior_padding/5`, `emit_negative_crop/4`), into three sequential
+steps mirroring `EMLX.Backend.pad/4`'s own eager algorithm exactly:
+
+1. **Interior padding** — reuses `EMLX.Backend`'s reshape/pad/slice trick
+   (append a size-1 trailing spacer dim, then for each axis in turn pad the
+   *next* axis by `next_axis_size * interior` and reshape/slice to fold that
+   into the current axis; the spacer role rotates forward one axis per
+   step). This generalizes Stage 13's `window_reduce`-specific pad-with-acc
+   trick to arbitrary axes/interior amounts/runtime pad-value operands (Stage
+   13's version assumed a compile-time-scalar acc; this one takes any scalar
+   ref).
+2. **Negative-lo/hi crop** — a plain static `:slice`, not run through the
+   interior-pad machinery (advisor's correction #2).
+3. **Plain non-negative pad** — for whatever `max(lo,0)`/`max(hi,0)` remains,
+   reusing the existing `emit_pad_with/5` helper unchanged.
+
+The wire `:pad` opcode itself is untouched — it still only ever carries
+non-negative lo/hi with interior=0 on the wire; **zero C++ changes**, per the
+stage doc's original direction to reuse rather than invent a second
+implementation.
+
+**Validation.**
+- Layer B reference (`EMLX.Native.ExprTest`, `describe "Stage 03 — pad"`, new
+  `:stage33`-tagged tests): interior-only (1D/2D), negative-only, mixed
+  positive/negative/interior, and a 3D case, each checked against
+  `Nx.Defn.Evaluator` on `EMLX.Backend`-tagged inputs.
+- Grad equivalence (`EMLX.GradEquivalenceTest`): the `window_sum`-with-strides
+  scenario flipped from asserting the known raise to asserting equivalence
+  (2D, plus a new 3D case); two new scenarios added per the broadened audit —
+  direct `Nx.pad`-forward grad (negative-lo/hi backward) and
+  `Nx.slice`-with-strides-forward grad (interior backward).
+- Full suite: 2679/2679 passed (827 doctests, 1852 tests), 0 regressions —
+  one pre-existing test (`EMLX.Native.ExprTest` "unknown op raises...")
+  used interior `:pad` as its generic-catch-all-error sentinel; since that's
+  no longer a raise, the sentinel was swapped to `triangular_solve`'s
+  permanent non-default-variant hard-raise (Stage 17/19), which is unrelated
+  to this stage's scope and still guaranteed to raise.
+
+**`EXPR_NODES.md`** flipped: `:pad` is now fully closed (no interior/negative
+carve-out remains) — negative lo/hi turned out to be needed (found by the
+broadened audit above), so both capabilities are closed together rather than
+narrowed to interior-only.

@@ -67,7 +67,7 @@ initial loss) on the reference curve itself, so the test would fail if the
 model were accidentally not learning.
 
 **Scope decision (procedure item 3, per advisor sign-off — both, not
-either/or):** two tests, both against the same oracle —
+either/or):** two tests, both against the same reference —
 
 1. Eager `EMLX.Backend` (params/data transferred to `EMLX.Backend`, trained
    via `Nx.Defn.jit_apply(compiler: Nx.Defn.Evaluator)`) — matches the

@@ -195,7 +195,7 @@ documented message; a while-body hook matches `Evaluator` iteration-by-
 iteration; a hook straddling a non-bare `while` (the `Graph.split`-chain
 regression case) matches `Evaluator` end-to-end; a hook inside a custom-fun
 `reduce` body fires once per fold step matching `Evaluator` (the
-reviewer-caught regression, oracled against `Nx.BinaryBackend` per the
+reviewer-caught regression, referenced against `Nx.BinaryBackend` per the
 existing `check_reduce_equiv/3` convention — eager EMLX has no `reduce`); a
 hook inside a `cond` nested inside a `reduce` body still raises. Full suite:
 2564 passed (825 doctests, 1739 tests), 0 failures, 0 regressions.

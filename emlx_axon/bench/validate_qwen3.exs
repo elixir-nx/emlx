@@ -193,6 +193,7 @@ native_serving =
   EMLXAxon.TextGeneration.from_mlx4bit(
     Path.expand(model_path_raw),
     tokenizer,
+    compiler: Nx.Defn.Evaluator,
     max_new_tokens: max_new,
     sampler: :greedy,
     profile_timing: native_profile_timing?

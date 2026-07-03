@@ -289,11 +289,14 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
-      # interior :pad is not lowered; use as sentinel for the catch-all message.
+      # triangular_solve's non-default variants are a permanent, documented
+      # hard-raise (Stage 17/19 — see workdir/native-compiler/19-retire-evaluator-fallback.md);
+      # use as sentinel for the catch-all message. (Interior/negative :pad used
+      # to be the sentinel here, but Stage 33 lowered it natively.)
       expr =
         Nx.Defn.debug_expr_apply(
-          fn t -> Nx.pad(t, 0.0, [{0, 0, 1}]) end,
-          [Nx.template({3}, :f32)]
+          fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end,
+          [Nx.template({3, 3}, :f32), Nx.template({3}, :f32)]
         )
 
       assert_raise ArgumentError, ~r/does not yet lower op/, fn -> Expr.lower(expr) end
@@ -580,7 +583,7 @@ defmodule EMLX.Native.ExprTest do
     assert_close(result, eager, tol)
   end
 
-  # Reduce oracle: eager EMLX has no `reduce`, so the equivalence target is the
+  # Reduce reference: eager EMLX has no `reduce`, so the equivalence target is the
   # Evaluator on BinaryBackend (Stage 12 spike — custom-fun reduce unroll).
   defp check_reduce_equiv(fun, inputs_eager, opts \\ []) do
     tol = Keyword.get(opts, :tol, 1.0e-4)
@@ -1048,6 +1051,37 @@ defmodule EMLX.Native.ExprTest do
     test "scalar pad value" do
       x = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
       check_equiv(fn t -> Nx.pad(t, -1.0, [{2, 2, 0}]) end, [x])
+    end
+
+    # Interior padding + negative lo/hi (Stage 33 — see EMLX.Native.Expr.expand_pad_general/5).
+    @tag :stage33
+    test "interior padding on 1D" do
+      x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, 0.0, [{0, 0, 2}]) end, [x])
+    end
+
+    @tag :stage33
+    test "interior padding on 2D, both axes, non-scalar-friendly pad value" do
+      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, -9.0, [{0, 0, 1}, {0, 0, 2}]) end, [x])
+    end
+
+    @tag :stage33
+    test "negative lo/hi crops on 2D" do
+      x = Nx.iota({4, 5}, type: :f32, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, 0.0, [{-1, -1, 0}, {0, -2, 0}]) end, [x])
+    end
+
+    @tag :stage33
+    test "mixed positive/negative/interior padding on 2D" do
+      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, 0.0, [{2, -1, 1}, {-1, 3, 2}]) end, [x])
+    end
+
+    @tag :stage33
+    test "interior padding on 3D" do
+      x = Nx.iota({2, 3, 4}, type: :f32, backend: EMLX.Backend)
+      check_equiv(fn t -> Nx.pad(t, 0.0, [{1, 1, 1}, {-1, 0, 0}, {0, 2, 2}]) end, [x])
     end
   end
 
@@ -3425,7 +3459,7 @@ defmodule EMLX.Native.ExprTest do
   # T>1 (and left-padded / non-sequential position_ids, which mlx::fast::rope's
   # offset argument cannot express) now lowers to a single in-graph
   # cos/sin/rotate composition (:fast_rope_positions / :fast_rope_with_freqs_positions)
-  # instead of raising. Oracle: the eager EMLX.Fast per-token-loop callback
+  # instead of raising. Reference: the eager EMLX.Fast per-token-loop callback
   # (via Nx.Defn.Evaluator), on left-padded positions specifically — the case
   # the eager implementation's own comment warns a hand-written formula could
   # diverge on.
@@ -3436,7 +3470,7 @@ defmodule EMLX.Native.ExprTest do
   # H>1 input (see mlx-fast-rope-multihead-bugreport.md). The new
   # :fast_rope_with_freqs_positions opcode does *not* call fast::rope (same
   # hand-written composition as :fast_rope_positions), so it disagrees with
-  # that broken eager oracle on H>1. H=1 still validates cleanly against
+  # that broken eager reference on H>1. H=1 still validates cleanly against
   # eager below; H>1 is validated against a pure-Nx primitive formula instead.
   describe "Stage 15 — prefill RoPE (Metal)" do
     @describetag :metal
@@ -3852,7 +3886,7 @@ defmodule EMLX.Native.ExprTest do
       refute_receive {:step, _}
       assert native_values == [1, 3, 6]
 
-      # Reduce oracle: eager EMLX has no `reduce`, so compare against the
+      # Reduce reference: eager EMLX has no `reduce`, so compare against the
       # Evaluator on BinaryBackend (same convention as `check_reduce_equiv/3`,
       # Stage 12 -- the reducer's own `Nx.tensor(0)` initial acc also needs
       # `default_backend` swapped, not just the input, since it's a literal
@@ -3916,7 +3950,7 @@ defmodule EMLX.Native.ExprTest do
     # right-operand `Nx.dot` now specializes to a `:quantized_matmul` opcode
     # once real (call-time) tensors reveal the quantization signature —
     # equivalence-tested against eager EMLX.Backend.dot/7 and
-    # Nx.Defn.Evaluator, both used as independent oracles.
+    # Nx.Defn.Evaluator, both used as independent references.
     @tag :stage25
     test "a quantized weight bound to a native-compiled defn now runs end-to-end" do
       weight =
@@ -4233,15 +4267,15 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  # Softmax normalisation over the last axis (primitive SDPA oracle helper).
+  # Softmax normalisation over the last axis (primitive SDPA reference helper).
   defp normalize_rows(t) do
     Nx.divide(t, Nx.sum(t, axes: [-1], keep_axes: true))
   end
 
-  # Pure-Nx primitive oracle for prefill RoPE against a precomputed `freqs`
+  # Pure-Nx primitive reference for prefill RoPE against a precomputed `freqs`
   # tensor (mirrors emlx_compiler.cpp's fast_rope_with_freqs_positions lambda:
   # inv_freq = reciprocal(freqs), half-rotate cos/sin blend). Needed for H>1
-  # cases because the eager EMLX.Fast.rope_with_freqs oracle calls
+  # cases because the eager EMLX.Fast.rope_with_freqs reference calls
   # mlx::core::fast::rope directly, which miscomputes non-head-0 rotations for
   # multi-head input — see mlx-fast-rope-multihead-bugreport.md. `a` is
   # {B, T, H, D}; `pos` is {B, T}; `freqs` is {dims/2}.

@@ -167,7 +167,7 @@ NIF boundary for them beyond what the caller already sends.
 
 Regression tests added (`while_counter_only_cond/3`, Stage 08 describe block,
 `emlx/test/emlx/native/expr_test.exs`): scalar and non-scalar payload, both vs
-the Evaluator oracle. Full suite green (2532 tests).
+the Evaluator reference. Full suite green (2532 tests).
 
 ## Stage 12 gate outcome + analysis (decision: dropped)
 

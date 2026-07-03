@@ -89,7 +89,7 @@ The Stage 10 (`10-fast-kernels.md`) equivalence tests for `rope`,
 compare the **compiled-graph opcode** against the **eager `EMLX.Fast` NIF**.
 Both call the identical `mlx::core::fast::rope` primitive under the hood, so
 they trivially agree with each other while both are wrong relative to the
-textbook RoPE formula — the bug is invisible to a "compiled vs eager" oracle
+textbook RoPE formula — the bug is invisible to a "compiled vs eager" reference
 that shares the same buggy primitive on both sides. It only surfaces when
 compared against an independent, hand-written primitive formula (as Stage 15's
 new prefill lowering — which does *not* call `fast::rope` — incidentally is).

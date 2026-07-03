@@ -91,7 +91,7 @@ surfaces rather than introduce new architecture.
   captures; `emlx_compiler.cpp`'s `op_registry` gained matching entries (the
   causal-key-masked+sinks one duplicates the existing in-graph causal/key_mask
   composition, then passes the extra `sinks` operand through). The Layer-B
-  Elixir interpreter (`dispatch/3`, used as the oracle in `expr_test.exs`) got
+  Elixir interpreter (`dispatch/3`, used as the reference in `expr_test.exs`) got
   matching clauses so both replay lanes stay covered by the same tests.
 - **Tests**: `sdpa_sinks_test.exs` (eager) checks all four variants against a
   from-scratch softmax-with-sinks reference implementation (row-max over both

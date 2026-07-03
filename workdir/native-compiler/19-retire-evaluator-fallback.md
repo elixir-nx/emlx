@@ -68,7 +68,7 @@ question was already settled and this stage enforces it.)
 `triangular_solve`'s non-default variants still raising `does not yet lower
 op` (a real, Stage-17-descoped gap, not closed by Stages 16–18): the deletion
 itself, gated by a green full-suite run before and after, is the correct
-oracle for whether anything still silently depended on the fallback lane —
+reference for whether anything still silently depended on the fallback lane —
 no a-priori decision was needed. Advisor also flagged a stale docstring
 (`expr.ex:187-189`, still describing the fallback) that the original
 Procedure's sweep list (step 6, scoped to Stage 09/10/15/`EXPR_NODES.md`)

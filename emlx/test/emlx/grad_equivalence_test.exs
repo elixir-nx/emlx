@@ -21,7 +21,7 @@ defmodule EMLX.GradEquivalenceTest do
       pass applies the exact same stop-gradient rule as the Evaluator, not
       whether grad exists at all.
 
-  Oracle convention (same as `grad_triage_test.exs`): `oracle/2` runs
+  Reference convention (same as `grad_triage_test.exs`): `reference/2` runs
   `Nx.Defn.jit_apply/3` with `compiler: Nx.Defn.Evaluator` on
   `Nx.BinaryBackend` tensors; `native/2` runs the same with `compiler: EMLX`.
   """
@@ -35,10 +35,10 @@ defmodule EMLX.GradEquivalenceTest do
   # `EMLX.Backend`. `Nx.Defn.Evaluator` uses that default backend for any
   # tensor it synthesizes internally (e.g. `window_max`'s padding fill value)
   # rather than matching the explicit-backend args passed in — so without
-  # this scoping, the oracle silently mixes in `EMLX.Backend` and stops being
+  # this scoping, the reference silently mixes in `EMLX.Backend` and stops being
   # a pure BinaryBackend/Evaluator reference. Found via this stage's
   # `window_max`-with-explicit-padding scenario (see Results below).
-  defp oracle(fun, args) do
+  defp reference(fun, args) do
     previous = Nx.default_backend()
     Nx.default_backend(Nx.BinaryBackend)
 
@@ -68,7 +68,7 @@ defmodule EMLX.GradEquivalenceTest do
   end
 
   defp assert_grad_equivalent(fun, args, tol \\ [atol: 1.0e-3, rtol: 1.0e-3]) do
-    assert_all_close(native(fun, args), oracle(fun, args), tol)
+    assert_all_close(native(fun, args), reference(fun, args), tol)
   end
 
   @shapes [{}, {4}, {2, 3}, {2, 2, 3}]
@@ -91,7 +91,7 @@ defmodule EMLX.GradEquivalenceTest do
   defn smooth_elementwise_grad(x), do: grad(x, &smooth_elementwise_loss/1)
 
   describe "smooth elementwise chain grad (sin/cos/log1p/tanh/sigmoid/sqrt/abs composed)" do
-    test "matches the Evaluator oracle across shapes and dtypes" do
+    test "matches the Evaluator reference across shapes and dtypes" do
       for shape <- @shapes, dtype <- @dtypes do
         x = bin(shape, dtype)
         assert_grad_equivalent(&smooth_elementwise_grad/1, [x])
@@ -115,7 +115,7 @@ defmodule EMLX.GradEquivalenceTest do
   defn reduction_zoo_grad(x), do: grad(x, &reduction_zoo_loss/1)
 
   describe "reduction chain grad (sum/mean/reduce_max/reduce_min composed)" do
-    test "matches the Evaluator oracle across rank>=1 shapes and dtypes" do
+    test "matches the Evaluator reference across rank>=1 shapes and dtypes" do
       for shape <- @rank1plus_shapes, dtype <- @dtypes do
         x = bin(shape, dtype)
         assert_grad_equivalent(&reduction_zoo_grad/1, [x])
@@ -132,7 +132,7 @@ defmodule EMLX.GradEquivalenceTest do
   defn dot_chain_grad(a, b), do: grad(a, fn a -> dot_chain_loss(a, b) end)
 
   describe "dot chain grad (dot -> tanh -> sum)" do
-    test "matches the Evaluator oracle across shape pairs and dtypes" do
+    test "matches the Evaluator reference across shape pairs and dtypes" do
       for {shape_a, shape_b} <- [{{2, 3}, {3, 2}}, {{4, 4}, {4, 4}}, {{3, 4}, {4, 2}}],
           dtype <- @dtypes do
         a = bin(shape_a, dtype)
@@ -163,7 +163,7 @@ defmodule EMLX.GradEquivalenceTest do
   defn nested_cond_grad(x), do: grad(x, &nested_cond_loss/1)
 
   describe "nested cond grad (cond inside cond, all four leaf branches)" do
-    test "matches the Evaluator oracle for each of the four branch combinations" do
+    test "matches the Evaluator reference for each of the four branch combinations" do
       # {all positive?, sum > 10 or all < -10?}
       cases = [
         Nx.tensor([1.0, 2.0, 8.0]),
@@ -198,15 +198,15 @@ defmodule EMLX.GradEquivalenceTest do
   defn while_with_cond_grad(x), do: grad(x, &while_with_cond_loss/1)
 
   describe "while-body-contains-cond grad" do
-    # Not checked against the `Nx.Defn.Evaluator` oracle here — a genuine
-    # `Nx.Defn.Grad` bug (not an EMLX bug) makes that oracle itself wrong for
+    # Not checked against the `Nx.Defn.Evaluator` reference here — a genuine
+    # `Nx.Defn.Grad` bug (not an EMLX bug) makes that reference itself wrong for
     # this exact scenario (backward `:while` + nested data-dependent `cond`).
     # See `workdir/native-compiler/nx-grad-while-cond-bugreport.md`: EMLX's
     # native result is finite-difference-correct; `Nx.Defn.Evaluator`'s
     # (pure-BinaryBackend, no EMLX involved) is off by up to 20 orders of
     # magnitude on some elements. So this scenario is checked against a
-    # finite-difference oracle instead.
-    test "matches a finite-difference oracle (not the known-broken Evaluator path)" do
+    # finite-difference reference instead.
+    test "matches a finite-difference reference (not the known-broken Evaluator path)" do
       eps = 1.0e-4
 
       for dtype <- @dtypes do
@@ -242,7 +242,7 @@ defmodule EMLX.GradEquivalenceTest do
   defn while_multi_carry_grad(x), do: grad(x, &while_multi_carry_loss/1)
 
   describe "multi-output while carries grad (3 carried tensors)" do
-    test "matches the Evaluator oracle" do
+    test "matches the Evaluator reference" do
       for dtype <- @dtypes do
         x = bin({4}, dtype)
         assert_grad_equivalent(&while_multi_carry_grad/1, [x])
@@ -269,7 +269,7 @@ defmodule EMLX.GradEquivalenceTest do
   defn nested_while_grad(x), do: grad(x, &nested_while_loss/1)
 
   describe "nested while grad (while inside while)" do
-    test "matches the Evaluator oracle" do
+    test "matches the Evaluator reference" do
       for dtype <- @dtypes do
         x = bin({3}, dtype)
         assert_grad_equivalent(&nested_while_grad/1, [x])
@@ -287,29 +287,71 @@ defmodule EMLX.GradEquivalenceTest do
 
   defn window_max_padded_grad(x), do: grad(x, &window_max_padded_loss/1)
 
+  defn window_sum_strided_3d_loss(x),
+    do: Nx.sum(Nx.window_sum(x, {2, 2, 2}, strides: [2, 1, 2]))
+
+  defn window_sum_strided_3d_grad(x), do: grad(x, &window_sum_strided_3d_loss/1)
+
   describe "windowed ops grad with non-default strides/padding" do
-    # Genuine gap found by this stage, named as Stage 33 (not fixed inline,
-    # per this stage's own discipline): `window_sum`'s backward (grad.ex's
+    # Closed by Stage 33: `window_sum`'s backward (grad.ex's
     # `grad(:window_sum, …)`) un-strides the cotangent via `Nx.pad` with
-    # *interior* padding whenever `strides != 1`, and `:pad` with interior
-    # padding is a pre-existing, deliberately-not-yet-lowered gap
-    # (`EXPR_NODES.md`'s "pad (simple: non-negative lo/hi, interior=0; …)").
+    # *interior* padding whenever `strides != 1`. `:pad` with interior padding
+    # (and negative lo/hi) now lowers natively (see `EMLX.Native.Expr.expand_pad_general/5`)
+    # instead of raising — this scenario used to assert the known raise
+    # (`EXPR_NODES.md`'s "pad (simple: non-negative lo/hi, interior=0; …)"),
+    # now it asserts equivalence like every other scenario in this suite.
     # Stage 23's `window_sum` grad scenario used default (unit) strides, so
     # it never exercised this path.
-    test "window_sum with non-unit strides raises the known :pad-interior gap (Stage 33)" do
+    test "window_sum with non-unit strides matches the Evaluator reference" do
       for shape <- [{4, 4}, {3, 5}], dtype <- @dtypes do
         x = bin(shape, dtype)
-
-        assert_raise ArgumentError, ~r/does not yet lower op :pad with interior padding/, fn ->
-          native(&window_sum_strided_grad/1, [x])
-        end
+        assert_grad_equivalent(&window_sum_strided_grad/1, [x])
       end
     end
 
-    test "window_max with padding matches the Evaluator oracle" do
+    test "window_sum with non-unit strides matches the Evaluator reference (3D)" do
+      for dtype <- @dtypes do
+        x = bin({4, 3, 5}, dtype)
+        assert_grad_equivalent(&window_sum_strided_3d_grad/1, [x])
+      end
+    end
+
+    test "window_max with padding matches the Evaluator reference" do
       for shape <- [{4, 4}, {3, 5}], dtype <- @dtypes do
         x = bin(shape, dtype)
         assert_grad_equivalent(&window_max_padded_grad/1, [x])
+      end
+    end
+  end
+
+  # ── 8b. direct :pad / :slice grad (Stage 33) ────────────────────────────────
+  #
+  # Broader than window ops (found during Stage 33's advisor review): grad.ex's
+  # own `grad(:pad, …)` un-pads the cotangent via *negative* lo/hi whenever the
+  # forward `Nx.pad` had positive lo/hi, unconditionally (no strides needed);
+  # `grad(:slice, …)` re-inserts *interior* padding into the cotangent whenever
+  # the forward `Nx.slice` used non-unit strides. Both are more common than the
+  # window_sum path above and exercise the same `:pad` decomposition from a
+  # different direction.
+
+  defn pad_positive_loss(x), do: Nx.sum(Nx.pad(x, 0.0, [{2, 1, 0}, {0, 3, 0}]))
+  defn pad_positive_grad(x), do: grad(x, &pad_positive_loss/1)
+
+  defn slice_strided_loss(x), do: Nx.sum(Nx.slice(x, [0, 0], [2, 3], strides: [2, 3]))
+  defn slice_strided_grad(x), do: grad(x, &slice_strided_loss/1)
+
+  describe "direct :pad / :slice grad (Stage 33)" do
+    test "pad with positive lo/hi (negative-lo/hi backward) matches the Evaluator reference" do
+      for shape <- [{4, 4}, {3, 5}], dtype <- @dtypes do
+        x = bin(shape, dtype)
+        assert_grad_equivalent(&pad_positive_grad/1, [x])
+      end
+    end
+
+    test "slice with non-unit strides (interior-pad backward) matches the Evaluator reference" do
+      for shape <- [{5, 8}], dtype <- @dtypes do
+        x = bin(shape, dtype)
+        assert_grad_equivalent(&slice_strided_grad/1, [x])
       end
     end
   end
@@ -344,28 +386,28 @@ defmodule EMLX.GradEquivalenceTest do
   defn argmax_gather_grad(x), do: grad(x, &argmax_gather_loss/1)
 
   describe "non-differentiable-op-as-operand grad (stop-gradient boundary parity)" do
-    test "sign(x) used as a multiplicative operand matches the Evaluator oracle" do
+    test "sign(x) used as a multiplicative operand matches the Evaluator reference" do
       for shape <- @shapes, dtype <- @dtypes do
         x = bin(shape, dtype)
         assert_grad_equivalent(&sign_operand_grad/1, [x])
       end
     end
 
-    test "floor(x) used as a multiplicative operand matches the Evaluator oracle" do
+    test "floor(x) used as a multiplicative operand matches the Evaluator reference" do
       for shape <- @shapes, dtype <- @dtypes do
         x = bin(shape, dtype)
         assert_grad_equivalent(&floor_operand_grad/1, [x])
       end
     end
 
-    test "a comparison feeding select matches the Evaluator oracle" do
+    test "a comparison feeding select matches the Evaluator reference" do
       for shape <- @shapes, dtype <- @dtypes do
         x = bin(shape, dtype)
         assert_grad_equivalent(&comparison_select_grad/1, [x])
       end
     end
 
-    test "argmax used to gather (max-pooling-style pattern) matches the Evaluator oracle" do
+    test "argmax used to gather (max-pooling-style pattern) matches the Evaluator reference" do
       for shape <- @rank1plus_shapes, dtype <- @dtypes do
         x = bin(shape, dtype)
         assert_grad_equivalent(&argmax_gather_grad/1, [x])
@@ -373,7 +415,7 @@ defmodule EMLX.GradEquivalenceTest do
     end
   end
 
-  # ── 10. finite-difference oracle (smooth ops only) ─────────────────────────
+  # ── 10. finite-difference reference (smooth ops only) ─────────────────────────
   #
   # FD is meaningless exactly at a non-differentiable op's discontinuity, so
   # this is restricted to the smooth subset (per advisor guidance) and run at
@@ -388,7 +430,7 @@ defmodule EMLX.GradEquivalenceTest do
   # copied from Emily's own number) — use a matching tolerance.
   @fd_tol [atol: 5.0e-3, rtol: 5.0e-3]
 
-  describe "finite-difference oracle (smooth unary ops, points away from discontinuities)" do
+  describe "finite-difference reference (smooth unary ops, points away from discontinuities)" do
     test "native grad matches central-difference FD for each smooth unary op" do
       x = Nx.tensor([0.3, 0.8, 1.4, 2.1], type: {:f, 64}, backend: Nx.BinaryBackend)
 

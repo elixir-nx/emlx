@@ -81,8 +81,8 @@ as `mlx-fast-rope-multihead-bugreport.md`. Because the new
 `fast_rope_with_freqs_positions` opcode never calls `fast::rope` (it uses the
 same manual formula as the already-trusted `fast_rope_positions` opcode), its
 H>1 equivalence tests were switched to a hand-written pure-Nx primitive
-oracle instead of the (for H>1) unreliable eager `EMLX.Fast.rope_with_freqs`
-oracle; an H=1 case still validates directly against eager. `rope_with_positions_callback`'s eager oracle (`fast_rope_positions`, a
+reference instead of the (for H>1) unreliable eager `EMLX.Fast.rope_with_freqs`
+reference; an H=1 case still validates directly against eager. `rope_with_positions_callback`'s eager reference (`fast_rope_positions`, a
 hand-written NIF that never calls `fast::rope`) is unaffected, so its tests
 were left comparing against eager throughout.
 

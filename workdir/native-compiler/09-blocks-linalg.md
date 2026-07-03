@@ -27,7 +27,7 @@ recognize the block struct for a native path, else lower its `default_expr`.
 
 - Every `Nx.Block.LinAlg.*` op either lowers via a native path or via
   `default_expr` descent, with results within documented tolerance vs the
-  reference oracle.
+  reference reference.
 - `default_expr` descent demonstrated for at least one block whose primitives
   all come from earlier stages.
 - `EXPR_NODES.md` §K boxes flipped; CI green.
@@ -74,7 +74,7 @@ No MLX determinant primitive: lowers via **`default_expr` descent**. 2×2/3×3 a
 pure primitives (no `while`); N>3 descends through the **recognized native LU
 block** (so no `while` is ever materialized). Note: EMLX.Backend's *eager* N>3
 determinant has a pre-existing `{:u,32}`/`{:s,64}` type bug, so the 4×4 test uses
-a `Nx.BinaryBackend` reference oracle.
+a `Nx.BinaryBackend` reference reference.
 
 | Item | Outcome | Notes / artifacts |
 |------|---------|-------------------|

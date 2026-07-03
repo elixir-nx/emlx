@@ -68,7 +68,7 @@ Evaluator. No host-split (option b) built.
   mask in-graph (the eager NIF's `all(key_mask).item<bool>()` host branch can't
   live inside `detail::compile`); correctness preserved, the no-padding
   micro-opt dropped.
-- **Interpreter** (Layer B oracle): fused-opcode dispatch calls the same eager
+- **Interpreter** (Layer B reference): fused-opcode dispatch calls the same eager
   `EMLX.fast_*` NIFs the C++ opcodes wrap.
 
 | Item | Outcome | Notes / artifacts |

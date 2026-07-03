@@ -181,7 +181,7 @@ logical_and, logical_or, logical_xor.
 - [x] broadcast
 - [x] as_type
 - [x] bitcast
-- [x] pad (simple: non-negative lo/hi, interior=0; interior/negative raises — not yet lowered)
+- [x] pad (fully closed, Stage 33: interior padding and negative lo/hi decompose into reshape/pad/slice/squeeze in `EMLX.Native.Expr.expand_pad_general/5`, no C++ change)
 - [x] reverse
 - [x] concatenate (variadic — args is `[list | ...]`)
 - [x] stack (variadic)

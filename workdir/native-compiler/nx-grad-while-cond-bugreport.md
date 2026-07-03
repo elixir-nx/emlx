@@ -123,6 +123,6 @@ Per this project's discipline (a testing stage does not fix compiler bugs
 inline, and this isn't even an EMLX bug), this is filed as a bug report, not
 fixed here. `EMLX.GradEquivalenceTest`'s
 `"while-body-contains-cond grad"` scenario is tested against a
-finite-difference oracle instead of `Nx.Defn.Evaluator` for this specific
+finite-difference reference instead of `Nx.Defn.Evaluator` for this specific
 scenario, with this bug report cited inline, so the suite still pins EMLX's
 (correct) behavior without depending on the known-broken `Evaluator` path.

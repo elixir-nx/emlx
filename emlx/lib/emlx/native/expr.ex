@@ -623,28 +623,37 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # pad: raises for interior > 0 or negative lo/hi (not yet lowered).
-  # iattrs = [n_dims, lo0, hi0, int0, lo1, hi1, int1, …].
+  # pad: the wire :pad opcode only ever carries non-negative lo/hi with
+  # interior=0 (MLX's own pad primitive has no interior-pad or crop support —
+  # see emit_pad_with/5). Interior padding and/or negative lo/hi decompose here,
+  # in Elixir, into a sequence of already-supported opcodes (reshape/pad/slice/
+  # squeeze) that mirrors EMLX.Backend.pad/4's own eager algorithm exactly
+  # (interior_padding_mlx/3 then slice_negative_padding/2 then a plain pad) —
+  # reusing an already-correct, already-tested implementation instead of a
+  # second one. iattrs (wire :pad only) = [n_dims, lo0, hi0, int0, lo1, hi1, int1, …].
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :pad, args: [tensor, pad_value, config]}},
          state
        ) do
-    if Enum.any?(config, fn {lo, hi, interior} -> lo < 0 or hi < 0 or interior > 0 end) do
-      raise ArgumentError,
-            "does not yet lower op :pad with interior padding or negative lo/hi values"
-    end
-
-    ref = make_ref()
-    operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
+    tensor_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
     pad_value_ref = Map.fetch!(state.node_to_ref, pad_value.data.id)
-    n_dims = length(config)
-    iattrs = [n_dims | Enum.flat_map(config, fn {lo, hi, interior} -> [lo, hi, interior] end)]
 
-    %{
-      state
-      | instructions: [{ref, :pad, [operand_ref, pad_value_ref], iattrs} | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, ref)
-    }
+    {result_ref, state} =
+      if Enum.any?(config, fn {lo, hi, interior} -> lo < 0 or hi < 0 or interior > 0 end) do
+        expand_pad_general(tensor_ref, pad_value_ref, Tuple.to_list(tensor.shape), config, state)
+      else
+        ref = make_ref()
+        n_dims = length(config)
+        iattrs = [n_dims | Enum.flat_map(config, fn {lo, hi, interior} -> [lo, hi, interior] end)]
+
+        {ref,
+         %{
+           state
+           | instructions: [{ref, :pad, [tensor_ref, pad_value_ref], iattrs} | state.instructions]
+         }}
+      end
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
   # reverse: iattrs = axes to flip (non-negative).
@@ -2515,6 +2524,113 @@ defmodule EMLX.Native.Expr do
     {new_ref, %{state | instructions: [{new_ref, :slice, [ref], iattrs} | state.instructions]}}
   end
 
+  # General :pad (interior padding and/or negative lo/hi), decomposed into
+  # existing opcodes. Order mirrors EMLX.Backend.pad/4 exactly: interior first
+  # (on the original shape), then crop the negative sides, then a plain
+  # non-negative pad for whatever's left.
+  defp expand_pad_general(tensor_ref, pad_value_ref, in_dims, config, state) do
+    interior_list = Enum.map(config, fn {_lo, _hi, interior} -> interior end)
+
+    {interior_ref, state} =
+      if Enum.all?(interior_list, &(&1 == 0)) do
+        {tensor_ref, state}
+      else
+        emit_interior_padding(tensor_ref, pad_value_ref, in_dims, interior_list, state)
+      end
+
+    interior_shape =
+      Enum.zip(in_dims, interior_list)
+      |> Enum.map(fn {d, interior} -> d + max(d - 1, 0) * interior end)
+
+    {cropped_ref, _cropped_shape, state} =
+      if Enum.any?(config, fn {lo, hi, _interior} -> lo < 0 or hi < 0 end) do
+        emit_negative_crop(interior_ref, interior_shape, config, state)
+      else
+        {interior_ref, interior_shape, state}
+      end
+
+    low_pads = Enum.map(config, fn {lo, _hi, _interior} -> max(lo, 0) end)
+    high_pads = Enum.map(config, fn {_lo, hi, _interior} -> max(hi, 0) end)
+
+    if Enum.all?(low_pads ++ high_pads, &(&1 == 0)) do
+      {cropped_ref, state}
+    else
+      emit_pad_with(cropped_ref, pad_value_ref, low_pads, high_pads, state)
+    end
+  end
+
+  # Interior padding via EMLX.Backend's own trick (interior_padding_mlx/3):
+  # append a size-1 trailing spacer dim, then for each axis in turn, pad the
+  # *next* axis (an original dim, or the trailing spacer for the last axis)
+  # by `next_axis_size * interior` on its high side with `pad_value_ref`,
+  # reshape to fold that padding into the current axis (row-major reinterpret
+  # turns each padded chunk into `interior` extra all-pad "rows" after every
+  # original row, including the last), then slice off the trailing-row excess
+  # (only `interior` gaps are wanted between `axis_size` rows, not `axis_size`
+  # of them). The next iteration's spacer is the axis this one just restored
+  # to its original size, so the spacer role rotates forward one axis at a
+  # time. Squeeze the trailing dim away at the end.
+  defp emit_interior_padding(ref, pad_value_ref, in_dims, interior_list, state) do
+    rank = length(in_dims)
+    shape0 = in_dims ++ [1]
+    {ref, state} = emit_reshape_instr(ref, shape0, state)
+
+    {final_ref, _final_shape, state} =
+      interior_list
+      |> Enum.with_index()
+      |> Enum.reduce({ref, shape0, state}, fn
+        {0, _axis_index}, {acc_ref, shape, st} ->
+          {acc_ref, shape, st}
+
+        {interior, axis_index}, {acc_ref, shape, st} ->
+          next_axis = axis_index + 1
+          axis_size = Enum.at(shape, axis_index)
+          next_axis_size = Enum.at(shape, next_axis)
+
+          pad_lows = List.duplicate(0, rank + 1)
+          pad_highs = List.replace_at(pad_lows, next_axis, next_axis_size * interior)
+          {padded_ref, st} = emit_pad_with(acc_ref, pad_value_ref, pad_lows, pad_highs, st)
+
+          new_axis_size = axis_size + axis_size * interior
+
+          reshaped_shape =
+            shape
+            |> List.replace_at(axis_index, new_axis_size)
+            |> List.replace_at(next_axis, next_axis_size)
+
+          {reshaped_ref, st} = emit_reshape_instr(padded_ref, reshaped_shape, st)
+
+          sliced_shape = List.replace_at(reshaped_shape, axis_index, new_axis_size - interior)
+          starts = List.duplicate(0, rank + 1)
+          strides = List.duplicate(1, rank + 1)
+          {sliced_ref, st} = emit_static_slice(reshaped_ref, reshaped_shape, starts, sliced_shape, strides, st)
+
+          {sliced_ref, sliced_shape, st}
+      end)
+
+    squeeze_ref = make_ref()
+
+    {squeeze_ref,
+     %{state | instructions: [{squeeze_ref, :squeeze, [final_ref], [rank]} | state.instructions]}}
+  end
+
+  # Crop negative lo/hi by slicing them off (EMLX.Backend.slice_negative_padding/2's
+  # decomposition — MLX's :pad primitive can only grow a tensor, never crop it).
+  defp emit_negative_crop(ref, shape, config, state) do
+    starts = Enum.map(config, fn {lo, _hi, _interior} -> max(-lo, 0) end)
+
+    lengths =
+      [shape, config, starts]
+      |> Enum.zip_with(fn [d, {_lo, hi, _interior}, start] ->
+        stop = if hi < 0, do: d + hi, else: d
+        stop - start
+      end)
+
+    strides = List.duplicate(1, length(shape))
+    {new_ref, state} = emit_static_slice(ref, shape, starts, lengths, strides, state)
+    {new_ref, lengths, state}
+  end
+
   # Decompose a flat window index `k` into per-dim offsets in row-major order
   # (last window dim varies fastest), matching Nx.BinaryBackend's window traversal.
   defp window_offsets(k, dims) do
@@ -3184,7 +3300,7 @@ defmodule EMLX.Native.Expr.Interpreter do
   end
 
   # EMLX.Fast fused kernels — call the same eager NIFs the C++ opcodes wrap so
-  # the interpreter (Layer B oracle) matches the C++ replay. Float attrs are the
+  # the interpreter (Layer B reference) matches the C++ replay. Float attrs are the
   # IEEE-754 bits encoded by the lowerer; decode via Expr.bits_to_f64/1.
   defp dispatch(:fast_rms_norm, [x, weight], [eps_bits]) do
     EMLX.fast_rms_norm(from_nx(x), from_nx(weight), Expr.bits_to_f64(eps_bits)) |> to_nx()
