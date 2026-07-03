@@ -1,6 +1,6 @@
 # Stage 32 — `runtime_call` dispatch cache (EXLA-style custom-call reuse)
 
-Status: not started. Named by
+Status: superseded (partial). Named by
 [`31-runtime-call-split-points`](31-runtime-call-split-points.md)'s
 Results, per user directive.
 
@@ -92,4 +92,67 @@ equivalent for `runtime_call` split points.
 
 ## Results
 
-(not started)
+**Status: superseded (partial) — user directive, 2026-07-02.** The dispatch
+cache mechanism itself was implemented, correctness-tested, and works; but
+"a couple of seconds, not tens of minutes" turned out to be the wrong bar to
+clear with this architecture. See
+[`32a-inline-runtime-call`](32a-inline-runtime-call.md), which replaces
+split-and-cache with not-splitting-at-all.
+
+1. **Implemented per the Procedure/advisor sign-off**: `EMLX.dispatch_key/3`
+   builds a structural (id-independent) signature of a stage `Expr` —
+   `EMLX.Defn.Tree.post_order/1`'s node list with tensor operands replaced by
+   their post-order position (not their trace-time `id`), functions reduced
+   to `{module, name, arity}`, opaque sub-scopes (`while`/`block`/`fun`
+   bodies, not visited by the parent `post_order/1`) recursed into via their
+   own self-contained signature. `EMLX.get_or_compile_program/6` now looks
+   this key up in a process-lifetime, named public ETS table
+   (`:emlx_native_dispatch_cache`, lazily created, idempotent under races)
+   instead of Stage 25's original per-`build_native_eval_fn`-closure table —
+   unifying with Stage 25's `quant_signature` cache per the stage doc's Open
+   Question 3 (cache key is now `{dispatch_key, quant_signature}`).
+2. **Found and fixed a real bug in this stage's own new code before it ever
+   reached a real model**: `sanitize_key_term/2`'s opaque-scope fallback
+   recomputed a shared sub-expression's structural signature from scratch on
+   *every* reference to it, with no memoization — the same
+   unmemoized-shared-subexpression blowup pattern
+   `nx-graph-split-bugreport.md`'s Bug 1 hit in `Nx.Defn.Graph`'s
+   `rewrite_subtree`. Fixed with a process-dictionary-scoped memo
+   (`id => signature`, live only for one `dispatch_key/3` call). Caught by
+   the real-model validation below, not by the unit suite (the unit tests'
+   expressions are too small to exhibit the blowup).
+3. **Regression tests**: `emlx/test/emlx/native/expr_test.exs`'s new
+   `:stage32` describe block (2 tests) — calling the same runtime_call-split
+   defn twice with different quantized weights (same shapes) shares one
+   cache entry across both calls, and two separately-defined-but-op-for-op-
+   identical defns (standing in for "two of Qwen3's 28 attention layers")
+   share one cache entry despite tracing to distinct `Expr` ids. Both
+   equivalence-tested against `Nx.Defn.Evaluator`. Full `emlx` suite:
+   2671 passed (827 doctests, 1844 tests), 0 failed — no regression.
+4. **Real-model validation against `validate_qwen3.exs` did not clear the
+   acceptance bar, and revealed the bar itself was set wrong.** Even after
+   fix #2, a `bb+rewrite` run (`EMLX_QWEN3_MAX_NEW=3`,
+   `EMLX_QWEN3_WARMUP_RUNS=1`, local `Qwen3-0.6B-MLX-4bit`) did not
+   complete within a 10-minute bound and was killed. This stage's original
+   Acceptance criterion ("same order of magnitude as `bb base`/`native`, not
+   tens-of-minutes-per-token") was too permissive — **user directive:
+   anything larger than a couple of seconds is unacceptable.** Root cause is
+   architectural, not a caching-completeness gap: `Nx.Defn.Graph.split`
+   fragments the model into ~2 flat stages per attention layer (Stage 31
+   Results item 5) *plus* the split/retrace bookkeeping itself scales with
+   real-model size (unlike the small synthetic repros both this stage and
+   Stage 31 validated against); caching the *compiled artifact* per
+   structural key (this stage's charter) does not remove that fragmentation
+   or retrace cost, it only avoids re-paying the NIF-compile portion of it
+   on a hit. A cold cache still pays real compile cost once per distinct
+   structural site, and a real 28-layer model has enough genuine structural
+   variation (or enough split-machinery overhead near that scale) to land
+   nowhere close to "a couple of seconds."
+5. **Deferred: Stage 32a.** The dispatch cache built here is retained (it is
+   correct, tested, and strictly beneficial for any stage that *does* get
+   split, e.g. a bare `while`'s surrounding flat stages), but it does not by
+   itself meet the real bar. Stage 32a takes a different architectural
+   approach — make an unrecognized `runtime_call` an **in-graph** compiled
+   instruction (no `Nx.Defn.Graph.split`, no host round-trip stage boundary
+   at all), mirroring how Stage 10's `EMLX.Fast.*` kernels already fuse into
+   the single compiled program. See that stage doc for the design.

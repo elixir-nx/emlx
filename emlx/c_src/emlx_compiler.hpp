@@ -32,5 +32,24 @@ ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
 ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
                           const ERL_NIF_TERM argv[]);
 
+// Stage 32a Procedures #2-#3 — the production ":host_callback" opcode. See
+// the "Host callback opcode" section in emlx_compiler.cpp. Callback
+// *identity* (which MFA a callback_slot maps to) lives entirely on the
+// Elixir side (EMLX.Native.Expr's per-program callback table); the target
+// pid for each call is resolved from emlx::current_caller_pid()
+// (emlx_async.hpp), not registered here — there is no registration NIF.
+ERL_NIF_TERM host_callback_resume(ErlNifEnv *env, int argc,
+                                  const ERL_NIF_TERM argv[]);
+
+// Stage 32a spike — see the "Stage 32a spike" section in emlx_compiler.cpp.
+// Not part of the production op registry; throwaway once the stage's
+// go/no-go verdict is written up.
+namespace spike32a {
+ERL_NIF_TERM run_program(ErlNifEnv *env, ErlNifPid target_pid,
+                         mlx::core::Device device, double input_value,
+                         uint64_t compile_id);
+ERL_NIF_TERM resume_call(ErlNifEnv *env, uint64_t call_id, double value);
+} // namespace spike32a
+
 } // namespace native
 } // namespace emlx

@@ -3,7 +3,7 @@
 # Throughput benchmark for EMLXAxon.rewrite/2 on Qwen3-0.6B-MLX-4bit.
 # Measures e2e tok/s for:
 #   - Bumblebee + stock Axon graph (no EMLXAxon.rewrite)
-#   - Bumblebee + full rewrite (default: all rewrites, including :native_attention)
+#   - Bumblebee + full rewrite (default: all rewrites)
 #   - EMLXAxon.TextGeneration (native bypass)
 #
 # Run from the emlx_axon directory:

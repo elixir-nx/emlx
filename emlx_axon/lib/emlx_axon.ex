@@ -16,7 +16,6 @@ defmodule EMLXAxon do
   | `:sdpa`              | Bumblebee `attention_output_impl/3`    | `EMLX.Fast.scaled_dot_product_attention_causal/4` or unmasked |
   | `:dropout`           | `op_name: :dropout` (inference)        | identity pass-through                          |
   | `:swiglu`            | `:multiply(container(up, silu(gate)))` | `EMLX.Fast.swiglu/2`                          |
-  | `:native_attention`  | Bumblebee causal self-attention        | `EMLX.kv_cache_attention_masked/8`            |
 
   ## Usage
 
@@ -92,11 +91,6 @@ defmodule EMLXAxon do
   @bumblebee_attn_mfa {Bumblebee.Layers, :attention_output_impl, 3}
   @bumblebee_repeat_interleave_mfa {Bumblebee.Layers, :"-repeat_interleave/3-fun-0-", 2}
   @bumblebee_update_attn_cache_mfa {Bumblebee.Layers.Decoder, :update_attention_cache, 5}
-  @bumblebee_put_block_cache_mfa {Bumblebee.Layers.Decoder, :"-put_block_cache/3-fun-0-", 3}
-  @kv_cache_proc_key :"$emlx_axon_native_attention_kv_cache"
-  # Memoizes Nx.to_number(offset_tensor) across all layers of a single forward pass.
-  # Stores {MapSet.t(layer_key), cached_integer_offset}.
-  @step_offset_proc_key :"$emlx_axon_step_offset_cache"
 
   @default_rewrites [
     :rms_norm,
@@ -106,9 +100,7 @@ defmodule EMLXAxon do
     :dropout,
     :swiglu,
     :attn_weights,
-    :if_present,
-    :native_attention,
-    :nullify_block_cache
+    :if_present
   ]
 
   @doc """
@@ -118,7 +110,7 @@ defmodule EMLXAxon do
 
     * `:only` — list of atoms selecting which rewrites to apply. Defaults to
       `[:rms_norm, :layer_norm, :rotary_embedding, :sdpa, :dropout, :swiglu,
-      :attn_weights, :if_present, :native_attention, :nullify_block_cache]`.
+      :attn_weights, :if_present]`.
       Pass `:gqa_cache_fix` explicitly when targeting a Bumblebee build whose
       `init_cache` allocates the KV cache with `num_key_value_heads` rather than
       `num_attention_heads` (i.e. the upstream PR branch patch).
@@ -148,8 +140,6 @@ defmodule EMLXAxon do
         |> maybe_add(:attn_weights, attn_weights_rewriter(), enabled)
         |> maybe_add(:if_present, if_present_rewriter(), enabled)
         |> maybe_add(:gqa_cache_fix, gqa_cache_fix_rewriter(), enabled)
-        |> maybe_add(:native_attention, native_attention_rewriter(), enabled)
-        |> maybe_add(:nullify_block_cache, nullify_block_cache_rewriter(), enabled)
 
       Axon.rewrite_nodes(model, fn node ->
         Enum.find_value(rewriters, :skip, fn {_key, fun} ->
@@ -774,368 +764,10 @@ defmodule EMLXAxon do
     )
   end
 
-  # ── Native KV attention ─────────────────────────────────────────────────────
-
-  @doc """
-  Returns the rewriter function for Bumblebee causal self-attention nodes.
-
-  This rewrite replaces the attention output with a single `Nx.runtime_call`
-  callback that updates a process-local ETS K/V cache and calls
-  `EMLX.kv_cache_attention_masked/8`. It intentionally only matches causal
-  attention without sliding-window masking; cross-attention and local attention
-  fall back to the original graph.
-  """
-  @spec native_attention_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def native_attention_rewriter do
-    fn %Axon.Node{op: op, opts: node_opts} ->
-      dropout_rate = Keyword.get(node_opts, :dropout_rate, 0.0)
-
-      if function_info(op) == @bumblebee_attn_mfa and dropout_rate == 0.0 do
-        original_op = op
-
-        fn [weights_dropped_axon, v_axon], _placeholder ->
-          nodes = weights_dropped_axon.nodes
-          weights_dropped_id = weights_dropped_axon.output
-
-          dropout_node = nodes[weights_dropped_id]
-          [attn_weights_id] = dropout_node.parent
-          attn_weights_node = nodes[attn_weights_id]
-
-          causal = Keyword.get(attn_weights_node.opts, :causal, false)
-          window_size = Keyword.get(attn_weights_node.opts, :window_size)
-          scale_opt = Keyword.get(attn_weights_node.opts, :scale)
-
-          # parents: [q_id, k_id, key_mask_id, head_mask_id, bias_id, offset_id]
-          [q_id, k_id, key_mask_id, _head_mask_id, _bias_id, _offset_id] =
-            attn_weights_node.parent
-
-          with true <- causal,
-               true <- is_nil(window_size),
-               {:ok, k_key_id, _k_value_id, _k_cache_id, k_offset_id} <-
-                 find_update_attention_cache(nodes, k_id),
-               {:ok, _v_key_id, v_value_id, _v_cache_id, v_offset_id} <-
-                 find_update_attention_cache(nodes, v_axon.output),
-               true <- k_offset_id == v_offset_id do
-            q_axon = %Axon{output: q_id, nodes: nodes}
-            new_k_axon = maybe_strip_repeat_interleave(nodes, k_key_id)
-            new_v_axon = maybe_strip_repeat_interleave(nodes, v_value_id)
-            offset_axon = %Axon{output: k_offset_id, nodes: nodes}
-
-            key_mask_axon = %Axon{output: key_mask_id, nodes: nodes}
-
-            build_native_attention_layer(
-              q_axon,
-              new_k_axon,
-              new_v_axon,
-              offset_axon,
-              key_mask_axon,
-              scale_opt
-            )
-          else
-            reason ->
-              IO.puts(
-                "[native_attention_rewriter] FALLTHROUGH causal=#{causal} window=#{inspect(window_size)} reason=#{inspect(reason)}"
-              )
-
-              Axon.layer(original_op, [weights_dropped_axon, v_axon])
-          end
-        end
-      else
-        :skip
-      end
-    end
-  end
-
-  defp build_native_attention_layer(
-         q_axon,
-         new_k_axon,
-         new_v_axon,
-         offset_axon,
-         key_mask_axon,
-         scale_opt
-       ) do
-    layer_key = make_ref()
-
-    Axon.layer(
-      fn q, new_k, new_v, offset, key_mask, op_opts ->
-        out = Nx.template(Nx.shape(q), Nx.type(q))
-        head_dim = elem(Nx.shape(q), 3)
-        scale = op_opts[:scale] || 1.0 / :math.sqrt(head_dim)
-
-        # Both prefill and decode are handled entirely inside the callback:
-        # - Prefill (t_new > 1): callback computes SDPA eagerly, stores K/V in ETS.
-        # - Decode  (t_new == 1): callback reads ETS cache, calls kv_cache_attention_masked.
-        Nx.runtime_call(
-          out,
-          {q, new_k, new_v, offset, key_mask},
-          [layer_key: op_opts[:layer_key], scale: scale],
-          &__MODULE__.native_kv_attn_callback/2
-        )
-      end,
-      [q_axon, new_k_axon, new_v_axon, offset_axon, key_mask_axon],
-      op_name: :native_kv_attention,
-      layer_key: layer_key,
-      scale: if(is_number(scale_opt), do: scale_opt, else: nil)
-    )
-  end
-
-  @doc false
-  def native_kv_attn_callback(
-        {query, new_k, new_v, offset_tensor, key_mask},
-        opts
-      ) do
-    layer_key = Keyword.fetch!(opts, :layer_key)
-    t_new = elem(Nx.shape(new_k), 1)
-
-    if t_new > 1 do
-      # Prefill path: always read the actual offset tensor.
-      #
-      # The step-offset cache may hold a stale value from a previous serving's
-      # last decode step when this layer_key is brand new (never seen before).
-      # For prefill the optimization is irrelevant (only 1 GPU→CPU sync per
-      # layer anyway since it's a single step), so bypass get_step_offset.
-      #
-      # Also accumulate this layer_key into the seen set so decode step 1 finds
-      # it already "seen" and issues a fresh read instead of using the (now
-      # correct) prefill cached_offset at the wrong decode position.
-      offset = Nx.to_number(offset_tensor)
-      register_prefill_layer(layer_key, offset)
-
-      if offset == 0 do
-        native_kv_prefill(query, new_k, new_v, key_mask, layer_key, opts)
-      else
-        native_kv_decode(query, new_k, new_v, offset, key_mask, layer_key, opts)
-      end
-    else
-      offset = get_step_offset(offset_tensor, layer_key)
-      native_kv_decode(query, new_k, new_v, offset, key_mask, layer_key, opts)
-    end
-  end
-
-  # Registers a layer_key seen during the prefill step.
-  # Accumulates all prefill keys into the seen set so that decode step 1
-  # will find each layer_key already "seen" and issue a fresh step-boundary read
-  # at the correct decode offset rather than reusing the prefill offset (0).
-  defp register_prefill_layer(layer_key, offset) do
-    new_state =
-      case Process.get(@step_offset_proc_key) do
-        nil -> {MapSet.new([layer_key]), offset}
-        {seen, _prev} -> {MapSet.put(seen, layer_key), offset}
-      end
-
-    Process.put(@step_offset_proc_key, new_state)
-  end
-
-  defp native_kv_prefill(query, new_k, new_v, key_mask, layer_key, opts) do
-    t_new = elem(Nx.shape(new_k), 1)
-    scale = Keyword.fetch!(opts, :scale)
-
-    # Bumblebee compiles with max_length = seq_length + max_new_tokens, so
-    # key_mask is {B, max_length} while new_k is {B, seq_length, N_kv, D}.
-    # Pad new_k/new_v with zeros to max_length before storing so the
-    # decode path can retrieve a buffer of the expected size.
-    max_len =
-      case Nx.shape(key_mask) do
-        {_, max} -> max
-        {_, _, _, max} -> max
-      end
-
-    pad_len = max_len - t_new
-    {b, _, nkv, d} = Nx.shape(new_k)
-    type = Nx.type(new_k)
-
-    {k_full, v_full} =
-      if pad_len > 0 do
-        zeros_k = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
-        zeros_v = Nx.broadcast(Nx.tensor(0, type: type), {b, pad_len, nkv, d})
-        {Nx.concatenate([new_k, zeros_k], axis: 1), Nx.concatenate([new_v, zeros_v], axis: 1)}
-      else
-        {new_k, new_v}
-      end
-
-    # Store raw {dev, ref} tuples — no ETS, no to_nx overhead for k/v.
-    cache_map = Process.get(@kv_cache_proc_key, %{})
-
-    Process.put(
-      @kv_cache_proc_key,
-      Map.put(cache_map, layer_key, {EMLX.Backend.from_nx(k_full), EMLX.Backend.from_nx(v_full)})
-    )
-
-    # Compute prefill SDPA eagerly here in the callback (avoids splitting the
-    # computation across the Axon layer boundary and the Nx.add(sdpa, zeros) trick).
-    # Use k_full/v_full (padded to max_length) and the FULL key_mask rather than
-    # slicing both to t_new. This exactly matches the default sdpa rewriter path
-    # (T_kv = max_length), ensuring identical NaN-propagation behavior on Metal
-    # for left-padded input sequences.
-
-    # Q/K/V: {B, T, N, D} → transpose to {B, N, T, D} for the NIF.
-    q_t = Nx.transpose(query, axes: [0, 2, 1, 3])
-    k_t = Nx.transpose(k_full, axes: [0, 2, 1, 3])
-    v_t = Nx.transpose(v_full, axes: [0, 2, 1, 3])
-
-    # kv_offset = 0 for prefill (lower-triangular causal mask from position 0).
-    sdpa_t =
-      EMLX.fast_sdpa_causal_key_masked(
-        EMLX.Backend.from_nx(q_t),
-        EMLX.Backend.from_nx(k_t),
-        EMLX.Backend.from_nx(v_t),
-        scale,
-        EMLX.Backend.from_nx(key_mask),
-        0
-      )
-      |> EMLX.Backend.to_nx()
-
-    # Transpose back to {B, T, N, D} and match query dtype.
-    out = Nx.transpose(sdpa_t, axes: [0, 2, 1, 3])
-    if Nx.type(out) == Nx.type(query), do: out, else: Nx.as_type(out, Nx.type(query))
-  end
-
-  defp native_kv_decode(query, new_k, new_v, offset, key_mask, layer_key, opts) do
-    t_new = elem(Nx.shape(new_k), 1)
-    valid_len = offset + t_new
-
-    {batch_size, max_length, mask_axis} =
-      case Nx.shape(key_mask) do
-        {batch_size, max_length} -> {batch_size, max_length, 1}
-        {batch_size, _heads, _query_len, max_length} -> {batch_size, max_length, 3}
-      end
-
-    {_, _, kv_heads, head_dim} = Nx.shape(new_k)
-    full_shape = {batch_size, max_length, kv_heads, head_dim}
-    type = Nx.type(new_k)
-    scale = Keyword.fetch!(opts, :scale)
-
-    # Get cached refs directly from process dict — no ETS lookup, no term copying.
-    cache_map = Process.get(@kv_cache_proc_key, %{})
-
-    {k_cache_ref, v_cache_ref} =
-      case Map.get(cache_map, layer_key) do
-        nil ->
-          # No prefill ran — initialize zero-filled cache buffer.
-          zeros = Nx.broadcast(Nx.tensor(0, type: type), full_shape)
-          {EMLX.Backend.from_nx(zeros), EMLX.Backend.from_nx(zeros)}
-
-        refs ->
-          refs
-      end
-
-    key_mask_sliced = Nx.slice_along_axis(key_mask, 0, valid_len, axis: mask_axis)
-
-    {attn_ref, k_upd_ref, v_upd_ref} =
-      EMLX.kv_cache_attention_masked(
-        EMLX.Backend.from_nx(query),
-        EMLX.Backend.from_nx(new_k),
-        EMLX.Backend.from_nx(new_v),
-        k_cache_ref,
-        v_cache_ref,
-        offset,
-        scale,
-        EMLX.Backend.from_nx(key_mask_sliced)
-      )
-
-    # Store raw refs directly — no to_nx for k/v, no ETS insert.
-    Process.put(@kv_cache_proc_key, Map.put(cache_map, layer_key, {k_upd_ref, v_upd_ref}))
-
-    attn_out = EMLX.Backend.to_nx(attn_ref)
-
-    if Nx.type(attn_out) == Nx.type(query) do
-      attn_out
-    else
-      Nx.as_type(attn_out, Nx.type(query))
-    end
-  end
-
-  defp find_update_attention_cache(nodes, node_id, seen \\ MapSet.new()) do
-    cond do
-      MapSet.member?(seen, node_id) ->
-        :error
-
-      node = nodes[node_id] ->
-        if function_info(node.op) == @bumblebee_update_attn_cache_mfa do
-          [key_id, value_id, cache_id, offset_id] = node.parent
-          {:ok, key_id, value_id, cache_id, offset_id}
-        else
-          seen = MapSet.put(seen, node_id)
-
-          # For :if_present nodes, only follow parent[1] (the on_true / cache-present branch).
-          # parent[0] is optional(condition) which chains through put_block_cache to OTHER
-          # layers' UAC nodes. parent[2] is the fallback (no cache). Only parent[1] leads
-          # to the current layer's own UAC.
-          parents_to_search =
-            if node.op_name == :if_present do
-              case node.parent do
-                [_cond, on_true, _on_false] -> [on_true]
-                _ -> node.parent
-              end
-            else
-              node.parent
-            end
-
-          Enum.find_value(parents_to_search, :error, fn parent_id ->
-            case find_update_attention_cache(nodes, parent_id, seen) do
-              {:ok, _key_id, _value_id, _cache_id, _offset_id} = found -> found
-              :error -> nil
-            end
-          end)
-        end
-
-      true ->
-        :error
-    end
-  end
-
   defp maybe_unwrap_optional(nodes, node_id) do
     case nodes[node_id] do
       %Axon.Node{op_name: :optional, parent: [inner_id]} -> inner_id
       _ -> node_id
-    end
-  end
-
-  @doc """
-  Returns the rewriter function for Bumblebee block-cache update nodes.
-
-  When native attention owns K/V state in an ETS table, the Axon block-cache
-  update chain is dead. Replacing `put_block_cache` with an identity lets DCE
-  prune `get_block_cache`, `update_attention_cache`, and container plumbing.
-  """
-  @spec nullify_block_cache_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
-  def nullify_block_cache_rewriter do
-    fn %Axon.Node{op: op} ->
-      if function_info(op) == @bumblebee_put_block_cache_mfa do
-        fn [cache_axon, _block_cache_axon], _placeholder -> cache_axon end
-      else
-        :skip
-      end
-    end
-  end
-
-  # Memoizes Nx.to_number(offset_tensor) within a single forward pass (decode step).
-  #
-  # All layer callbacks within one forward pass share the same offset value. Calling
-  # Nx.to_number once per layer forces one GPU→CPU sync per layer. Instead, call it
-  # once per step: detect the step boundary by tracking which layer_keys have been
-  # called in the current step. When a layer_key appears AGAIN (it was already seen in
-  # the previous step), we know a new step has begun and issue one fresh Nx.to_number;
-  # all other layers reuse the cache.
-  defp get_step_offset(offset_tensor, layer_key) do
-    case Process.get(@step_offset_proc_key) do
-      nil ->
-        offset = Nx.to_number(offset_tensor)
-        Process.put(@step_offset_proc_key, {MapSet.new([layer_key]), offset})
-        offset
-
-      {seen, cached_offset} ->
-        if MapSet.member?(seen, layer_key) do
-          # layer_key already seen in the prior step cycle → this is the start of a new step.
-          offset = Nx.to_number(offset_tensor)
-          Process.put(@step_offset_proc_key, {MapSet.new([layer_key]), offset})
-          offset
-        else
-          Process.put(@step_offset_proc_key, {MapSet.put(seen, layer_key), cached_offset})
-          cached_offset
-        end
     end
   end
 
@@ -1218,13 +850,7 @@ defmodule EMLXAxon do
     end
   end
 
-  defp expand_enabled(enabled) do
-    if :native_attention in enabled do
-      Enum.uniq([:if_present | enabled])
-    else
-      enabled
-    end
-  end
+  defp expand_enabled(enabled), do: enabled
 
   defp maybe_add(acc, key, fun, enabled) do
     if key in enabled, do: [{key, fun} | acc], else: acc

@@ -67,6 +67,16 @@ defmodule EMLX.Native.ExprTest do
     EMLX.Quantization.quantized_matmul(x, qw) |> Nx.add(1.0) |> Nx.multiply(2.0)
   end
 
+  # Stage 32 helper: a *separate* defn with the exact same op sequence as
+  # `dequant_surrounded/2` (different name/source location, so it traces to
+  # a structurally-identical-but-distinct `Expr` with fresh ids) -- stands
+  # in for "another one of the 28 structurally-identical Qwen3 attention
+  # layers" without needing a real 28-layer model in this unit test.
+  defn dequant_surrounded_other_site(x, qw) do
+    dense = EMLX.Quantization.dequantize(qw)
+    Nx.add(x, dense) |> Nx.multiply(2.0)
+  end
+
   # Stage 03 helpers for interpreter↔C++ parity tests.
   defn reshape_23(x), do: Nx.reshape(x, {2, 3})
   defn broadcast_23(x), do: Nx.broadcast(x, {2, 3})
@@ -4119,6 +4129,102 @@ defmodule EMLX.Native.ExprTest do
       eager = fun.(x, w)
 
       assert_all_close(native, eager)
+    end
+  end
+
+  # ── Stage 32 helpers: introspecting the process-lifetime dispatch cache ──
+  #
+  # `:emlx_native_dispatch_cache` is a single table shared by the whole test
+  # run (and, in a real system, the whole node) -- other concurrently
+  # running test modules may be inserting unrelated entries into it at the
+  # same time. To assert "compiled once, reused" without flaking on that
+  # concurrent traffic, every Stage 32 test below uses tensor shapes chosen
+  # to be implausible anywhere else in this suite (odd-looking prime-ish
+  # dimensions) and filters the cache down to only the entries whose key
+  # mentions that exact shape before counting, instead of trusting the raw
+  # table size.
+  defp dispatch_cache_entries_mentioning(shape) do
+    :emlx_native_dispatch_cache
+    |> :ets.tab2list()
+    |> Enum.filter(fn {key, _resource, _hooks} -> term_mentions?(key, shape) end)
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.uniq()
+  end
+
+  defp term_mentions?(term, needle) when term == needle, do: true
+
+  defp term_mentions?(term, needle) when is_tuple(term) do
+    term |> Tuple.to_list() |> term_mentions?(needle)
+  end
+
+  defp term_mentions?(term, needle) when is_list(term) do
+    Enum.any?(term, &term_mentions?(&1, needle))
+  end
+
+  defp term_mentions?(term, needle) when is_map(term) do
+    term |> Map.to_list() |> term_mentions?(needle)
+  end
+
+  defp term_mentions?(_term, _needle), do: false
+
+  describe "Stage 32 — runtime_call split-point dispatch cache (compile once, reuse)" do
+    # See workdir/native-compiler/32-runtime-call-dispatch-cache.md. Stage 31
+    # made an unrecognized `:runtime_call` correct but not fast: every call
+    # re-split and re-compiled the surrounding flat stages from scratch, with
+    # zero reuse across decode steps or structurally-identical call sites
+    # (e.g. Qwen3's 28 attention layers). `dispatch_key/3` +
+    # `get_or_compile_program/6` now cache a flat stage's compiled program
+    # persistently, keyed by a structural (id-independent) signature instead
+    # of by `Expr` object identity, so it survives across
+    # `Nx.Defn.Graph.run/3`'s per-call re-tracing.
+
+    @tag :stage32
+    test "calling the same runtime_call-split defn twice compiles its flat stages once" do
+      shape = {19, 128}
+      w1 = Nx.iota(shape, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      w2 = Nx.iota(shape, type: :f32) |> Nx.divide(7) |> Nx.backend_transfer(EMLX.Backend)
+      qw1 = EMLX.quantize(w1, [])
+      qw2 = EMLX.quantize(w2, [])
+      x = Nx.iota(shape, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
+
+      native1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw1)
+      entries_after_first = dispatch_cache_entries_mentioning(shape)
+      assert entries_after_first != []
+
+      native2 = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw2)
+      entries_after_second = dispatch_cache_entries_mentioning(shape)
+
+      assert entries_after_second == entries_after_first
+
+      eager1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw1)
+      eager2 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw2)
+      assert_all_close(native1, eager1)
+      assert_all_close(native2, eager2)
+    end
+
+    @tag :stage32
+    test "two structurally-identical but distinct call sites share one cache entry" do
+      shape = {23, 192}
+      w1 = Nx.iota(shape, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      w2 = Nx.iota(shape, type: :f32) |> Nx.divide(7) |> Nx.backend_transfer(EMLX.Backend)
+      qw1 = EMLX.quantize(w1, [])
+      qw2 = EMLX.quantize(w2, [])
+      x = Nx.iota(shape, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
+
+      # Two separately-defined defns with the identical op sequence stand in
+      # for "two of Qwen3's 28 structurally-identical attention layers":
+      # each traces to a fresh `Expr` (different ids), but the same shape of
+      # computation.
+      native1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw1)
+      native2 = Nx.Defn.jit(&dequant_surrounded_other_site/2, compiler: EMLX).(x, qw2)
+
+      entries = dispatch_cache_entries_mentioning(shape)
+      assert length(entries) == 1
+
+      eager1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw1)
+      eager2 = Nx.Defn.jit(&dequant_surrounded_other_site/2, compiler: Nx.Defn.Evaluator).(x, qw2)
+      assert_all_close(native1, eager1)
+      assert_all_close(native2, eager2)
     end
   end
 

@@ -70,6 +70,43 @@
 
 namespace emlx {
 
+// The ErlNifPid that dispatched the `SyncOp` currently executing on *this*
+// worker thread, or `nullptr` outside any `SyncOp`'s dynamic extent. Safe
+// as a thread-local because `emlx::Worker`'s job queue is a single FIFO
+// serviced by exactly one OS thread, one job at a time (see
+// emlx_worker.hpp's `thread_main`) — no two jobs ever run concurrently on
+// the same worker thread, so there is no cross-job race on this variable.
+//
+// Used by `host_callback::HostCallback::eval_cpu`/`eval_gpu`
+// (emlx_compiler.cpp) to route a mid-eval host-callback message to the
+// ACTUAL current caller, not whichever process happened to trigger the
+// compiled program's first trace. `mlx::core::detail::compile()` traces
+// its interpreter lambda — and constructs every `Primitive` object,
+// including `HostCallback` — exactly ONCE per structural cache entry;
+// every subsequent real `eval()` replays those same already-built
+// `Primitive` objects without rebuilding them (see Stage 32a Procedure
+// #1's spike results). Baking a target pid into `HostCallback`'s
+// constructor would therefore route every future replay's callback to
+// whichever process triggered the FIRST evaluation, forever — wrong as
+// soon as the same compiled program (Stage 32's structural cache) is
+// reused across calls from more than one logical caller, which is the
+// *normal* case (e.g. a decode loop replaying the same compiled
+// attention-layer program every step). Reading a thread-local set fresh
+// by `async_dispatch` on every dispatched call avoids baking anything
+// call-specific into the compiled graph at all.
+inline thread_local ErlNifPid *g_current_caller_pid_ptr = nullptr;
+
+// Returns the calling pid for whatever `SyncOp` is currently executing on
+// this worker thread via `false` if called outside any `SyncOp`'s dynamic
+// extent — a programming/wiring error, not something to silently paper
+// over with a stale or garbage pid.
+inline bool current_caller_pid(ErlNifPid *out) {
+  if (!g_current_caller_pid_ptr)
+    return false;
+  *out = *g_current_caller_pid_ptr;
+  return true;
+}
+
 // Build an `{:error, "<message>"}` tuple in `msg_env`. Uses
 // `enif_make_string` to mirror nx::nif::error so the Elixir side can
 // `List.to_string/1` it uniformly.
@@ -142,6 +179,11 @@ ERL_NIF_TERM async_dispatch(ErlNifEnv *env, int argc,
   try {
     worker->post([msg_env, job_ref_msg, caller_pid,
                   op_argv = std::move(op_argv)]() mutable {
+      // See g_current_caller_pid_ptr's doc comment above: safe because
+      // this worker thread runs exactly one job at a time.
+      ErlNifPid current_caller = caller_pid;
+      g_current_caller_pid_ptr = &current_caller;
+
       ERL_NIF_TERM payload;
       try {
         payload = SyncOp(msg_env, static_cast<int>(op_argv.size()),
@@ -153,6 +195,8 @@ ERL_NIF_TERM async_dispatch(ErlNifEnv *env, int argc,
         // hangs.
         payload = error_from_current_exception(msg_env);
       }
+
+      g_current_caller_pid_ptr = nullptr;
 
       ERL_NIF_TERM reply =
           enif_make_tuple2(msg_env, job_ref_msg, payload);

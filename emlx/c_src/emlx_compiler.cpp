@@ -10,11 +10,16 @@
 // integers, no lockstep parity table to maintain.
 
 #include "emlx_compiler.hpp"
+#include "mlx/allocator.h"
 #include "mlx/compile_impl.h"
+#include "mlx/primitives.h"
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
 #include <numeric>
+#include <thread>
 #include <unordered_map>
 
 namespace emlx {
@@ -408,6 +413,292 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
 // compose inside a compiled graph regardless of the graph's default (worker)
 // stream — validated to work for both :cpu and :gpu default devices.
 static const mlx::core::Device k_linalg_cpu(mlx::core::Device::DeviceType::cpu, 0);
+
+// ── Host callback opcode (Stage 32a Procedures #2-#3) ───────────────────────
+//
+// Production version of the `spike32a::HostCallback` mechanism validated by
+// Procedure #1's spike (see that namespace's comment, above `op_registry`'s
+// definition site in this file's history, for why this is a bespoke
+// `mlx::core::Primitive` rather than `mlx::core::custom_function`: the
+// latter runs its wrapped function eagerly at trace time, so it cannot
+// re-fire on every compiled-graph replay). Given operand arrays, the
+// "host_callback" op below synchronously sends them to the CURRENT calling
+// Erlang process (see below), blocks the worker OS thread for a reply
+// (bounded by a timeout so a real deadlock fails loudly instead of hanging
+// forever), and returns the reply as the op's result array.
+//
+// Callback *identity* — mapping a real `runtime_call` callback's
+// `{module, function}` MFA to actual dispatch logic — lives entirely on
+// the Elixir side (`EMLX.Native.Expr`'s per-program callback-slot table,
+// resolved by `EMLX.__compile__`'s eval loop). The `callback_slot`
+// forwarded below is an opaque integer as far as C++ is concerned: it is
+// never resolved to a pid or a function here, only round-tripped in the
+// message so the *current caller* (see next paragraph) can look it up in
+// its own table.
+//
+// The *target pid* for the mid-eval message is deliberately NOT anything
+// registered or baked into the `HostCallback` primitive's constructor.
+// `mlx::core::detail::compile()` traces its interpreter lambda — building
+// every `Primitive` object, including `HostCallback` — exactly once per
+// structural cache entry; every subsequent real `eval()` replays those
+// same already-built objects (see Procedure #1's spike results). Baking a
+// pid in at construction time would route every future replay's callback
+// to whichever process triggered the FIRST evaluation, forever — wrong as
+// soon as the same compiled program (Stage 32's structural cache) is
+// reused across calls from more than one logical caller, the normal case
+// for e.g. a decode loop replaying the same compiled attention layer
+// every step. Instead, `host_round_trip` reads
+// `emlx::current_caller_pid()` (emlx_async.hpp) — a thread-local set
+// fresh by `async_dispatch` for whichever call is *currently* running on
+// this worker thread — so each real invocation routes to its own actual
+// caller, not a stale one.
+namespace host_callback {
+
+// Returns `src` unchanged if already row-major contiguous, otherwise a
+// fresh array holding a byte-for-byte row-major copy of its logical
+// contents. `src` must already be evaluated (guaranteed here: called only
+// on `eval_cpu`/`eval_gpu` inputs, or on a callback's reply after the
+// Elixir caller's own force-eval — see the two call sites below).
+//
+// Deliberately hand-rolled instead of `mlx::core::eval(mlx::core::
+// contiguous(src))`: that builds a *lazy* node and needs a real `eval()`
+// to materialize it, but this runs from inside `host_round_trip`/`run()`,
+// themselves invoked BY a thread already inside `mlx::core::eval()`'s own
+// dependency walk for the outer compiled graph -- a nested `eval()` call
+// on that same thread reenters MLX's scheduler and self-deadlocks (a
+// plain, non-recursive mutex; confirmed empirically, not from the docs).
+// A pure host-side byte copy has no such reentrancy hazard.
+static mlx::core::array make_row_major_contiguous(const mlx::core::array &src) {
+  if (src.flags().row_contiguous) {
+    return src;
+  }
+
+  size_t nbytes = src.nbytes();
+  mlx::core::allocator::Buffer buf = mlx::core::allocator::malloc(nbytes);
+  auto *dst_ptr = static_cast<uint8_t *>(buf.raw_ptr());
+  const auto *src_ptr = src.data<uint8_t>();
+  size_t item = src.itemsize();
+  int ndim = src.ndim();
+  const auto &shape = src.shape();
+  const auto &strides = src.strides(); // element strides, not bytes
+
+  size_t total = static_cast<size_t>(src.size());
+  std::vector<int> coord(ndim, 0);
+  for (size_t linear = 0; linear < total; linear++) {
+    int64_t src_elem_offset = 0;
+    for (int d = 0; d < ndim; d++)
+      src_elem_offset += static_cast<int64_t>(coord[d]) * strides[d];
+    std::memcpy(dst_ptr + linear * item,
+                src_ptr + static_cast<size_t>(src_elem_offset) * item, item);
+
+    for (int d = ndim - 1; d >= 0; d--) {
+      if (++coord[d] < shape[d])
+        break;
+      coord[d] = 0;
+    }
+  }
+
+  auto deleter = [](mlx::core::allocator::Buffer b) {
+    mlx::core::allocator::free(b);
+  };
+  return mlx::core::array(buf, src.shape(), src.dtype(), deleter);
+}
+
+struct PendingCall {
+  std::mutex m;
+  std::condition_variable cv;
+  bool ready = false;
+  std::optional<mlx::core::array> reply;
+};
+
+static std::mutex g_pending_mutex;
+static std::unordered_map<uint64_t, std::shared_ptr<PendingCall>> g_pending;
+static std::atomic<uint64_t> g_next_call_id{1};
+
+// Sends every operand array's {resource_ref, shape, dtype_atom} to the
+// CURRENT caller (emlx::current_caller_pid(), not a registered/baked-in
+// pid — see the namespace comment above) as a self-describing message (so
+// the receiver never needs to call back into any EMLX worker-routed NIF
+// to inspect them -- e.g. EMLX.shape/1 -- since the worker thread that
+// would service that call is the very one blocked below; see resume()'s
+// comment), then blocks (bounded) for host_callback_resume/2 and returns
+// the reply array. Mirrors spike32a::host_round_trip, generalized from a
+// scalar double to arbitrary-shape/dtype array operands and replies.
+static mlx::core::array
+host_round_trip(uint64_t callback_slot,
+                const std::vector<mlx::core::array> &operands) {
+  ErlNifPid target;
+  if (!emlx::current_caller_pid(&target))
+    throw std::runtime_error(
+        "emlx::native host_callback: no current caller pid -- eval_program "
+        "was not reached through emlx::async_dispatch (this is an EMLX "
+        "wiring bug, not something a caller triggered)");
+
+  uint64_t call_id = g_next_call_id.fetch_add(1, std::memory_order_relaxed);
+  auto pending = std::make_shared<PendingCall>();
+  {
+    std::lock_guard<std::mutex> lk(g_pending_mutex);
+    g_pending[call_id] = pending;
+  }
+
+  ErlNifEnv *msg_env = enif_alloc_env();
+  std::vector<ERL_NIF_TERM> operand_terms;
+  operand_terms.reserve(operands.size());
+  for (const auto &raw : operands) {
+    // Force row-major contiguity before handing raw bytes to Erlang: an
+    // operand reaching here may be a lazy strided *view* even once
+    // evaluated (e.g. `transpose` -- pervasive in native_kv_attn_callback's
+    // Q/K/V handling), and `create_tensor_resource`'s NIF resource is read
+    // back byte-for-byte assuming row-major layout on the Elixir side (see
+    // `EMLX.Backend.to_nx/2`) -- see `make_row_major_contiguous`'s comment
+    // for why this can't just be `mlx::core::eval(mlx::core::contiguous(raw))`.
+    mlx::core::array a = make_row_major_contiguous(raw);
+    ERL_NIF_TERM ref_term = create_tensor_resource(msg_env, a);
+    std::vector<ERL_NIF_TERM> dims;
+    dims.reserve(a.ndim());
+    for (auto d : a.shape())
+      dims.push_back(enif_make_int64(msg_env, static_cast<ErlNifSInt64>(d)));
+    ERL_NIF_TERM shape_term = enif_make_list_from_array(
+        msg_env, dims.data(), static_cast<unsigned>(dims.size()));
+    const std::string *dtype_name = dtype2string(a.dtype());
+    ERL_NIF_TERM dtype_term =
+        enif_make_atom(msg_env, dtype_name ? dtype_name->c_str() : "float32");
+    operand_terms.push_back(
+        enif_make_tuple3(msg_env, ref_term, shape_term, dtype_term));
+  }
+  ERL_NIF_TERM operands_term =
+      enif_make_list_from_array(msg_env, operand_terms.data(),
+                                static_cast<unsigned>(operand_terms.size()));
+
+  ERL_NIF_TERM msg =
+      enif_make_tuple4(msg_env, enif_make_atom(msg_env, "emlx_host_callback"),
+                       enif_make_uint64(msg_env, call_id),
+                       enif_make_uint64(msg_env, callback_slot), operands_term);
+  ErlNifPid target_copy = target;
+  enif_send(NULL, &target_copy, msg_env, msg);
+  enif_free_env(msg_env);
+
+  std::unique_lock<std::mutex> lk(pending->m);
+  bool got_reply = pending->cv.wait_for(lk, std::chrono::seconds(30),
+                                        [&] { return pending->ready; });
+  {
+    std::lock_guard<std::mutex> lk2(g_pending_mutex);
+    g_pending.erase(call_id);
+  }
+  if (!got_reply) {
+    throw std::runtime_error(
+        "emlx::native host_callback: timed out waiting for "
+        "host_callback_resume/2 -- worker thread deadlocked, or the "
+        "registered Erlang process never replied");
+  }
+  return *pending->reply;
+}
+
+// Called by host_callback_resume/2, directly on whatever (BEAM scheduler /
+// dirty-scheduler) thread invokes that NIF -- deliberately NOT posted
+// through emlx::Worker::post, since the worker thread is the one blocked
+// in host_round_trip above; routing the resume through its own job queue
+// would self-deadlock (the sharpest risk flagged in Procedure #1's spike).
+//
+// Deliberately does NOT call `mlx::core::eval(reply)` here: a dirty
+// scheduler thread is an arbitrary OS thread with no MLX stream of its
+// own, so evaluating a GPU-stream-backed `reply` from here fails hard
+// ("There is no Stream(gpu, N) in current thread" -- the exact failure
+// mode emlx_async.hpp's top comment warns about for any MLX op run off
+// its owning stream's thread). The Elixir caller
+// (`EMLX.dispatch_host_callback/5`) is responsible for force-evaluating
+// its callback's result -- routed through the correct worker/queue, via
+// an ordinary worker-routed `EMLX.NIF.eval/2` call -- before invoking
+// `host_callback_resume/2`, exactly as `eval_program` requires
+// pre-evaluated inputs (see its comment).
+static bool resume(uint64_t call_id, mlx::core::array reply) {
+  std::shared_ptr<PendingCall> pending;
+  {
+    std::lock_guard<std::mutex> lk(g_pending_mutex);
+    auto it = g_pending.find(call_id);
+    if (it == g_pending.end())
+      return false;
+    pending = it->second;
+  }
+  {
+    std::lock_guard<std::mutex> lk(pending->m);
+    pending->reply = std::move(reply);
+    pending->ready = true;
+  }
+  pending->cv.notify_one();
+  return true;
+}
+
+// CPU-pinned (see k_linalg_cpu precedent above) so it composes inside a
+// compiled graph regardless of the graph's default (:cpu or :gpu) stream --
+// eval_gpu is unreachable by construction, not by contract (same shape as
+// spike32a::HostCallback).
+class HostCallback : public mlx::core::Primitive {
+public:
+  HostCallback(mlx::core::Stream stream, uint64_t callback_slot)
+      : mlx::core::Primitive(stream), callback_slot_(callback_slot) {}
+
+  void eval_cpu(const std::vector<mlx::core::array> &inputs,
+                std::vector<mlx::core::array> &outputs) override {
+    run(inputs, outputs);
+  }
+  void eval_gpu(const std::vector<mlx::core::array> &inputs,
+                std::vector<mlx::core::array> &outputs) override {
+    run(inputs, outputs);
+  }
+
+  const char *name() const override { return "emlx_host_callback"; }
+
+private:
+  void run(const std::vector<mlx::core::array> &inputs,
+           std::vector<mlx::core::array> &outputs) {
+    mlx::core::array raw_reply = host_round_trip(callback_slot_, inputs);
+    // Same contiguity concern as the operand side (see host_round_trip's
+    // comment): the Erlang callback's reply (e.g. native_kv_prefill's
+    // `Nx.transpose(sdpa_t, ...)`) may still be a lazy strided view even
+    // after EMLX.dispatch_host_callback/6's force-eval -- `eval()` alone
+    // doesn't guarantee row-major layout, and this memcpy below assumes it.
+    mlx::core::array reply = make_row_major_contiguous(raw_reply);
+    auto &out = outputs[0];
+    if (reply.nbytes() != out.nbytes() || reply.dtype() != out.dtype()) {
+      const std::string *want = dtype2string(out.dtype());
+      const std::string *got = dtype2string(reply.dtype());
+      throw std::runtime_error(
+          "emlx::native host_callback: Erlang callback's reply does not "
+          "match the op's declared output (declared " +
+          std::to_string(out.nbytes()) + " bytes of " + (want ? *want : "?") +
+          ", got " + std::to_string(reply.nbytes()) + " bytes of " +
+          (got ? *got : "?") + ")");
+    }
+    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+    std::memcpy(out.data<uint8_t>(), reply.data<uint8_t>(), out.nbytes());
+  }
+
+  uint64_t callback_slot_;
+};
+
+} // namespace host_callback
+
+// host_callback_resume/2 — argv[0]: call_id (integer), argv[1]: reply
+// tensor resource ref. Deliberately NOT worker-routed (see resume()'s
+// comment); registered as a dirty NIF in emlx_nif.cpp since mlx::core::eval
+// inside resume() may do real (CPU- or GPU-bound) compute.
+ERL_NIF_TERM host_callback_resume(ErlNifEnv *env, int argc,
+                                  const ERL_NIF_TERM argv[]) {
+  try {
+    ErlNifUInt64 call_id;
+    if (!enif_get_uint64(env, argv[0], &call_id))
+      return nx::nif::error(
+          env, "host_callback_resume: expected an integer call_id");
+    TensorP reply_tp(env, argv[1]);
+    if (!reply_tp.is_valid())
+      return reply_tp.error();
+    bool ok = host_callback::resume(call_id, *reply_tp.data());
+    return ok ? nx::nif::ok(env)
+              : nx::nif::error(env, "host_callback_resume: unknown call_id");
+  }
+  CATCH()
+}
 
 static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
@@ -1361,6 +1652,32 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            false, k_linalg_cpu);
      }},
 
+    // ── host_callback (Stage 32a Procedures #2-#4) ───────────────────────
+    //
+    // attrs = [callback_slot, dtype_int, n_dims, d0..dn-1] — output
+    // shape/dtype, since a Primitive-backed array must declare its
+    // shape/dtype at construction time (mirrors iota/eye above, also
+    // shaped-by-attrs rather than shaped-by-input). `callback_slot` is an
+    // opaque index into the *Elixir-side* per-program callback table
+    // (`EMLX.Native.Expr.lower/2` assigns it; `EMLX.__compile__`'s eval
+    // loop resolves it against the {module, function, opts} it recorded
+    // for this compiled program) — never resolved on the C++ side, only
+    // round-tripped in the `{:emlx_host_callback, ...}` message. Operands
+    // are the callback's input arrays, in the order `lower/2` emits them.
+    {"host_callback",
+     [](const auto &ops, const auto &attrs) {
+       uint64_t callback_slot = static_cast<uint64_t>(attrs[0]);
+       auto out_dtype = int_to_dtype(attrs[1]);
+       int n_dims = static_cast<int>(attrs[2]);
+       std::vector<int> out_shape(n_dims);
+       for (int i = 0; i < n_dims; i++)
+         out_shape[i] = static_cast<int>(attrs[3 + i]);
+
+       auto primitive = std::make_shared<host_callback::HostCallback>(
+           mlx::core::default_stream(k_linalg_cpu), callback_slot);
+       return mlx::core::array(to_shape(out_shape), out_dtype, primitive, ops);
+     }},
+
     // ── EMLX.Fast fused kernels (mlx::core::fast) ──────────────────────────
     //
     // Recognized from EMLX.Fast.* runtime_call callbacks (see expr.ex
@@ -1951,6 +2268,280 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
   }
   CATCH()
 }
+
+// ── Stage 32a spike: host-callback Primitive ──────────────────────────────
+//
+// Investigates the load-bearing unknown named in
+// workdir/native-compiler/32a-inline-runtime-call.md Procedure #1: can the
+// worker OS thread executing a compiled program's replay safely call back
+// into Erlang and block for a reply, without deadlocking EMLX's
+// ASYNC_NIF/enif_send worker-queue dispatch or corrupting in-flight Metal
+// state. Throwaway spike code, not wired into `op_registry` — see the
+// stage doc's Results for the verdict and next steps.
+//
+// NOT built on mlx::core::custom_function. Reading MLX's actual source
+// (mlx/transforms.cpp @ d4c81062) showed `custom_function`'s wrapped `fun`
+// runs eagerly at graph-construction time ("auto outputs = fun(args);"),
+// not deferred to eval — the `CustomTransforms` primitive it builds only
+// overrides autodiff (vjp/jvp/vmap); its own eval_cpu/eval_gpu just passes
+// through the already-computed outputs. Since `compile_program` traces its
+// interpreter lambda once and `mlx::core::detail::compile`'s replay skips
+// re-invoking that outer builder (the entire point of the compile cache),
+// wrapping a host callback in `custom_function` would fire it exactly once
+// at first-trace time and never again on replay — wrong for a
+// per-decode-step callback. Instead this spike defines a bespoke
+// `Primitive` subclass (the same mechanism every other opcode in this file
+// already uses via `mlx::core::linalg::*` / `EMLX.Fast`), whose
+// eval_cpu/eval_gpu bodies genuinely re-run on every real evaluation of a
+// compiled graph, including replays — see Results item 1 in the stage doc.
+namespace spike32a {
+
+struct PendingCall {
+  std::mutex m;
+  std::condition_variable cv;
+  bool ready = false;
+  double reply_value = 0.0;
+};
+
+static std::mutex g_pending_mutex;
+static std::unordered_map<uint64_t, std::shared_ptr<PendingCall>> g_pending;
+static std::atomic<uint64_t> g_next_call_id{1};
+
+// Per-compile_id trace/eval counters, to empirically check Open Question 2
+// (does wrapping a host-callback node in mlx::core::detail::compile change
+// how the compile cache treats re-tracing across calls?).
+static std::mutex g_counters_mutex;
+static std::unordered_map<uint64_t, int> g_trace_count;
+static std::unordered_map<uint64_t, int> g_eval_count;
+
+static uint64_t thread_id_hash() {
+  return std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+
+// Set by HostCallback::run() (i.e. from inside eval_cpu/eval_gpu) so
+// run_program can compare it against the thread it captured just before
+// calling mx::eval -- answers "does the callback run on the same OS thread
+// that called eval, or does MLX ever dispatch it elsewhere (e.g. a Metal
+// completion handler)?" without assuming either way.
+static std::atomic<uint64_t> g_last_callback_thread_hash{0};
+
+// The host round trip: enif_send a {call_id, value} message to `pid`, then
+// block until spike32a_resume/2 (a plain, non-worker-routed NIF called
+// directly by a *different* Erlang process on a *different* OS thread)
+// notifies us. Bounded by a generous timeout so a real deadlock fails the
+// test instead of hanging the suite forever.
+static double host_round_trip(ErlNifPid pid, double request_value) {
+  uint64_t call_id = g_next_call_id.fetch_add(1, std::memory_order_relaxed);
+  auto pending = std::make_shared<PendingCall>();
+  {
+    std::lock_guard<std::mutex> lk(g_pending_mutex);
+    g_pending[call_id] = pending;
+  }
+
+  ErlNifEnv *msg_env = enif_alloc_env();
+  ERL_NIF_TERM msg =
+      enif_make_tuple3(msg_env, enif_make_atom(msg_env, "spike32a_callback"),
+                       enif_make_uint64(msg_env, call_id),
+                       enif_make_double(msg_env, request_value));
+  ErlNifPid target = pid;
+  enif_send(NULL, &target, msg_env, msg);
+  enif_free_env(msg_env);
+
+  std::unique_lock<std::mutex> lk(pending->m);
+  bool got_reply = pending->cv.wait_for(lk, std::chrono::seconds(10),
+                                        [&] { return pending->ready; });
+  {
+    std::lock_guard<std::mutex> lk2(g_pending_mutex);
+    g_pending.erase(call_id);
+  }
+  if (!got_reply) {
+    throw std::runtime_error(
+        "spike32a: timed out waiting for resume -- worker thread deadlocked");
+  }
+  return pending->reply_value;
+}
+
+// Called by spike32a_resume/2, on whatever (BEAM scheduler) thread invokes
+// that plain NIF directly -- deliberately NOT posted through
+// emlx::Worker::post, since bypassing the worker's own job queue to
+// unblock it is exactly the property under test.
+bool resume(uint64_t call_id, double value) {
+  std::shared_ptr<PendingCall> pending;
+  {
+    std::lock_guard<std::mutex> lk(g_pending_mutex);
+    auto it = g_pending.find(call_id);
+    if (it == g_pending.end())
+      return false;
+    pending = it->second;
+  }
+  {
+    std::lock_guard<std::mutex> lk(pending->m);
+    pending->reply_value = value;
+    pending->ready = true;
+  }
+  pending->cv.notify_one();
+  return true;
+}
+
+// CPU-pinned (see k_linalg_cpu precedent above) so it composes inside a
+// compiled graph regardless of the graph's default (:cpu or :gpu) stream --
+// eval_gpu is unreachable by construction, not by contract.
+class HostCallback : public mlx::core::Primitive {
+public:
+  HostCallback(mlx::core::Stream stream, ErlNifPid pid, uint64_t compile_id)
+      : mlx::core::Primitive(stream), pid_(pid), compile_id_(compile_id) {}
+
+  void eval_cpu(const std::vector<mlx::core::array> &inputs,
+                std::vector<mlx::core::array> &outputs) override {
+    run(inputs, outputs);
+  }
+  void eval_gpu(const std::vector<mlx::core::array> &inputs,
+                std::vector<mlx::core::array> &outputs) override {
+    run(inputs, outputs);
+  }
+
+  const char *name() const override { return "spike32a_host_callback"; }
+
+private:
+  void run(const std::vector<mlx::core::array> &inputs,
+           std::vector<mlx::core::array> &outputs) {
+    {
+      std::lock_guard<std::mutex> lk(g_counters_mutex);
+      g_eval_count[compile_id_]++;
+    }
+    g_last_callback_thread_hash.store(thread_id_hash());
+    auto &x = inputs[0];
+    auto &out = outputs[0];
+    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+    double in_val = static_cast<double>(x.data<float>()[0]);
+    double reply = host_round_trip(pid_, in_val);
+    out.data<float>()[0] = static_cast<float>(reply);
+  }
+
+  ErlNifPid pid_;
+  uint64_t compile_id_;
+};
+
+// argv[0] : target_pid  (local pid -- receives the {:spike32a_callback, _,
+//           _} message and is expected to reply via spike32a_resume/2)
+// argv[1] : device      (atom :cpu / :gpu -- the *surrounding* graph's
+//           default stream; the HostCallback node itself is always
+//           CPU-pinned, exactly like the existing linalg opcodes)
+// argv[2] : input_value (number)
+// argv[3] : compile_id  (integer -- test-controlled mlx::core::detail::
+//           compile() cache key; pass the same id across calls to assert
+//           replay-without-retrace, a different id to force a fresh trace)
+ERL_NIF_TERM run_program(ErlNifEnv *env, ErlNifPid target_pid,
+                         mlx::core::Device device, double input_value,
+                         uint64_t compile_id) {
+  try {
+    mlx::core::Stream graph_stream = mlx::core::default_stream(device);
+    mlx::core::Stream cpu_stream = mlx::core::default_stream(k_linalg_cpu);
+
+    uint64_t worker_thread_hash = thread_id_hash();
+    {
+      std::lock_guard<std::mutex> lk(g_counters_mutex);
+      g_trace_count.try_emplace(compile_id, 0);
+      g_eval_count.try_emplace(compile_id, 0);
+    }
+
+    // Chains real graph_stream compute both BEFORE and AFTER the CPU-pinned
+    // callback node inside the SAME compiled program, per reviewer
+    // feedback: (a) the callback's output must be consumed by a downstream
+    // instruction, not just returned raw, to exercise the interpreter's
+    // dependency tracking / buffer-lifetime handling across a blocking
+    // host round trip; (b) on :gpu, `y`'s producing add must have real
+    // Metal command-encoder/stream state live at the point the callback
+    // blocks, so the round trip is actually adjacent to in-flight GPU work
+    // rather than isolated from it.
+    emlx::function fn = [target_pid, cpu_stream, graph_stream, compile_id](
+                            const std::vector<mlx::core::array> &inputs)
+        -> std::vector<mlx::core::array> {
+      {
+        std::lock_guard<std::mutex> lk(g_counters_mutex);
+        g_trace_count[compile_id]++;
+      }
+      auto primitive =
+          std::make_shared<HostCallback>(cpu_stream, target_pid, compile_id);
+      mlx::core::array callback_out = mlx::core::array(
+          inputs[0].shape(), inputs[0].dtype(), primitive, {inputs[0]});
+
+      mlx::core::array z = mlx::core::add(
+          mlx::core::multiply(callback_out, mlx::core::array(2.0f),
+                              graph_stream),
+          inputs[0], graph_stream);
+
+      // A second, independent graph_stream op in the SAME compiled program
+      // -- NOT feeding the callback's input (seeding it that way tripped a
+      // real MLX elementwise-fusion/dependency bug, see Results item 6).
+      // This one exercises "does other real GPU compute adjacent to the
+      // callback's blocking round trip survive" without hitting that
+      // landmine: it shares the program with the callback but isn't wired
+      // into its dependency chain.
+      mlx::core::array w =
+          mlx::core::add(inputs[0], mlx::core::array(100.0f), graph_stream);
+      return {z, w};
+    };
+
+    mlx::core::array x =
+        mlx::core::full({1}, input_value, mlx::core::float32, graph_stream);
+    // Mirror eval_program's precaution (see its comment): force-evaluate the
+    // input before handing it to the compiled fn, or a replay can read
+    // stale/reused-buffer data from a previous call's leaf.
+    mlx::core::eval(x);
+
+    // NOTE: unlike this spike's first draft, the lock deliberately does NOT
+    // span mx::eval(outputs) below -- mirroring eval_program's existing,
+    // narrower scope (compile-cache safety only). A host callback's
+    // round trip can block for an unbounded, host-dependent duration; holding
+    // this process-wide mutex across it would stall every other worker's
+    // compile/evict path for that whole duration. See Results.
+    std::vector<mlx::core::array> outputs;
+    {
+      std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
+      emlx::function compiled_fn =
+          mlx::core::detail::compile(std::move(fn), compile_id);
+      outputs = compiled_fn({x});
+    }
+    mlx::core::eval(outputs);
+
+    double result = static_cast<double>(outputs[0].item<float>());
+    // `w` (outputs[1]) is a second, independent graph_stream op sharing the
+    // program with the callback but not depending on it -- reading it back
+    // correctly (after the callback's blocking round trip already
+    // completed via mx::eval above) is the encoder/stream-survival check.
+    double independent_result = static_cast<double>(outputs[1].item<float>());
+    bool same_thread =
+        (g_last_callback_thread_hash.load() == worker_thread_hash);
+
+    int trace_count, eval_count;
+    {
+      std::lock_guard<std::mutex> lk(g_counters_mutex);
+      trace_count = g_trace_count[compile_id];
+      eval_count = g_eval_count[compile_id];
+    }
+
+    ERL_NIF_TERM ret = enif_make_tuple5(
+        env, enif_make_double(env, result),
+        same_thread ? enif_make_atom(env, "true")
+                    : enif_make_atom(env, "false"),
+        enif_make_int(env, trace_count), enif_make_int(env, eval_count),
+        enif_make_double(env, independent_result));
+    return nx::nif::ok(env, ret);
+  } catch (const std::exception &e) {
+    return nx::nif::error(env, e.what());
+  } catch (...) {
+    return nx::nif::error(env, "spike32a: unknown error");
+  }
+}
+
+ERL_NIF_TERM resume_call(ErlNifEnv *env, uint64_t call_id, double value) {
+  bool ok = resume(call_id, value);
+  return ok ? nx::nif::ok(env)
+            : nx::nif::error(env, "spike32a: unknown call_id");
+}
+
+} // namespace spike32a
 
 } // namespace native
 } // namespace emlx
