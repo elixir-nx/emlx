@@ -213,7 +213,7 @@ inline const std::string *dtype2string(const mlx::core::Dtype dtype) {
   return nullptr;
 }
 
-// ─── `fine` bridging (Stage 26 pilot) ───────────────────────────────────────
+// ─── `fine` bridging ─────────────────────────────────────────────────────
 //
 // `fine::nif()`/`FINE_NIF` (the library's own typed-dispatch entry points)
 // translate a thrown C++ exception into a *raised* Elixir exception via

@@ -1,16 +1,4 @@
 defmodule EMLX.GradTriageTest do
-  @moduledoc """
-  Stage 23 (gradient-training-parity, scoping-only): triage of
-  `Nx.Defn.grad`-wrapped functions run through `compiler: EMLX`, referenced
-  against `Nx.BinaryBackend` via `compiler: Nx.Defn.Evaluator`.
-
-  This is the triage instrument the stage doc's Procedure calls for — its
-  pass/fail results feed the Results table in
-  `workdir/native-compiler/23-gradient-training-parity.md`, not a permanent
-  regression suite for a shipped feature. Scenarios that pass stay here as
-  regression coverage; scenarios that fail are the seeds for follow-on
-  stages (27+).
-  """
   use EMLX.Case, async: false
   import Nx.Defn
 
@@ -50,7 +38,7 @@ defmodule EMLX.GradTriageTest do
 
   # window_max's backward hits :window_scatter_max (not just window_sum
   # again, unlike window_sum's own backward) — a distinct opcode, tested
-  # separately per the Stage 20 finding this stage's doc calls out.
+  # separately.
   defn window_max_loss(x), do: Nx.sum(Nx.window_max(x, {2, 2}))
   defn window_max_grad(x), do: grad(x, &window_max_loss/1)
 
@@ -136,7 +124,7 @@ defmodule EMLX.GradTriageTest do
     end
   end
 
-  describe "windowed-reduce grad (eager EMLX.Backend.window_reduce/6 hard-raises; window_sum forward is native-only in the compiler's IR — Stage 20 finding)" do
+  describe "windowed-reduce grad (eager EMLX.Backend.window_reduce/6 hard-raises; window_sum forward is native-only in the compiler's IR)" do
     test "window_sum grad matches the Evaluator reference under compiler: EMLX" do
       x = bin([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]])
 

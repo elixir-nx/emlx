@@ -82,7 +82,7 @@ static std::string int_to_quant_mode(int64_t val) {
   return table[static_cast<size_t>(val)];
 }
 
-// ── Prefill-RoPE helper (Stage 15 Part B) ──────────────────────────────────
+// ── Prefill-RoPE helper ──────────────────────────────────────────────────
 //
 // mlx::fast::rope's offset argument is either a scalar or one starting
 // position per batch example (sequential from there) — it cannot express
@@ -820,7 +820,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        return mlx::core::einsum(spec, {ops[0], ops[1]});
      }},
 
-    // ── quantized_matmul (Stage 25) ──────────────────────────────────────────
+    // ── quantized_matmul ──────────────────────────────────────────────────────
     //
     // iattrs = [group_size, bits, transpose_int, mode_int, has_bias_int]
     // Operands: [activation, weight, scales, biases?] — biases present only
@@ -1566,7 +1566,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // rope (arbitrary per-token position_ids, base-derived inv_freq):
     // operands = [a, position_ids]; attrs = [dims, traditional, base_bits,
     // scale_bits]. Prefill path (T>1) / high-base decode — mirrors
-    // emlx_fast.cpp's fast_rope_positions eager NIF (Stage 15 Part B).
+    // emlx_fast.cpp's fast_rope_positions eager NIF.
     {"fast_rope_positions",
      [](const auto &ops, const auto &attrs) {
        int dims = static_cast<int>(attrs[0]);
@@ -1608,7 +1608,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // `inv_freqs = reciprocal(freqs)` (see mlx/fast.cpp default_inv_freqs vs
     // the inputs.size()==3 branch), so we replicate that reciprocal here
     // rather than using `freqs` directly, to stay bit-for-bit with the eager
-    // EMLX.Fast.rope_with_freqs_callback path this replaces (Stage 15 Part B).
+    // EMLX.Fast.rope_with_freqs_callback path this replaces.
     {"fast_rope_with_freqs_positions",
      [](const auto &ops, const auto &attrs) {
        int dims = static_cast<int>(attrs[0]);

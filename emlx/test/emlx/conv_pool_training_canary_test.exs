@@ -1,22 +1,5 @@
 defmodule EMLX.ConvPoolTrainingCanaryTest do
   @moduledoc """
-  Stage 30 (`conv-pool-training-curve-canary`): a training-curve-matching
-  canary for `window`-reduction-backed conv/pool training (window ops off
-  `via_binary` — already closed per Stage 23's finding, re-verified here by
-  grepping `lib/emlx/backend.ex` for `window_op/5`/`window_scatter_function/7`
-  as the sole implementations, no `via_binary`).
-
-  A small handwritten conv → relu → max-pool → dense classifier trains for
-  `@steps` SGD steps against a fixed, deterministic 3-batch dataset, and the
-  resulting per-step loss curve is compared against a `Nx.BinaryBackend` /
-  `Nx.Defn.Evaluator` reference — not just "does it run," but "does it
-  converge the same way." Per advisor sign-off (`/tackle-step` pre-work
-  check): only `Nx.window_max` (max-pool) is used, not strided `window_sum`
-  (avg-pool), to stay clear of Stage 33's known strided-`window_sum`-grad
-  gap; both the eager `EMLX.Backend` lane and the native `compiler: EMLX`
-  lane are exercised against the same reference, since Stage 23/28 covered
-  grad correctness on both.
-
   Reference convention matches `grad_equivalence_test.exs`: scope the
   process-global default backend to `Nx.BinaryBackend` around
   `Nx.Defn.Evaluator` so any tensor the Evaluator synthesizes internally

@@ -995,8 +995,7 @@ defmodule EMLX do
   end
 
   # Microscaled modes pin an exact {group_size, bits} pair (MLX's
-  # `fp_quantize` — see `mlx::core::quantize` in `mlx/ops.h`). Mirrors
-  # `Emily.QuantizedWeight`'s `@microscaled_constraints`, which was checked
+  # `fp_quantize` — see `mlx::core::quantize` in `mlx/ops.h`), checked
   # directly against the same MLX version this repo vendors.
   @microscaled_constraints %{"mxfp4" => {32, 4}, "mxfp8" => {32, 8}, "nvfp4" => {16, 4}}
   @valid_quantization_modes ~w(affine mxfp4 mxfp8 nvfp4)
@@ -2038,9 +2037,9 @@ defmodule EMLX do
   # that manage their own queues (equivalent to a manual `with_queue`).
   @valid_compiler_keys [:device, :max_concurrency, :command_queue]
 
-  # Stage 32: process-lifetime dispatch cache backing `dispatch_key/3` +
+  # Process-lifetime dispatch cache backing `dispatch_key/3` +
   # `get_or_compile_program/6` (see their docs) — a compiled program is keyed
-  # by a *structural* signature of its stage `Expr` (not object identity), so
+  # by a *structural* signature of its `Expr` (not object identity), so
   # it survives across `Nx.Defn.Graph.run/3`'s per-call re-tracing and is
   # shared across structurally-identical call sites (e.g. every one of
   # Qwen3's 28 attention layers), not just within one closure's lifetime.
@@ -2251,14 +2250,13 @@ defmodule EMLX do
     end)
   end
 
-  # Derives the "quantization signature" a call's bound inputs need — see
-  # workdir/native-compiler/25-quantized-dot-full-fix.md. A quantized
-  # weight's Nx-visible `.shape`/`.type` deliberately mirror its logical
-  # dense shape (so eager `Nx.dot` can transparently reroute to
+  # Derives the "quantization signature" a call's bound inputs need. A
+  # quantized weight's Nx-visible `.shape`/`.type` deliberately mirror its
+  # logical dense shape (so eager `Nx.dot` can transparently reroute to
   # `EMLX.quantized_matmul` via `EMLX.Backend.dot/7`'s runtime dispatch) —
-  # invisible to `EMLX.Native.Expr.lower/2` at trace time (Stage 24). Once
-  # real tensors are bound (here, at call time) their `quantization_config`
-  # is visible, so a specialized program can be built (Stage 25) that lowers
+  # invisible to `EMLX.Native.Expr.lower/2` at trace time. Once real tensors
+  # are bound (here, at call time) their `quantization_config` is visible,
+  # so a specialized program can be built that lowers
   # the specific `:dot` nodes consuming these positions to
   # `:quantized_matmul` instead of plain `:dot`. Returns `%{}` when nothing
   # is quantized — the common, zero-overhead case.
@@ -2271,7 +2269,7 @@ defmodule EMLX do
   # `EMLX.Quantization.dequantize/1`'s own `:runtime_call` split-point
   # operand) is never specialized on, so it must not affect the cache key
   # either — otherwise every distinct quantized tensor identity would mint
-  # its own permanently-unreused Stage 32 dispatch-cache entry for an
+  # its own permanently-unreused dispatch-cache entry for an
   # otherwise structurally-identical program.
   defp quant_signature(tensors, allowed_positions) do
     tensors
@@ -2292,8 +2290,8 @@ defmodule EMLX do
   # Builds the per-call eval closure for the flat (no-while) native path.
   # `output_expr`/`num_inputs` are kept (not just the eagerly-compiled plain
   # `program_resource`) so a quantized call can lower+compile a *specialized*
-  # program on demand (Stage 25) — see `get_or_compile_program/6`. `base_key`
-  # is this stage's structural dispatch key (Stage 32, `dispatch_key/3`),
+  # program on demand — see `get_or_compile_program/6`. `base_key`
+  # is the structural dispatch key (`dispatch_key/3`),
   # threaded through so a quantized specialization is cached persistently
   # too, not just the plain program.
   # `output_expr` also serves as the type/shape template for reconstructing
@@ -2316,7 +2314,7 @@ defmodule EMLX do
     # See `quant_signature/2`'s doc for why this must be restricted to
     # positions actually consumed by a `:dot` — otherwise a quantized
     # tensor merely passed to e.g. an `EMLX.Fast.*` fused kernel would
-    # fragment the Stage 32 dispatch cache with one dead-weight entry per
+    # fragment the dispatch cache with one dead-weight entry per
     # distinct tensor identity.
     quantizable_positions = EMLX.Native.Expr.quantizable_param_positions(output_expr)
 
@@ -2398,8 +2396,8 @@ defmodule EMLX do
   end
 
   # Looks up (or lazily lowers+compiles) the program for `{base_key,
-  # quant_signature}` in the process-lifetime dispatch cache (Stage 32).
-  # `base_key` (see `dispatch_key/3`) is a structural signature of the stage
+  # quant_signature}` in the process-lifetime dispatch cache.
+  # `base_key` (see `dispatch_key/3`) is a structural signature of the
   # `Expr` — stable across `Nx.Defn.Graph.run/3`'s per-call re-tracing and
   # shared across structurally-identical call sites (e.g. every one of
   # Qwen3's 28 attention layers's surrounding stages), not scoped to one
@@ -2432,7 +2430,7 @@ defmodule EMLX do
 
   # Lazily creates (idempotently — races are resolved by `:ets.new/2` raising
   # `ArgumentError` on the loser, which we swallow) the named, public,
-  # process-lifetime ETS table backing the Stage 32 dispatch cache. Named
+  # process-lifetime ETS table backing the dispatch cache. Named
   # (not `:persistent_term`-stashed) so no GC-triggering `:persistent_term`
   # writes are needed to publish it — the atom name is the handle.
   defp dispatch_cache_table, do: ensure_named_ets_table(@native_dispatch_cache_table)
@@ -2460,14 +2458,13 @@ defmodule EMLX do
 
   # A structural, id-independent signature of `output_expr` — the cache key
   # `get_or_compile_program/6` dispatches on (paired with a call-time
-  # `quant_signature`). Two stage `Expr`s that are the *same shape of
+  # `quant_signature`). Two `Expr`s that are the *same shape of
   # computation* (same op sequence, shapes, dtypes, and static attrs) hash to
   # the same key even though `Nx.Defn.Expr` assigns each a fresh `id` per
   # trace — which is what lets Qwen3's 28 structurally-identical attention
   # layers (or the same layer across decode steps) share one compiled
-  # program instead of recompiling per call (Stage 32's charter). Coarser
-  # than a bit-identical `Expr` hash (deliberately — see the stage doc's
-  # Open Questions): tensor-valued args are replaced by their position in
+  # program instead of recompiling per call. Coarser than a bit-identical
+  # `Expr` hash (deliberately): tensor-valued args are replaced by their position in
   # `EMLX.Defn.Tree.post_order/1`'s dependency-first listing (itself
   # id-independent and structurally stable across identical call sites),
   # not by the referenced node's `id`.

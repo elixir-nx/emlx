@@ -33,7 +33,7 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
-  # Stage 32a Procedure #4 — see the comment on the C++ side (emlx_nif.cpp).
+  # See the comment on the C++ side (emlx_nif.cpp).
   def eval_many(_worker, _tensor_refs) do
     :erlang.nif_error(:nif_not_loaded)
   end

@@ -4,23 +4,19 @@ defmodule EMLXAxon.Qwen3.Model do
 
   ## Defn / JIT strategy
 
-  **Stale-doc correction (found during Stage 34's perf-regression
-  investigation, `workdir/native-compiler/34-native-perf-regression.md`):**
-  this section used to describe a `defnp`/`Nx.Defn.Compiler.__jit__`-based
-  strategy. That is no longer how the hot path works — `Layers.swiglu/2`
-  (the sole remaining `defn` in `Layers`/`Attention`) is dead code (`mlp/5`
-  below calls `EMLX.Fast.swiglu/2` directly, not `Layers.swiglu/2`), and
-  `Sampler.top_p_gpu/3` is only reached by the `:top_p_gpu` sampler, not
-  `:greedy`. For the quantized (MLX-4bit) and dense native-greedy paths
-  actually exercised by `bench/validate_qwen3.exs`, **every** hot-path call
-  is a plain eager function call against concrete `EMLX.Backend` tensors —
+  For the quantized (MLX-4bit) and dense native-greedy paths actually
+  exercised by `bench/validate_qwen3.exs`, **every** hot-path call is a plain
+  eager function call against concrete `EMLX.Backend` tensors —
   `EMLX.qwen3_*` NIFs, `EMLX.Fast.*` fused kernels, `Nx.dot` (quantized
-  dispatch per Stage 25) — with no `Nx.Defn.Expr` tracing or
-  `Nx.Defn.Compiler` involved anywhere in the loop. This is why a
-  `:compiler` option threaded into `EMLXAxon.TextGeneration.serving/3` would
-  be a no-op regardless of whether it's read out of `opts`: there is no
-  `Nx.Defn` call site downstream for it to select a compiler for. See Stage
-  34's Results for the investigation that found this.
+  dispatch) — with no `Nx.Defn.Expr` tracing or `Nx.Defn.Compiler` involved
+  anywhere in the loop. `Layers.swiglu/2` (the sole remaining `defn` in
+  `Layers`/`Attention`) is dead code (`mlp/5` below calls
+  `EMLX.Fast.swiglu/2` directly, not `Layers.swiglu/2`), and
+  `Sampler.top_p_gpu/3` is only reached by the `:top_p_gpu` sampler, not
+  `:greedy`. This is why a `:compiler` option threaded into
+  `EMLXAxon.TextGeneration.serving/3` would be a no-op regardless of whether
+  it's read out of `opts`: there is no `Nx.Defn` call site downstream for it
+  to select a compiler for.
 
   `Nx.put_slice` KV-cache update (dynamic start index) and the valid-slice
   read (dynamic end index) also always ran eagerly, independent of the above.

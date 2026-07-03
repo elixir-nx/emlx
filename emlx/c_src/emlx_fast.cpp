@@ -3,12 +3,11 @@
 // mlx::fast ops — single fused Metal shaders
 // ============================================================================
 //
-// Stage 26 pilot: ported to `fine`'s typed decode/encode (see the "`fine`
-// bridging" section of emlx_nif_shared.hpp) instead of the hand-rolled
-// PARAM/TENSOR_PARAM/TENSOR/CATCH macros. Each NIF is a typed
-// `NAME##_impl` function plus a one-line `FINE_ASYNC_NIF(NAME)` — the
-// registered NIF name, arity, and the ASYNC_NIF/nif_funcs[] wiring in
-// emlx_nif.cpp are all unchanged.
+// Uses `fine`'s typed decode/encode (see the "`fine` bridging" section of
+// emlx_nif_shared.hpp) instead of the hand-rolled PARAM/TENSOR_PARAM/TENSOR/
+// CATCH macros used elsewhere. Each NIF is a typed `NAME##_impl` function
+// plus a one-line `FINE_ASYNC_NIF(NAME)` — the registered NIF name, arity,
+// and the ASYNC_NIF/nif_funcs[] wiring in emlx_nif.cpp are all unchanged.
 
 // fast_rms_norm — fused RMS normalisation
 // MLX: mlx::fast::rms_norm(x, weight, eps, stream) → array, same shape as x

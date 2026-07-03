@@ -1,13 +1,11 @@
 defmodule EMLX.SdpaSinksTest do
   @moduledoc """
-  Stage 22 (fast-kernel-quant-parity): SDPA attention sinks (Emily M26
-  parity). Equivalence-tests `EMLX.Fast.scaled_dot_product_attention*`'s
-  `:sinks` opt against the fallback softmax-with-sinks math:
+  SDPA attention sinks. Equivalence-tests
+  `EMLX.Fast.scaled_dot_product_attention*`'s `:sinks` opt against the
+  fallback softmax-with-sinks math:
 
       row_max = max(reduce_max(logits), sinks_broadcast)
       probs = exp(logits - row_max) / (sum(exp(logits - row_max)) + exp(sinks - row_max))
-
-  (same formula as Emily's M26 fallback — see `~/coding/emily/PLAN.md`).
   """
   use EMLX.Case, async: true
 
@@ -59,8 +57,8 @@ defmodule EMLX.SdpaSinksTest do
     Nx.less_equal(col, row)
   end
 
-  # f32 tolerance matches Emily's own reported max-abs-diff (~2e-7) for this
-  # exact fallback-vs-fused-kernel comparison.
+  # f32 tolerance for this exact fallback-vs-fused-kernel comparison
+  # (max-abs-diff observed ~2e-7).
   @tol 1.0e-4
 
   describe "EMLX.Fast.scaled_dot_product_attention/5 (opts, no mask) with :sinks" do

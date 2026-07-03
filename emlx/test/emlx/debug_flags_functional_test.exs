@@ -58,7 +58,7 @@ defmodule EMLX.DebugFlagsFunctionalTest do
     end
   end
 
-  test "conv raises on a NaN-producing convolution (Stage 21 extension)" do
+  test "conv raises on a NaN-producing convolution" do
     input = Nx.tensor([[[[:nan, 1.0, 1.0, 1.0]]]], type: :f32)
     kernel = Nx.tensor([[[[1.0, 1.0]]]], type: :f32)
 
@@ -68,7 +68,7 @@ defmodule EMLX.DebugFlagsFunctionalTest do
   end
 
   @tag :metal
-  test "EMLX.Fast.rms_norm raises on a NaN-producing input (Stage 21 extension)" do
+  test "EMLX.Fast.rms_norm raises on a NaN-producing input" do
     x = Nx.tensor([[:nan, 1.0, 1.0, 1.0]], type: :f32) |> gpu()
     w = Nx.tensor([1.0, 1.0, 1.0, 1.0], type: :f32) |> gpu()
 

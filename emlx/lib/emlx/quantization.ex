@@ -127,8 +127,7 @@ defmodule EMLX.Quantization do
     # Microscaled modes store scales as :u8 (a packed exponent byte, not a
     # float dtype), so `Nx.type(s)` doesn't apply there — MLX's `dequantize`
     # reconstructs a float array regardless of mode; :bf16 matches the
-    # convention used elsewhere for microscaled outputs (e.g. Emily's
-    # `QuantizedWeight.to_dense/1`).
+    # convention used elsewhere for microscaled outputs.
     out_type =
       case qw do
         %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{mode: "affine", scales: s}}} ->

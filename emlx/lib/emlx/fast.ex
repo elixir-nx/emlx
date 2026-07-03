@@ -1334,7 +1334,7 @@ defmodule EMLX.Fast do
 
   @doc """
   Variadic-operand einsum computed by MLX's path-optimised
-  `mlx::core::einsum` kernel (Emily `Emily.Fast.einsum/2` parity).
+  `mlx::core::einsum` kernel.
 
   `subscripts` is a standard Einstein-summation equation (e.g.
   `"ij,jk->ik"`, `"bij,bjk->bik"`, `"bhid,bhjd->bhij"`,

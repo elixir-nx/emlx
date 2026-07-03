@@ -1,11 +1,4 @@
 defmodule EMLX.MicroscaledQuantizationTest do
-  @moduledoc """
-  Stage 22 (fast-kernel-quant-parity): microscaled quantization modes
-  (`"mxfp4"`, `"mxfp8"`, `"nvfp4"`), threaded through `EMLX.quantize/2`,
-  `EMLX.dequantize/1`, `EMLX.quantized_matmul/2`, `EMLX.Quantization.Config`,
-  and the transparent `Nx.dot` dispatch — alongside `"affine"` as the
-  baseline/regression case.
-  """
   use EMLX.Case, async: true
 
   @moduletag :metal

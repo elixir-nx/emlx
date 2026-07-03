@@ -1,12 +1,10 @@
 defmodule EMLX.GradEquivalenceTest do
   @moduledoc """
-  Stage 28 (`grad-equivalence-suite`): permanent grad-equivalence regression
-  suite, widening Stage 23's 8-scenario triage (`grad_triage_test.exs`) into
-  materially more op-class combinations, shapes, and dtypes (Emily M9
-  testing-half parity).
+  Permanent grad-equivalence regression suite, widening
+  `grad_triage_test.exs`'s 8-scenario triage into materially more op-class
+  combinations, shapes, and dtypes.
 
-  Two adjustments to the stage doc's original plan (user directive + advisor
-  sign-off — see `workdir/native-compiler/28-grad-equivalence-suite.md`):
+  Two adjustments to the original plan (user directive + advisor sign-off):
 
     * **No `StreamData`.** Breadth comes from table-driven fixed
       scenario × shape × dtype combinations (looped at test-run time), not
@@ -75,7 +73,7 @@ defmodule EMLX.GradEquivalenceTest do
   @rank1plus_shapes [{4}, {2, 3}, {2, 2, 3}]
   @dtypes [{:f, 32}, {:f, 64}]
 
-  # ── 1. smooth elementwise chain (broader op mix than Stage 23's sin*cos) ───
+  # ── 1. smooth elementwise chain (broader op mix than sin*cos) ─────────────
 
   defn smooth_elementwise_loss(x) do
     x
@@ -293,15 +291,12 @@ defmodule EMLX.GradEquivalenceTest do
   defn window_sum_strided_3d_grad(x), do: grad(x, &window_sum_strided_3d_loss/1)
 
   describe "windowed ops grad with non-default strides/padding" do
-    # Closed by Stage 33: `window_sum`'s backward (grad.ex's
-    # `grad(:window_sum, …)`) un-strides the cotangent via `Nx.pad` with
-    # *interior* padding whenever `strides != 1`. `:pad` with interior padding
-    # (and negative lo/hi) now lowers natively (see `EMLX.Native.Expr.expand_pad_general/5`)
-    # instead of raising — this scenario used to assert the known raise
-    # (`EXPR_NODES.md`'s "pad (simple: non-negative lo/hi, interior=0; …)"),
-    # now it asserts equivalence like every other scenario in this suite.
-    # Stage 23's `window_sum` grad scenario used default (unit) strides, so
-    # it never exercised this path.
+    # `window_sum`'s backward (grad.ex's `grad(:window_sum, …)`) un-strides
+    # the cotangent via `Nx.pad` with *interior* padding whenever
+    # `strides != 1`. `:pad` with interior padding (and negative lo/hi) lowers
+    # natively (see `EMLX.Native.Expr.expand_pad_general/5`). The default
+    # (unit-stride) `window_sum` grad scenario elsewhere in this suite never
+    # exercises this path.
     test "window_sum with non-unit strides matches the Evaluator reference" do
       for shape <- [{4, 4}, {3, 5}], dtype <- @dtypes do
         x = bin(shape, dtype)
@@ -324,9 +319,9 @@ defmodule EMLX.GradEquivalenceTest do
     end
   end
 
-  # ── 8b. direct :pad / :slice grad (Stage 33) ────────────────────────────────
+  # ── 8b. direct :pad / :slice grad ────────────────────────────────────────
   #
-  # Broader than window ops (found during Stage 33's advisor review): grad.ex's
+  # Broader than window ops: grad.ex's
   # own `grad(:pad, …)` un-pads the cotangent via *negative* lo/hi whenever the
   # forward `Nx.pad` had positive lo/hi, unconditionally (no strides needed);
   # `grad(:slice, …)` re-inserts *interior* padding into the cotangent whenever
@@ -340,7 +335,7 @@ defmodule EMLX.GradEquivalenceTest do
   defn slice_strided_loss(x), do: Nx.sum(Nx.slice(x, [0, 0], [2, 3], strides: [2, 3]))
   defn slice_strided_grad(x), do: grad(x, &slice_strided_loss/1)
 
-  describe "direct :pad / :slice grad (Stage 33)" do
+  describe "direct :pad / :slice grad" do
     test "pad with positive lo/hi (negative-lo/hi backward) matches the Evaluator reference" do
       for shape <- [{4, 4}, {3, 5}], dtype <- @dtypes do
         x = bin(shape, dtype)
@@ -426,8 +421,8 @@ defmodule EMLX.GradEquivalenceTest do
 
   @smooth_unary_ops [:sin, :cos, :exp, :tanh, :sigmoid, :sqrt, :log, :cbrt, :expm1, :log1p]
   @fd_eps 1.0e-3
-  # f32 central differences bottom out ~1e-3 relative (re-verified here, not
-  # copied from Emily's own number) — use a matching tolerance.
+  # f32 central differences bottom out ~1e-3 relative — use a matching
+  # tolerance.
   @fd_tol [atol: 5.0e-3, rtol: 5.0e-3]
 
   describe "finite-difference reference (smooth unary ops, points away from discontinuities)" do

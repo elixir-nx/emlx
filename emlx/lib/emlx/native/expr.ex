@@ -74,7 +74,7 @@ defmodule EMLX.Native.Expr do
   `Nx.Random.*` functions decompose via `threefry2x32` into primitive ops (bitwise, add, iota)
   and work automatically once `:iota` is lowered.
 
-  ## Hooks (`token` / `attach_token`, Stage 18)
+  ## Hooks (`token` / `attach_token`)
 
   `Nx.Defn.Kernel.hook/2,3` is fire-and-forget, not control flow:
   `attach_token(token, expr)`'s runtime value is `expr` unchanged (the token's
@@ -97,14 +97,14 @@ defmodule EMLX.Native.Expr do
   branch was actually taken, a genuine behavior divergence from
   `Nx.Defn.Evaluator` (which only fires the selected branch's hook). A hook
   inside a bare `while` body needs no such guard: the body is always
-  recompiled by re-entering this same compiler as its own top-level scope
-  (Stage 08), so it fires once per host loop iteration exactly like the
+  recompiled by re-entering this same compiler as its own top-level scope,
+  so it fires once per host loop iteration exactly like the
   Evaluator — and `lower/2`'s `top_scope_ids` (computed once, from
   `Nx.Defn.Tree.scope_ids/1` over the pristine top-level tree) correctly
   reflects that fresh scope.
 
-  A custom-fun `reduce`/`window_reduce` body (Stage 12/13 static unroll) and a
-  statically-unrolled nested `while` under a `:block` (Stage 17) are the same
+  A custom-fun `reduce`/`window_reduce` body (static unroll) and a
+  statically-unrolled nested `while` under a `:block` are the same
   "always executes in full, not conditionally" shape as a `while` body, but
   are lowered *inline* within the same `lower/2` call (`lower_fun_body/3` /
   `lower_tuple_body/3`) rather than by re-entering `lower/2` fresh — so a hook
@@ -116,10 +116,10 @@ defmodule EMLX.Native.Expr do
   correctly excludes any `cond` nested *inside* that body, so a genuinely
   cond-branch-local hook a level deeper still raises.
 
-  ## Quantized dot specialization (Stage 25)
+  ## Quantized dot specialization
 
-  A quantized `Nx.dot` right-operand is invisible at trace time (Stage 24):
-  the bound tensor's `quantization_config` only exists once a real tensor is
+  A quantized `Nx.dot` right-operand is invisible at trace time: the bound
+  tensor's `quantization_config` only exists once a real tensor is
   materialized, after tracing/lowering has already produced a plain
   `:parameter` template. `lower/3`'s optional `quant_signature` — a
   `%{param_position => EMLX.Quantization.Config.t()}` map built at call time
@@ -444,7 +444,7 @@ defmodule EMLX.Native.Expr do
     raise ArgumentError, "population_count is not supported by EMLX"
   end
 
-  # block: dispatch on struct — Stage 02 handles Nx.Block.LogicalNot.
+  # block: dispatch on struct — handles Nx.Block.LogicalNot.
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -785,7 +785,7 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # custom-fun reduce: lowered by static trace-time unrolling (Stage 12 spike).
+  # custom-fun reduce: lowered by static trace-time unrolling.
   # The reduce axes have a trace-time-known extent, so we fold the user's scalar
   # reducer `fun` over that extent, vectorized across the kept axes — each fold
   # step re-lowers the reducer body inline (acc ← prev result). Graph-equivalent
@@ -1722,8 +1722,7 @@ defmodule EMLX.Native.Expr do
 
   # triangular_solve: single-output. Direct op node (not a block).
   # args = [a, b, opts]. Only the common configuration (left_side + no transform)
-  # is lowered natively; other variants are a permanent hard-raise (Stage 17
-  # descoped, Stage 19 accepted — see workdir/native-compiler/19-retire-evaluator-fallback.md).
+  # is lowered natively; other variants are a permanent hard-raise.
   defp expand_node(
          %T{
            type: out_type,
@@ -1919,7 +1918,7 @@ defmodule EMLX.Native.Expr do
   # the leaf is a no-op here.
   defp expand_node(%T{data: %Nx.Defn.Expr{op: :fun}}, state), do: state
 
-  # Hooks (Stage 18) — see the moduledoc's "Hooks" section. `:token` never
+  # Hooks — see the moduledoc's "Hooks" section. `:token` never
   # produces a value anything else reads (only `attach_token`'s wrapped expr
   # is used downstream), so this clause contributes zero instructions; it
   # only records each hook's already-lowered ref(s) as an extra program
@@ -2214,7 +2213,7 @@ defmodule EMLX.Native.Expr do
     %{inner_state | node_to_ref: Map.put(inner_state.node_to_ref, id, result_ref)}
   end
 
-  # ── while (static unroll for counted range loops — Stage 17) ──────────────
+  # ── while (static unroll for counted range loops) ──────────────────────────
   #
   # Matches the exact shape `Nx.Defn.Expr.while_range/7` (`unroll: false`,
   # the default for `while acc, i <- first..last//step do ... end`) always
@@ -2339,7 +2338,7 @@ defmodule EMLX.Native.Expr do
      }}
   end
 
-  # ── custom-fun reduce (static unroll — Stage 12 spike) ────────────────────
+  # ── custom-fun reduce (static unroll) ──────────────────────────────────────
   #
   # `reduce` folds a user scalar reducer `fun(element, acc)` over the reduce
   # axes.  Their extent is known at trace time, so we transpose the reduce axes
@@ -2650,8 +2649,8 @@ defmodule EMLX.Native.Expr do
   above: the right operand specializes to `:quantized_matmul`, the left
   operand raises a clear `ArgumentError` instead of silently miscomputing
   on packed bits). `EMLX.quant_signature/2` intersects a call's bound
-  quantized tensors against this set before building a Stage 32
-  dispatch-cache key, so a quantized tensor merely *passed through* to
+  quantized tensors against this set before building a dispatch-cache key,
+  so a quantized tensor merely *passed through* to
   something else (e.g. an `EMLX.Fast.*` fused kernel's `:__EMLX__`
   metadata `operands`, or `EMLX.Quantization.dequantize/1`'s own
   `:runtime_call` split-point operand) doesn't fragment the cache with
@@ -3090,7 +3089,7 @@ defmodule EMLX.Native.Expr.Interpreter do
 
   # quantized_matmul — iattrs = [group_size, bits, transpose_int, mode_int, has_bias_int]
   # operands = [activation, weight, scales, biases?]. Mirrors
-  # EMLX.Backend.quantized_dot/4's runtime dispatch (Stage 25).
+  # EMLX.Backend.quantized_dot/4's runtime dispatch.
   defp dispatch(:quantized_matmul, operands, [group_size, bits, transpose_int, mode_int, has_bias]) do
     {activation, weight, scales, biases} =
       case {has_bias, operands} do
