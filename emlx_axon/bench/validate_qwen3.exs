@@ -21,6 +21,9 @@
 #   EMLX_QWEN3_SKIP_BB_REWRITE     — set to "1" to skip the Bumblebee+EMLXAxon.rewrite path
 #                                    entirely (no rewrite/compile/warmup/bench), leaving only
 #                                    "bb base" vs "native" in the comparison (default: off)
+#   EMLX_QWEN3_SKIP_BB_BASE        — set to "1" to skip the Bumblebee base (no rewrite) path
+#                                    entirely (no compile/warmup/bench), leaving only
+#                                    "bb+rewrite" vs "native" in the comparison (default: off)
 
 Nx.default_backend({EMLX.Backend, device: :gpu})
 
@@ -43,6 +46,7 @@ seq_len      = String.to_integer(System.get_env("EMLX_QWEN3_SEQUENCE_LENGTH", "1
 
 native_profile_timing? = System.get_env("EMLX_QWEN3_NATIVE_PROFILE_TIMING") != "0"
 skip_bb_rewrite?       = System.get_env("EMLX_QWEN3_SKIP_BB_REWRITE") == "1"
+skip_bb_base?          = System.get_env("EMLX_QWEN3_SKIP_BB_BASE") == "1"
 
 # Qwen3 instruct chat template — long enough that EOS won't hit within max_new tokens.
 prompt =
@@ -92,15 +96,20 @@ model_base = model_info.model
 
 # ── Build serving ─────────────────────────────────────────────────────────────
 
-IO.puts("==> Building Bumblebee.Text.generation serving (base — no rewrite) ...")
 serving_base =
-  Bumblebee.Text.generation(
-    %{model_info | model: model_base},
-    tokenizer,
-    generation_config,
-    compile: [batch_size: 1, sequence_length: seq_len],
-    defn_options: [compiler: EMLX]
-  )
+  if skip_bb_base? do
+    IO.puts("==> Skipping Bumblebee base serving (EMLX_QWEN3_SKIP_BB_BASE=1) ...")
+    nil
+  else
+    IO.puts("==> Building Bumblebee.Text.generation serving (base — no rewrite) ...")
+    Bumblebee.Text.generation(
+      %{model_info | model: model_base},
+      tokenizer,
+      generation_config,
+      compile: [batch_size: 1, sequence_length: seq_len],
+      defn_options: [compiler: EMLX]
+    )
+  end
 
 serving_rewrite =
   if skip_bb_rewrite? do
@@ -176,8 +185,11 @@ bb_extract = fn %{results: [%{text: text, token_summary: summary}]} ->
   {text, summary.output}
 end
 
-Bench.warmup("bb base", serving_base, prompt, bb_extract, warmup_runs)
-base_bb_results = Bench.bench("bb base", serving_base, prompt, bb_extract, bench_runs)
+base_bb_results =
+  unless skip_bb_base? do
+    Bench.warmup("bb base", serving_base, prompt, bb_extract, warmup_runs)
+    Bench.bench("bb base", serving_base, prompt, bb_extract, bench_runs)
+  end
 
 bb_results =
   unless skip_bb_rewrite? do
@@ -224,33 +236,31 @@ IO.puts("""
 === Summary (#{bench_runs} runs, #{max_new} max_new_tokens, Qwen3-0.6B-MLX-4bit) ===
 """)
 
-base_stats   = Bench.stats("bb base    (Bumblebee, no rewrite)           ", base_bb_results)
+base_stats   = if base_bb_results, do: Bench.stats("bb base    (Bumblebee, no rewrite)           ", base_bb_results)
 bb_stats     = if bb_results, do: Bench.stats("bb+rewrite (Bumblebee + EMLXAxon.rewrite)   ", bb_results)
 native_stats = Bench.stats("native     (EMLXAxon.TextGeneration)      ", native_results)
 
 native_vs_base =
-  if base_stats.median > 0,
+  if base_stats && base_stats.median > 0,
     do: Float.round(native_stats.median / base_stats.median, 2),
     else: :n_a
 
-if bb_stats do
-  rewrite_vs_base =
-    if base_stats.median > 0,
-      do: Float.round(bb_stats.median / base_stats.median, 2),
-      else: :n_a
+rewrite_vs_base =
+  if bb_stats && base_stats && base_stats.median > 0,
+    do: Float.round(bb_stats.median / base_stats.median, 2),
+    else: :n_a
 
-  native_vs_rewrite =
-    if bb_stats.median > 0,
-      do: Float.round(native_stats.median / bb_stats.median, 2),
-      else: :n_a
+native_vs_rewrite =
+  if bb_stats && bb_stats.median > 0,
+    do: Float.round(native_stats.median / bb_stats.median, 2),
+    else: :n_a
 
-  IO.puts("""
-    bb+rewrite / bb base:  #{rewrite_vs_base}×
-    native / bb base:      #{native_vs_base}×
-    native / bb+rewrite:   #{native_vs_rewrite}×
-  """)
-else
-  IO.puts("""
-    native / bb base:      #{native_vs_base}×
-  """)
-end
+lines =
+  [
+    if(bb_stats && base_stats, do: "    bb+rewrite / bb base:  #{rewrite_vs_base}×"),
+    if(base_stats, do: "    native / bb base:      #{native_vs_base}×"),
+    if(bb_stats, do: "    native / bb+rewrite:   #{native_vs_rewrite}×")
+  ]
+  |> Enum.reject(&is_nil/1)
+
+IO.puts("\n" <> Enum.join(lines, "\n") <> "\n")
