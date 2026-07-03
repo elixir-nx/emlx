@@ -29,10 +29,12 @@ defmodule EMLX.Fast do
     `runtime_call` just runs the real NIF against concrete tensors, so it's
     both exact (not a slower plain-`Nx` approximation) and free to build
     (unlike a full composite reference formula, `Nx.runtime_call/4` is a
-    single lightweight node — no per-op sub-expression tracing cost). It is
-    **not** differentiable as-is; each op's `*_reference/N` plain-`Nx`
-    formula is kept (unused for now) for a future `Nx.Defn.Kernel.custom_grad/2`
-    annotation once `Nx.Defn.grad` support is needed.
+    single lightweight node — no per-op sub-expression tracing cost). The
+    `:__EMLX__` node is itself wrapped once more in a
+    `Nx.Defn.Kernel.custom_grad/3` annotation (`with_reference_grad/3`) so
+    `Nx.Defn.grad` differentiates through each op's plain-`Nx` `*_reference/N`
+    formula (VJP via `Nx.Defn.Grad.transform/3` — see `with_reference_grad/3`)
+    instead of hitting the non-differentiable `runtime_call` forward pass.
 
   A bare `Nx.runtime_call` (anything *not* wrapped in `:__EMLX__` metadata)
   always forces a graph split — see `EMLX.split_point?/1`.
@@ -77,10 +79,9 @@ defmodule EMLX.Fast do
   # `position_freqs/6`, `rope_broadcast_shape/2`, `rope_rotate/5`,
   # `rope_split_half/5`, `rope_interleaved/5`, `repeat_kv_heads/2`,
   # `apply_causal_mask/4`, `apply_causal_key_mask/5`, `apply_generic_mask/2`,
-  # `iota_bin/2`, `neg_inf_like/1`) are no longer wired into the traced
-  # dispatch path (see moduledoc) — kept for an upcoming
-  # `Nx.Defn.Kernel.custom_grad/2` annotation, hence the "unused function"
-  # compiler warnings below.
+  # `iota_bin/2`, `neg_inf_like/1`) are no longer used for the traced
+  # *forward* dispatch path (see moduledoc) — each is instead called from a
+  # `with_reference_grad/3` closure to compute `Nx.Defn.grad`'s backward pass.
 
   # ── Traced/eager dispatch helpers ───────────────────────────────────────────
 
@@ -97,6 +98,31 @@ defmodule EMLX.Fast do
     Nx.Defn.Expr.metadata(reference, %{__EMLX__: %{op: opcode, operands: operands, attrs: attrs}})
   end
 
+  # Wraps `fused` (an `emlx_metadata/4` node) with a `custom_grad/3`
+  # annotation so `Nx.Defn.grad` differentiates through the op's plain-`Nx`
+  # `*_reference/N` formula instead of hitting the opaque, non-differentiable
+  # `Nx.runtime_call` forward pass. `reference_fn` is applied positionally to
+  # `inputs` (same order as the `emlx_metadata/4` `operands` list) and must
+  # recompute the same (single-tensor) value as `fused`.
+  #
+  # Reuses `Nx.Defn.Grad` itself rather than hand-deriving each op's backward
+  # formula: for any (possibly multi-output-shaped) `y = reference_fn(inputs)`
+  # and upstream cotangent `g` (same shape as `y`), the VJP w.r.t. `inputs` is
+  # exactly `grad(inputs, sum(g * y))` — a standard trick for building a VJP
+  # out of a scalar-output `grad`.
+  defp with_reference_grad(fused, inputs, reference_fn) when is_function(reference_fn) do
+    Nx.Defn.Kernel.custom_grad(fused, inputs, fn g ->
+      {_value, grad} =
+        Nx.Defn.Grad.transform(
+          List.to_tuple(inputs),
+          fn args -> args |> Tuple.to_list() |> then(&apply(reference_fn, &1)) |> Nx.multiply(g) |> Nx.sum() end,
+          & &1
+        )
+
+      Tuple.to_list(grad)
+    end)
+  end
+
   # ── RMS Norm ────────────────────────────────────────────────────────────────
 
   @doc """
@@ -110,12 +136,15 @@ defmodule EMLX.Fast do
   """
   deftransform rms_norm(x, weight, eps) do
     if traced?([x, weight]) do
-      emlx_metadata(
-        Nx.runtime_call(Nx.to_template(x), {x, weight}, [eps: eps], &rms_norm_callback/2),
-        :fast_rms_norm,
-        [x, weight],
-        [NativeExpr.f64_bits(eps)]
-      )
+      fused =
+        emlx_metadata(
+          Nx.runtime_call(Nx.to_template(x), {x, weight}, [eps: eps], &rms_norm_callback/2),
+          :fast_rms_norm,
+          [x, weight],
+          [NativeExpr.f64_bits(eps)]
+        )
+
+      with_reference_grad(fused, [x, weight], fn x, weight -> rms_norm_reference(x, weight, eps) end)
     else
       rms_norm_callback({x, weight}, eps: eps)
     end
@@ -155,17 +184,22 @@ defmodule EMLX.Fast do
   """
   deftransform layer_norm(x, weight, bias, eps) do
     if traced?([x, weight, bias]) do
-      emlx_metadata(
-        Nx.runtime_call(
-          Nx.to_template(x),
-          {x, weight, bias},
-          [eps: eps],
-          &layer_norm_callback/2
-        ),
-        :fast_layer_norm,
-        [x, weight, bias],
-        [NativeExpr.f64_bits(eps)]
-      )
+      fused =
+        emlx_metadata(
+          Nx.runtime_call(
+            Nx.to_template(x),
+            {x, weight, bias},
+            [eps: eps],
+            &layer_norm_callback/2
+          ),
+          :fast_layer_norm,
+          [x, weight, bias],
+          [NativeExpr.f64_bits(eps)]
+        )
+
+      with_reference_grad(fused, [x, weight, bias], fn x, weight, bias ->
+        layer_norm_reference(x, weight, bias, eps)
+      end)
     else
       layer_norm_callback({x, weight, bias}, eps: eps)
     end
@@ -208,17 +242,22 @@ defmodule EMLX.Fast do
   """
   deftransform layer_norm(x, weight, eps) do
     if traced?([x, weight]) do
-      emlx_metadata(
-        Nx.runtime_call(
-          Nx.to_template(x),
-          {x, weight},
-          [eps: eps],
-          &layer_norm_no_bias_callback/2
-        ),
-        :fast_layer_norm_no_bias,
-        [x, weight],
-        [NativeExpr.f64_bits(eps)]
-      )
+      fused =
+        emlx_metadata(
+          Nx.runtime_call(
+            Nx.to_template(x),
+            {x, weight},
+            [eps: eps],
+            &layer_norm_no_bias_callback/2
+          ),
+          :fast_layer_norm_no_bias,
+          [x, weight],
+          [NativeExpr.f64_bits(eps)]
+        )
+
+      with_reference_grad(fused, [x, weight], fn x, weight ->
+        layer_norm_no_bias_reference(x, weight, eps)
+      end)
     else
       layer_norm_no_bias_callback({x, weight}, eps: eps)
     end
@@ -304,12 +343,22 @@ defmodule EMLX.Fast do
             &sdpa_causal_key_masked_sinks_callback/2
           )
 
-        emlx_metadata(
-          inner,
-          :fast_sdpa_causal_key_masked_sinks,
-          [q, k, v, key_mask, sinks],
-          [NativeExpr.f64_bits(scale), kv_offset]
-        )
+        fused =
+          emlx_metadata(
+            inner,
+            :fast_sdpa_causal_key_masked_sinks,
+            [q, k, v, key_mask, sinks],
+            [NativeExpr.f64_bits(scale), kv_offset]
+          )
+
+        with_reference_grad(fused, [q, k, v, key_mask, sinks], fn q, k, v, key_mask, sinks ->
+          sdpa_reference(q, k, v, scale,
+            causal: true,
+            key_mask: key_mask,
+            kv_offset: kv_offset,
+            sinks: sinks
+          )
+        end)
       else
         inner =
           Nx.runtime_call(
@@ -319,12 +368,17 @@ defmodule EMLX.Fast do
             &sdpa_causal_key_masked_callback/2
           )
 
-        emlx_metadata(
-          inner,
-          :fast_sdpa_causal_key_masked,
-          [q, k, v, key_mask],
-          [NativeExpr.f64_bits(scale), kv_offset]
-        )
+        fused =
+          emlx_metadata(
+            inner,
+            :fast_sdpa_causal_key_masked,
+            [q, k, v, key_mask],
+            [NativeExpr.f64_bits(scale), kv_offset]
+          )
+
+        with_reference_grad(fused, [q, k, v, key_mask], fn q, k, v, key_mask ->
+          sdpa_reference(q, k, v, scale, causal: true, key_mask: key_mask, kv_offset: kv_offset)
+        end)
       end
     else
       if sinks do
@@ -413,12 +467,17 @@ defmodule EMLX.Fast do
       traditional_int = if traditional, do: 1, else: 0
       opts = [dims: dims, traditional: traditional, base: base, scale: scale, offset: offset]
 
-      emlx_metadata(
-        Nx.runtime_call(Nx.to_template(a), a, opts, &rope_callback/2),
-        :fast_rope,
-        [a],
-        [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale), offset]
-      )
+      fused =
+        emlx_metadata(
+          Nx.runtime_call(Nx.to_template(a), a, opts, &rope_callback/2),
+          :fast_rope,
+          [a],
+          [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale), offset]
+        )
+
+      with_reference_grad(fused, [a], fn a ->
+        rope_reference(a, dims, traditional, base, scale, offset)
+      end)
     else
       rope_callback(a, dims: dims, traditional: traditional, base: base, scale: scale, offset: offset)
     end
@@ -481,25 +540,35 @@ defmodule EMLX.Fast do
       out = Nx.to_template(a)
       opts = [dims: dims, traditional: traditional, base: base, scale: scale]
 
+      reference_fn = fn a, position_ids ->
+        rope_with_positions_reference(a, position_ids, dims, traditional, base, scale)
+      end
+
       if t1_use_fast? do
         inner =
           Nx.runtime_call(out, {a, position_ids}, opts, &rope_with_positions_fast_callback/2)
 
-        emlx_metadata(
-          inner,
-          :fast_rope_ids,
-          [a, position_ids],
-          [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale)]
-        )
+        fused =
+          emlx_metadata(
+            inner,
+            :fast_rope_ids,
+            [a, position_ids],
+            [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale)]
+          )
+
+        with_reference_grad(fused, [a, position_ids], reference_fn)
       else
         inner = Nx.runtime_call(out, {a, position_ids}, opts, &rope_with_positions_callback/2)
 
-        emlx_metadata(
-          inner,
-          :fast_rope_positions,
-          [a, position_ids],
-          [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale)]
-        )
+        fused =
+          emlx_metadata(
+            inner,
+            :fast_rope_positions,
+            [a, position_ids],
+            [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale)]
+          )
+
+        with_reference_grad(fused, [a, position_ids], reference_fn)
       end
     else
       if t1_use_fast? do
@@ -584,25 +653,35 @@ defmodule EMLX.Fast do
       out = Nx.to_template(a)
       opts = [dims: dims, traditional: traditional, scale: scale]
 
+      reference_fn = fn a, position_ids, freqs ->
+        rope_with_freqs_reference(a, position_ids, dims, traditional, scale, freqs)
+      end
+
       if t == 1 do
         inner =
           Nx.runtime_call(out, {a, position_ids, freqs}, opts, &rope_with_freqs_fast_callback/2)
 
-        emlx_metadata(
-          inner,
-          :fast_rope_with_freqs,
-          [a, position_ids, freqs],
-          [dims, traditional_int, NativeExpr.f64_bits(scale)]
-        )
+        fused =
+          emlx_metadata(
+            inner,
+            :fast_rope_with_freqs,
+            [a, position_ids, freqs],
+            [dims, traditional_int, NativeExpr.f64_bits(scale)]
+          )
+
+        with_reference_grad(fused, [a, position_ids, freqs], reference_fn)
       else
         inner = Nx.runtime_call(out, {a, position_ids, freqs}, opts, &rope_with_freqs_callback/2)
 
-        emlx_metadata(
-          inner,
-          :fast_rope_with_freqs_positions,
-          [a, position_ids, freqs],
-          [dims, traditional_int, NativeExpr.f64_bits(scale)]
-        )
+        fused =
+          emlx_metadata(
+            inner,
+            :fast_rope_with_freqs_positions,
+            [a, position_ids, freqs],
+            [dims, traditional_int, NativeExpr.f64_bits(scale)]
+          )
+
+        with_reference_grad(fused, [a, position_ids, freqs], reference_fn)
       end
     else
       if t == 1 do
@@ -666,9 +745,9 @@ defmodule EMLX.Fast do
 
   # ── RoPE reference formulas ─────────────────────────────────────────────────
   #
-  # Plain-Nx fallbacks used only as the `inner` expr of a `:__EMLX__` metadata
-  # node (see moduledoc) — this compiler never evaluates them; they exist for
-  # shape/type inference and for non-EMLX `Nx.Defn.Compiler`s.
+  # Plain-Nx formulas used only from a `with_reference_grad/3` closure (see
+  # moduledoc) to compute `Nx.Defn.grad`'s backward pass — the fused forward
+  # pass never evaluates them.
 
   # `a` is `{B, ..., T, D}` (T second-to-last axis) — matches `rope/6`.
   defp rope_reference(a, dims, traditional, base, scale, offset) do
@@ -823,7 +902,8 @@ defmodule EMLX.Fast do
   deftransform swiglu(gate, up) do
     if traced?([gate, up]) do
       inner = Nx.runtime_call(Nx.to_template(gate), {gate, up}, [], &swiglu_callback/2)
-      emlx_metadata(inner, :fast_swiglu, [gate, up], [])
+      fused = emlx_metadata(inner, :fast_swiglu, [gate, up], [])
+      with_reference_grad(fused, [gate, up], &swiglu_reference/2)
     else
       swiglu_callback({gate, up}, [])
     end
@@ -885,10 +965,18 @@ defmodule EMLX.Fast do
 
       if sinks do
         inner = Nx.runtime_call(out, {q, k, v, sinks}, [scale: scale], &sdpa_sinks_callback/2)
-        emlx_metadata(inner, :fast_sdpa_sinks, [q, k, v, sinks], [NativeExpr.f64_bits(scale)])
+        fused = emlx_metadata(inner, :fast_sdpa_sinks, [q, k, v, sinks], [NativeExpr.f64_bits(scale)])
+
+        with_reference_grad(fused, [q, k, v, sinks], fn q, k, v, sinks ->
+          sdpa_reference(q, k, v, scale, sinks: sinks)
+        end)
       else
         inner = Nx.runtime_call(out, {q, k, v}, [scale: scale], &sdpa_callback/2)
-        emlx_metadata(inner, :fast_sdpa, [q, k, v], [NativeExpr.f64_bits(scale)])
+        fused = emlx_metadata(inner, :fast_sdpa, [q, k, v], [NativeExpr.f64_bits(scale)])
+
+        with_reference_grad(fused, [q, k, v], fn q, k, v ->
+          sdpa_reference(q, k, v, scale, [])
+        end)
       end
     else
       if sinks do
@@ -917,12 +1005,21 @@ defmodule EMLX.Fast do
         inner =
           Nx.runtime_call(out, {q, k, v, mask, sinks}, [scale: scale], &sdpa_masked_sinks_callback/2)
 
-        emlx_metadata(inner, :fast_sdpa_masked_sinks, [q, k, v, mask, sinks], [
-          NativeExpr.f64_bits(scale)
-        ])
+        fused =
+          emlx_metadata(inner, :fast_sdpa_masked_sinks, [q, k, v, mask, sinks], [
+            NativeExpr.f64_bits(scale)
+          ])
+
+        with_reference_grad(fused, [q, k, v, mask, sinks], fn q, k, v, mask, sinks ->
+          sdpa_reference(q, k, v, scale, mask: mask, sinks: sinks)
+        end)
       else
         inner = Nx.runtime_call(out, {q, k, v, mask}, [scale: scale], &sdpa_masked_callback/2)
-        emlx_metadata(inner, :fast_sdpa_masked, [q, k, v, mask], [NativeExpr.f64_bits(scale)])
+        fused = emlx_metadata(inner, :fast_sdpa_masked, [q, k, v, mask], [NativeExpr.f64_bits(scale)])
+
+        with_reference_grad(fused, [q, k, v, mask], fn q, k, v, mask ->
+          sdpa_reference(q, k, v, scale, mask: mask)
+        end)
       end
     else
       if sinks do
@@ -1047,12 +1144,21 @@ defmodule EMLX.Fast do
         inner =
           Nx.runtime_call(out, {q, k, v, sinks}, [scale: scale], &sdpa_causal_sinks_callback/2)
 
-        emlx_metadata(inner, :fast_sdpa_causal_sinks, [q, k, v, sinks], [
-          NativeExpr.f64_bits(scale)
-        ])
+        fused =
+          emlx_metadata(inner, :fast_sdpa_causal_sinks, [q, k, v, sinks], [
+            NativeExpr.f64_bits(scale)
+          ])
+
+        with_reference_grad(fused, [q, k, v, sinks], fn q, k, v, sinks ->
+          sdpa_reference(q, k, v, scale, causal: true, sinks: sinks)
+        end)
       else
         inner = Nx.runtime_call(out, {q, k, v}, [scale: scale], &sdpa_causal_callback/2)
-        emlx_metadata(inner, :fast_sdpa_causal, [q, k, v], [NativeExpr.f64_bits(scale)])
+        fused = emlx_metadata(inner, :fast_sdpa_causal, [q, k, v], [NativeExpr.f64_bits(scale)])
+
+        with_reference_grad(fused, [q, k, v], fn q, k, v ->
+          sdpa_reference(q, k, v, scale, causal: true)
+        end)
       end
     else
       if sinks do
@@ -1101,9 +1207,10 @@ defmodule EMLX.Fast do
 
   # ── SDPA reference formula ───────────────────────────────────────────────────
   #
-  # Plain-Nx fallback used only as the `inner` expr of a `:__EMLX__` metadata
-  # node (see moduledoc). q/k/v are `{B, N, T, D}`; GQA-repeats k/v to N_q
-  # heads before a broadcasted dot-product (no batched-matmul axis juggling).
+  # Plain-Nx formula used only from a `with_reference_grad/3` closure (see
+  # moduledoc) to compute `Nx.Defn.grad`'s backward pass. q/k/v are
+  # `{B, N, T, D}`; GQA-repeats k/v to N_q heads before a broadcasted
+  # dot-product (no batched-matmul axis juggling).
 
   defp sdpa_reference(q, k, v, scale, opts) do
     causal = Keyword.get(opts, :causal, false)
