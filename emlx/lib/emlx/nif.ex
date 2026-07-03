@@ -149,29 +149,4 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
-  # ── Stage 32a spike NIFs (throwaway) ──────────────────────────────────────
-  # See "Stage 32a spike" in c_src/emlx_compiler.cpp. spike32a_run is
-  # worker-routed (argv[0] = worker); spike32a_resume deliberately is NOT —
-  # it must run directly on the calling process's scheduler thread, bypassing
-  # the worker's own job queue, since that's exactly the property under test.
-  def spike32a_run(_worker, _target_pid, _device, _input_value, _compile_id) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def spike32a_resume(_call_id, _value) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  # ── Stage 32a Procedures #2-#3: production host_callback opcode NIF ───────
-  #
-  # See "Host callback opcode" in c_src/emlx_compiler.cpp. There is no
-  # registration NIF -- the target pid for each call is resolved from
-  # emlx::current_caller_pid() (c_src/emlx_async.hpp), i.e. whichever
-  # process actually called eval_program. host_callback_resume must run
-  # directly on the calling process's scheduler thread, bypassing the
-  # worker's own job queue, since the worker is the one blocked waiting for
-  # this call (see the C++ comment).
-  def host_callback_resume(_call_id, _reply_tensor_ref) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
 end

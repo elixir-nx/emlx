@@ -1842,66 +1842,6 @@ ASYNC_NIF(compile_program)
 NIF(eval_program) { return emlx::native::eval_program(env, argc, argv); }
 ASYNC_NIF(eval_program)
 
-// ── Stage 32a spike NIFs (see emlx_compiler.cpp's "Stage 32a spike"
-// section) — throwaway, not part of the production op registry.
-//
-// argv[0]: target_pid, argv[1]: device atom, argv[2]: input value,
-// argv[3]: compile_id (integer).
-NIF(spike32a_run) {
-  try {
-    ErlNifPid target_pid;
-    if (!enif_get_local_pid(env, argv[0], &target_pid))
-      return nx::nif::error(env, "spike32a: invalid target pid");
-    DEVICE_PARAM(1, device);
-    double input_value;
-    if (!enif_get_double(env, argv[2], &input_value)) {
-      int64_t iv;
-      if (!enif_get_int64(env, argv[2], reinterpret_cast<ErlNifSInt64 *>(&iv)))
-        return nx::nif::error(env, "spike32a: invalid input value");
-      input_value = static_cast<double>(iv);
-    }
-    ErlNifUInt64 compile_id;
-    if (!enif_get_uint64(env, argv[3], &compile_id))
-      return nx::nif::error(env, "spike32a: invalid compile_id");
-    return emlx::native::spike32a::run_program(env, target_pid, device,
-                                               input_value, compile_id);
-  }
-  CATCH()
-}
-ASYNC_NIF(spike32a_run)
-
-// Deliberately NOT an ASYNC_NIF: this must run directly on the calling
-// (BEAM scheduler) thread, bypassing emlx::Worker::post entirely, since
-// unblocking the worker's job without going through its own queue is
-// exactly the property under test.
-NIF(spike32a_resume) {
-  ErlNifUInt64 call_id;
-  if (!enif_get_uint64(env, argv[0], &call_id))
-    return nx::nif::error(env, "spike32a: invalid call_id");
-  double value;
-  if (!enif_get_double(env, argv[1], &value)) {
-    int64_t iv;
-    if (!enif_get_int64(env, argv[1], reinterpret_cast<ErlNifSInt64 *>(&iv)))
-      return nx::nif::error(env, "spike32a: invalid value");
-    value = static_cast<double>(iv);
-  }
-  return emlx::native::spike32a::resume_call(env, call_id, value);
-}
-
-// ── Stage 32a Procedures #2-#3: production ":host_callback" opcode NIF ─────
-//
-// Thin wrapper delegating to emlx_compiler.cpp — see its "Host callback
-// opcode" section. There is no registration NIF: the target pid for each
-// call is resolved from emlx::current_caller_pid() (emlx_async.hpp), not
-// registered up front. host_callback_resume is deliberately NOT an
-// ASYNC_NIF (must run directly on the calling thread, bypassing
-// emlx::Worker::post, for the same reason spike32a_resume does — see its
-// comment above) but IS registered dirty below since it may call
-// mlx::core::eval on real (possibly GPU-bound) work.
-NIF(host_callback_resume) {
-  return emlx::native::host_callback_resume(env, argc, argv);
-}
-
 static ErlNifFunc nif_funcs[] = {
     {"eval", 2, eval_async},
     {"eval_many", 2, eval_many_async},
@@ -2083,13 +2023,6 @@ static ErlNifFunc nif_funcs[] = {
     // ── Native compiler NIFs.
     {"compile_program", 9, compile_program_async},
     {"eval_program", 3, eval_program_async},
-
-    // ── Stage 32a spike NIFs (throwaway).
-    {"spike32a_run", 5, spike32a_run_async},
-    {"spike32a_resume", 2, spike32a_resume},
-
-    // ── Stage 32a Procedures #2-#3: production host_callback opcode NIF.
-    {"host_callback_resume", 2, host_callback_resume, ERL_NIF_DIRTY_JOB_CPU_BOUND},
 
     // ── Qwen3 model accelerators (emlx_fast/qwen3.cpp).
     {"qwen3_kv_cache_attention", 11, qwen3_kv_cache_attention_async},

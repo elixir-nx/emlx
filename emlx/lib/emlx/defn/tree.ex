@@ -70,6 +70,19 @@ defmodule EMLX.Defn.Tree do
   # fun's args[0] contains inner-scope parameter templates — no parent-scope deps.
   defp visit_scope_deps(%T{data: %Nx.Defn.Expr{op: :fun}}, acc), do: acc
 
+  # `:__EMLX__`-tagged metadata (see `EMLX.Fast`) marks a node whose *real*
+  # dependencies are its `operands` list, not whatever plain-Nx composite
+  # `inner` expr it wraps — `inner` is a reference formula the EMLX compiler
+  # never evaluates (see `EMLX.Native.Expr`'s `:metadata` `expand_node`
+  # clause), so its internal subgraph must stay out of the ordering entirely;
+  # otherwise those nodes would still get lowered as dead instructions.
+  defp visit_scope_deps(
+         %T{data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: %{operands: operands}}]}},
+         acc
+       ) do
+    Enum.reduce(operands, acc, &visit/2)
+  end
+
   # For all other ops (including while and block, which expose parent-scope deps
   # via apply_args :scope), recurse into same-scope operands before emitting.
   defp visit_scope_deps(node, acc) do

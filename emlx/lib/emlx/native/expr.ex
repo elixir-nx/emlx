@@ -61,7 +61,7 @@ defmodule EMLX.Native.Expr do
   | `:iota`   | `[dtype_int, n_dims, axis_int, d0..dn-1]` — dtype, rank, axis (−1=flat), shape dims. No operands. |
   | `:eye`    | `[dtype_int, m, n]` — dtype and the two shape dims. No operands.    |
   | `:quantized_matmul` | `[group_size, bits, transpose_int, mode_int, has_bias_int]` — see "Quantized dot specialization" below. Operands: `[activation, weight, scales, biases?]` (biases omitted when `has_bias_int` is 0). |
-  | `:host_callback` | `[callback_slot, dtype_int, n_dims, d0..dn-1]` — output shape/dtype (a `Primitive`-backed array declares these at construction time). Operands: the callback's input arrays. Emitted by `lower/2` for any unrecognized `:runtime_call` (Stage 32a — see `workdir/native-compiler/32a-inline-runtime-call.md`). `callback_slot` is resolved back to a real `{fun, opts}` by `EMLX.build_native_eval_fn/6` via `runtime_call_callback_specs/1`, not by anything on the C++ side — the mid-eval message's target is `emlx::current_caller_pid()` (whichever process is actually calling `eval_program`), not a registered pid. |
+  | `:fast_rms_norm`, `:fast_layer_norm`, `:fast_layer_norm_no_bias`, `:fast_swiglu`, `:fast_sdpa*`, `:fast_rope*` | `EMLX.Fast.*`'s fused `mlx::core::fast::*`-backed opcodes. Emitted for a `:metadata` node carrying a `:__EMLX__` key (see the `:metadata` `expand_node` clause and `EMLX.Fast`'s moduledoc) — never for a bare `:runtime_call` (that always requires a graph split; see `EMLX.split_point?/1`). |
 
   Non-negative axes: the lowerer normalises negative axis values before encoding
   so C++ handlers can use them directly as 0-based indices.
@@ -247,12 +247,7 @@ defmodule EMLX.Native.Expr do
       # parent scope — see the moduledoc's "Hooks" section for why a
       # cond-branch-local hook must raise instead.
       top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new(),
-      quant_signature: quant_signature,
-      # Stage 32a Procedures #2-#4 — 0-based counter assigning each
-      # unrecognized `:runtime_call` node's `:host_callback` instruction a
-      # `callback_slot`, in post-order encounter order. See
-      # `expand_host_callback/4` and `runtime_call_callback_specs/1`.
-      next_callback_slot: 0
+      quant_signature: quant_signature
     }
 
     state = Enum.reduce(ordered, state, &expand_node/2)
@@ -330,6 +325,36 @@ defmodule EMLX.Native.Expr do
     %{
       state
       | captures: [{ref, backend_tensor} | state.captures],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
+  end
+
+  # `:__EMLX__`-tagged metadata (see `EMLX.Fast`) marks a node whose *real*
+  # value is a fused native op, not whatever plain-Nx composite formula
+  # `inner` computes. `inner` exists only so non-EMLX consumers (any other
+  # `Nx.Defn.Compiler`, or `Nx.Defn.Evaluator`) get a genuine, correct
+  # (if slower) fallback, and so `operands` are ordinary reachable
+  # dependencies for `EMLX.Defn.Tree.post_order/1` to visit — this compiler
+  # never lowers `inner` itself. `operands` are the same `%Nx.Tensor{}`
+  # values embedded in `inner`'s own subtree (so `state.node_to_ref` already
+  # has an entry for each by the time this clause runs); `attrs` is the
+  # int-attr list, already encoded (see `EMLX.Fast`'s `f64_bits/1` uses).
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :metadata,
+             args: [_inner, %{__EMLX__: %{op: opcode, operands: operands, attrs: attrs}}]
+           }
+         },
+         state
+       ) do
+    ref = make_ref()
+    operand_refs = Enum.map(operands, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    %{
+      state
+      | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
   end
@@ -1879,48 +1904,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # ── runtime_call: route EMLX.Fast.* fused kernels to native opcodes ────────
-  #
-  # EMLX.Fast.* functions emit `Nx.runtime_call(out, container, opts, &cb/2)`.
-  # We recognize the callback (by module+name+arity) and emit a single fused
-  # opcode that calls the matching `mlx::core::fast::*` primitive inside the
-  # compiled graph — keeping the whole defn in one NIF replay. Operands come
-  # from the call's tensor container (in flatten order); float opts (eps/scale/
-  # base) ride the int-attr channel as IEEE-754 bits (see `f64_bits/1`).
-  #
-  # Any *other* `:runtime_call` (Stage 32a Procedures #2-#4) lowers to a
-  # `:host_callback` instruction instead of raising / becoming a host-driven
-  # `Nx.Defn.Graph` split point (Stage 31, now retired — see `emlx.ex`'s
-  # "Stage 32a" section): the callback still runs as real Elixir, on the
-  # calling process, with real materialized tensors (so `Process.get/put`-
-  # backed mutable state and `Nx.to_number/1` just work — Procedure #6),
-  # but *inline*, mid-eval, inside the very same single NIF call as
-  # everything else in scope, not as a separate compiled program.
-  defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :runtime_call, args: [tensor_expr, fun, _out, opts]}} =
-           node,
-         state
-       ) do
-    if recognized_runtime_call?(fun) do
-      {opcode, attrs} = fast_kernel_dispatch(fun, opts)
-
-      operand_refs =
-        [tensor_expr]
-        |> Composite.flatten_list()
-        |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
-
-      ref = make_ref()
-
-      %{
-        state
-        | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
-          node_to_ref: Map.put(state.node_to_ref, id, ref)
-      }
-    else
-      expand_host_callback(id, tensor_expr, node, state)
-    end
-  end
-
   # :fun nodes surface as opaque leaves in the parent ordering (post_order does
   # not descend their bodies).  They carry no value on their own — the owning op
   # (e.g. :reduce) reaches into `fun.data.args` and lowers the body itself — so
@@ -1998,37 +1981,6 @@ defmodule EMLX.Native.Expr do
 
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
-  end
-
-  # `callback_slot` is this call's 0-based position among ALL unrecognized
-  # `:runtime_call` nodes in `output`'s post-order traversal (`state`'s
-  # `next_callback_slot` counter, incremented in this same order `lower/2`
-  # walks `ordered`); `runtime_call_callback_specs/1` derives a matching
-  # per-call `{fun, opts, output_template}` list by re-walking the SAME
-  # `output` in the SAME order — see its doc for why opts are deliberately
-  # NOT baked into this instruction (only shape/dtype are, mirroring
-  # iota/eye above): a shared compiled program (Stage 32's dispatch cache)
-  # must give correct per-call opts to structurally-identical call sites
-  # (e.g. each of Qwen3's 28 attention layers) despite sharing one
-  # `callback_slot` assignment.
-  defp expand_host_callback(id, tensor_expr, node, state) do
-    operand_refs =
-      [tensor_expr]
-      |> Composite.flatten_list()
-      |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
-
-    dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(node.type))
-    shape_list = Tuple.to_list(node.shape)
-    iattrs = [state.next_callback_slot, dtype_int, length(shape_list) | shape_list]
-
-    ref = make_ref()
-
-    %{
-      state
-      | instructions: [{ref, :host_callback, operand_refs, iattrs} | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, ref),
-        next_callback_slot: state.next_callback_slot + 1
-    }
   end
 
   # ── dot helpers ────────────────────────────────────────────────────────────
@@ -2574,91 +2526,6 @@ defmodule EMLX.Native.Expr do
     digits
   end
 
-  # ── EMLX.Fast runtime_call recognition ─────────────────────────────────────
-  #
-  # Maps a recognized `&EMLX.Fast.*_callback/2` capture to a fused opcode and its
-  # integer-attr list. The decode/T=1 callbacks route to a single
-  # `mlx::core::fast::*` opcode; the per-token prefill RoPE callbacks
-  # (`rope_with_positions_callback` / `rope_with_freqs_callback`, T>1) route to
-  # an in-graph cos/sin/rotate primitive composition instead (Stage 15 Part B —
-  # `mlx::fast::rope`'s offset can't express arbitrary per-token positions).
-  @doc """
-  True when `fun` (a `:runtime_call` node's callback capture) is a recognized
-  `EMLX.Fast.*` fused kernel this compiler lowers to a single
-  `mlx::core::fast::*`-backed opcode (`fast_kernel_dispatch/2`). Any other
-  `:runtime_call` still lowers in-graph, via the generic `:host_callback`
-  opcode (Stage 32a) — see `expand_host_callback/4`.
-  """
-  @spec recognized_runtime_call?((term(), term() -> term())) :: boolean()
-  def recognized_runtime_call?(fun) when is_function(fun, 2) do
-    Function.info(fun)[:module] == EMLX.Fast
-  end
-
-  @doc """
-  Returns `{fun, opts, container_template, output_template,
-  operand_param_positions}` for every unrecognized `:runtime_call` node
-  reachable from `output`, in the same post-order encounter order
-  `lower/2`/`expand_host_callback/4` use to assign each one's
-  `callback_slot` (Stage 32a Procedures #3-#4) — position `i` in this list
-  is `callback_slot` `i`. `container_template` is the callback's operand
-  container shape (a plain Composite template, e.g. a 5-tuple of tensor
-  templates for `native_kv_attn_callback`) — needed to reconstruct the
-  real container `fun` expects from the flat operand list a
-  `{:emlx_host_callback, ...}` message carries. `operand_param_positions`
-  is parallel to that flattened operand list: the defn parameter position
-  for a leaf that is a bare, untouched `:parameter` pass-through, or `nil`
-  otherwise — mirrors `EMLX.build_native_eval_fn/6`'s
-  `output_param_positions`, and exists for the same reason: a quantized
-  operand's Elixir-side `quantization_config` (Stage 24/25) is invisible
-  on the wire (only shape/dtype travel in the
-  `{:emlx_host_callback, ...}` message), so a pass-through quantized
-  parameter must be substituted back from the caller's real bound input
-  tensor instead of reconstructed from the wire refs.
-
-  Callers (`EMLX.build_native_eval_fn/6`) use this to build a per-call
-  callback dispatch table *without* re-lowering/re-compiling: unlike an
-  `EMLX.Fast.*` fused kernel's numeric opts (baked into the compiled
-  program's instructions as IEEE-754 bits — see `fast_kernel_dispatch/2`),
-  a `:host_callback` instruction's `opts` are deliberately NOT part of the
-  compiled program at all (only shape/dtype are — see
-  `expand_host_callback/4`), so this must be re-derived fresh from each
-  call's own traced `output` every time. This is what lets structurally-
-  identical call sites with different opts (e.g. each of Qwen3's 28
-  attention layers, whose `layer_key` is a distinct `make_ref()`) share
-  ONE compiled program/dispatch-cache entry (Stage 32) while each call
-  still invokes its callback with its own correct opts.
-  """
-  @spec runtime_call_callback_specs(Nx.Container.t()) ::
-          [
-            {(term(), term() -> term()), keyword(), Nx.Container.t(), Nx.Container.t(),
-             [non_neg_integer() | nil]}
-          ]
-  def runtime_call_callback_specs(output) do
-    output
-    |> EMLX.Defn.Tree.post_order()
-    |> Enum.flat_map(fn
-      %T{data: %Nx.Defn.Expr{op: :runtime_call, args: [tensor_expr, fun, out, opts]}} ->
-        if recognized_runtime_call?(fun) do
-          []
-        else
-          container_template = Composite.traverse(tensor_expr, &Nx.to_template/1)
-
-          operand_param_positions =
-            [tensor_expr]
-            |> Composite.flatten_list()
-            |> Enum.map(fn
-              %T{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos
-              _ -> nil
-            end)
-
-          [{fun, opts, container_template, out, operand_param_positions}]
-        end
-
-      _ ->
-        []
-    end)
-  end
-
   @doc """
   Returns the set of defn parameter positions that appear as either
   operand of a `:dot` node somewhere in `output`'s post-order traversal —
@@ -2669,11 +2536,10 @@ defmodule EMLX.Native.Expr do
   on packed bits). `EMLX.quant_signature/2` intersects a call's bound
   quantized tensors against this set before building a Stage 32
   dispatch-cache key, so a quantized tensor merely *passed through* to
-  something else (e.g. Stage 32a's `:host_callback` opcode, or
-  `EMLX.Quantization.dequantize/1` reading it via
-  `runtime_call_callback_specs/1`'s pass-through-parameter path) doesn't
-  fragment the cache with one dead-weight entry per distinct tensor
-  identity.
+  something else (e.g. an `EMLX.Fast.*` fused kernel's `:__EMLX__`
+  metadata `operands`, or `EMLX.Quantization.dequantize/1`'s own
+  `:runtime_call` split-point operand) doesn't fragment the cache with
+  one dead-weight entry per distinct tensor identity.
   """
   @spec quantizable_param_positions(Nx.Container.t()) :: MapSet.t(non_neg_integer())
   def quantizable_param_positions(output) do
@@ -2695,104 +2561,6 @@ defmodule EMLX.Native.Expr do
     do: MapSet.put(acc, pos)
 
   defp maybe_put_param_position(acc, _node), do: acc
-
-  defp fast_kernel_dispatch(fun, opts) when is_function(fun, 2) do
-    info = Function.info(fun)
-    module = info[:module]
-    name = info[:name]
-
-    unless recognized_runtime_call?(fun) do
-      raise ArgumentError,
-            "does not yet lower op :runtime_call for #{inspect(module)}.#{name}/2 " <>
-              "(only EMLX.Fast.* fused kernels are recognized)"
-    end
-
-    case name do
-      :rms_norm_callback ->
-        {:fast_rms_norm, [f64_bits(opts[:eps])]}
-
-      :layer_norm_callback ->
-        {:fast_layer_norm, [f64_bits(opts[:eps])]}
-
-      :layer_norm_no_bias_callback ->
-        {:fast_layer_norm_no_bias, [f64_bits(opts[:eps])]}
-
-      :swiglu_callback ->
-        {:fast_swiglu, []}
-
-      :sdpa_callback ->
-        {:fast_sdpa, [f64_bits(opts[:scale])]}
-
-      :sdpa_sinks_callback ->
-        {:fast_sdpa_sinks, [f64_bits(opts[:scale])]}
-
-      :sdpa_masked_callback ->
-        {:fast_sdpa_masked, [f64_bits(opts[:scale])]}
-
-      :sdpa_masked_sinks_callback ->
-        {:fast_sdpa_masked_sinks, [f64_bits(opts[:scale])]}
-
-      :sdpa_causal_callback ->
-        {:fast_sdpa_causal, [f64_bits(opts[:scale])]}
-
-      :sdpa_causal_sinks_callback ->
-        {:fast_sdpa_causal_sinks, [f64_bits(opts[:scale])]}
-
-      :sdpa_causal_key_masked_callback ->
-        {:fast_sdpa_causal_key_masked, [f64_bits(opts[:scale]), opts[:kv_offset]]}
-
-      :sdpa_causal_key_masked_sinks_callback ->
-        {:fast_sdpa_causal_key_masked_sinks, [f64_bits(opts[:scale]), opts[:kv_offset]]}
-
-      :rope_callback ->
-        {:fast_rope,
-         [
-           opts[:dims],
-           bool_int(opts[:traditional]),
-           f64_bits(opts[:base]),
-           f64_bits(opts[:scale]),
-           opts[:offset]
-         ]}
-
-      :rope_with_positions_fast_callback ->
-        {:fast_rope_ids,
-         [
-           opts[:dims],
-           bool_int(opts[:traditional]),
-           f64_bits(opts[:base]),
-           f64_bits(opts[:scale])
-         ]}
-
-      :rope_with_freqs_fast_callback ->
-        {:fast_rope_with_freqs,
-         [opts[:dims], bool_int(opts[:traditional]), f64_bits(opts[:scale])]}
-
-      # Prefill RoPE (T>1) / high-base decode — arbitrary per-token position_ids,
-      # inv_freq derived from `base`. Composed via primitive cos/sin/rotate ops
-      # in-graph (no new C++ kernel); matches the eager fast_rope_positions NIF.
-      :rope_with_positions_callback ->
-        {:fast_rope_positions,
-         [
-           opts[:dims],
-           bool_int(opts[:traditional]),
-           f64_bits(opts[:base]),
-           f64_bits(opts[:scale])
-         ]}
-
-      # Prefill RoPE (T>1) with a precomputed freqs tensor (e.g. :llama3 scaling).
-      # Same primitive composition, inv_freq = reciprocal(freqs) (matches
-      # mlx::fast::rope's freqs overload) instead of deriving it from `base`.
-      :rope_with_freqs_callback ->
-        {:fast_rope_with_freqs_positions,
-         [opts[:dims], bool_int(opts[:traditional]), f64_bits(opts[:scale])]}
-
-      other ->
-        raise ArgumentError, "does not yet lower op :runtime_call for EMLX.Fast.#{other}/2"
-    end
-  end
-
-  defp bool_int(true), do: 1
-  defp bool_int(false), do: 0
 
   # Float opts ride the int-attr channel as their IEEE-754 double bits
   # (reinterpreted as a signed int64). The C++ side reverses it via memcpy.

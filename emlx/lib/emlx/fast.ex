@@ -1,11 +1,41 @@
 defmodule EMLX.Fast do
   @moduledoc """
   Single-kernel Metal shaders from `mlx::fast`, exposed as `deftransform`
-  functions backed by `Nx.runtime_call`.
+  functions.
 
   Every function is defn-safe: call inside `defn`, `Nx.Defn.jit`, or from
   `Axon.rewrite_nodes/2` rewrite callbacks without restriction — **except
   `einsum/2`**, which is eager-only (see its docs).
+
+  ## Two execution paths
+
+  Each `deftransform` here dispatches on whether its tensor arguments are
+  concrete (eager — a real `EMLX.Backend`-backed tensor) or expression-backed
+  (traced — building an `Nx.Defn.Expr` graph):
+
+  - **Eager**: the fused NIF (e.g. `EMLX.fast_rms_norm/3`) runs immediately.
+  - **Traced**: the function returns an `Nx.Defn.Expr.metadata/2` node
+    carrying a `:__EMLX__` key — `%{op: opcode, operands: [...], attrs: [...]}`
+    — naming the native EMLX opcode, its operand tensors, and its int-encoded
+    attributes (see `EMLX.Native.Expr.f64_bits/1`). `EMLX.Native.Expr`'s
+    `:metadata` `expand_node` clause recognizes this key and lowers straight
+    to the native op — no graph split. The metadata node wraps an
+    `Nx.runtime_call/4` of the *same* eager callback used above (`inner`) —
+    this compiler never evaluates it (it's discarded in favor of the
+    `:__EMLX__` payload); it exists only so (a) the operand tensors are
+    ordinary reachable dependencies for `EMLX.Defn.Tree.post_order/1` to
+    visit, and (b) any other `Nx.Defn.Compiler` — notably the default
+    `Nx.Defn.Evaluator` and `Nx.Defn.Grad` — still gets a correct fallback:
+    `runtime_call` just runs the real NIF against concrete tensors, so it's
+    both exact (not a slower plain-`Nx` approximation) and free to build
+    (unlike a full composite reference formula, `Nx.runtime_call/4` is a
+    single lightweight node — no per-op sub-expression tracing cost). It is
+    **not** differentiable as-is; each op's `*_reference/N` plain-`Nx`
+    formula is kept (unused for now) for a future `Nx.Defn.Kernel.custom_grad/2`
+    annotation once `Nx.Defn.grad` support is needed.
+
+  A bare `Nx.runtime_call` (anything *not* wrapped in `:__EMLX__` metadata)
+  always forces a graph split — see `EMLX.split_point?/1`.
 
   ## Functions
 
@@ -41,6 +71,32 @@ defmodule EMLX.Fast do
   require EMLX.Debug
   import EMLX.Debug, only: [assert_no_nan_inf!: 2]
 
+  alias EMLX.Native.Expr, as: NativeExpr
+
+  # The `*_reference/N` plain-`Nx` formulas below (and their private helpers:
+  # `position_freqs/6`, `rope_broadcast_shape/2`, `rope_rotate/5`,
+  # `rope_split_half/5`, `rope_interleaved/5`, `repeat_kv_heads/2`,
+  # `apply_causal_mask/4`, `apply_causal_key_mask/5`, `apply_generic_mask/2`,
+  # `iota_bin/2`, `neg_inf_like/1`) are no longer wired into the traced
+  # dispatch path (see moduledoc) — kept for an upcoming
+  # `Nx.Defn.Kernel.custom_grad/2` annotation, hence the "unused function"
+  # compiler warnings below.
+
+  # ── Traced/eager dispatch helpers ───────────────────────────────────────────
+
+  # True when any of `tensors` is expression-backed (i.e. we're being traced
+  # by `Nx.Defn`, as opposed to running eagerly on concrete tensors).
+  defp traced?(tensors) do
+    Enum.any?(List.wrap(tensors), &match?(%Nx.Tensor{data: %Nx.Defn.Expr{}}, &1))
+  end
+
+  # Wraps `reference` (a plain-Nx formula, never evaluated by EMLX's
+  # compiler) with the `:__EMLX__` metadata naming the real native opcode,
+  # its operand tensors, and its int-encoded attrs.
+  defp emlx_metadata(reference, opcode, operands, attrs) do
+    Nx.Defn.Expr.metadata(reference, %{__EMLX__: %{op: opcode, operands: operands, attrs: attrs}})
+  end
+
   # ── RMS Norm ────────────────────────────────────────────────────────────────
 
   @doc """
@@ -53,8 +109,27 @@ defmodule EMLX.Fast do
   Output shape and type match `x`.
   """
   deftransform rms_norm(x, weight, eps) do
-    out = Nx.template(Nx.shape(x), Nx.type(x))
-    Nx.runtime_call(out, {x, weight}, [eps: eps], &__MODULE__.rms_norm_callback/2)
+    if traced?([x, weight]) do
+      emlx_metadata(
+        Nx.runtime_call(Nx.to_template(x), {x, weight}, [eps: eps], &rms_norm_callback/2),
+        :fast_rms_norm,
+        [x, weight],
+        [NativeExpr.f64_bits(eps)]
+      )
+    else
+      rms_norm_callback({x, weight}, eps: eps)
+    end
+  end
+
+  defp rms_norm_reference(x, weight, eps) do
+    x
+    |> Nx.pow(2)
+    |> Nx.mean(axes: [-1], keep_axes: true)
+    |> Nx.add(eps)
+    |> Nx.sqrt()
+    |> then(&Nx.divide(x, &1))
+    |> Nx.multiply(weight)
+    |> Nx.as_type(Nx.type(x))
   end
 
   @doc false
@@ -79,8 +154,33 @@ defmodule EMLX.Fast do
   Output shape and type match `x`.
   """
   deftransform layer_norm(x, weight, bias, eps) do
-    out = Nx.template(Nx.shape(x), Nx.type(x))
-    Nx.runtime_call(out, {x, weight, bias}, [eps: eps], &__MODULE__.layer_norm_callback/2)
+    if traced?([x, weight, bias]) do
+      emlx_metadata(
+        Nx.runtime_call(
+          Nx.to_template(x),
+          {x, weight, bias},
+          [eps: eps],
+          &layer_norm_callback/2
+        ),
+        :fast_layer_norm,
+        [x, weight, bias],
+        [NativeExpr.f64_bits(eps)]
+      )
+    else
+      layer_norm_callback({x, weight, bias}, eps: eps)
+    end
+  end
+
+  defp layer_norm_reference(x, weight, bias, eps) do
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    centered = Nx.subtract(x, mean)
+    variance = Nx.mean(Nx.pow(centered, 2), axes: [-1], keep_axes: true)
+
+    centered
+    |> Nx.divide(Nx.sqrt(Nx.add(variance, eps)))
+    |> Nx.multiply(weight)
+    |> Nx.add(bias)
+    |> Nx.as_type(Nx.type(x))
   end
 
   @doc false
@@ -107,8 +207,32 @@ defmodule EMLX.Fast do
   Output shape and type match `x`.
   """
   deftransform layer_norm(x, weight, eps) do
-    out = Nx.template(Nx.shape(x), Nx.type(x))
-    Nx.runtime_call(out, {x, weight}, [eps: eps], &__MODULE__.layer_norm_no_bias_callback/2)
+    if traced?([x, weight]) do
+      emlx_metadata(
+        Nx.runtime_call(
+          Nx.to_template(x),
+          {x, weight},
+          [eps: eps],
+          &layer_norm_no_bias_callback/2
+        ),
+        :fast_layer_norm_no_bias,
+        [x, weight],
+        [NativeExpr.f64_bits(eps)]
+      )
+    else
+      layer_norm_no_bias_callback({x, weight}, eps: eps)
+    end
+  end
+
+  defp layer_norm_no_bias_reference(x, weight, eps) do
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    centered = Nx.subtract(x, mean)
+    variance = Nx.mean(Nx.pow(centered, 2), axes: [-1], keep_axes: true)
+
+    centered
+    |> Nx.divide(Nx.sqrt(Nx.add(variance, eps)))
+    |> Nx.multiply(weight)
+    |> Nx.as_type(Nx.type(x))
   end
 
   @doc false
@@ -125,9 +249,10 @@ defmodule EMLX.Fast do
   end
 
   @doc """
-  Causal SDPA with the key_mask check delegated to the C++ NIF.
+  Causal SDPA with the key_mask check delegated to the C++ NIF (eager) or
+  folded directly into the compiled graph (traced).
 
-  At runtime the NIF evaluates `all(key_mask == 1)`:
+  When eager, the NIF evaluates `all(key_mask == 1)`:
   - **true** (no padding, e.g. single-sequence decode) → pure causal SDPA,
     no mask tensor allocated.
   - **false** (padded batch or multi-sequence) → builds a combined
@@ -135,6 +260,10 @@ defmodule EMLX.Fast do
 
   This avoids the `Nx.cond` double-evaluation problem: the NIF forces eval
   of only the small `{B, T_kv}` key_mask subgraph, then branches in C++.
+
+  When traced, the compiled `:fast_sdpa_causal_key_masked*` opcode always
+  builds the combined causal+key_mask additive mask in-graph (a compiled
+  program can't branch on a runtime `all(key_mask)` check).
 
   Input/output layout matches `scaled_dot_product_attention_causal/4`:
   - `q`        — `{B, N_q,  T_q,  D}`
@@ -163,22 +292,46 @@ defmodule EMLX.Fast do
     kv_offset = if t_q == 1, do: t_kv - 1, else: 0
     sinks = Keyword.get(opts, :sinks)
 
-    out = Nx.template(Nx.shape(q), Nx.type(q))
+    if traced?([q, k, v, key_mask, sinks]) do
+      out = Nx.to_template(q)
 
-    if sinks do
-      Nx.runtime_call(
-        out,
-        {q, k, v, key_mask, sinks},
-        [scale: scale, kv_offset: kv_offset],
-        &__MODULE__.sdpa_causal_key_masked_sinks_callback/2
-      )
+      if sinks do
+        inner =
+          Nx.runtime_call(
+            out,
+            {q, k, v, key_mask, sinks},
+            [scale: scale, kv_offset: kv_offset],
+            &sdpa_causal_key_masked_sinks_callback/2
+          )
+
+        emlx_metadata(
+          inner,
+          :fast_sdpa_causal_key_masked_sinks,
+          [q, k, v, key_mask, sinks],
+          [NativeExpr.f64_bits(scale), kv_offset]
+        )
+      else
+        inner =
+          Nx.runtime_call(
+            out,
+            {q, k, v, key_mask},
+            [scale: scale, kv_offset: kv_offset],
+            &sdpa_causal_key_masked_callback/2
+          )
+
+        emlx_metadata(
+          inner,
+          :fast_sdpa_causal_key_masked,
+          [q, k, v, key_mask],
+          [NativeExpr.f64_bits(scale), kv_offset]
+        )
+      end
     else
-      Nx.runtime_call(
-        out,
-        {q, k, v, key_mask},
-        [scale: scale, kv_offset: kv_offset],
-        &__MODULE__.sdpa_causal_key_masked_callback/2
-      )
+      if sinks do
+        sdpa_causal_key_masked_sinks_callback({q, k, v, key_mask, sinks}, scale: scale, kv_offset: kv_offset)
+      else
+        sdpa_causal_key_masked_callback({q, k, v, key_mask}, scale: scale, kv_offset: kv_offset)
+      end
     end
   end
 
@@ -256,14 +409,19 @@ defmodule EMLX.Fast do
   Output shape and type match `a`.
   """
   deftransform rope(a, dims, traditional, base, scale, offset) do
-    out = Nx.template(Nx.shape(a), Nx.type(a))
+    if traced?(a) do
+      traditional_int = if traditional, do: 1, else: 0
+      opts = [dims: dims, traditional: traditional, base: base, scale: scale, offset: offset]
 
-    Nx.runtime_call(
-      out,
-      a,
-      [dims: dims, traditional: traditional, base: base, scale: scale, offset: offset],
-      &__MODULE__.rope_callback/2
-    )
+      emlx_metadata(
+        Nx.runtime_call(Nx.to_template(a), a, opts, &rope_callback/2),
+        :fast_rope,
+        [a],
+        [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale), offset]
+      )
+    else
+      rope_callback(a, dims: dims, traditional: traditional, base: base, scale: scale, offset: offset)
+    end
   end
 
   @doc false
@@ -299,18 +457,17 @@ defmodule EMLX.Fast do
   Output shape and type match `a`.
 
   > ### Sequential positions only (fast T=1 path) {: .warning}
-  > For **decode** with `T = 1` and `base` below about `1.0e5`, the `fast_rope_ids` NIF
-  > is used; it assumes sequential positions from `position_ids[b, 0]`. For **larger**
-  > `base` (e.g. Qwen3 `rope_theta` 1M) or **prefill** (`T > 1`), the Nx per-token
-  > path is used, matching Bumblebee for arbitrary per-token `position_ids`.
+  > For **decode** with `T = 1` and `base` below about `1.0e5`, the `fast_rope_ids`
+  > opcode is used; it assumes sequential positions from `position_ids[b, 0]`. For
+  > **larger** `base` (e.g. Qwen3 `rope_theta` 1M) or **prefill** (`T > 1`), the
+  > per-token `fast_rope_positions` opcode is used, matching Bumblebee for
+  > arbitrary per-token `position_ids`.
   """
   deftransform rope_with_positions(a, position_ids, dims, traditional, base, scale) do
-    out = Nx.template(Nx.shape(a), Nx.type(a))
-
     # Branch at JIT/deftransform time on T (index 1 in Bumblebee {B, T, N, D} layout).
     # T is a compile-time constant when Bumblebee uses static sequence_length compilation.
-    #  - Decode  (T = 1): sequential positions — fast_rope_ids NIF (1 Metal dispatch).
-    #  - Prefill (T > 1): arbitrary per-token positions — fast_rope_positions NIF.
+    #  - Decode  (T = 1): sequential positions — fast_rope_ids (1 Metal dispatch).
+    #  - Prefill (T > 1): arbitrary per-token positions — fast_rope_positions.
     t = elem(Nx.shape(a), 1)
     base = base * 1.0
     # `fast_rope_ids` uses a scalar `base` in `mlx::fast::rope` that does not
@@ -318,21 +475,48 @@ defmodule EMLX.Fast do
     # `rope_theta` (Qwen2/3 use 1e6+). `fast_rope_positions` matches
     # Bumblebee; use it for T=1 when `base` is in that regime (A13).
     t1_use_fast? = t == 1 and base < 1.0e5
+    traditional_int = if traditional, do: 1, else: 0
 
-    if t1_use_fast? do
-      Nx.runtime_call(
-        out,
-        {a, position_ids},
-        [dims: dims, traditional: traditional, base: base, scale: scale],
-        &__MODULE__.rope_with_positions_fast_callback/2
-      )
+    if traced?([a, position_ids]) do
+      out = Nx.to_template(a)
+      opts = [dims: dims, traditional: traditional, base: base, scale: scale]
+
+      if t1_use_fast? do
+        inner =
+          Nx.runtime_call(out, {a, position_ids}, opts, &rope_with_positions_fast_callback/2)
+
+        emlx_metadata(
+          inner,
+          :fast_rope_ids,
+          [a, position_ids],
+          [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale)]
+        )
+      else
+        inner = Nx.runtime_call(out, {a, position_ids}, opts, &rope_with_positions_callback/2)
+
+        emlx_metadata(
+          inner,
+          :fast_rope_positions,
+          [a, position_ids],
+          [dims, traditional_int, NativeExpr.f64_bits(base), NativeExpr.f64_bits(scale)]
+        )
+      end
     else
-      Nx.runtime_call(
-        out,
-        {a, position_ids},
-        [dims: dims, traditional: traditional, base: base, scale: scale],
-        &__MODULE__.rope_with_positions_callback/2
-      )
+      if t1_use_fast? do
+        rope_with_positions_fast_callback({a, position_ids},
+          dims: dims,
+          traditional: traditional,
+          base: base,
+          scale: scale
+        )
+      else
+        rope_with_positions_callback({a, position_ids},
+          dims: dims,
+          traditional: traditional,
+          base: base,
+          scale: scale
+        )
+      end
     end
   end
 
@@ -382,8 +566,8 @@ defmodule EMLX.Fast do
   - `position_ids` — `{B, T}` integer tensor. For **decode** (`T = 1`) the fast path uses
     `position_ids[b,0]` as the per-batch offset into `freqs` (same contract as
     `mlx::fast::rope` with a scalar offset per batch). For **prefill** (`T > 1`) a
-    per-token Nx path runs so arbitrary positions (e.g. left-padded
-    `[0,…,0,1,2,…]`) are correct; the NIF’s offset-only entry point cannot represent
+    per-token path runs so arbitrary positions (e.g. left-padded
+    `[0,…,0,1,2,…]`) are correct; the offset-only entry point cannot represent
     that.
   - `dims`         — number of feature dims to rotate.
   - `traditional`  — `false` for split-half (Bumblebee / Qwen3); `true` for interleaved.
@@ -393,23 +577,47 @@ defmodule EMLX.Fast do
   Output shape and type match `a`.
   """
   deftransform rope_with_freqs(a, position_ids, dims, traditional, scale, freqs) do
-    out = Nx.template(Nx.shape(a), Nx.type(a))
     t = elem(Nx.shape(a), 1)
+    traditional_int = if traditional, do: 1, else: 0
 
-    if t == 1 do
-      Nx.runtime_call(
-        out,
-        {a, position_ids, freqs},
-        [dims: dims, traditional: traditional, scale: scale],
-        &__MODULE__.rope_with_freqs_fast_callback/2
-      )
+    if traced?([a, position_ids, freqs]) do
+      out = Nx.to_template(a)
+      opts = [dims: dims, traditional: traditional, scale: scale]
+
+      if t == 1 do
+        inner =
+          Nx.runtime_call(out, {a, position_ids, freqs}, opts, &rope_with_freqs_fast_callback/2)
+
+        emlx_metadata(
+          inner,
+          :fast_rope_with_freqs,
+          [a, position_ids, freqs],
+          [dims, traditional_int, NativeExpr.f64_bits(scale)]
+        )
+      else
+        inner = Nx.runtime_call(out, {a, position_ids, freqs}, opts, &rope_with_freqs_callback/2)
+
+        emlx_metadata(
+          inner,
+          :fast_rope_with_freqs_positions,
+          [a, position_ids, freqs],
+          [dims, traditional_int, NativeExpr.f64_bits(scale)]
+        )
+      end
     else
-      Nx.runtime_call(
-        out,
-        {a, position_ids, freqs},
-        [dims: dims, traditional: traditional, scale: scale],
-        &__MODULE__.rope_with_freqs_callback/2
-      )
+      if t == 1 do
+        rope_with_freqs_fast_callback({a, position_ids, freqs},
+          dims: dims,
+          traditional: traditional,
+          scale: scale
+        )
+      else
+        rope_with_freqs_callback({a, position_ids, freqs},
+          dims: dims,
+          traditional: traditional,
+          scale: scale
+        )
+      end
     end
   end
 
@@ -456,6 +664,149 @@ defmodule EMLX.Fast do
     end
   end
 
+  # ── RoPE reference formulas ─────────────────────────────────────────────────
+  #
+  # Plain-Nx fallbacks used only as the `inner` expr of a `:__EMLX__` metadata
+  # node (see moduledoc) — this compiler never evaluates them; they exist for
+  # shape/type inference and for non-EMLX `Nx.Defn.Compiler`s.
+
+  # `a` is `{B, ..., T, D}` (T second-to-last axis) — matches `rope/6`.
+  defp rope_reference(a, dims, traditional, base, scale, offset) do
+    rank = Nx.rank(a)
+    t_axis = rank - 2
+    d_axis = rank - 1
+    t = elem(Nx.shape(a), t_axis)
+    half = div(dims, 2)
+
+    inv_freq =
+      Nx.iota({half}, type: :f32, backend: Nx.BinaryBackend)
+      |> Nx.multiply(2.0 / dims)
+      |> then(&Nx.pow(base * 1.0, &1))
+      |> then(&Nx.divide(1.0, &1))
+
+    positions =
+      Nx.iota({t}, type: :f32, backend: Nx.BinaryBackend)
+      |> Nx.add(offset * 1.0)
+      |> Nx.multiply(scale * 1.0)
+
+    freqs = Nx.outer(positions, inv_freq)
+    freqs_bcast = Nx.reshape(freqs, rope_broadcast_shape(rank, [{t_axis, t}, {d_axis, half}]))
+
+    rope_rotate(a, dims, traditional, freqs_bcast, d_axis)
+  end
+
+  # `a` is `{B, T, ..., D}` (Bumblebee convention, T at axis 1) — matches
+  # `rope_with_positions/6`. `position_ids` is `{B, T}`.
+  defp rope_with_positions_reference(a, position_ids, dims, traditional, base, scale) do
+    rank = Nx.rank(a)
+    d_axis = rank - 1
+    half = div(dims, 2)
+    {b, t} = {elem(Nx.shape(position_ids), 0), elem(Nx.shape(position_ids), 1)}
+
+    inv_freq =
+      Nx.iota({half}, type: :f32, backend: Nx.BinaryBackend)
+      |> Nx.multiply(2.0 / dims)
+      |> then(&Nx.pow(base * 1.0, &1))
+      |> then(&Nx.divide(1.0, &1))
+
+    freqs_bt = position_freqs(position_ids, inv_freq, scale, b, t, half)
+    freqs_bcast = Nx.reshape(freqs_bt, rope_broadcast_shape(rank, [{0, b}, {1, t}, {d_axis, half}]))
+
+    rope_rotate(a, dims, traditional, freqs_bcast, d_axis)
+  end
+
+  # Same layout as `rope_with_positions_reference/6`, but `inv_freq` is
+  # supplied directly as `reciprocal(freqs)` (matches `mlx::fast::rope`'s
+  # freqs overload — see the `fast_rope_with_freqs*` opcodes).
+  defp rope_with_freqs_reference(a, position_ids, dims, traditional, scale, freqs) do
+    rank = Nx.rank(a)
+    d_axis = rank - 1
+    half = div(dims, 2)
+    {b, t} = {elem(Nx.shape(position_ids), 0), elem(Nx.shape(position_ids), 1)}
+
+    inv_freq = Nx.divide(1.0, Nx.as_type(freqs, :f32))
+
+    freqs_bt = position_freqs(position_ids, inv_freq, scale, b, t, half)
+    freqs_bcast = Nx.reshape(freqs_bt, rope_broadcast_shape(rank, [{0, b}, {1, t}, {d_axis, half}]))
+
+    rope_rotate(a, dims, traditional, freqs_bcast, d_axis)
+  end
+
+  defp position_freqs(position_ids, inv_freq, scale, b, t, half) do
+    pos_bt1 =
+      position_ids
+      |> Nx.as_type(:f32)
+      |> Nx.multiply(scale * 1.0)
+      |> Nx.reshape({b, t, 1})
+
+    Nx.multiply(pos_bt1, Nx.reshape(inv_freq, {1, 1, half}))
+  end
+
+  # Builds a reshape target with `1`s everywhere except the given
+  # `{axis, size}` pairs — used to broadcast a `{..., half}`-shaped
+  # cos/sin table against `a`'s full rank without touching axes it
+  # passes through untouched (e.g. the heads axis).
+  defp rope_broadcast_shape(rank, axis_sizes) do
+    for i <- 0..(rank - 1) do
+      case List.keyfind(axis_sizes, i, 0) do
+        {^i, size} -> size
+        nil -> 1
+      end
+    end
+    |> List.to_tuple()
+  end
+
+  # Rotates the first `dims` elements of `a`'s last axis by `freqs_bcast`
+  # (already reshaped to broadcast against `a`), passing the remainder
+  # through unchanged. `traditional` selects interleaved-pair vs
+  # split-half rotation (must match the model checkpoint's convention).
+  defp rope_rotate(a, dims, traditional, freqs_bcast, d_axis) do
+    full_d = elem(Nx.shape(a), d_axis)
+    half = div(dims, 2)
+    rotate_part = Nx.slice_along_axis(a, 0, dims, axis: d_axis)
+    cos = Nx.cos(freqs_bcast)
+    sin = Nx.sin(freqs_bcast)
+
+    rotated =
+      if traditional do
+        rope_interleaved(rotate_part, cos, sin, d_axis, half)
+      else
+        rope_split_half(rotate_part, cos, sin, d_axis, half)
+      end
+
+    result =
+      if dims == full_d do
+        rotated
+      else
+        pass_part = Nx.slice_along_axis(a, dims, full_d - dims, axis: d_axis)
+        Nx.concatenate([rotated, pass_part], axis: d_axis)
+      end
+
+    Nx.as_type(result, Nx.type(a))
+  end
+
+  defp rope_split_half(rotate_part, cos, sin, d_axis, half) do
+    x1 = Nx.slice_along_axis(rotate_part, 0, half, axis: d_axis)
+    x2 = Nx.slice_along_axis(rotate_part, half, half, axis: d_axis)
+    rotated_half = Nx.concatenate([Nx.negate(x2), x1], axis: d_axis)
+    cos2 = Nx.concatenate([cos, cos], axis: d_axis)
+    sin2 = Nx.concatenate([sin, sin], axis: d_axis)
+    Nx.add(Nx.multiply(rotate_part, cos2), Nx.multiply(rotated_half, sin2))
+  end
+
+  defp rope_interleaved(rotate_part, cos, sin, d_axis, half) do
+    front = rotate_part |> Nx.shape() |> Tuple.to_list() |> Enum.take(d_axis)
+    paired = Nx.reshape(rotate_part, List.to_tuple(front ++ [half, 2]))
+
+    x1 = paired |> Nx.slice_along_axis(0, 1, axis: d_axis + 1) |> Nx.squeeze(axes: [d_axis + 1])
+    x2 = paired |> Nx.slice_along_axis(1, 1, axis: d_axis + 1) |> Nx.squeeze(axes: [d_axis + 1])
+
+    out1 = Nx.subtract(Nx.multiply(x1, cos), Nx.multiply(x2, sin))
+    out2 = Nx.add(Nx.multiply(x1, sin), Nx.multiply(x2, cos))
+
+    Nx.stack([out1, out2], axis: d_axis + 1) |> Nx.reshape(Nx.shape(rotate_part))
+  end
+
   # ── SwiGLU ──────────────────────────────────────────────────────────────────
 
   @doc """
@@ -470,8 +821,19 @@ defmodule EMLX.Fast do
   Output has the same shape and dtype as `gate`.
   """
   deftransform swiglu(gate, up) do
-    out = Nx.template(Nx.shape(gate), Nx.type(gate))
-    Nx.runtime_call(out, {gate, up}, [], &__MODULE__.swiglu_callback/2)
+    if traced?([gate, up]) do
+      inner = Nx.runtime_call(Nx.to_template(gate), {gate, up}, [], &swiglu_callback/2)
+      emlx_metadata(inner, :fast_swiglu, [gate, up], [])
+    else
+      swiglu_callback({gate, up}, [])
+    end
+  end
+
+  defp swiglu_reference(gate, up) do
+    gate
+    |> Nx.multiply(Nx.sigmoid(gate))
+    |> Nx.multiply(up)
+    |> Nx.as_type(Nx.type(gate))
   end
 
   @doc false
@@ -517,12 +879,23 @@ defmodule EMLX.Fast do
   """
   deftransform scaled_dot_product_attention(q, k, v, scale, opts) when is_list(opts) do
     sinks = Keyword.get(opts, :sinks)
-    out = Nx.template(Nx.shape(q), Nx.type(q))
 
-    if sinks do
-      Nx.runtime_call(out, {q, k, v, sinks}, [scale: scale], &__MODULE__.sdpa_sinks_callback/2)
+    if traced?([q, k, v, sinks]) do
+      out = Nx.to_template(q)
+
+      if sinks do
+        inner = Nx.runtime_call(out, {q, k, v, sinks}, [scale: scale], &sdpa_sinks_callback/2)
+        emlx_metadata(inner, :fast_sdpa_sinks, [q, k, v, sinks], [NativeExpr.f64_bits(scale)])
+      else
+        inner = Nx.runtime_call(out, {q, k, v}, [scale: scale], &sdpa_callback/2)
+        emlx_metadata(inner, :fast_sdpa, [q, k, v], [NativeExpr.f64_bits(scale)])
+      end
     else
-      Nx.runtime_call(out, {q, k, v}, [scale: scale], &__MODULE__.sdpa_callback/2)
+      if sinks do
+        sdpa_sinks_callback({q, k, v, sinks}, scale: scale)
+      else
+        sdpa_callback({q, k, v}, scale: scale)
+      end
     end
   end
 
@@ -536,17 +909,27 @@ defmodule EMLX.Fast do
   """
   deftransform scaled_dot_product_attention(q, k, v, scale, mask, opts) when is_list(opts) do
     sinks = Keyword.get(opts, :sinks)
-    out = Nx.template(Nx.shape(q), Nx.type(q))
 
-    if sinks do
-      Nx.runtime_call(
-        out,
-        {q, k, v, mask, sinks},
-        [scale: scale],
-        &__MODULE__.sdpa_masked_sinks_callback/2
-      )
+    if traced?([q, k, v, mask, sinks]) do
+      out = Nx.to_template(q)
+
+      if sinks do
+        inner =
+          Nx.runtime_call(out, {q, k, v, mask, sinks}, [scale: scale], &sdpa_masked_sinks_callback/2)
+
+        emlx_metadata(inner, :fast_sdpa_masked_sinks, [q, k, v, mask, sinks], [
+          NativeExpr.f64_bits(scale)
+        ])
+      else
+        inner = Nx.runtime_call(out, {q, k, v, mask}, [scale: scale], &sdpa_masked_callback/2)
+        emlx_metadata(inner, :fast_sdpa_masked, [q, k, v, mask], [NativeExpr.f64_bits(scale)])
+      end
     else
-      Nx.runtime_call(out, {q, k, v, mask}, [scale: scale], &__MODULE__.sdpa_masked_callback/2)
+      if sinks do
+        sdpa_masked_sinks_callback({q, k, v, mask, sinks}, scale: scale)
+      else
+        sdpa_masked_callback({q, k, v, mask}, scale: scale)
+      end
     end
   end
 
@@ -656,17 +1039,27 @@ defmodule EMLX.Fast do
   """
   deftransform scaled_dot_product_attention_causal(q, k, v, scale, opts) when is_list(opts) do
     sinks = Keyword.get(opts, :sinks)
-    out = Nx.template(Nx.shape(q), Nx.type(q))
 
-    if sinks do
-      Nx.runtime_call(
-        out,
-        {q, k, v, sinks},
-        [scale: scale],
-        &__MODULE__.sdpa_causal_sinks_callback/2
-      )
+    if traced?([q, k, v, sinks]) do
+      out = Nx.to_template(q)
+
+      if sinks do
+        inner =
+          Nx.runtime_call(out, {q, k, v, sinks}, [scale: scale], &sdpa_causal_sinks_callback/2)
+
+        emlx_metadata(inner, :fast_sdpa_causal_sinks, [q, k, v, sinks], [
+          NativeExpr.f64_bits(scale)
+        ])
+      else
+        inner = Nx.runtime_call(out, {q, k, v}, [scale: scale], &sdpa_causal_callback/2)
+        emlx_metadata(inner, :fast_sdpa_causal, [q, k, v], [NativeExpr.f64_bits(scale)])
+      end
     else
-      Nx.runtime_call(out, {q, k, v}, [scale: scale], &__MODULE__.sdpa_causal_callback/2)
+      if sinks do
+        sdpa_causal_sinks_callback({q, k, v, sinks}, scale: scale)
+      else
+        sdpa_causal_callback({q, k, v}, scale: scale)
+      end
     end
   end
 
@@ -705,6 +1098,130 @@ defmodule EMLX.Fast do
 
     if Nx.type(out) != Nx.type(q), do: Nx.as_type(out, Nx.type(q)), else: out
   end
+
+  # ── SDPA reference formula ───────────────────────────────────────────────────
+  #
+  # Plain-Nx fallback used only as the `inner` expr of a `:__EMLX__` metadata
+  # node (see moduledoc). q/k/v are `{B, N, T, D}`; GQA-repeats k/v to N_q
+  # heads before a broadcasted dot-product (no batched-matmul axis juggling).
+
+  defp sdpa_reference(q, k, v, scale, opts) do
+    causal = Keyword.get(opts, :causal, false)
+    mask = Keyword.get(opts, :mask)
+    key_mask = Keyword.get(opts, :key_mask)
+    sinks = Keyword.get(opts, :sinks)
+    kv_offset = Keyword.get(opts, :kv_offset, 0)
+
+    {_b, n_q, t_q, _d} = Nx.shape(q)
+    {_b, n_kv, t_kv, _d} = Nx.shape(k)
+    groups = div(n_q, n_kv)
+
+    k_g = repeat_kv_heads(k, groups)
+    v_g = repeat_kv_heads(v, groups)
+
+    # Batched contraction over D (no explicit {B,N,T_q,T_kv,D} intermediate —
+    # keeps this reference cheap to *trace* even at prefill sequence lengths,
+    # since it's rebuilt (never evaluated) on every EMLX-compiled call).
+    scores =
+      q
+      |> Nx.dot([3], [0, 1], k_g, [3], [0, 1])
+      |> Nx.multiply(scale * 1.0)
+
+    scores =
+      cond do
+        causal and key_mask != nil -> apply_causal_key_mask(scores, kv_offset, t_q, t_kv, key_mask)
+        causal -> apply_causal_mask(scores, kv_offset, t_q, t_kv)
+        mask != nil -> apply_generic_mask(scores, mask)
+        true -> scores
+      end
+
+    scores =
+      if sinks do
+        b = elem(Nx.shape(scores), 0)
+
+        sinks_col =
+          sinks
+          |> Nx.as_type(Nx.type(scores))
+          |> Nx.reshape({1, n_q, 1, 1})
+          |> Nx.broadcast({b, n_q, t_q, 1})
+
+        Nx.concatenate([scores, sinks_col], axis: 3)
+      else
+        scores
+      end
+
+    probs =
+      scores
+      |> Nx.subtract(Nx.reduce_max(scores, axes: [3], keep_axes: true))
+      |> Nx.exp()
+
+    probs = Nx.divide(probs, Nx.sum(probs, axes: [3], keep_axes: true))
+    probs = Nx.slice_along_axis(probs, 0, t_kv, axis: 3)
+
+    probs
+    |> Nx.dot([3], [0, 1], v_g, [2], [0, 1])
+    |> Nx.as_type(Nx.type(q))
+  end
+
+  defp repeat_kv_heads(kv, 1), do: kv
+
+  defp repeat_kv_heads(kv, groups) do
+    {b, n_kv, t, d} = Nx.shape(kv)
+
+    kv
+    |> Nx.new_axis(2)
+    |> Nx.broadcast({b, n_kv, groups, t, d})
+    |> Nx.reshape({b, n_kv * groups, t, d})
+  end
+
+  # `Nx.select/3` uses its *predicate*'s shape as the output shape verbatim
+  # (it does not pick the pairwise-broadcast-compatible union like `add`/
+  # `multiply` do), so `mask`/`keep` must already be pre-broadcast to
+  # `Nx.shape(scores)` here. That broadcast runs on `Nx.iota`'s constant
+  # backend (see `iota_bin/2`'s note) — `Nx.BinaryBackend`, plain CPU memory —
+  # rather than on `scores`'s own (traced) backend, so it never touches a
+  # real GPU/MLX allocation.
+  defp apply_causal_mask(scores, kv_offset, t_q, t_kv) do
+    query_positions = iota_bin({t_q}, :s32) |> Nx.add(kv_offset) |> Nx.reshape({1, 1, t_q, 1})
+    key_positions = iota_bin({t_kv}, :s32) |> Nx.reshape({1, 1, 1, t_kv})
+
+    mask =
+      key_positions |> Nx.less_equal(query_positions) |> Nx.broadcast(Nx.shape(scores))
+
+    Nx.select(mask, scores, neg_inf_like(scores))
+  end
+
+  defp apply_causal_key_mask(scores, kv_offset, t_q, t_kv, key_mask) do
+    b = elem(Nx.shape(key_mask), 0)
+    km = key_mask |> Nx.not_equal(0) |> Nx.reshape({b, 1, 1, t_kv})
+
+    query_positions = iota_bin({t_q}, :s32) |> Nx.add(kv_offset) |> Nx.reshape({1, 1, t_q, 1})
+    key_positions = iota_bin({t_kv}, :s32) |> Nx.reshape({1, 1, 1, t_kv})
+    causal_bool = Nx.less_equal(key_positions, query_positions)
+
+    keep = km |> Nx.logical_and(causal_bool) |> Nx.broadcast(Nx.shape(scores))
+    Nx.select(keep, scores, neg_inf_like(scores))
+  end
+
+  defp apply_generic_mask(scores, mask) do
+    if Nx.Type.integer?(Nx.type(mask)) do
+      bool_mask = mask |> Nx.not_equal(0) |> Nx.broadcast(Nx.shape(scores))
+      Nx.select(bool_mask, scores, neg_inf_like(scores))
+    else
+      Nx.add(scores, mask)
+    end
+  end
+
+  # Pinned to `Nx.BinaryBackend` (cheap, CPU-only) rather than
+  # `Nx.default_backend/0` — `deftransform` code (unlike `defn` bodies) isn't
+  # auto-rewritten into `Nx.Defn.Expr` construction, so plain `Nx.iota/2` and
+  # `Nx.tensor/2` calls here would otherwise allocate *real* tensors on
+  # whatever backend the caller has configured (typically `EMLX.Backend`,
+  # i.e. real, uncomputed MLX graph nodes) merely to be embedded as constants
+  # in this never-evaluated reference formula.
+  defp iota_bin(shape, type), do: Nx.iota(shape, type: type, backend: Nx.BinaryBackend)
+
+  defp neg_inf_like(scores), do: Nx.tensor(-1.0e9, type: Nx.type(scores), backend: Nx.BinaryBackend)
 
   # ── Einsum ────────────────────────────────────────────────────────────────
 

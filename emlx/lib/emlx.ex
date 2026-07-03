@@ -2000,92 +2000,6 @@ defmodule EMLX do
     end
   end
 
-  # Stage 32a Procedures #2-#4 — like `await_worker/1`, but also services any
-  # `{:emlx_host_callback, call_id, callback_slot, operands}` message that
-  # arrives while waiting: the C++ `HostCallback` primitive
-  # (c_src/emlx_compiler.cpp) sends one every time a `:host_callback`
-  # instruction is evaluated, blocking the worker thread for
-  # `host_callback_resume/2`. `callback_specs` (from
-  # `EMLX.Native.Expr.runtime_call_callback_specs/1`) resolves `callback_slot`
-  # back to the real `{fun, opts, container_template}` to invoke.
-  defp await_worker_with_host_callbacks(job_ref, callback_specs, dev, tensors) do
-    receive do
-      {:emlx_host_callback, call_id, callback_slot, operands} ->
-        dispatch_host_callback(call_id, callback_slot, operands, callback_specs, dev, tensors)
-        await_worker_with_host_callbacks(job_ref, callback_specs, dev, tensors)
-
-      {^job_ref, :ok} -> :ok
-      {^job_ref, {:ok, result}} -> result
-      {^job_ref, {:error, reason}} -> raise(EMLX.NIFError, List.to_string(reason))
-    end
-  end
-
-  # Reconstructs the callback's real operand container from the message's
-  # flat `[{ref, shape, dtype_atom}]` list (self-describing — see
-  # `host_round_trip`'s C++ comment for why: the worker thread that would
-  # service a worker-routed NIF call to inspect these is the very one
-  # blocked below), invokes the callback, and resumes the blocked worker
-  # with the result.
-  #
-  # Runs the callback body on `EMLX.Application.host_callback_worker/1`'s
-  # dedicated queue, NOT the caller's current queue: `dev`'s *default*
-  # worker is the one blocked inside `host_round_trip` right now, so any
-  # Nx/EMLX op the callback issues (e.g. `Nx.to_number/1`, or its own
-  # tensor math) would self-deadlock if routed there (Stage 32a Procedure
-  # #2's second deadlock finding). Runs in *this* process, though — not a
-  # separate dispatcher process — so `Process.get/put`-backed callback
-  # state (e.g. `native_kv_attn_callback`'s KV-cache bookkeeping) sees the
-  # same process dictionary the caller's `defn` invocation always ran in
-  # (Procedure #6).
-  defp dispatch_host_callback(call_id, callback_slot, operands, callback_specs, dev, tensors) do
-    {fun, opts, container_template, _output_template, operand_param_positions} =
-      Enum.at(callback_specs, callback_slot)
-
-    # A pass-through quantized parameter (Stage 24/25) has an Elixir-side-
-    # only `quantization_config` invisible on the wire (only shape/dtype
-    # travel in the message) -- substitute the caller's real bound tensor
-    # instead of reconstructing a plain one from the ref. Mirrors
-    # `build_native_eval_fn/6`'s `output_param_positions` handling.
-    operand_tensors =
-      operands
-      |> Enum.zip(operand_param_positions)
-      |> Enum.map(fn
-        {_operand, pos} when not is_nil(pos) ->
-          Enum.at(tensors, pos)
-
-        {{ref, shape, dtype_atom}, nil} ->
-          template = Nx.template(List.to_tuple(shape), EMLX.Native.from_mlx_type(dtype_atom))
-          EMLX.Backend.to_nx({dev, ref}, template)
-      end)
-
-    {container, []} =
-      Nx.Defn.Composite.traverse(container_template, operand_tensors, fn _leaf, [t | rest] ->
-        {t, rest}
-      end)
-
-    %EMLX.CommandQueue{ref: callback_worker} = EMLX.Application.host_callback_worker(dev)
-
-    reply_tensor =
-      EMLX.CommandQueue.with_queue(EMLX.Application.host_callback_worker(dev), fn ->
-        result = fun.(container, opts)
-
-        case result do
-          %Nx.Tensor{data: %EMLX.Backend{}} = t -> t
-          %Nx.Tensor{} = t -> Nx.backend_copy(t, {EMLX.Backend, device: dev})
-        end
-      end)
-
-    %Nx.Tensor{data: %EMLX.Backend{ref: {_dev, reply_ref}}} = reply_tensor
-
-    # host_callback_resume/2 is a *dirty* NIF (arbitrary OS thread, no MLX
-    # stream of its own) and deliberately does not evaluate `reply_ref`
-    # itself (see its C++ comment) -- force it here, on the callback
-    # worker's own thread (which owns its stream, GPU included), before
-    # handing the ref across.
-    :ok = EMLX.NIF.eval(callback_worker, reply_ref) |> unwrap!() |> await_worker()
-    :ok = EMLX.NIF.host_callback_resume(call_id, reply_ref)
-  end
-
   deftensor slice(tensor, starts, stops, strides)
   deftensor slice_update(tensor, tensor_updates, starts, stops)
   deftensor squeeze(tensor, axes)
@@ -2131,6 +2045,19 @@ defmodule EMLX do
   # shared across structurally-identical call sites (e.g. every one of
   # Qwen3's 28 attention layers), not just within one closure's lifetime.
   @native_dispatch_cache_table :emlx_native_dispatch_cache
+
+  # A second, process-lifetime cache in front of `dispatch_key/3`'s own
+  # (expensive — O(nodes), plus per-opaque-scope SHA256 hashing) structural
+  # walk, keyed by `output_expr`'s own node identity rather than its
+  # structural signature. This matters for `run_while_loop/3`'s host-driven
+  # `cond_fn`/`body_fn`: `Nx.Defn.jit/2` retraces `fn _ -> body_expr end`
+  # once and caches *that* trace by argument template, so every subsequent
+  # call re-enters `__jit__`/`build_eval_fn` with the *exact same* `Expr`
+  # (identical ids, not just structurally identical) — walking it again on
+  # every decode step is pure waste. (This is unlike `Nx.Defn.Graph.run/3`'s
+  # per-stage re-tracing, which *does* mint fresh ids each call — hence
+  # `dispatch_key/3` still has to fall back to the structural walk on a miss.)
+  @dispatch_key_by_id_table :emlx_dispatch_key_by_id
 
   @impl Nx.Defn.Compiler
   def __jit__(key, vars, fun, args_list, opts) do
@@ -2198,29 +2125,31 @@ defmodule EMLX do
     end)
   end
 
-  # Routes a traced expression to the right eval-closure builder. `while` is
-  # handled by structural splitting (`Nx.Defn.Graph`) — the loop runs from
-  # Elixir while every straight-line segment compiles to a single-NIF native
-  # program. `:runtime_call` (recognized or not) never splits (Stage 32a
-  # retired Stage 31's split-point handling for it — see
-  # `workdir/native-compiler/32a-inline-runtime-call.md`): an unrecognized
-  # one lowers in-graph to the `:host_callback` opcode
-  # (`EMLX.Native.Expr.expand_host_callback/4`) and its Elixir callback
-  # fires *inline*, mid-eval, from `build_native_eval_fn/6` — still one NIF
-  # call per `defn` invocation, no graph fragmentation.
+  # Routes a traced expression to the right eval-closure builder. `while` and
+  # a bare (unrecognized) `:runtime_call` are both structural split points
+  # (`Nx.Defn.Graph`) — the loop, or the callback, runs from Elixir while
+  # every straight-line segment still compiles to a single-NIF native
+  # program. An `EMLX.Fast.*` fused kernel is *not* a `:runtime_call` node at
+  # all (it's a plain `:metadata`-tagged expr — see `EMLX.Fast`'s moduledoc),
+  # so it never splits; it lowers in-graph to a single fused opcode
+  # (`EMLX.Native.Expr`'s `:metadata` clause).
   #
-  #   * no `while` in the parent scope   -> one flat native program.
-  #   * a bare tail `while` (base case)  -> host-driven loop; the condition
-  #     and body are compiled by re-entering this compiler (so a nested
-  #     `while` in the body recurses through the same path).
-  #   * a `while` split point with surrounding work -> `Nx.Defn.Graph.split/2`
-  #     on every `while` node, replayed by `Nx.Defn.Graph.run/3` with
+  #   * no split point in the parent scope -> one flat native program.
+  #   * a bare tail `while`/`:runtime_call` (base case) -> host-driven; the
+  #     `while` condition/body (or the `:runtime_call`'s callback) run by
+  #     re-entering this compiler / real Elixir, so a nested split point
+  #     recurses through the same path.
+  #   * a split point with surrounding work -> `Nx.Defn.Graph.split/2` on
+  #     every split point, replayed by `Nx.Defn.Graph.run/3` with
   #     `compiler: EMLX`; each stage re-enters this compiler (flat stages
-  #     compile flat, isolated split-point stages hit the base case above).
+  #     compile flat, isolated split-point stages hit a base case above).
   defp build_eval_fn(output_expr, worker, effective_device, num_inputs) do
     cond do
       bare_while?(output_expr) ->
         build_while_base_eval_fn(output_expr, effective_device)
+
+      bare_runtime_call?(output_expr) ->
+        build_runtime_call_base_eval_fn(output_expr, effective_device)
 
       not contains_split_point?(output_expr) ->
         base_key = dispatch_key(output_expr, num_inputs, effective_device)
@@ -2235,16 +2164,40 @@ defmodule EMLX do
     end
   end
 
-  # True when the parent scope contains a `while` split point. `post_order/1`
-  # treats `while` as an opaque leaf, so this only sees parent-scope split
-  # points — nested ones inside a `while` body surface when that body is
-  # compiled.
+  # True when the parent scope contains a `while`/`:runtime_call` split
+  # point. `post_order/1` treats both as opaque leaves, so this only sees
+  # parent-scope split points — nested ones inside a sub-scope surface when
+  # that sub-scope is compiled.
   defp contains_split_point?(output_expr) do
     output_expr |> EMLX.Defn.Tree.post_order() |> Enum.any?(&split_point?/1)
   end
 
   defp split_point?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :while}}), do: true
+  defp split_point?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :runtime_call}}), do: true
   defp split_point?(%Nx.Tensor{}), do: false
+
+  # A `:__EMLX__` metadata node's `_inner` is now itself an `Nx.runtime_call`
+  # (see `EMLX.Fast`'s moduledoc) — real and correct for `Nx.Defn.Evaluator`,
+  # but invisible to *this* compiler's own lowering (`EMLX.Native.Expr`'s
+  # `:metadata` clause never looks at it). `EMLX.Defn.Tree.post_order/1`
+  # already knows to skip it (so `contains_split_point?/1` above is unaffected),
+  # but `Nx.Defn.Graph.split/2` uses the *generic* `Nx.Defn.Tree`, which has no
+  # such rule and walks straight into `_inner` — finding a bare `:runtime_call`
+  # there and (wrongly) carving out an extra split stage for it. Collecting
+  # every metadata node's immediate `_inner` id here lets `split_on_split_point/2`
+  # ignore exactly those nodes while still splitting on any *real* `:runtime_call`
+  # elsewhere in the graph.
+  defp collect_metadata_inner_ids(output_expr) do
+    output_expr
+    |> EMLX.Defn.Tree.post_order()
+    |> Enum.reduce(MapSet.new(), fn
+      %Nx.Tensor{data: %Nx.Defn.Expr{op: :metadata, args: [inner, %{__EMLX__: _}]}}, acc ->
+        MapSet.put(acc, inner.data.id)
+
+      %Nx.Tensor{}, acc ->
+        acc
+    end)
+  end
 
   # Compiles an `EMLX.Native.Expr` program to a NIF resource on `worker`.
   # Captured host tensors are copied onto `device` first: a `defn`-embedded
@@ -2313,12 +2266,13 @@ defmodule EMLX do
   # `allowed_positions` (`EMLX.Native.Expr.quantizable_param_positions/1`,
   # computed once from `output_expr`) restricts this to positions actually
   # consumed as a `:dot` right operand somewhere in the program: a
-  # quantized tensor merely *passed through* to something else (e.g. Stage
-  # 32a's `:host_callback` opcode, or `EMLX.Quantization.dequantize/1`'s
-  # own runtime_call operand) is never specialized on, so it must not
-  # affect the cache key either — otherwise every distinct quantized
-  # tensor identity would mint its own permanently-unreused Stage 32
-  # dispatch-cache entry for an otherwise structurally-identical program.
+  # quantized tensor merely *passed through* to something else (e.g. an
+  # `EMLX.Fast.*` fused kernel's `:__EMLX__` metadata operands, or
+  # `EMLX.Quantization.dequantize/1`'s own `:runtime_call` split-point
+  # operand) is never specialized on, so it must not affect the cache key
+  # either — otherwise every distinct quantized tensor identity would mint
+  # its own permanently-unreused Stage 32 dispatch-cache entry for an
+  # otherwise structurally-identical program.
   defp quant_signature(tensors, allowed_positions) do
     tensors
     |> Enum.with_index()
@@ -2359,20 +2313,11 @@ defmodule EMLX do
     output_template = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
     real_output_count = [output_template] |> Nx.Defn.Composite.flatten_list() |> length()
 
-    # Stage 32a Procedures #2-#4 — every unrecognized `:runtime_call`
-    # reachable from `output_expr`, in `callback_slot` order (see
-    # `EMLX.Native.Expr.runtime_call_callback_specs/1`'s doc for why this is
-    # re-derived from `output_expr` here rather than read off the shared,
-    # dispatch-cached `program_resource`: opts differ per call site even
-    # when structurally-identical call sites share one compiled program).
-    # Usually `[]` — the common case pays only this one cheap tree walk.
-    callback_specs = EMLX.Native.Expr.runtime_call_callback_specs(output_expr)
-
     # See `quant_signature/2`'s doc for why this must be restricted to
     # positions actually consumed by a `:dot` — otherwise a quantized
-    # tensor merely passed to e.g. a `:host_callback` would fragment the
-    # Stage 32 dispatch cache with one dead-weight entry per distinct
-    # tensor identity.
+    # tensor merely passed to e.g. an `EMLX.Fast.*` fused kernel would
+    # fragment the Stage 32 dispatch cache with one dead-weight entry per
+    # distinct tensor identity.
     quantizable_positions = EMLX.Native.Expr.quantizable_param_positions(output_expr)
 
     # Static (independent of quant_signature): which output leaves are a bare,
@@ -2410,21 +2355,6 @@ defmodule EMLX do
         |> unwrap!()
 
       all_refs = await_worker(job_ref)
-
-      # `eval_program` defers materialization (its output refs are still
-      # lazy graph nodes — see its C++ comment); a `:host_callback`
-      # instruction's mid-eval message only fires once something actually
-      # drives evaluation. Force it here, servicing any
-      # `{:emlx_host_callback, ...}` message(s) that arrive along the way,
-      # so we're guaranteed to still be listening for them — unlike a
-      # caller reading these lazily much later (e.g. via `Nx.to_binary/1`
-      # from unrelated code with no idea a callback message might arrive).
-      # Skipped entirely when this program has no callbacks (the common
-      # case): preserves the existing fully-lazy-output behavior.
-      if callback_specs != [] do
-        eval_job_ref = EMLX.NIF.eval_many(worker, all_refs) |> unwrap!()
-        await_worker_with_host_callbacks(eval_job_ref, callback_specs, dev, tensors)
-      end
 
       {out_refs, hook_refs} = Enum.split(all_refs, real_output_count)
 
@@ -2505,19 +2435,26 @@ defmodule EMLX do
   # process-lifetime ETS table backing the Stage 32 dispatch cache. Named
   # (not `:persistent_term`-stashed) so no GC-triggering `:persistent_term`
   # writes are needed to publish it — the atom name is the handle.
-  defp dispatch_cache_table do
-    case :ets.whereis(@native_dispatch_cache_table) do
+  defp dispatch_cache_table, do: ensure_named_ets_table(@native_dispatch_cache_table)
+
+  # Lazily creates (idempotently — races are resolved by `:ets.new/2` raising
+  # `ArgumentError` on the loser, which we swallow) a named, public,
+  # process-lifetime ETS table. Named (not `:persistent_term`-stashed) so no
+  # GC-triggering `:persistent_term` writes are needed to publish it — the
+  # atom name is the handle.
+  defp ensure_named_ets_table(name) do
+    case :ets.whereis(name) do
       :undefined ->
         try do
-          :ets.new(@native_dispatch_cache_table, [:named_table, :public, :set, read_concurrency: true])
+          :ets.new(name, [:named_table, :public, :set, read_concurrency: true])
         rescue
           ArgumentError -> :ok
         end
 
-        @native_dispatch_cache_table
+        name
 
       _tid ->
-        @native_dispatch_cache_table
+        name
     end
   end
 
@@ -2547,6 +2484,30 @@ defmodule EMLX do
   @dispatch_key_memo_pdict_key {__MODULE__, :dispatch_key_memo}
 
   defp dispatch_key(output_expr, num_inputs, device) do
+    id_key = {expr_id_fingerprint(output_expr), num_inputs, device}
+    table = ensure_named_ets_table(@dispatch_key_by_id_table)
+
+    case :ets.lookup(table, id_key) do
+      [{_key, base_key}] ->
+        base_key
+
+      [] ->
+        base_key = compute_dispatch_key(output_expr, num_inputs, device)
+        :ets.insert(table, {id_key, base_key})
+        base_key
+    end
+  end
+
+  # Cheap (O(number of output leaves), not O(nodes)) identity fingerprint —
+  # see `@dispatch_key_by_id_table`. Distinct traces never share an `Expr`
+  # node id, so matching ids here guarantee the exact same graph.
+  defp expr_id_fingerprint(output_expr) do
+    [output_expr]
+    |> Nx.Defn.Composite.flatten_list()
+    |> Enum.map(fn %Nx.Tensor{data: %Nx.Defn.Expr{id: id}} -> id end)
+  end
+
+  defp compute_dispatch_key(output_expr, num_inputs, device) do
     Process.put(@dispatch_key_memo_pdict_key, %{})
 
     try do
@@ -2569,8 +2530,24 @@ defmodule EMLX do
     positions = nodes |> Enum.with_index() |> Map.new(fn {t, i} -> {t.data.id, i} end)
 
     node_sigs =
-      Enum.map(nodes, fn %Nx.Tensor{data: %Nx.Defn.Expr{op: op, args: args}} = t ->
-        {op, t.shape, t.type, sanitize_key_term(args, positions)}
+      Enum.map(nodes, fn
+        %Nx.Tensor{data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: emlx} = meta]}} =
+            t
+        when map_size(meta) == 1 ->
+          # `_inner` (the plain-Nx reference formula) is deliberately excluded
+          # from the signature, not just skipped like `EMLX.Defn.Tree.post_order/1`
+          # does for lowering: `_inner` closes over real upstream operands (e.g.
+          # `x` in `rms_norm_reference/3`), so treating it like any other arg
+          # here would make `sanitize_key_term/2` fall into its "opaque
+          # sub-scope" fallback below and re-walk `_inner`'s *entire* transitive
+          # dependency graph (i.e. every prior layer) from scratch — once per
+          # fused-kernel call site. Signing only the real `__EMLX__` payload
+          # (which is exactly what `EMLX.Native.Expr.lower/2` actually lowers)
+          # keeps this O(1) per node instead of O(depth) per node.
+          {:__emlx__, t.shape, t.type, sanitize_key_term(emlx, positions)}
+
+        %Nx.Tensor{data: %Nx.Defn.Expr{op: op, args: args}} = t ->
+          {op, t.shape, t.type, sanitize_key_term(args, positions)}
       end)
 
     output_sigs =
@@ -2593,6 +2570,21 @@ defmodule EMLX do
   # becomes its `{module, name, arity}` — identity without hashing its
   # closure environment. Everything else (numbers, atoms, strings, structs
   # used as plain option carriers) is kept as-is.
+  #
+  # An opaque sub-scope's signature is condensed to a `:crypto.hash/2` digest
+  # (`{:scope, digest}`) rather than embedded verbatim: `@dispatch_key_memo_pdict_key`
+  # only dedups *building* the raw signature once per `id`, but the same
+  # (interned, i.e. shared-by-reference) large signature term can still be
+  # *referenced* from many call sites — e.g. Axon's own `axon_layer:`
+  # metadata wraps every layer, so a late layer's real (non-`__EMLX__`)
+  # metadata `inner` recurses into an opaque scope covering that layer's
+  # entire upstream history. `:ets.lookup/2`'s key hash walks every logical
+  # occurrence of a subterm regardless of sharing, so embedding the raw
+  # signature at O(occurrences) call sites made the final cache-key hash
+  # O(occurrences × signature size) — cheap to *build* (reference reuse) but
+  # catastrophically slow to *hash* on a real 28-layer model. Digesting once
+  # per unique `id` and reusing the (small, fixed-size) digest everywhere
+  # keeps both build and hash O(unique upstream work).
   defp sanitize_key_term(%Nx.Tensor{data: %Nx.Defn.Expr{id: id}} = t, positions) do
     case Map.fetch(positions, id) do
       {:ok, pos} ->
@@ -2606,7 +2598,8 @@ defmodule EMLX do
             sig
 
           :error ->
-            sig = {:scope, expr_structural_signature(t)}
+            digest = :crypto.hash(:sha256, :erlang.term_to_binary(expr_structural_signature(t)))
+            sig = {:scope, digest}
             Process.put(@dispatch_key_memo_pdict_key, Map.put(memo, id, sig))
             sig
         end
@@ -2667,7 +2660,8 @@ defmodule EMLX do
   # (if any) is propagated through the process binding set by the outer
   # wrapper.
   defp build_split_chain_eval_fn(output_expr, effective_device) do
-    stages = Nx.Defn.Graph.split(output_expr, &split_on_split_point/1)
+    hidden_ids = collect_metadata_inner_ids(output_expr)
+    stages = Nx.Defn.Graph.split(output_expr, &split_on_split_point(&1, hidden_ids))
 
     fn [params] ->
       {_worker, dev} = resolve_worker(effective_device)
@@ -2677,8 +2671,8 @@ defmodule EMLX do
     end
   end
 
-  defp split_on_split_point(%Nx.Tensor{} = t) do
-    if split_point?(t), do: :both, else: :none
+  defp split_on_split_point(%Nx.Tensor{data: %Nx.Defn.Expr{id: id}} = t, hidden_ids) do
+    if not MapSet.member?(hidden_ids, id) and split_point?(t), do: :both, else: :none
   end
 
   # Builds the eval closure for the base case: a bare tail `while` whose initial
@@ -2799,6 +2793,106 @@ defmodule EMLX do
     [initial]
     |> Nx.Defn.Composite.flatten_list()
     |> Enum.all?(&match?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter}}, &1))
+  end
+
+  defp find_runtime_call_node(output_expr) do
+    output_expr
+    |> EMLX.Defn.Tree.post_order()
+    |> Enum.find(&(&1.data.op == :runtime_call))
+  end
+
+  # True for the base case: the output projects exactly one `:runtime_call`
+  # (each leaf is the call node or an `:elem` of it, mirroring `bare_while?/1`
+  # — `Nx.runtime_call`'s output template may itself be a tuple) and that
+  # call's own operand container is made entirely of parameters — i.e. all
+  # pre-call work has already been split into an earlier stage.
+  defp bare_runtime_call?(output_expr) do
+    leaves = Nx.Defn.Composite.flatten_list([output_expr])
+
+    call_ids =
+      leaves
+      |> Enum.flat_map(fn
+        %Nx.Tensor{data: %Nx.Defn.Expr{op: :runtime_call, id: id}} ->
+          [id]
+
+        %Nx.Tensor{
+          data: %Nx.Defn.Expr{
+            op: :elem,
+            args: [%Nx.Tensor{data: %Nx.Defn.Expr{op: :runtime_call, id: id}}, _]
+          }
+        } ->
+          [id]
+
+        _ ->
+          []
+      end)
+      |> Enum.uniq()
+
+    case call_ids do
+      [cid] ->
+        all_project =
+          Enum.all?(leaves, fn
+            %Nx.Tensor{data: %Nx.Defn.Expr{op: :runtime_call, id: ^cid}} ->
+              true
+
+            %Nx.Tensor{
+              data: %Nx.Defn.Expr{op: :elem, args: [%Nx.Tensor{data: %Nx.Defn.Expr{id: ^cid}}, _]}
+            } ->
+              true
+
+            _ ->
+              false
+          end)
+
+        all_project and runtime_call_operands_all_params?(find_runtime_call_node(output_expr))
+
+      _ ->
+        false
+    end
+  end
+
+  defp runtime_call_operands_all_params?(%Nx.Tensor{
+         data: %Nx.Defn.Expr{args: [tensor_expr | _]}
+       }) do
+    [tensor_expr]
+    |> Nx.Defn.Composite.flatten_list()
+    |> Enum.all?(&match?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter}}, &1))
+  end
+
+  # Builds the eval closure for the base case: a bare tail `:runtime_call`
+  # whose operand container is exactly the stage inputs. The callback runs
+  # directly, in this process, on real materialised tensors — same contract
+  # as `Nx.Defn.Evaluator`'s own `:runtime_call` handling.
+  defp build_runtime_call_base_eval_fn(output_expr, effective_device) do
+    %Nx.Tensor{data: %Nx.Defn.Expr{args: [tensor_expr, fun, _out, opts]}} =
+      find_runtime_call_node(output_expr)
+
+    operand_positions =
+      [tensor_expr]
+      |> Nx.Defn.Composite.flatten_list()
+      |> Enum.map(fn %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos end)
+
+    output_template = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
+
+    fn [params] ->
+      {_worker, dev} = resolve_worker(effective_device)
+      inputs = Enum.map(params, &materialise_tensor(&1, dev))
+      operand_tensors = Enum.map(operand_positions, &Enum.at(inputs, &1))
+
+      {container, []} =
+        Nx.Defn.Composite.traverse(tensor_expr, operand_tensors, fn _leaf, [t | rest] ->
+          {t, rest}
+        end)
+
+      result_flat = fun.(container, opts) |> then(&Nx.Defn.Composite.flatten_list([&1]))
+
+      {output_container, []} =
+        Nx.Defn.Composite.traverse(output_template, result_flat, fn _leaf, [t | rest] ->
+          {t, rest}
+        end)
+
+      [output_container]
+    end
   end
 
   # Maps a flat output leaf to the carry index it projects from `while_id`.

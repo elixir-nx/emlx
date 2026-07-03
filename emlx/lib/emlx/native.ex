@@ -31,9 +31,9 @@ defmodule EMLX.Native do
   def to_mlx_type(:bool), do: :bool
 
   @doc """
-  Maps a canonical MLX type atom (as sent by e.g. the `:host_callback`
-  opcode's mid-eval message — see `dtype2string` in c_src/emlx_nif_shared.hpp)
-  back to an `Nx.Type.t()`. Only covers the canonical MLX dtypes
+  Maps a canonical MLX type atom (as produced by `dtype2string` in
+  c_src/emlx_nif_shared.hpp) back to an `Nx.Type.t()`. Only covers the
+  canonical MLX dtypes
   `to_mlx_type/1` can produce — not a general inverse (several `Nx.Type.t()`s
   widen to the same MLX type, e.g. `{:f, 8}`/`{:f, 16}` both become
   `:float16`, so this picks the direct/canonical one).
