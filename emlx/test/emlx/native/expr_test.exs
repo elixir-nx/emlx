@@ -4109,14 +4109,19 @@ defmodule EMLX.Native.ExprTest do
 
     @tag :stage31
     test "a recognized EMLX.Fast.* runtime_call is still lowered in-graph, not split" do
-      # Regression guard: split_point?/1 must not treat every :runtime_call as
-      # a split point, only unrecognized ones -- otherwise every EMLX.Fast.*
-      # fused kernel (rms_norm, sdpa, rope, ...) would silently lose its
-      # single-NIF-replay fusion. A numeric assert_all_close alone can't catch
-      # that regression (Nx.Defn.Graph.split/run is numerically transparent),
-      # so assert the structural IR shape directly, mirroring the Stage 10
-      # "rms_norm runtime_call lowers to a single :fast_rms_norm instruction"
-      # test: a single fused opcode, no host round-trip.
+      # Regression guard: split_point?/1 does treat every :runtime_call node
+      # as a split point (it doesn't distinguish recognized vs unrecognized),
+      # but EMLX.Fast.*'s runtime_call is wrapped as the `_inner` of a
+      # `:__EMLX__` metadata node, and EMLX.Defn.Tree.post_order/1 (used by
+      # contains_split_point?/1) skips straight past that `_inner` -- so it's
+      # never seen as a split point in the first place. Otherwise every
+      # EMLX.Fast.* fused kernel (rms_norm, sdpa, rope, ...) would silently
+      # lose its single-NIF-replay fusion. A numeric assert_all_close alone
+      # can't catch that regression (Nx.Defn.Graph.split/run is numerically
+      # transparent), so assert the structural IR shape directly, mirroring
+      # the Stage 10 "rms_norm runtime_call lowers to a single
+      # :fast_rms_norm instruction" test: a single fused opcode, no host
+      # round-trip.
       fun = fn x, w -> EMLX.Fast.rms_norm(x, w, 1.0e-6) end
       expr = Nx.Defn.debug_expr_apply(fun, [Nx.template({2, 4}, :f32), Nx.template({4}, :f32)])
       prog = Expr.lower(expr)

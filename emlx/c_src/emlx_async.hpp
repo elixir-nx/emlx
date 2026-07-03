@@ -77,23 +77,14 @@ namespace emlx {
 // emlx_worker.hpp's `thread_main`) — no two jobs ever run concurrently on
 // the same worker thread, so there is no cross-job race on this variable.
 //
-// Used by `host_callback::HostCallback::eval_cpu`/`eval_gpu`
-// (emlx_compiler.cpp) to route a mid-eval host-callback message to the
-// ACTUAL current caller, not whichever process happened to trigger the
-// compiled program's first trace. `mlx::core::detail::compile()` traces
-// its interpreter lambda — and constructs every `Primitive` object,
-// including `HostCallback` — exactly ONCE per structural cache entry;
-// every subsequent real `eval()` replays those same already-built
-// `Primitive` objects without rebuilding them (see Stage 32a Procedure
-// #1's spike results). Baking a target pid into `HostCallback`'s
-// constructor would therefore route every future replay's callback to
-// whichever process triggered the FIRST evaluation, forever — wrong as
-// soon as the same compiled program (Stage 32's structural cache) is
-// reused across calls from more than one logical caller, which is the
-// *normal* case (e.g. a decode loop replaying the same compiled
-// attention-layer program every step). Reading a thread-local set fresh
-// by `async_dispatch` on every dispatched call avoids baking anything
-// call-specific into the compiled graph at all.
+// Was used to route a mid-eval host-callback message (a since-removed
+// in-graph `:host_callback` primitive, replaced by graph-splitting on bare
+// `Nx.runtime_call` — see `EMLX.__compile__/3`) to the ACTUAL current
+// caller, not whichever process happened to trigger a compiled program's
+// first trace. Currently has no reader (`current_caller_pid/1` below is
+// unused); kept as generic caller-pid plumbing set by `async_dispatch` on
+// every dispatched call, in case a future primitive needs per-call routing
+// without baking a pid into the compiled graph.
 inline thread_local ErlNifPid *g_current_caller_pid_ptr = nullptr;
 
 // Returns the calling pid for whatever `SyncOp` is currently executing on

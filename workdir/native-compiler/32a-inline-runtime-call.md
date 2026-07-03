@@ -1,19 +1,47 @@
 # Stage 32a — inline (non-splitting) `runtime_call` execution
 
-Status: in progress — Procedures #1–#5 and #5b are done (spike, production
-`:host_callback` opcode, thread-local caller-pid redesign, `EMLX.Native.Expr`
-lowering + `emlx.ex` wiring, Stage 31 split-point removal for `runtime_call`,
-full `mix test` suite green). Procedure #8 (`validate_qwen3.exs`) found and
-fixed a real deadlock (nested `mlx::core::eval()` reentrancy) and a real
-silent-corruption bug (non-contiguous operand/reply byte serialization), but
-uncovered a **new, unresolved** correctness bug: a prefill call's `offset`
-operand reads garbage on a generation request's compiled-program replay
-after a prior request already ran many calls against it (see Results for
-what's been ruled out). Procedures #6/#7 (mutable-host-state regression
-test, structural-fusion regression tests) are not started. See Results for
-full detail before continuing.
+Status: **ABANDONED — superseded by [`32b-emlx-metadata-custom-grad`](32b-emlx-metadata-custom-grad.md).**
+Procedure #8's unresolved race condition (a prefill call's `offset` operand
+reading garbage on a second-or-later generation request replaying the same
+compiled program — see Results) was never root-caused. Rather than keep
+debugging a sporadic GPU-buffer/command-queue timing hazard in the
+`:host_callback` in-graph opcode itself, the user redirected: `EMLX.Fast.*`
+(the only production caller needing *fast*, non-split, in-graph execution)
+gets its own dedicated `:__EMLX__` `Nx.Defn.metadata` mechanism instead of
+a generalized "any `runtime_call` becomes in-graph" opcode — see Stage 32b.
+Every unrecognized `runtime_call` (the case this stage targeted) goes back
+to Stage 31's `Nx.Defn.Graph.split` behavior, which has no known correctness
+issues, only the performance ceiling that motivated this stage in the first
+place — an acceptable trade given `EMLX.Fast.*`'s throughput-critical paths
+no longer need `runtime_call`-based splitting at all. All C++ `host_callback`
+machinery this stage built (opcode, NIFs, thread-local caller-pid plumbing)
+has been removed from `c_src/`/`lib/` production code (kept below only as a
+historical record of what was tried and why it didn't ship); the two bench
+scripts that exercised it (`bench/host_callback_opcode.exs`,
+`bench/host_callback_multi_caller.exs`) were deleted since they call NIFs
+that no longer exist.
+
 Named by [`32-runtime-call-dispatch-cache`](32-runtime-call-dispatch-cache.md)'s
-Results, per user directive, superseding that stage's approach.
+Results, per user directive, superseding that stage's approach. The
+remainder of this document is preserved as-written at the time of
+abandonment (original "in progress" status text below), for historical
+reference only — do not treat it as describing current behavior.
+
+---
+
+Status (historical, at time of abandonment): in progress — Procedures #1–#5
+and #5b are done (spike, production `:host_callback` opcode, thread-local
+caller-pid redesign, `EMLX.Native.Expr` lowering + `emlx.ex` wiring, Stage 31
+split-point removal for `runtime_call`, full `mix test` suite green).
+Procedure #8 (`validate_qwen3.exs`) found and fixed a real deadlock (nested
+`mlx::core::eval()` reentrancy) and a real silent-corruption bug
+(non-contiguous operand/reply byte serialization), but uncovered a **new,
+unresolved** correctness bug: a prefill call's `offset` operand reads garbage
+on a generation request's compiled-program replay after a prior request
+already ran many calls against it (see Results for what's been ruled out).
+Procedures #6/#7 (mutable-host-state regression test, structural-fusion
+regression tests) are not started. See Results for full detail before
+continuing.
 
 ## Why this stage exists
 

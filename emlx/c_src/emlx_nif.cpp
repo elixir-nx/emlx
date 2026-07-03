@@ -480,13 +480,13 @@ NIF(eval) {
   return nx::nif::ok(env);
 }
 
-// Stage 32a Procedure #4 — evaluates several tensors in one round trip
-// instead of one `eval` NIF call per ref. Used by `EMLX.build_native_eval_fn/6`
-// to force-materialize every real output + hook ref of a `:host_callback`-
-// containing compiled program (whose `HostCallback::eval_cpu` only fires
-// once something drives real materialization -- `eval_program` itself
-// returns lazy refs, see its comment) while still listening for the
-// `{:emlx_host_callback, ...}` message(s) that fire along the way.
+// Evaluates several tensors in one round trip instead of one `eval` NIF
+// call per ref. `eval_program` itself returns lazy refs (see its comment);
+// this batches their materialization. Currently unused from Elixir (kept
+// as a general-purpose multi-ref eval primitive) — the earlier in-graph
+// `:host_callback` round-trip opcode that motivated it was removed in
+// favor of graph-splitting on bare `Nx.runtime_call` (see `EMLX.__compile__/3`
+// and `EMLX.Defn.Tree`'s `:__EMLX__` metadata handling in `expr.ex`).
 NIF(eval_many) {
   LIST_PARAM(0, std::vector<mlx::core::array>, inputs);
   mlx::core::eval(inputs);
