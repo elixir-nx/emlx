@@ -50,29 +50,6 @@ create_tensor_resource(ErlNifEnv *env, mlx::core::array tensor) {
   return ret;
 }
 
-ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
-  ERL_NIF_TERM ret;
-  std::atomic<int> *refcount;
-  auto function_ptr = (emlx::function *)enif_alloc_resource(
-      resource_object<emlx::function>::type,
-      sizeof(std::function<std::vector<array>(const std::vector<array> &)>) +
-          sizeof(std::atomic<int>) + sizeof(std::atomic_flag));
-
-  if (function_ptr == NULL) {
-    return enif_make_badarg(env);
-  }
-
-  new (function_ptr) emlx::function(function);
-  refcount = new (function_ptr + 1) std::atomic<int>(1);
-  new (refcount + 1) std::atomic_flag();
-
-  ret = enif_make_resource(env, function_ptr);
-  enif_release_resource(function_ptr);
-
-  return ret;
-}
-
-
 NIF(deallocate) {
   TensorP t(env, argv[0]);
   if (t.deallocate()) {
@@ -110,14 +87,6 @@ NIF(ones) {
   DEVICE_PARAM(2, device);
 
   TENSOR(mlx::core::ones(to_shape(shape), type, device));
-}
-
-NIF(zeros) {
-  SHAPE_PARAM(0, shape);
-  TYPE_PARAM(1, type);
-  DEVICE_PARAM(2, device);
-
-  TENSOR(mlx::core::zeros(to_shape(shape), type, device));
 }
 
 NIF(reshape) {
@@ -1025,10 +994,6 @@ NIF(command_queue_synchronize) {
 static int open_resources(ErlNifEnv *env) {
   const char *mod = "EMLX";
   if (!open_resource<mlx::core::array>(env, mod, "MLXArray")) {
-    return -1;
-  }
-
-  if (!open_resource<emlx::function>(env, mod, "CompiledFunction")) {
     return -1;
   }
 

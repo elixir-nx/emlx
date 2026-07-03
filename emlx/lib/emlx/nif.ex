@@ -107,22 +107,6 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
-  # ── Graph capture / replay ─────────────────────────────────────────────────
-  # graph_capture/3 — walks the lazy MLX DAG from `outputs` back to `inputs`,
-  # builds and simplifies a replayable tape, and returns an opaque compiled_ref.
-  # Must be called while the arrays are still lazy (before eval).
-  #
-  # graph_replay/2 — substitutes `new_inputs` into the stored tape and returns
-  # new lazy output arrays without re-dispatching any Nx ops.
-
-  def graph_capture(_inputs, _outputs, _shapeless) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def graph_replay(_compiled_ref, _new_inputs) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
   # ── Native.Expr compiler NIFs ─────────────────────────────────────────────
   # compile_program — builds an opaque ProgramResource from the Native.Expr IR
   # and a set of captured arrays. Worker-routed (argv[0] = worker).

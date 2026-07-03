@@ -4,7 +4,6 @@
 #include "mlx/mlx.h"
 
 inline ErlNifResourceType *TENSOR_TYPE;
-inline ErlNifResourceType *FUNCTION_TYPE;
 
 namespace emlx {
 typedef std::function<std::vector<mlx::core::array>(
@@ -113,7 +112,6 @@ int open_resource(ErlNifEnv *env, const char *mod, const char *name,
 }
 
 ERL_NIF_TERM create_tensor_resource(ErlNifEnv *env, mlx::core::array tensor);
-ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function);
 
 namespace nx {
 namespace nif {
@@ -282,13 +280,6 @@ inline int get(ErlNifEnv *env, ERL_NIF_TERM term, bool *var) {
     return 0; // error
 
   return 1;
-}
-
-// function
-
-inline int get(ErlNifEnv *env, ERL_NIF_TERM term, emlx::function *&var) {
-  return enif_get_resource(env, term, resource_object<emlx::function>::type,
-                           reinterpret_cast<void **>(&var));
 }
 
 // Containers

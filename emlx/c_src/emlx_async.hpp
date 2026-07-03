@@ -64,39 +64,10 @@
 #include "erl_nif.h"
 #include "nx_nif_utils.hpp"
 
-#include <cstring>
 #include <exception>
 #include <vector>
 
 namespace emlx {
-
-// The ErlNifPid that dispatched the `SyncOp` currently executing on *this*
-// worker thread, or `nullptr` outside any `SyncOp`'s dynamic extent. Safe
-// as a thread-local because `emlx::Worker`'s job queue is a single FIFO
-// serviced by exactly one OS thread, one job at a time (see
-// emlx_worker.hpp's `thread_main`) — no two jobs ever run concurrently on
-// the same worker thread, so there is no cross-job race on this variable.
-//
-// Was used to route a mid-eval host-callback message (a since-removed
-// in-graph `:host_callback` primitive, replaced by graph-splitting on bare
-// `Nx.runtime_call` — see `EMLX.__compile__/3`) to the ACTUAL current
-// caller, not whichever process happened to trigger a compiled program's
-// first trace. Currently has no reader (`current_caller_pid/1` below is
-// unused); kept as generic caller-pid plumbing set by `async_dispatch` on
-// every dispatched call, in case a future primitive needs per-call routing
-// without baking a pid into the compiled graph.
-inline thread_local ErlNifPid *g_current_caller_pid_ptr = nullptr;
-
-// Returns the calling pid for whatever `SyncOp` is currently executing on
-// this worker thread via `false` if called outside any `SyncOp`'s dynamic
-// extent — a programming/wiring error, not something to silently paper
-// over with a stale or garbage pid.
-inline bool current_caller_pid(ErlNifPid *out) {
-  if (!g_current_caller_pid_ptr)
-    return false;
-  *out = *g_current_caller_pid_ptr;
-  return true;
-}
 
 // Build an `{:error, "<message>"}` tuple in `msg_env`. Uses
 // `enif_make_string` to mirror nx::nif::error so the Elixir side can
@@ -170,11 +141,6 @@ ERL_NIF_TERM async_dispatch(ErlNifEnv *env, int argc,
   try {
     worker->post([msg_env, job_ref_msg, caller_pid,
                   op_argv = std::move(op_argv)]() mutable {
-      // See g_current_caller_pid_ptr's doc comment above: safe because
-      // this worker thread runs exactly one job at a time.
-      ErlNifPid current_caller = caller_pid;
-      g_current_caller_pid_ptr = &current_caller;
-
       ERL_NIF_TERM payload;
       try {
         payload = SyncOp(msg_env, static_cast<int>(op_argv.size()),
@@ -186,8 +152,6 @@ ERL_NIF_TERM async_dispatch(ErlNifEnv *env, int argc,
         // hangs.
         payload = error_from_current_exception(msg_env);
       }
-
-      g_current_caller_pid_ptr = nullptr;
 
       ERL_NIF_TERM reply =
           enif_make_tuple2(msg_env, job_ref_msg, payload);

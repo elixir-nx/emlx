@@ -29,27 +29,4 @@ defmodule EMLX.Native do
   def to_mlx_type({:c, 64}), do: :complex64
   def to_mlx_type({:c, 128}), do: :complex64
   def to_mlx_type(:bool), do: :bool
-
-  @doc """
-  Maps a canonical MLX type atom (as produced by `dtype2string` in
-  c_src/emlx_nif_shared.hpp) back to an `Nx.Type.t()`. Only covers the
-  canonical MLX dtypes
-  `to_mlx_type/1` can produce — not a general inverse (several `Nx.Type.t()`s
-  widen to the same MLX type, e.g. `{:f, 8}`/`{:f, 16}` both become
-  `:float16`, so this picks the direct/canonical one).
-  """
-  @spec from_mlx_type(atom()) :: Nx.Type.t()
-  def from_mlx_type(:uint8), do: {:u, 8}
-  def from_mlx_type(:uint16), do: {:u, 16}
-  def from_mlx_type(:uint32), do: {:u, 32}
-  def from_mlx_type(:uint64), do: {:u, 64}
-  def from_mlx_type(:int8), do: {:s, 8}
-  def from_mlx_type(:int16), do: {:s, 16}
-  def from_mlx_type(:int32), do: {:s, 32}
-  def from_mlx_type(:int64), do: {:s, 64}
-  def from_mlx_type(:float16), do: {:f, 16}
-  def from_mlx_type(:float32), do: {:f, 32}
-  def from_mlx_type(:bfloat16), do: {:bf, 16}
-  def from_mlx_type(:complex64), do: {:c, 64}
-  def from_mlx_type(:bool), do: :bool
 end

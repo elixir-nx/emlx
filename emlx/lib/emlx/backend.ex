@@ -835,7 +835,6 @@ defmodule EMLX.Backend do
       # Get the actual shape after summation
       actual_shape = EMLX.shape(result)
       # FIXME: MLX returns whatever the original type is, but Nx expects u8 -> u32
-      # scalar_type = EMLX.scalar_type(result)
 
       # Create a new output tensor with the correct shape
       %{out | shape: actual_shape}
