@@ -10,7 +10,8 @@ defmodule EMLXRoot do
       aliases: [
         setup: cmd("deps.get"),
         compile: cmd("compile"),
-        test: cmd("test")
+        test: cmd("test"),
+        format: cmd("format")
       ]
     ]
   end

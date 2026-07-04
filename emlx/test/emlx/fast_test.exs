@@ -478,6 +478,7 @@ defmodule EMLX.FastTest do
       )
     end
   end
+
   defp causal_kv_attention_reference(q, new_k, new_v, k_cache, v_cache, offset, scale, key_mask) do
     q = Nx.backend_transfer(q, Nx.BinaryBackend)
     new_k = Nx.backend_transfer(new_k, Nx.BinaryBackend)

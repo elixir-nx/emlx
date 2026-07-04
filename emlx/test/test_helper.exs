@@ -1,3 +1,10 @@
+# MLX's CPU backend JIT-compiles fused kernels via `popen`/`pclose`, which
+# fails with `ECHILD` under the BEAM's default SIGCHLD=SIG_IGN disposition
+# (see `EMLX.Application`'s moduledoc for the full explanation). Library
+# code doesn't get to make this call for consumers, but our own test suite
+# is exactly the kind of deployment where we do control this trade-off.
+:os.set_signal(:sigchld, :default)
+
 use_gpu? =
   String.downcase(System.get_env("EMLX_TEST_DEFAULT_GPU", "false")) in [
     "1",
@@ -38,6 +45,7 @@ distributed_exclude =
         match?({:ok, _}, Node.start(:"emlx_primary@127.0.0.1", :longnames)) ->
       {:ok, _pid, peer} = :peer.start(%{name: :"emlx_peer@127.0.0.1"})
       true = :erpc.call(peer, :code, :set_path, [:code.get_path()])
+      :ok = :erpc.call(peer, :os, :set_signal, [:sigchld, :default])
       :ok = :erpc.call(peer, Application, :put_env, [:emlx, :default_device, default_device])
       :ok = :erpc.call(peer, Application, :put_env, [:nx, :default_backend, backend])
       {:ok, _} = :erpc.call(peer, :application, :ensure_all_started, [:nx])

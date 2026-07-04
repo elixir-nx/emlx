@@ -28,8 +28,7 @@ defmodule EMLXAxon.MixProject do
         %{
           "MLX_INCLUDE_DIR" => Path.join(emlx_priv_dir, "mlx/include"),
           "MLX_LIB_DIR" => Path.join(emlx_priv_dir, "mlx/lib"),
-          "QWEN3_ABI_INCLUDE_DIR" =>
-            Path.join(Mix.Project.deps_paths()[:emlx], "c_src/emlx_fast")
+          "QWEN3_ABI_INCLUDE_DIR" => Path.join(Mix.Project.deps_paths()[:emlx], "c_src/emlx_fast")
         }
       end,
       compilers: [:elixir_make] ++ Mix.compilers()

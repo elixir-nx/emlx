@@ -134,6 +134,46 @@ defmodule EMLX.Macro do
 end
 
 defmodule EMLX do
+  @moduledoc """
+  Low-level MLX NIF wrappers and the native `Nx.Defn.Compiler` for
+  `EMLX.Backend` tensors.
+
+  Most users don't call this module directly — set `EMLX.Backend` as your
+  `Nx` backend (see the [README](readme.html)) and, optionally, `EMLX` as
+  your `Nx.Defn` compiler for the JIT-compiled native path:
+
+      Nx.Defn.default_options(compiler: EMLX)
+
+  ## CPU JIT compilation and SIGCHLD
+
+  On the CPU backend, MLX JIT-compiles fused kernels the first time it sees
+  a new graph shape by shelling out to `popen("g++ ...")` and reading the
+  result back via `pclose()`. The BEAM sets `SIGCHLD` to `SIG_IGN` by
+  default (so it can run as PID 1 in a container without leaking zombies);
+  under Linux/POSIX semantics that makes the kernel auto-reap any child the
+  instant it exits, so by the time MLX's `pclose()` calls `waitpid()` there
+  is nothing left to collect — it fails with `ECHILD`
+  (`** (EMLX.NIFError) ... pclose() failed.`), independent of whether the
+  compile itself would have succeeded.
+
+  EMLX does not change this VM-wide setting itself — doing so from a
+  dependency would silently change zombie-reaping behavior for the whole
+  host application. If you hit this error (typically on Linux CPU backend,
+  the first time a given fused-op shape runs), restore the default
+  disposition yourself, as early as possible in your own application
+  (e.g. in your own `Application.start/2`, before `:emlx` or `:nx` start
+  doing real work):
+
+      :os.set_signal(:sigchld, :default)
+
+  This is the same fix TensorFlow's Erlang bindings needed for the
+  identical reason — see
+  https://erlang.org/pipermail/erlang-questions/2020-November/100109.html.
+  Only skip this if your VM runs as PID 1 in a container and can't
+  tolerate the (small, `g++`-subprocess-shaped) risk of zombie processes.
+  See `EMLX.Application` for more detail.
+  """
+
   use EMLX.Macro
 
   @profile_eval Application.compile_env(:emlx, :profile_eval, false)

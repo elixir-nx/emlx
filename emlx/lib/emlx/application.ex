@@ -33,6 +33,13 @@ defmodule EMLX.Application do
   this module silently skips the GPU worker. Subsequent
   `EMLX.eval/1` calls on a GPU tensor will raise at use time with the
   underlying `:persistent_term` `ArgumentError`.
+
+  ## CPU JIT compilation and SIGCHLD
+
+  Hitting `** (EMLX.NIFError) ... pclose() failed.` on the CPU backend? See
+  the "CPU JIT compilation and SIGCHLD" section of the `EMLX` moduledoc —
+  it's a BEAM/MLX interaction this application deliberately does not paper
+  over for you.
   """
 
   use Application
