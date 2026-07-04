@@ -44,7 +44,22 @@ defmodule EMLX.Application do
     ensure_default_worker!(:gpu, _gpu_optional? = true)
     ensure_worker!(:runtime_call_worker, :cpu, _gpu_optional? = false)
     ensure_worker!(:runtime_call_worker, :gpu, _gpu_optional? = true)
+    ensure_qwen3_plugin_loaded!()
     Supervisor.start_link([], strategy: :one_for_one, name: __MODULE__)
+  end
+
+  @doc false
+  def ensure_qwen3_plugin_loaded! do
+    path = :filename.join(:code.priv_dir(:emlx), ~c"libemlx_qwen3.so")
+
+    case EMLX.NIF.load_qwen3_plugin(List.to_string(path)) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        raise EMLX.NIFError,
+              "EMLX.Application could not load the qwen3 plugin: " <> List.to_string(reason)
+    end
   end
 
   @doc """

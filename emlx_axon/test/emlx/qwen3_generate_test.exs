@@ -625,9 +625,9 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
 
     assert_raise ArgumentError,
-                 ~r/qwen3_forward_greedy_ids_token_id requires batch size 1, got batch size 2/,
+                 ~r/forward_greedy_ids_token_id requires batch size 1, got batch size 2/,
                  fn ->
-                   EMLX.qwen3_forward_greedy_ids_token_id(
+                   EMLX.Native.Qwen3.forward_greedy_ids_token_id(
                      EMLX.Backend.from_nx(input_ids),
                      EMLX.Backend.from_nx(state.embed_tokens),
                      [],
@@ -656,8 +656,8 @@ defmodule EMLXAxon.Qwen3GenerateTest do
 
     embed_ref = EMLX.Backend.from_nx(state.embed_tokens)
 
-    assert_raise ArgumentError, ~r/qwen3_forward_greedy_ids_chunk requires batch size 1/, fn ->
-      EMLX.qwen3_forward_greedy_ids_chunk(
+    assert_raise ArgumentError, ~r/forward_greedy_ids_chunk requires batch size 1/, fn ->
+      EMLX.Native.Qwen3.forward_greedy_ids_chunk(
         EMLX.Backend.from_nx(input_ids),
         embed_ref,
         [],

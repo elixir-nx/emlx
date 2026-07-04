@@ -885,80 +885,80 @@ results =
 ==> Building Bumblebee.Text.generation serving (base — no rewrite) ...
 
 ==> [Qwen3-0.6B (dense bf16) / bb base] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 1178 ms  "<think> Okay, the user wants a list of twenty programming la..."
-    warmup 2: 60 tokens / 1014 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 1: 60 tokens / 1233 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 1101 ms  "<think> Okay, the user wants a list of twenty programming la..."
 
 ==> [Qwen3-0.6B (dense bf16) / bb base] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 1006 ms = 59.6 tok/s
-    run 2: 60 tokens / 1055 ms = 56.9 tok/s
-    run 3: 60 tokens / 1092 ms = 54.9 tok/s
-    run 4: 60 tokens / 1040 ms = 57.7 tok/s
-    run 5: 60 tokens / 1035 ms = 58.0 tok/s
-    bb base           (Bumblebee, no rewrite)        : median=57.7  mean=57.4±1.5  min/max=54.9/59.6 tok/s
+    run 1: 60 tokens / 1063 ms = 56.4 tok/s
+    run 2: 60 tokens / 1218 ms = 49.3 tok/s
+    run 3: 60 tokens / 1237 ms = 48.5 tok/s
+    run 4: 60 tokens / 1142 ms = 52.5 tok/s
+    run 5: 60 tokens / 1135 ms = 52.9 tok/s
+    bb base           (Bumblebee, no rewrite)        : median=52.5  mean=51.9±2.8  min/max=48.5/56.4 tok/s
 
 ==> Spawning isolated peer for lane :bb_rewrite ...
 ==> Applying EMLXAxon.rewrite/1 (all rewrites — best performing path) ...
 
 ==> [Qwen3-0.6B (dense bf16) / bb+rewrite] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 909 ms  "<think> Okay, the user wants a list of twenty programming la..."
-    warmup 2: 60 tokens / 827 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 1: 60 tokens / 1071 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 813 ms  "<think> Okay, the user wants a list of twenty programming la..."
 
 ==> [Qwen3-0.6B (dense bf16) / bb+rewrite] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 778 ms = 77.1 tok/s
-    run 2: 60 tokens / 744 ms = 80.6 tok/s
-    run 3: 60 tokens / 744 ms = 80.6 tok/s
-    run 4: 60 tokens / 761 ms = 78.8 tok/s
-    run 5: 60 tokens / 729 ms = 82.3 tok/s
-    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=80.6  mean=79.9±1.8  min/max=77.1/82.3 tok/s
+    run 1: 60 tokens / 840 ms = 71.4 tok/s
+    run 2: 60 tokens / 769 ms = 78.0 tok/s
+    run 3: 60 tokens / 775 ms = 77.4 tok/s
+    run 4: 60 tokens / 731 ms = 82.1 tok/s
+    run 5: 60 tokens / 783 ms = 76.6 tok/s
+    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=77.4  mean=77.1±3.4  min/max=71.4/82.1 tok/s
 
 ==> Spawning isolated peer for lane :native ...
 
 ==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...
-    loaded in 303 ms
+    loaded in 232 ms
 
 ==> [Qwen3-0.6B (dense bf16) / native] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 835 ms  "<think> Okay, the user wants a list of twenty programming la..."
-    warmup 2: 60 tokens / 720 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 1: 60 tokens / 817 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 732 ms  "<think> Okay, the user wants a list of twenty programming la..."
 
 ==> [Qwen3-0.6B (dense bf16) / native] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 716 ms = 83.8 tok/s
-    run 2: 60 tokens / 721 ms = 83.2 tok/s
-    run 3: 60 tokens / 717 ms = 83.7 tok/s
-    run 4: 60 tokens / 713 ms = 84.2 tok/s
-    run 5: 60 tokens / 733 ms = 81.9 tok/s
-    native            (EMLXAxon.TextGeneration)       : median=83.7  mean=83.4±0.8  min/max=81.9/84.2 tok/s
+    run 1: 60 tokens / 738 ms = 81.3 tok/s
+    run 2: 60 tokens / 730 ms = 82.2 tok/s
+    run 3: 60 tokens / 750 ms = 80.0 tok/s
+    run 4: 60 tokens / 738 ms = 81.3 tok/s
+    run 5: 60 tokens / 737 ms = 81.4 tok/s
+    native            (EMLXAxon.TextGeneration)       : median=81.3  mean=81.2±0.7  min/max=80.0/82.2 tok/s
 
 ==> Spawning isolated peer for lane :emily_eager ...
 
 ==> [Qwen3-0.6B (dense bf16) / emily-eager] Loading model on Emily.Backend ...
 
 ==> [Qwen3-0.6B (dense bf16) / emily-eager] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 8017 ms  "<think> Okay, the user wants a list of twenty programming la..."
-    warmup 2: 60 tokens / 8460 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 1: 60 tokens / 9928 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 9143 ms  "<think> Okay, the user wants a list of twenty programming la..."
 
 ==> [Qwen3-0.6B (dense bf16) / emily-eager] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 8760 ms = 6.8 tok/s
-    run 2: 60 tokens / 7382 ms = 8.1 tok/s
-    run 3: 60 tokens / 7792 ms = 7.7 tok/s
-    run 4: 60 tokens / 7632 ms = 7.9 tok/s
-    run 5: 60 tokens / 7016 ms = 8.6 tok/s
-    emily-eager       (Evaluator + Emily.Backend)      : median=7.9  mean=7.8±0.6  min/max=6.8/8.6 tok/s
+    run 1: 60 tokens / 9367 ms = 6.4 tok/s
+    run 2: 60 tokens / 9221 ms = 6.5 tok/s
+    run 3: 60 tokens / 9966 ms = 6.0 tok/s
+    run 4: 60 tokens / 10313 ms = 5.8 tok/s
+    run 5: 60 tokens / 10523 ms = 5.7 tok/s
+    emily-eager       (Evaluator + Emily.Backend)      : median=6.0  mean=6.1±0.3  min/max=5.7/6.5 tok/s
 
 ==> Spawning isolated peer for lane :emily_native ...
 
 ==> [Qwen3-0.6B (dense bf16) / emily-native] Loading model on Emily.Backend ...
 
 ==> [Qwen3-0.6B (dense bf16) / emily-native] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 862 ms  "<think> Okay, the user wants a list of twenty programming la..."
-    warmup 2: 60 tokens / 960 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 1: 60 tokens / 928 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 925 ms  "<think> Okay, the user wants a list of twenty programming la..."
 
 ==> [Qwen3-0.6B (dense bf16) / emily-native] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 942 ms = 63.7 tok/s
-    run 2: 60 tokens / 827 ms = 72.6 tok/s
-    run 3: 60 tokens / 994 ms = 60.4 tok/s
-    run 4: 60 tokens / 771 ms = 77.8 tok/s
-    run 5: 60 tokens / 843 ms = 71.2 tok/s
-    emily-native      (Emily.Compiler, native: true)   : median=71.2  mean=69.1±6.3  min/max=60.4/77.8 tok/s
+    run 1: 60 tokens / 1039 ms = 57.7 tok/s
+    run 2: 60 tokens / 1118 ms = 53.7 tok/s
+    run 3: 60 tokens / 1061 ms = 56.6 tok/s
+    run 4: 60 tokens / 954 ms = 62.9 tok/s
+    run 5: 60 tokens / 1010 ms = 59.4 tok/s
+    emily-native      (Emily.Compiler, native: true)   : median=57.7  mean=58.1±3.0  min/max=53.7/62.9 tok/s
 
 ################################################################################
 === Qwen3-0.6B-MLX-4bit — {:local, "/Users/valente/models/Qwen3-0.6B-MLX-4bit"} ===
@@ -967,7 +967,7 @@ results =
 
 ==> Spawning isolated peer for lane :bb_base ...
 
-11:27:02.546 [debug] the following PyTorch parameters were unused:
+12:11:42.918 [debug] the following PyTorch parameters were unused:
 
   * model.embed_tokens.biases
   * model.embed_tokens.scales
@@ -1163,7 +1163,7 @@ results =
   * model.layers.20.sel (truncated)
 ==> Loading MLX-4bit params (dequantize → Bumblebee layout → re-quantize) ...
 
-11:27:02.551 [debug] the following parameters were ignored, because of non-matching shape:
+12:11:42.928 [debug] the following parameters were ignored, because of non-matching shape:
 
   * decoder.blocks.19.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
   * decoder.blocks.12.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
@@ -1257,24 +1257,24 @@ results =
   * decoder.blocks.6.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
   * decoder.blocks.22.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
   * decoder.blocks.1.ffn.intermediate.kernel (expect (truncated)
-    params loaded in 99 ms
+    params loaded in 139 ms
 ==> Building Bumblebee.Text.generation serving (base — no rewrite) ...
 
 ==> [Qwen3-0.6B-MLX-4bit / bb base] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 1310 ms  "<think> Okay, the user is asking for twenty programming lang..."
-    warmup 2: 60 tokens / 975 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 1: 60 tokens / 1777 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 1583 ms  "<think> Okay, the user is asking for twenty programming lang..."
 
 ==> [Qwen3-0.6B-MLX-4bit / bb base] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 961 ms = 62.4 tok/s
-    run 2: 60 tokens / 1002 ms = 59.9 tok/s
-    run 3: 60 tokens / 1080 ms = 55.6 tok/s
-    run 4: 60 tokens / 1097 ms = 54.7 tok/s
-    run 5: 60 tokens / 1055 ms = 56.9 tok/s
-    bb base           (Bumblebee, no rewrite)        : median=56.9  mean=57.9±2.9  min/max=54.7/62.4 tok/s
+    run 1: 60 tokens / 1760 ms = 34.1 tok/s
+    run 2: 60 tokens / 1777 ms = 33.8 tok/s
+    run 3: 60 tokens / 1435 ms = 41.8 tok/s
+    run 4: 60 tokens / 1416 ms = 42.4 tok/s
+    run 5: 60 tokens / 1585 ms = 37.9 tok/s
+    bb base           (Bumblebee, no rewrite)        : median=37.9  mean=38.0±3.7  min/max=33.8/42.4 tok/s
 
 ==> Spawning isolated peer for lane :bb_rewrite ...
 
-11:27:14.774 [debug] the following PyTorch parameters were unused:
+12:12:00.472 [debug] the following PyTorch parameters were unused:
 
   * model.embed_tokens.biases
   * model.embed_tokens.scales
@@ -1470,7 +1470,7 @@ results =
   * model.layers.20.sel (truncated)
 ==> Loading MLX-4bit params (dequantize → Bumblebee layout → re-quantize) ...
 
-11:27:14.780 [debug] the following parameters were ignored, because of non-matching shape:
+12:12:00.497 [debug] the following parameters were ignored, because of non-matching shape:
 
   * decoder.blocks.19.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
   * decoder.blocks.12.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
@@ -1564,37 +1564,37 @@ results =
   * decoder.blocks.6.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
   * decoder.blocks.22.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
   * decoder.blocks.1.ffn.intermediate.kernel (expect (truncated)
-    params loaded in 109 ms
+    params loaded in 136 ms
 ==> Applying EMLXAxon.rewrite/1 (all rewrites — best performing path) ...
 
 ==> [Qwen3-0.6B-MLX-4bit / bb+rewrite] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 922 ms  "<think> Okay, the user is asking for twenty programming lang..."
-    warmup 2: 60 tokens / 716 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 1: 60 tokens / 961 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 815 ms  "<think> Okay, the user is asking for twenty programming lang..."
 
 ==> [Qwen3-0.6B-MLX-4bit / bb+rewrite] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 694 ms = 86.5 tok/s
-    run 2: 60 tokens / 745 ms = 80.5 tok/s
-    run 3: 60 tokens / 722 ms = 83.1 tok/s
-    run 4: 60 tokens / 829 ms = 72.4 tok/s
-    run 5: 60 tokens / 769 ms = 78.0 tok/s
-    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=80.5  mean=80.1±4.8  min/max=72.4/86.5 tok/s
+    run 1: 60 tokens / 1104 ms = 54.3 tok/s
+    run 2: 60 tokens / 1585 ms = 37.9 tok/s
+    run 3: 60 tokens / 1357 ms = 44.2 tok/s
+    run 4: 60 tokens / 1414 ms = 42.4 tok/s
+    run 5: 60 tokens / 1343 ms = 44.7 tok/s
+    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=44.2  mean=44.7±5.4  min/max=37.9/54.3 tok/s
 
 ==> Spawning isolated peer for lane :native ...
 
 ==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...
-    loaded in 117 ms
+    loaded in 183 ms
 
 ==> [Qwen3-0.6B-MLX-4bit / native] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 421 ms  "<think> Okay, the user is asking for twenty programming lang..."
-    warmup 2: 60 tokens / 452 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 1: 60 tokens / 529 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 497 ms  "<think> Okay, the user is asking for twenty programming lang..."
 
 ==> [Qwen3-0.6B-MLX-4bit / native] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 429 ms = 139.9 tok/s
-    run 2: 60 tokens / 498 ms = 120.5 tok/s
-    run 3: 60 tokens / 381 ms = 157.5 tok/s
-    run 4: 60 tokens / 388 ms = 154.6 tok/s
-    run 5: 60 tokens / 493 ms = 121.7 tok/s
-    native            (EMLXAxon.TextGeneration)       : median=139.9  mean=138.8±15.7  min/max=120.5/157.5 tok/s
+    run 1: 60 tokens / 365 ms = 164.4 tok/s
+    run 2: 60 tokens / 552 ms = 108.7 tok/s
+    run 3: 60 tokens / 555 ms = 108.1 tok/s
+    run 4: 60 tokens / 508 ms = 118.1 tok/s
+    run 5: 60 tokens / 526 ms = 114.1 tok/s
+    native            (EMLXAxon.TextGeneration)       : median=114.1  mean=122.7±21.2  min/max=108.1/164.4 tok/s
 
 ==> Spawning isolated peer for lane :emily_quantized ...
 
@@ -1602,16 +1602,16 @@ results =
     quantizing every Axon.dense node (bits=4, group_size=64) ...
 
 ==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Warmup (2 run(s), not timed) ...
-    warmup 1: 60 tokens / 1937 ms  "<think> Okay, the user is asking for twenty programming lang..."
-    warmup 2: 60 tokens / 1872 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 1: 60 tokens / 2614 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 3608 ms  "<think> Okay, the user is asking for twenty programming lang..."
 
 ==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Benchmark (5 run(s)) ...
-    run 1: 60 tokens / 1955 ms = 30.7 tok/s
-    run 2: 60 tokens / 1937 ms = 31.0 tok/s
-    run 3: 60 tokens / 1932 ms = 31.1 tok/s
-    run 4: 60 tokens / 1910 ms = 31.4 tok/s
-    run 5: 60 tokens / 1873 ms = 32.0 tok/s
-    emily-quantized   (Emily int4, native: true)      : median=31.1  mean=31.2±0.4  min/max=30.7/32.0 tok/s
+    run 1: 60 tokens / 3497 ms = 17.2 tok/s
+    run 2: 60 tokens / 4004 ms = 15.0 tok/s
+    run 3: 60 tokens / 3380 ms = 17.8 tok/s
+    run 4: 60 tokens / 3882 ms = 15.5 tok/s
+    run 5: 60 tokens / 3638 ms = 16.5 tok/s
+    emily-quantized   (Emily int4, native: true)      : median=16.5  mean=16.4±1.0  min/max=15.0/17.8 tok/s
 ```
 
 <!-- livebook:{"output":true} -->
@@ -1641,5 +1641,5 @@ results
 <!-- livebook:{"output":true} -->
 
 ```text
-[%{stddev: 1.5, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb base", median_tok_s: 57.7, mean_tok_s: 57.4, min_tok_s: 54.9, max_tok_s: 59.6}, %{stddev: 1.8, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb+rewrite", median_tok_s: 80.6, mean_tok_s: 79.9, min_tok_s: 77.1, max_tok_s: 82.3}, %{stddev: 0.8, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "native", median_tok_s: 83.7, mean_tok_s: 83.4, min_tok_s: 81.9, max_tok_s: 84.2}, %{stddev: 0.6, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-eager", median_tok_s: 7.9, mean_tok_s: 7.8, min_tok_s: 6.8, max_tok_s: 8.6}, %{stddev: 6.3, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-native", median_tok_s: 71.2, mean_tok_s: 69.1, min_tok_s: 60.4, max_tok_s: 77.8}, %{stddev: 2.9, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb base", median_tok_s: 56.9, mean_tok_s: 57.9, min_tok_s: 54.7, max_tok_s: 62.4}, %{stddev: 4.8, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb+rewrite", median_tok_s: 80.5, mean_tok_s: 80.1, min_tok_s: 72.4, max_tok_s: 86.5}, %{stddev: 15.7, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "native", median_tok_s: 139.9, mean_tok_s: 138.8, min_tok_s: 120.5, max_tok_s: 157.5}, %{stddev: 0.4, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "emily-quantized", median_tok_s: 31.1, mean_tok_s: 31.2, min_tok_s: 30.7, max_tok_s: 32.0}]
+[%{stddev: 2.8, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb base", median_tok_s: 52.5, mean_tok_s: 51.9, min_tok_s: 48.5, max_tok_s: 56.4}, %{stddev: 3.4, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb+rewrite", median_tok_s: 77.4, mean_tok_s: 77.1, min_tok_s: 71.4, max_tok_s: 82.1}, %{stddev: 0.7, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "native", median_tok_s: 81.3, mean_tok_s: 81.2, min_tok_s: 80.0, max_tok_s: 82.2}, %{stddev: 0.3, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-eager", median_tok_s: 6.0, mean_tok_s: 6.1, min_tok_s: 5.7, max_tok_s: 6.5}, %{stddev: 3.0, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-native", median_tok_s: 57.7, mean_tok_s: 58.1, min_tok_s: 53.7, max_tok_s: 62.9}, %{stddev: 3.7, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb base", median_tok_s: 37.9, mean_tok_s: 38.0, min_tok_s: 33.8, max_tok_s: 42.4}, %{stddev: 5.4, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb+rewrite", median_tok_s: 44.2, mean_tok_s: 44.7, min_tok_s: 37.9, max_tok_s: 54.3}, %{stddev: 21.2, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "native", median_tok_s: 114.1, mean_tok_s: 122.7, min_tok_s: 108.1, max_tok_s: 164.4}, %{stddev: 1.0, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "emily-quantized", median_tok_s: 16.5, mean_tok_s: 16.4, min_tok_s: 15.0, max_tok_s: 17.8}]
 ```

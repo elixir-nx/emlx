@@ -479,7 +479,7 @@ defmodule EMLX.FastTest do
     end
   end
 
-  describe "EMLX.qwen3_kv_cache_attention/9 validation" do
+  describe "EMLX.Native.Qwen3.kv_cache_attention/9 validation" do
     test "rejects malformed Q rank before reading shapes" do
       q = Nx.broadcast(0.0, {1, 1, 4}) |> Nx.as_type(:f16) |> gpu()
       k = Nx.broadcast(0.0, {1, 1, 1, 4}) |> Nx.as_type(:f16) |> gpu()
@@ -488,7 +488,7 @@ defmodule EMLX.FastTest do
       v_cache = Nx.broadcast(0.0, {1, 1, 4, 4}) |> Nx.as_type(:f16) |> gpu()
 
       assert_raise EMLX.NIFError, ~r/q expects rank 4/, fn ->
-        EMLX.qwen3_kv_cache_attention(
+        EMLX.Native.Qwen3.kv_cache_attention(
           EMLX.Backend.from_nx(q),
           EMLX.Backend.from_nx(k),
           EMLX.Backend.from_nx(v),
@@ -510,7 +510,7 @@ defmodule EMLX.FastTest do
       v_cache = Nx.broadcast(0.0, {1, 1, 4, 4}) |> Nx.as_type(:f16) |> gpu()
 
       assert_raise EMLX.NIFError, ~r/offset must be non-negative/, fn ->
-        EMLX.qwen3_kv_cache_attention(
+        EMLX.Native.Qwen3.kv_cache_attention(
           EMLX.Backend.from_nx(q),
           EMLX.Backend.from_nx(k),
           EMLX.Backend.from_nx(v),
@@ -532,7 +532,7 @@ defmodule EMLX.FastTest do
       v_cache = Nx.broadcast(0.0, {1, 1, 4, 4}) |> Nx.as_type(:f16) |> gpu()
 
       assert_raise EMLX.NIFError, ~r/KV cache capacity 4 is smaller than required length 5/, fn ->
-        EMLX.qwen3_kv_cache_attention(
+        EMLX.Native.Qwen3.kv_cache_attention(
           EMLX.Backend.from_nx(q),
           EMLX.Backend.from_nx(k),
           EMLX.Backend.from_nx(v),
@@ -564,7 +564,7 @@ defmodule EMLX.FastTest do
       scale = 1.0 / :math.sqrt(head_dim)
 
       {attn_ref, k_ref, v_ref} =
-        EMLX.qwen3_kv_cache_attention(
+        EMLX.Native.Qwen3.kv_cache_attention(
           EMLX.Backend.from_nx(gpu(q_cpu)),
           EMLX.Backend.from_nx(gpu(k_cpu)),
           EMLX.Backend.from_nx(gpu(v_cpu)),
@@ -629,7 +629,7 @@ defmodule EMLX.FastTest do
       scale = 1.0 / :math.sqrt(head_dim)
 
       {attn_ref, k_ref, v_ref} =
-        EMLX.qwen3_kv_cache_attention(
+        EMLX.Native.Qwen3.kv_cache_attention(
           EMLX.Backend.from_nx(gpu(q_cpu)),
           EMLX.Backend.from_nx(gpu(k_cpu)),
           EMLX.Backend.from_nx(gpu(v_cpu)),
@@ -695,7 +695,7 @@ defmodule EMLX.FastTest do
       eps = 1.0e-6
 
       out_ref =
-        EMLX.qwen3_mlp(
+        EMLX.Native.Qwen3.mlp(
           EMLX.Backend.from_nx(gpu(hidden_cpu)),
           EMLX.Backend.from_nx(gpu(norm_cpu)),
           EMLX.Backend.from_nx(gpu(gate_cpu)),
@@ -719,7 +719,7 @@ defmodule EMLX.FastTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.qwen3_attention_block(
+        EMLX.Native.Qwen3.attention_block(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -766,7 +766,7 @@ defmodule EMLX.FastTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.qwen3_attention_block(
+        EMLX.Native.Qwen3.attention_block(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -815,7 +815,7 @@ defmodule EMLX.FastTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.qwen3_layer(
+        EMLX.Native.Qwen3.layer(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -876,7 +876,7 @@ defmodule EMLX.FastTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.qwen3_layer(
+        EMLX.Native.Qwen3.layer(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -1067,7 +1067,7 @@ defmodule EMLX.FastTest do
         end)
 
       out_ref =
-        EMLX.qwen3_attention_residual(
+        EMLX.Native.Qwen3.attention_residual(
           EMLX.Backend.from_nx(gpu(hidden)),
           EMLX.Backend.from_nx(gpu(attn_out)),
           EMLX.Backend.from_nx(gpu(o_proj))
@@ -1106,7 +1106,7 @@ defmodule EMLX.FastTest do
       eps = 1.0e-6
 
       token_ref =
-        EMLX.qwen3_final_greedy(
+        EMLX.Native.Qwen3.final_greedy(
           EMLX.Backend.from_nx(gpu(hidden)),
           EMLX.Backend.from_nx(gpu(norm)),
           EMLX.Backend.from_nx(gpu(lm_head)),
@@ -1163,7 +1163,7 @@ defmodule EMLX.FastTest do
       assert {:cpu, _ref} = EMLX.Backend.from_nx(embed_tokens)
 
       {_token_id, [{{k_device, _k_ref}, {v_device, _v_ref}}]} =
-        EMLX.qwen3_forward_greedy_token_id(
+        EMLX.Native.Qwen3.forward_greedy_token_id(
           0,
           EMLX.Backend.from_nx(embed_tokens),
           [layer],
@@ -1210,7 +1210,7 @@ defmodule EMLX.FastTest do
       }
 
       {token_ref, _kv_cache} =
-        EMLX.qwen3_forward_greedy_ids(
+        EMLX.Native.Qwen3.forward_greedy_ids(
           EMLX.Backend.from_nx(input_ids),
           EMLX.Backend.from_nx(embed_tokens),
           [layer],
@@ -1225,7 +1225,7 @@ defmodule EMLX.FastTest do
         )
 
       {token_id, _kv_cache} =
-        EMLX.qwen3_forward_greedy_token_id(
+        EMLX.Native.Qwen3.forward_greedy_token_id(
           0,
           EMLX.Backend.from_nx(embed_tokens),
           [layer],
@@ -1250,7 +1250,7 @@ defmodule EMLX.FastTest do
     end
   end
 
-  describe "EMLX.qwen3_attention_block/15 validation" do
+  describe "EMLX.Native.Qwen3.attention_block/15 validation" do
     test "qwen3_kv_cache_attention rejects required cache length overflow before graph construction" do
       q = Nx.broadcast(0.0, {1, 1, 2, 2}) |> Nx.as_type(:f32) |> gpu()
       k = Nx.broadcast(0.0, {1, 1, 1, 2}) |> Nx.as_type(:f32) |> gpu()
@@ -1261,7 +1261,7 @@ defmodule EMLX.FastTest do
       assert_raise EMLX.NIFError,
                    ~r/KV cache capacity 4 is smaller than required length 2147483648/,
                    fn ->
-                     EMLX.qwen3_kv_cache_attention(
+                     EMLX.Native.Qwen3.kv_cache_attention(
                        EMLX.Backend.from_nx(q),
                        EMLX.Backend.from_nx(k),
                        EMLX.Backend.from_nx(v),
@@ -1281,7 +1281,7 @@ defmodule EMLX.FastTest do
       assert_raise EMLX.NIFError,
                    ~r/KV cache capacity 4 is smaller than required length 2147483649/,
                    fn ->
-                     EMLX.qwen3_layer(
+                     EMLX.Native.Qwen3.layer(
                        EMLX.Backend.from_nx(gpu(fixtures.hidden)),
                        EMLX.Backend.from_nx(gpu(fixtures.norm1)),
                        EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -1311,7 +1311,7 @@ defmodule EMLX.FastTest do
       assert_raise EMLX.NIFError,
                    ~r/KV cache capacity 4 is smaller than required length 2147483649/,
                    fn ->
-                     EMLX.qwen3_attention_block(
+                     EMLX.Native.Qwen3.attention_block(
                        EMLX.Backend.from_nx(gpu(fixtures.hidden)),
                        EMLX.Backend.from_nx(gpu(fixtures.norm1)),
                        EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -1338,9 +1338,9 @@ defmodule EMLX.FastTest do
       lm_head = Nx.broadcast(0.1, {4, 4}) |> Nx.as_type(:f32) |> gpu()
 
       assert_raise ArgumentError,
-                   ~r/qwen3_forward_greedy_ids_token_id requires batch size 1, got batch size 2/,
+                   ~r/forward_greedy_ids_token_id requires batch size 1, got batch size 2/,
                    fn ->
-                     EMLX.qwen3_forward_greedy_ids_token_id(
+                     EMLX.Native.Qwen3.forward_greedy_ids_token_id(
                        EMLX.Backend.from_nx(input_ids),
                        EMLX.Backend.from_nx(embed_tokens),
                        [:invalid_layer],
@@ -1363,9 +1363,9 @@ defmodule EMLX.FastTest do
       lm_head = Nx.broadcast(0.1, {4, 4}) |> Nx.as_type(:f32) |> gpu()
 
       assert_raise ArgumentError,
-                   ~r/qwen3_forward_greedy_ids_chunk requires sequence length 1, got sequence length 2/,
+                   ~r/forward_greedy_ids_chunk requires sequence length 1, got sequence length 2/,
                    fn ->
-                     EMLX.qwen3_forward_greedy_ids_chunk(
+                     EMLX.Native.Qwen3.forward_greedy_ids_chunk(
                        EMLX.Backend.from_nx(input_ids),
                        EMLX.Backend.from_nx(embed_tokens),
                        [:invalid_layer],
@@ -1397,7 +1397,7 @@ defmodule EMLX.FastTest do
       assert_raise EMLX.NIFError,
                    ~r/projection output widths must be divisible by head_dim/,
                    fn ->
-                     EMLX.qwen3_attention_block(
+                     EMLX.Native.Qwen3.attention_block(
                        EMLX.Backend.from_nx(hidden),
                        EMLX.Backend.from_nx(norm),
                        EMLX.Backend.from_nx(q_proj),
@@ -1540,7 +1540,7 @@ defmodule EMLX.FastTest do
   defp qwen3_layer_quantized_call(fixtures) do
     scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
-    EMLX.qwen3_layer_quantized(
+    EMLX.Native.Qwen3.layer_quantized(
       EMLX.Backend.from_nx(gpu(fixtures.hidden)),
       ensure_gpu(fixtures.norm1),
       ensure_gpu(fixtures.q_proj),
@@ -1655,7 +1655,7 @@ defmodule EMLX.FastTest do
     }
 
     {token_refs, _kv_cache} =
-      EMLX.qwen3_forward_greedy_ids_chunk_quantized(
+      EMLX.Native.Qwen3.forward_greedy_ids_chunk_quantized(
         EMLX.Backend.from_nx(input_ids),
         EMLX.Backend.from_nx(fixtures.embed_tokens),
         [layer],
@@ -1692,7 +1692,7 @@ defmodule EMLX.FastTest do
             |> Nx.new_axis(0)
 
           {hidden_ref, k_ref, v_ref} =
-            EMLX.qwen3_layer_quantized(
+            EMLX.Native.Qwen3.layer_quantized(
               EMLX.Backend.from_nx(hidden),
               ensure_gpu(fixtures.norm1),
               ensure_gpu(fixtures.q_proj),

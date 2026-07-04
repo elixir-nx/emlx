@@ -9,6 +9,10 @@ esc = $(subst $(space),\$(space),$(1))
 PRIV_DIR = $(MIX_APP_PATH)/priv
 BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)/objs
 EMLX_SO = $(PRIV_DIR)/libemlx.so
+# Standalone qwen3 compute plugin (c_src/emlx_fast/qwen3_plugin.cpp) — no
+# erl_nif dependency, `dlopen`'d at runtime by EMLX.NIF.load_qwen3_plugin/1.
+# See c_src/emlx_fast/qwen3_plugin_abi.hpp for the rationale.
+EMLX_QWEN3_SO = $(PRIV_DIR)/libemlx_qwen3.so
 EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
 
 # Only used if MLX_BUILD is true
@@ -48,11 +52,15 @@ MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
 SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_fast/qwen3_plugin_abi.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 
+# Standalone qwen3 plugin — separate shared library, no erl_nif dependency.
+QWEN3_PLUGIN_SOURCES = c_src/emlx_fast/qwen3_plugin.cpp
+QWEN3_PLUGIN_OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(QWEN3_PLUGIN_SOURCES))
+
 # Main targets
-all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_SO))
+all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_SO)) $(call esc,$(EMLX_QWEN3_SO))
 	@ echo > /dev/null
 
 $(call esc,$(PRIV_DIR)):
@@ -101,6 +109,12 @@ $(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(OBJECTS)
 	@ mkdir -p "$(EMLX_LIB_DIR)"
 	@ cp -a "$(MLX_LIB_DIR)"/* "$(EMLX_LIB_DIR)"
 	$(CXX) $(OBJECTS) -o "$(EMLX_SO)" $(LDFLAGS)
+
+# Depends on $(EMLX_SO) (not just $(MLX_SO)) so the mlx lib copy above has
+# already happened — this plugin's rpath (`@loader_path/mlx/lib`) resolves
+# relative to its own location in the same $(PRIV_DIR).
+$(call esc,$(EMLX_QWEN3_SO)): $(call esc,$(EMLX_SO)) $(QWEN3_PLUGIN_OBJECTS)
+	$(CXX) $(QWEN3_PLUGIN_OBJECTS) -o "$(EMLX_QWEN3_SO)" $(LDFLAGS)
 
 clean:
 	rm -rf "$(PRIV_DIR)"
