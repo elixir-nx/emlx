@@ -133,4 +133,13 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
+  # resolve_runtime_call — delivers the real Elixir callback's reply for one
+  # in-flight Nx.runtime_call/4 round trip (see EMLX.await_worker/2 and
+  # EMLX.Native.Expr's moduledoc "Runtime calls" section), waking the worker
+  # thread blocked inside EMLXRuntimeCall::eval_cpu/eval_gpu. NOT
+  # worker-routed — no argv[0] worker ref; runs directly on the calling
+  # scheduler thread.
+  def resolve_runtime_call(_pending, _status, _result) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end

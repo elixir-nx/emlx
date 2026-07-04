@@ -201,11 +201,12 @@ bb_results =
 
 IO.puts("\n==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...")
 t_native = System.monotonic_time(:millisecond)
+
 native_serving =
   EMLXAxon.TextGeneration.from_mlx4bit(
     Path.expand(model_path_raw),
     tokenizer,
-    compiler: Nx.Defn.Evaluator,
+    defn_options: [compiler: Nx.Defn.Evaluator],
     max_new_tokens: max_new,
     sampler: :greedy,
     profile_timing: native_profile_timing?
@@ -219,9 +220,9 @@ native_extract = fn
 
   %{results: [%{generated_text: text}]} ->
     %{"input_ids" => ids} =
-      Nx.with_default_backend(Nx.BinaryBackend, fn ->
-        Bumblebee.apply_tokenizer(tokenizer, text)
-      end)
+      Bumblebee.apply_tokenizer(tokenizer, text)
+      # Nx.with_default_backend(Nx.BinaryBackend, fn ->
+      # end)
 
     {text, elem(Nx.shape(ids), 1)}
 end

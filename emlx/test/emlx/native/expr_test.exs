@@ -3770,7 +3770,7 @@ defmodule EMLX.Native.ExprTest do
   defp dispatch_cache_entries_mentioning(shape) do
     :emlx_native_dispatch_cache
     |> :ets.tab2list()
-    |> Enum.filter(fn {key, _resource, _hooks} -> term_mentions?(key, shape) end)
+    |> Enum.filter(fn {key, _resource, _hooks, _runtime_calls} -> term_mentions?(key, shape) end)
     |> Enum.map(&elem(&1, 0))
     |> Enum.uniq()
   end

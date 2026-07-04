@@ -20,6 +20,10 @@ defmodule EMLX.Native.Expr do
   - `outputs`  — list of refs identifying the return values.
   - `hooks`    — `[%{name, callback, template, refs}]` for `Nx.Defn.Kernel.hook/2,3`
                  observers reached from the top-level scope (see "Hooks" below).
+  - `runtime_calls` — `[%{index, callback, args_template, arg_param_positions, opts}]`
+                 for `Nx.runtime_call/4` sites lowered in-graph as a genuine
+                 `:runtime_call` opcode (see "Runtime calls" below), indexed
+                 by the `callback_index` baked into each site's `iattrs`.
 
   ## iattrs encoding per opcode
 
@@ -61,7 +65,8 @@ defmodule EMLX.Native.Expr do
   | `:iota`   | `[dtype_int, n_dims, axis_int, d0..dn-1]` — dtype, rank, axis (−1=flat), shape dims. No operands. |
   | `:eye`    | `[dtype_int, m, n]` — dtype and the two shape dims. No operands.    |
   | `:quantized_matmul` | `[group_size, bits, transpose_int, mode_int, has_bias_int]` — see "Quantized dot specialization" below. Operands: `[activation, weight, scales, biases?]` (biases omitted when `has_bias_int` is 0). |
-  | `:fast_rms_norm`, `:fast_layer_norm`, `:fast_layer_norm_no_bias`, `:fast_swiglu`, `:fast_sdpa*`, `:fast_rope*` | `EMLX.Fast.*`'s fused `mlx::core::fast::*`-backed opcodes. Emitted for a `:metadata` node carrying a `:__EMLX__` key (see the `:metadata` `expand_node` clause and `EMLX.Fast`'s moduledoc) — never for a bare `:runtime_call` (that always requires a graph split; see `EMLX.split_point?/1`). |
+  | `:fast_rms_norm`, `:fast_layer_norm`, `:fast_layer_norm_no_bias`, `:fast_swiglu`, `:fast_sdpa*`, `:fast_rope*` | `EMLX.Fast.*`'s fused `mlx::core::fast::*`-backed opcodes. Emitted for a `:metadata` node carrying a `:__EMLX__` key (see the `:metadata` `expand_node` clause and `EMLX.Fast`'s moduledoc). |
+  | `:runtime_call` | `[callback_index, n_outputs, dtype0, n_dims0, d0.., dtype1, n_dims1, d1.., ...]` — index into the program's `runtime_calls` field, output count, then one `[dtype_int, n_dims, dims...]` group per output (see "Runtime calls" below). Operands are the flattened leaves of the callback's argument container, in order. |
 
   Non-negative axes: the lowerer normalises negative axis values before encoding
   so C++ handlers can use them directly as 0-based indices.
@@ -115,6 +120,47 @@ defmodule EMLX.Native.Expr do
   over just that body before lowering it (`merge_scope_ids/2`) — which still
   correctly excludes any `cond` nested *inside* that body, so a genuinely
   cond-branch-local hook a level deeper still raises.
+
+  ## Runtime calls (`Nx.runtime_call/4`)
+
+  Unlike a hook, `Nx.runtime_call/4`'s callback return value *is* threaded
+  back into the graph (`Nx.Defn.Evaluator.eval_apply/5`'s `:runtime_call`
+  clause feeds `fun`'s result straight back as the node's value), so it
+  cannot be a fire-and-forget passthrough like `:token` — it lowers to a
+  real `:runtime_call` opcode with real output(s). At eval time the compiled
+  MLX graph's `EMLXRuntimeCall` primitive (`emlx_compiler.cpp`) blocks the
+  worker OS thread, `enif_send`s a request (callback index + encoded operand
+  bytes) to the calling BEAM process, and waits on a mutex/condvar handle for
+  `EMLX.NIF.resolve_runtime_call/3` to deliver the reply — see
+  `EMLX.await_worker/2`'s `:emlx_runtime_call` receive clause, which runs the
+  real callback and replies. This one primitive genuinely re-executes on
+  every replay of the compiled tape (unlike the interpreter lambda itself,
+  which MLX's `compile()` only ever runs once to build said tape — see the
+  plan doc this was implemented from for why a plain closure call inside the
+  lambda would not have worked).
+
+  Single-tensor vs. tuple/container output are both single `:runtime_call`
+  instructions: a single-tensor result stores one ref in `node_to_ref`; a
+  tuple/container result stores a list of refs (the multi-output linalg
+  convention `:elem` already reads from — see qr/eigh/svd/lu above), one per
+  flattened output leaf.
+
+  Same cond-branch-locality hazard as a hook (see "Hooks" above) applies
+  identically here: EMLX's `cond` unconditionally evaluates every branch and
+  `:select`s, so a `:runtime_call` reachable only from inside a `cond`
+  branch — not the shared/parent scope, per `top_scope_ids` — would fire its
+  callback on every call regardless of which branch "won", diverging from
+  `Nx.Defn.Evaluator` (which only ever calls the selected branch's callback).
+  Such a call raises instead of lowering, exactly like the hook guard.
+
+  `while`-body-nested and custom-fun-reduction-body-nested `:runtime_call`
+  need no special guard, for the same reasons documented for hooks above.
+
+  A bare-`:parameter` operand leaf's original bound value is substituted
+  back in place of the raw bytes MLX sent over the wire whenever that
+  value carries `quantization_config` (`arg_param_positions`, set by this
+  clause) — see `EMLX.handle_runtime_call/5`'s doc for why (mirrors the
+  identical output-side substitution in `EMLX.build_native_eval_fn/7`).
 
   ## Quantized dot specialization
 
@@ -181,7 +227,7 @@ defmodule EMLX.Native.Expr do
   }
 
   @enforce_keys [:inputs, :captures, :constants, :instructions, :outputs]
-  defstruct [:inputs, :captures, :constants, :instructions, :outputs, hooks: []]
+  defstruct [:inputs, :captures, :constants, :instructions, :outputs, hooks: [], runtime_calls: []]
 
   @type node_ref :: reference()
   @type hook :: %{
@@ -190,13 +236,21 @@ defmodule EMLX.Native.Expr do
           template: Nx.Container.t(),
           refs: [node_ref()]
         }
+  @type runtime_call :: %{
+          index: non_neg_integer(),
+          callback: (Nx.Container.t(), keyword() -> Nx.Container.t()),
+          args_template: Nx.Container.t(),
+          arg_param_positions: [non_neg_integer() | nil],
+          opts: keyword()
+        }
   @type t :: %__MODULE__{
           inputs: [node_ref()],
           captures: [{node_ref(), Nx.Tensor.t()}],
           constants: [{node_ref(), number(), Nx.Type.t()}],
           instructions: [{node_ref(), atom(), [node_ref()], [integer()]}],
           outputs: [node_ref()],
-          hooks: [hook()]
+          hooks: [hook()],
+          runtime_calls: [runtime_call()]
         }
 
   # ── lowering ──────────────────────────────────────────────────────────────
@@ -243,9 +297,11 @@ defmodule EMLX.Native.Expr do
       instructions: [],
       node_to_ref: %{},
       hooks: [],
-      # A hook (`:token`/`:attach_token`) is only lowerable from the shared/
-      # parent scope — see the moduledoc's "Hooks" section for why a
-      # cond-branch-local hook must raise instead.
+      runtime_calls: [],
+      # A hook (`:token`/`:attach_token`) or a `:runtime_call` is only
+      # lowerable from the shared/parent scope — see the moduledoc's "Hooks"
+      # / "Runtime calls" sections for why a cond-branch-local one must raise
+      # instead.
       top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new(),
       quant_signature: quant_signature
     }
@@ -272,7 +328,8 @@ defmodule EMLX.Native.Expr do
       constants: Enum.reverse(state.constants),
       instructions: Enum.reverse(state.instructions),
       outputs: output_refs,
-      hooks: Enum.reverse(state.hooks)
+      hooks: Enum.reverse(state.hooks),
+      runtime_calls: Enum.reverse(state.runtime_calls)
     }
   end
 
@@ -1985,6 +2042,94 @@ defmodule EMLX.Native.Expr do
        ) do
     ref = Map.fetch!(state.node_to_ref, expr.data.id)
     %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
+  end
+
+  # `:runtime_call` — see the moduledoc's "Runtime calls" section. `args`
+  # is `[tensor_expr, callback, out_template, opts]`
+  # (`Nx.Defn.Expr.runtime_call/4`): `out_template` is a plain `%Nx.Tensor{}`
+  # for a single-tensor result, or any other `Nx.Container.t()` (tuple, list,
+  # map, custom struct) for a multi-output result — both cases lower to one
+  # `:runtime_call` instruction, storing either a single ref or a list of
+  # refs (the multi-output linalg convention) in `node_to_ref`.
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :runtime_call,
+             args: [tensor_expr, callback, out_template, opts]
+           }
+         },
+         state
+       ) do
+    unless MapSet.member?(state.top_scope_ids, id) do
+      raise ArgumentError,
+            "cannot lower a runtime_call nested inside a cond branch: EMLX's cond compiles " <>
+              "by evaluating every branch unconditionally (:select), which would fire this " <>
+              "runtime_call's callback on every call regardless of which branch is actually " <>
+              "taken -- a behavior divergence from Nx.Defn.Evaluator (which only fires the " <>
+              "selected branch's callback). Move the runtime_call outside the cond."
+    end
+
+    operand_leaves = Composite.flatten_list([tensor_expr])
+
+    operand_refs = Enum.map(operand_leaves, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    # A bare `:parameter` leaf's position, or `nil` — parallel to
+    # `operand_refs`/`args_template`'s leaf order. Lets `EMLX.handle_runtime_call/5`
+    # substitute back the *original* bound tensor for a leaf whose real bound
+    # value turns out to carry `quantization_config` (see
+    # `EMLX.Quantization.dequantize/1`): a quantized tensor's Nx-visible
+    # `.type`/`.shape` is a logical fiction over a differently-shaped, scale/
+    # bias-stripped physical MLX array (see `EMLX.build_native_eval_fn/7`'s
+    # doc for the identical output-side case), so naively rebuilding the
+    # callback's argument from the raw bytes MLX actually sent over the wire
+    # via `leaf.type`/`leaf.shape` would corrupt it. A leaf that isn't a bare
+    # parameter can never be quantized in the first place (quantization_config
+    # is real backend metadata that cannot survive being produced by an MLX
+    # op — only a directly-bound tensor carries it), so `nil` there is exact,
+    # not just a fallback.
+    arg_param_positions =
+      Enum.map(operand_leaves, fn
+        %T{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos
+        _ -> nil
+      end)
+
+    output_templates =
+      case out_template do
+        %Nx.Tensor{} = t -> [t]
+        container -> Composite.flatten_list([container])
+      end
+
+    callback_index = length(state.runtime_calls)
+
+    iattrs =
+      [callback_index, length(output_templates)] ++
+        Enum.flat_map(output_templates, fn t ->
+          dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(t.type))
+          shape = Tuple.to_list(t.shape)
+          [dtype_int, length(shape) | shape]
+        end)
+
+    runtime_call = %{
+      index: callback_index,
+      callback: callback,
+      args_template: Composite.traverse(tensor_expr, &Nx.to_template/1),
+      arg_param_positions: arg_param_positions,
+      opts: opts
+    }
+
+    result_ref =
+      case out_template do
+        %Nx.Tensor{} -> make_ref()
+        _ -> Enum.map(output_templates, fn _ -> make_ref() end)
+      end
+
+    %{
+      state
+      | instructions: [{result_ref, :runtime_call, operand_refs, iattrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, result_ref),
+        runtime_calls: [runtime_call | state.runtime_calls]
+    }
   end
 
   # while (statically-counted range loop, unrolled) — see block-descent helper

@@ -1009,6 +1009,12 @@ static int open_resources(ErlNifEnv *env) {
     return -1;
   }
 
+  // emlx::native::PendingRuntimeCall — opaque handle for one in-flight
+  // Nx.runtime_call/4 round trip (see emlx_runtime_call_bridge.hpp).
+  if (!open_resource<emlx::native::PendingRuntimeCall>(env, mod, "PendingRuntimeCall")) {
+    return -1;
+  }
+
   return 0;
 }
 
@@ -1988,6 +1994,10 @@ static ErlNifFunc nif_funcs[] = {
     // ── Native compiler NIFs.
     {"compile_program", 9, compile_program_async},
     {"eval_program", 3, eval_program_async},
+    // resolve_runtime_call is NOT worker-routed: it only decodes a reply and
+    // memcpy's it into pre-registered buffers/notifies a condvar — no MLX
+    // graph work, so it can run directly on the calling BEAM scheduler.
+    {"resolve_runtime_call", 3, emlx::native::resolve_runtime_call},
 
     // ── Qwen3 model accelerators (emlx_fast/qwen3.cpp).
     {"qwen3_kv_cache_attention", 11, qwen3_kv_cache_attention_async},

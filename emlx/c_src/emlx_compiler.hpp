@@ -21,6 +21,12 @@ namespace native {
 struct Expr {
   int num_inputs = 0;
   std::uintptr_t compile_id = 0;  // unique key for mlx::core::detail compile cache
+  // True when this program contains an inlined `:runtime_call` node — see
+  // eval_program: such a program is force-evaluated (mlx::core::eval on the
+  // outputs) before returning, instead of the usual deferred/lazy return, so
+  // EMLXRuntimeCall::eval_cpu/eval_gpu fires while this NIF call's caller
+  // pid (emlx::g_current_caller_pid) is still in scope.
+  bool has_runtime_call = false;
   emlx::function compiled_fn;
 
   ~Expr();

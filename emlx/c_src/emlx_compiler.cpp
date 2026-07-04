@@ -10,6 +10,7 @@
 // integers, no lockstep parity table to maintain.
 
 #include "emlx_compiler.hpp"
+#include "emlx_runtime_call_bridge.hpp"
 #include "mlx/allocator.h"
 #include "mlx/compile_impl.h"
 #include "mlx/primitives.h"
@@ -1658,7 +1659,88 @@ contiguous_all(std::vector<mlx::core::array> arrs) {
   return arrs;
 }
 
+// A genuine `mlx::core::Primitive` for `Nx.runtime_call/4` — see
+// EMLX.Native.Expr's moduledoc "Runtime calls" section. Unlike every other
+// entry in this file (a plain function called once, during the single
+// interpreter-lambda trace `mlx::core::detail::compile()` performs — see
+// this file's header comment), a Primitive's `eval_cpu`/`eval_gpu` genuinely
+// re-executes on every replay of the cached compiled tape, which is what
+// lets the real Elixir callback fire once per `eval_program` call instead of
+// once ever. `eval()` blocks the calling worker OS thread inside
+// `invoke_runtime_call` (emlx_runtime_call_bridge.hpp) until the Elixir side
+// replies via `EMLX.NIF.resolve_runtime_call/3`.
+class EMLXRuntimeCall : public mlx::core::Primitive {
+public:
+  EMLXRuntimeCall(mlx::core::Stream stream, int64_t callback_index)
+      : mlx::core::Primitive(stream), callback_index_(callback_index) {}
+
+  void eval_cpu(const std::vector<mlx::core::array> &inputs,
+               std::vector<mlx::core::array> &outputs) override {
+    eval(inputs, outputs);
+  }
+  void eval_gpu(const std::vector<mlx::core::array> &inputs,
+               std::vector<mlx::core::array> &outputs) override {
+    eval(inputs, outputs);
+  }
+
+  // Side-effecting (fires an Elixir callback with observable effects) —
+  // never dedup/CSE. This is also `Primitive::is_equivalent`'s own default,
+  // kept explicit here for clarity rather than relied upon.
+  bool is_equivalent(const mlx::core::Primitive &) const override { return false; }
+
+  const char *name() const override { return "EMLXRuntimeCall"; }
+
+private:
+  void eval(const std::vector<mlx::core::array> &inputs,
+           std::vector<mlx::core::array> &outputs) {
+    emlx::native::invoke_runtime_call(callback_index_, inputs, outputs);
+  }
+
+  int64_t callback_index_;
+};
+
 static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
+    // runtime_call: operands = flattened callback-argument leaves, in order.
+    // attrs = [callback_index, n_outputs, dtype0, n_dims0, d0.., dtype1,
+    // n_dims1, d1.., ...] — see EMLX.Native.Expr's moduledoc iattrs table.
+    // outputs = one array per declared output, produced by the
+    // EMLXRuntimeCall primitive above (never eagerly computed here).
+    {"runtime_call",
+     [](const auto &ops, const auto &attrs) -> std::vector<mlx::core::array> {
+       size_t off = 0;
+       int64_t callback_index = attrs[off++];
+       int64_t n_outputs = attrs[off++];
+
+       std::vector<mlx::core::Shape> shapes;
+       std::vector<mlx::core::Dtype> dtypes;
+       shapes.reserve(static_cast<size_t>(n_outputs));
+       dtypes.reserve(static_cast<size_t>(n_outputs));
+
+       for (int64_t i = 0; i < n_outputs; i++) {
+         dtypes.push_back(int_to_dtype(attrs[off++]));
+         int64_t n_dims = attrs[off++];
+         std::vector<int> dims(static_cast<size_t>(n_dims));
+         for (int64_t d = 0; d < n_dims; d++) {
+           dims[static_cast<size_t>(d)] = static_cast<int>(attrs[off++]);
+         }
+         shapes.push_back(to_shape(dims));
+       }
+
+       // Pinned to the CPU stream (like the linalg factorizations above),
+       // regardless of the compiled graph's default device. eval_gpu is
+       // never actually reached this way: the primitive does no Metal work
+       // of its own (it only blocks the worker thread on the Elixir
+       // round-trip and memcpy's the reply into the output buffer), and
+       // running it under mlx::core::gpu::eval's Metal command-buffer
+       // bookkeeping segfaults — see workdir/native-compiler/32a for
+       // details. MLX handles the cross-stream data dependencies (GPU
+       // operand arrays feeding a CPU-pinned primitive, and vice versa)
+       // the same way it does for the linalg ops.
+       auto primitive = std::make_shared<EMLXRuntimeCall>(
+           mlx::core::default_stream(k_linalg_cpu), callback_index);
+       return mlx::core::array::make_arrays(shapes, dtypes, primitive, ops);
+     }},
+
     // qr (reduced mode): operands = [a]; outputs = [q, r].
     {"qr",
      [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
@@ -1809,11 +1891,14 @@ ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
 
     // Validate all op names against the registry at compile time so that any
     // unknown op surfaces here rather than inside the lambda at eval time.
+    bool has_runtime_call = false;
     for (const auto &name : op_names) {
       if (op_registry.find(name) == op_registry.end() &&
           multi_op_registry.find(name) == multi_op_registry.end())
         return nx::nif::error(
             env, ("emlx::native: unknown op \"" + name + "\"").c_str());
+      if (name == "runtime_call")
+        has_runtime_call = true;
     }
 
     // Build constant arrays on the current (worker) thread using its default stream.
@@ -1899,6 +1984,7 @@ ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
     new (ptr) Expr();
     ptr->num_inputs = num_inputs_val;
     ptr->compile_id = unique_id;
+    ptr->has_runtime_call = has_runtime_call;
     {
       std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
       ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
@@ -1943,6 +2029,22 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
     {
       std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
       outputs = prog->compiled_fn(inputs);
+    }
+
+    // A program containing an inlined `:runtime_call` node must be forced to
+    // materialize now, while the caller pid this NIF call was dispatched
+    // with (emlx::g_current_caller_pid, set by emlx::async_dispatch — see
+    // emlx_async.hpp) is still in scope: EMLXRuntimeCall::eval_cpu/eval_gpu
+    // reads it to know which BEAM process to send the round-trip request
+    // to. Deliberately outside `s_mlx_compile_mutex`'s scope above — that
+    // lock is process-wide (shared with every other worker's
+    // compile_program/eval_program calls), and a runtime_call's blocking
+    // wait can run arbitrary, unbounded Elixir code, including calls that
+    // themselves need that same lock on another worker thread. Every other
+    // program keeps today's lazy/deferred return (no eval() call here).
+    if (prog->has_runtime_call) {
+      mlx::core::eval(outputs);
+      mlx::core::synchronize();
     }
 
     size_t n = outputs.size();
