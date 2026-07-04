@@ -3045,6 +3045,26 @@ defmodule EMLX.Native.Expr do
                                                         {ops, ors, ias, rmap, flat} ->
         wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
 
+        # Defensive: a `@kind_instr` operand must reference a *prior*
+        # instruction's already-pushed result (the C++ interpreter's flat
+        # `results` accumulator only contains entries for instructions
+        # processed so far -- see emlx_compiler.cpp's `resolve` lambda). A
+        # forward/self reference here would silently pass this Elixir-side
+        # map lookup (the ref exists in `rmap`) but crash the NIF with an
+        # opaque `vector::_M_range_check` once C++ tries to index into a
+        # `results` vector that isn't that big yet. Catching it here turns
+        # that into an actionable error pointing at the offending op.
+        for packed <- wire_operands,
+            (packed >>> @kind_shift) == @kind_instr,
+            (packed &&& (1 <<< @kind_shift) - 1) >= flat do
+          raise ArgumentError,
+                "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
+                  "references result index #{packed &&& (1 <<< @kind_shift) - 1} of the " <>
+                  "flat results accumulator, but only #{flat} result(s) have been produced " <>
+                  "so far -- this is a forward/self reference bug in program lowering, not " <>
+                  "a valid program. Full instruction list: #{inspect(prog.instructions)}"
+        end
+
         {rmap2, flat2} =
           case id do
             ids when is_list(ids) ->
