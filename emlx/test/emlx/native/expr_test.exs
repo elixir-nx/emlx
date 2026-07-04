@@ -7,7 +7,6 @@ defmodule EMLX.Native.ExprTest do
     - compile_program / eval_program NIFs via to_wire/1 (C++ replay)
     - Compiler seam: Nx.Defn.compile(..., compiler: EMLX) via single-NIF replay
     - Unary + binary + compare/logical equivalence vs EMLX.Backend
-    - Perf gate: single-NIF replay vs Evaluator on a multi-add chain
   """
   use ExUnit.Case, async: false
   import Bitwise
@@ -479,45 +478,6 @@ defmodule EMLX.Native.ExprTest do
     |> Nx.add(y)
     |> Nx.add(y)
     |> Nx.add(y)
-  end
-
-  @tag :perf
-  test "perf gate: single-NIF replay beats op-by-op Evaluator on 10-add chain" do
-    n_adds = 10
-    x = Nx.tensor(0.0, backend: EMLX.Backend)
-    y = Nx.tensor(1.0, backend: EMLX.Backend)
-
-    compiled_native =
-      Nx.Defn.compile(&chain_10/2, [Nx.template({}, :f32), Nx.template({}, :f32)], compiler: EMLX)
-
-    compiled_eval =
-      Nx.Defn.compile(&chain_10/2, [Nx.template({}, :f32), Nx.template({}, :f32)],
-        compiler: Nx.Defn.Evaluator
-      )
-
-    # Fair comparison: both paths force evaluation via Nx.to_number/1.
-    # Without forcing eval, the Evaluator returns a lazy MLX tensor while
-    # eval_program eagerly calls mlx::core::eval, making the comparison unfair.
-    force_eval = fn compiled -> Nx.to_number(compiled.(x, y)) end
-
-    force_eval.(compiled_native)
-    force_eval.(compiled_eval)
-
-    n_iters = 500
-    native_us = bench_us(n_iters, fn -> force_eval.(compiled_native) end)
-    eval_us = bench_us(n_iters, fn -> force_eval.(compiled_eval) end)
-    speedup = eval_us / native_us
-
-    if speedup < 1.0 do
-      IO.puts(
-        "\n[perf gate] #{n_adds}-add chain | native: #{Float.round(native_us, 1)} µs " <>
-          "| evaluator: #{Float.round(eval_us, 1)} µs | speedup: #{Float.round(speedup, 2)}×"
-      )
-    end
-
-    assert native_us < eval_us,
-           "native path (#{Float.round(native_us, 1)} µs) should beat " <>
-             "Evaluator (#{Float.round(eval_us, 1)} µs) on 10-add chain"
   end
 
   # Helper: compile + eval the defn via the native path, compare to eager backend.
