@@ -570,7 +570,13 @@ defmodule EMLX do
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
              is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) do
     {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
-    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device))))
+
+    device =
+      merge_device(
+        dev_q,
+        merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device)))
+      )
+
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -810,7 +816,10 @@ defmodule EMLX do
     {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
 
     device =
-      merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device))))
+      merge_device(
+        dev_q,
+        merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device)))
+      )
 
     {worker, effective_device} = resolve_worker(device)
 
@@ -1088,7 +1097,7 @@ defmodule EMLX do
         {_dev_gate, ref_gate},
         {_dev_up, ref_up},
         {_dev_down, ref_down},
-        eps 
+        eps
       )
       when is_tensor(dev_h, ref_h) and is_float(eps) do
     device = dev_h
@@ -2191,9 +2200,15 @@ defmodule EMLX do
       #   nx::nif::ok(env, term)   => {:ok, term}
       #   nx::nif::error(env, msg) => {:error, msg}
       # The async wrapper forwards the payload as-is in {ref, payload}.
-      {^job_ref, :ok} -> :ok
-      {^job_ref, {:ok, result}} -> result
-      {^job_ref, {:error, reason}} -> raise(EMLX.NIFError, List.to_string(reason))
+      {^job_ref, :ok} ->
+        :ok
+
+      {^job_ref, {:ok, result}} ->
+        result
+
+      {^job_ref, {:error, reason}} ->
+        raise(EMLX.NIFError, List.to_string(reason))
+
       {:emlx_runtime_call, pending, callback_index, args_binaries} ->
         handle_runtime_call(pending, callback_index, args_binaries, runtime_calls, tensors, dev)
         await_worker(job_ref, runtime_calls, tensors, dev)
@@ -2249,11 +2264,15 @@ defmodule EMLX do
         end
       )
 
-    callback_queue = %EMLX.CommandQueue{ref: EMLX.Application.runtime_call_worker(dev), device: dev}
+    callback_queue = %EMLX.CommandQueue{
+      ref: EMLX.Application.runtime_call_worker(dev),
+      device: dev
+    }
 
     reply =
       try do
-        result = EMLX.CommandQueue.with_queue(callback_queue, fn -> callback.(args_container, opts) end)
+        result =
+          EMLX.CommandQueue.with_queue(callback_queue, fn -> callback.(args_container, opts) end)
 
         binaries =
           [result]
@@ -2923,7 +2942,7 @@ defmodule EMLX do
   # compilation on the same device; the command queue (if any) is
   # propagated through the process binding set by the outer wrapper.
   defp build_split_chain_eval_fn(output_expr, effective_device) do
-    stages = Nx.Defn.Graph.split(output_expr, &(if split_point?(&1), do: :both, else: :none))
+    stages = Nx.Defn.Graph.split(output_expr, &if(split_point?(&1), do: :both, else: :none))
 
     fn [params] ->
       {_worker, dev} = resolve_worker(effective_device)
@@ -3052,7 +3071,6 @@ defmodule EMLX do
     |> Nx.Defn.Composite.flatten_list()
     |> Enum.all?(&match?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter}}, &1))
   end
-
 
   # Maps a flat output leaf to the carry index it projects from `while_id`.
   defp while_output_index(%Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}}, while_id)

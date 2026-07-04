@@ -520,7 +520,6 @@ defmodule EMLX.Native.ExprTest do
              "Evaluator (#{Float.round(eval_us, 1)} µs) on 10-add chain"
   end
 
-
   # Helper: compile + eval the defn via the native path, compare to eager backend.
   defp check_equiv(fun, inputs_eager, opts \\ []) do
     tol = Keyword.get(opts, :tol, 1.0e-4)
@@ -839,7 +838,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "reshape" do
     test "1D → 2D, 2D → 1D" do
       x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], backend: EMLX.Backend)
@@ -1115,7 +1113,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "sum" do
     test "sum all axes f32" do
       x = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: EMLX.Backend)
@@ -1361,7 +1358,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "dot (non-batched)" do
     test "matmul {2,3} × {3,4} → {2,4}" do
       a = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
@@ -1394,7 +1390,6 @@ defmodule EMLX.Native.ExprTest do
       check_equiv(fn x, y -> Nx.dot(x, [2], [0], y, [1], [0]) end, [a, b], tol: 1.0e-3)
     end
   end
-
 
   describe "conv (1D)" do
     test "1D conv {1,1,5} input, {1,1,3} kernel" do
@@ -1436,7 +1431,6 @@ defmodule EMLX.Native.ExprTest do
       check_equiv(fn x, k -> Nx.conv(x, k) end, [input, kernel], tol: 1.0e-3)
     end
   end
-
 
   defn sum_all(x), do: Nx.sum(x)
   defn matmul_22(a, b), do: Nx.dot(a, b)
@@ -1491,7 +1485,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   defn sum_axis1_keep(x), do: Nx.sum(x, axes: [1], keep_axes: true)
   defn argmax_axis0(x), do: Nx.argmax(x, axis: 0)
   defn matmul_defn(a, b), do: Nx.dot(a, b)
@@ -1538,7 +1531,6 @@ defmodule EMLX.Native.ExprTest do
   defn take_along_axis_defn(x, idx), do: Nx.take_along_axis(x, idx, axis: 0)
   defn indexed_put_defn(x, idx, updates), do: Nx.indexed_put(x, idx, updates)
   defn indexed_add_defn(x, idx, updates), do: Nx.indexed_add(x, idx, updates)
-
 
   describe "select" do
     test "interpreter parity — f32" do
@@ -1609,7 +1601,6 @@ defmodule EMLX.Native.ExprTest do
       assert_close(native, eager)
     end
   end
-
 
   describe "slice (static indices)" do
     test "interpreter parity — static 2D slice" do
@@ -1702,7 +1693,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "gather" do
     test "interpreter parity — 2D gather on axis 0" do
       x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
@@ -1776,7 +1766,6 @@ defmodule EMLX.Native.ExprTest do
       assert_close(native, eager)
     end
   end
-
 
   describe "indexed_put" do
     test "interpreter parity" do
@@ -1862,7 +1851,6 @@ defmodule EMLX.Native.ExprTest do
     |> await_worker!()
   end
 
-
   defn sort_asc_defn(x), do: Nx.sort(x, axis: 0, direction: :asc)
   defn sort_desc_defn(x), do: Nx.sort(x, axis: 1, direction: :desc)
   defn argsort_asc_defn(x), do: Nx.argsort(x, axis: 0, direction: :asc)
@@ -1883,7 +1871,6 @@ defmodule EMLX.Native.ExprTest do
   defn fft2_defn(x), do: Nx.fft2(x)
   defn rfft_defn(x), do: Nx.rfft(x)
 
-
   defn iota_flat_defn(), do: Nx.iota({3, 4})
   defn iota_axis1_defn(), do: Nx.iota({3, 4}, axis: 1)
   defn iota_f32_defn(), do: Nx.iota({5}, type: :f32)
@@ -1899,7 +1886,6 @@ defmodule EMLX.Native.ExprTest do
     {samples, _key} = Nx.Random.normal(key, shape: {8})
     samples
   end
-
 
   describe "sort" do
     test "sort ascending, axis 0 vs EMLX.Backend — f32" do
@@ -1981,7 +1967,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "window reductions" do
     test "window_sum 2x2, no padding vs EMLX.Backend — f32" do
       x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
@@ -2045,7 +2030,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "cumulative reductions" do
     test "cumulative_sum axis 1 vs EMLX.Backend — f32" do
       x = Nx.iota({2, 4}, type: :f32, backend: EMLX.Backend)
@@ -2088,7 +2072,6 @@ defmodule EMLX.Native.ExprTest do
       assert_close(native, eager)
     end
   end
-
 
   describe "fft / ifft" do
     test "fft 1D vs EMLX.Backend" do
@@ -2137,7 +2120,6 @@ defmodule EMLX.Native.ExprTest do
       assert_complex_close(native, eager)
     end
   end
-
 
   describe "iota" do
     test "iota flat: IR has :iota instruction, no operands" do
@@ -2194,7 +2176,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "eye" do
     test "eye: IR has :eye instruction, no operands" do
       prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
@@ -2243,7 +2224,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "Nx.Random" do
     test "Nx.Random.uniform: native matches evaluator for fixed key" do
       key = Nx.Random.key(42) |> Nx.backend_transfer(EMLX.Backend)
@@ -2275,7 +2255,6 @@ defmodule EMLX.Native.ExprTest do
       assert_close(native, eager, 1.0e-4)
     end
   end
-
 
   # cond: simple two-branch predicate on a scalar.
   defn cond_two_branch(x) do
@@ -2309,7 +2288,6 @@ defmodule EMLX.Native.ExprTest do
       {Nx.add(x, 1), Nx.add(i, 1), n}
     end
   end
-
 
   # A) A `while` followed by a deeply-shared post-DAG. `add(acc, acc)` references
   # `acc` twice, so after N levels the graph is N nodes but 2^N tree paths. The
@@ -2353,7 +2331,6 @@ defmodule EMLX.Native.ExprTest do
     %{value: Nx.add(acc, 1.0), doubled: Nx.multiply(acc, 2.0)}
   end
 
-
   describe "cond" do
     test "cond two-branch: native matches evaluator (negative input)" do
       x = Nx.tensor(-3.0, backend: EMLX.Backend)
@@ -2378,7 +2355,6 @@ defmodule EMLX.Native.ExprTest do
       end
     end
   end
-
 
   describe "while" do
     test "while: count from 0 to 10" do
@@ -2442,7 +2418,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "splitter regressions" do
     # A) Without id-memoization in rewrite_subtree this hangs (2^28 tree walk),
     # so a generous-but-bounded timeout turns the hang into a test failure.
@@ -2475,7 +2450,6 @@ defmodule EMLX.Native.ExprTest do
       assert_close(native.doubled, eager.doubled)
     end
   end
-
 
   defn cholesky_defn(x), do: Nx.LinAlg.cholesky(x)
   defn det_defn(x), do: Nx.LinAlg.determinant(x)
@@ -2663,7 +2637,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-
   describe "block-descent completeness (AllClose/Phase/TopK)" do
     test "all_close: close tensors vs EMLX.Backend" do
       a = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
@@ -2721,7 +2694,6 @@ defmodule EMLX.Native.ExprTest do
       assert Nx.to_flat_list(native_indices) == Nx.to_flat_list(eager_indices)
     end
   end
-
 
   # Routing/IR-shape assertions are pure Elixir (no NIF) — run without GPU.
   describe "fused-kernel recognition (lowering)" do
@@ -2977,6 +2949,7 @@ defmodule EMLX.Native.ExprTest do
 
     test "sdpa (additive mask, + sinks): fused replay matches eager" do
       scale = 0.125
+
       fun = fn q, k, v, m, s ->
         EMLX.Fast.scaled_dot_product_attention(q, k, v, scale, m, sinks: s)
       end
@@ -3669,9 +3642,11 @@ defmodule EMLX.Native.ExprTest do
       qw = EMLX.quantize(weight, [])
       y = Nx.iota({64, 4}, type: :f32) |> Nx.backend_transfer(EMLX.Backend)
 
-      assert_raise ArgumentError, ~r/does not yet lower op :dot with a quantized left operand/, fn ->
-        Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(qw, y)
-      end
+      assert_raise ArgumentError,
+                   ~r/does not yet lower op :dot with a quantized left operand/,
+                   fn ->
+                     Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(qw, y)
+                   end
     end
   end
 
@@ -3792,7 +3767,6 @@ defmodule EMLX.Native.ExprTest do
   defp term_mentions?(_term, _needle), do: false
 
   describe "runtime_call split-point dispatch cache (compile once, reuse)" do
-
     test "calling the same runtime_call-split defn twice compiles its flat stages once" do
       shape = {19, 128}
       w1 = Nx.iota(shape, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)

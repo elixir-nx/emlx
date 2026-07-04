@@ -77,7 +77,9 @@ defmodule EMLX.Defn.Tree do
   # clause), so its internal subgraph must stay out of the ordering entirely;
   # otherwise those nodes would still get lowered as dead instructions.
   defp visit_scope_deps(
-         %T{data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: %{operands: operands}}]}},
+         %T{
+           data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: %{operands: operands}}]}
+         },
          acc
        ) do
     Enum.reduce(operands, acc, &visit/2)

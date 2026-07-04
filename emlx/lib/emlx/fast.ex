@@ -115,7 +115,13 @@ defmodule EMLX.Fast do
       {_value, grad} =
         Nx.Defn.Grad.transform(
           List.to_tuple(inputs),
-          fn args -> args |> Tuple.to_list() |> then(&apply(reference_fn, &1)) |> Nx.multiply(g) |> Nx.sum() end,
+          fn args ->
+            args
+            |> Tuple.to_list()
+            |> then(&apply(reference_fn, &1))
+            |> Nx.multiply(g)
+            |> Nx.sum()
+          end,
           & &1
         )
 
@@ -144,7 +150,9 @@ defmodule EMLX.Fast do
           [NativeExpr.f64_bits(eps)]
         )
 
-      with_reference_grad(fused, [x, weight], fn x, weight -> rms_norm_reference(x, weight, eps) end)
+      with_reference_grad(fused, [x, weight], fn x, weight ->
+        rms_norm_reference(x, weight, eps)
+      end)
     else
       rms_norm_callback({x, weight}, eps: eps)
     end
@@ -382,7 +390,10 @@ defmodule EMLX.Fast do
       end
     else
       if sinks do
-        sdpa_causal_key_masked_sinks_callback({q, k, v, key_mask, sinks}, scale: scale, kv_offset: kv_offset)
+        sdpa_causal_key_masked_sinks_callback({q, k, v, key_mask, sinks},
+          scale: scale,
+          kv_offset: kv_offset
+        )
       else
         sdpa_causal_key_masked_callback({q, k, v, key_mask}, scale: scale, kv_offset: kv_offset)
       end
@@ -479,7 +490,13 @@ defmodule EMLX.Fast do
         rope_reference(a, dims, traditional, base, scale, offset)
       end)
     else
-      rope_callback(a, dims: dims, traditional: traditional, base: base, scale: scale, offset: offset)
+      rope_callback(a,
+        dims: dims,
+        traditional: traditional,
+        base: base,
+        scale: scale,
+        offset: offset
+      )
     end
   end
 
@@ -789,7 +806,9 @@ defmodule EMLX.Fast do
       |> then(&Nx.divide(1.0, &1))
 
     freqs_bt = position_freqs(position_ids, inv_freq, scale, b, t, half)
-    freqs_bcast = Nx.reshape(freqs_bt, rope_broadcast_shape(rank, [{0, b}, {1, t}, {d_axis, half}]))
+
+    freqs_bcast =
+      Nx.reshape(freqs_bt, rope_broadcast_shape(rank, [{0, b}, {1, t}, {d_axis, half}]))
 
     rope_rotate(a, dims, traditional, freqs_bcast, d_axis)
   end
@@ -806,7 +825,9 @@ defmodule EMLX.Fast do
     inv_freq = Nx.divide(1.0, Nx.as_type(freqs, :f32))
 
     freqs_bt = position_freqs(position_ids, inv_freq, scale, b, t, half)
-    freqs_bcast = Nx.reshape(freqs_bt, rope_broadcast_shape(rank, [{0, b}, {1, t}, {d_axis, half}]))
+
+    freqs_bcast =
+      Nx.reshape(freqs_bt, rope_broadcast_shape(rank, [{0, b}, {1, t}, {d_axis, half}]))
 
     rope_rotate(a, dims, traditional, freqs_bcast, d_axis)
   end
@@ -965,7 +986,9 @@ defmodule EMLX.Fast do
 
       if sinks do
         inner = Nx.runtime_call(out, {q, k, v, sinks}, [scale: scale], &sdpa_sinks_callback/2)
-        fused = emlx_metadata(inner, :fast_sdpa_sinks, [q, k, v, sinks], [NativeExpr.f64_bits(scale)])
+
+        fused =
+          emlx_metadata(inner, :fast_sdpa_sinks, [q, k, v, sinks], [NativeExpr.f64_bits(scale)])
 
         with_reference_grad(fused, [q, k, v, sinks], fn q, k, v, sinks ->
           sdpa_reference(q, k, v, scale, sinks: sinks)
@@ -1003,7 +1026,12 @@ defmodule EMLX.Fast do
 
       if sinks do
         inner =
-          Nx.runtime_call(out, {q, k, v, mask, sinks}, [scale: scale], &sdpa_masked_sinks_callback/2)
+          Nx.runtime_call(
+            out,
+            {q, k, v, mask, sinks},
+            [scale: scale],
+            &sdpa_masked_sinks_callback/2
+          )
 
         fused =
           emlx_metadata(inner, :fast_sdpa_masked_sinks, [q, k, v, mask, sinks], [
@@ -1015,7 +1043,9 @@ defmodule EMLX.Fast do
         end)
       else
         inner = Nx.runtime_call(out, {q, k, v, mask}, [scale: scale], &sdpa_masked_callback/2)
-        fused = emlx_metadata(inner, :fast_sdpa_masked, [q, k, v, mask], [NativeExpr.f64_bits(scale)])
+
+        fused =
+          emlx_metadata(inner, :fast_sdpa_masked, [q, k, v, mask], [NativeExpr.f64_bits(scale)])
 
         with_reference_grad(fused, [q, k, v, mask], fn q, k, v, mask ->
           sdpa_reference(q, k, v, scale, mask: mask)
@@ -1236,10 +1266,17 @@ defmodule EMLX.Fast do
 
     scores =
       cond do
-        causal and key_mask != nil -> apply_causal_key_mask(scores, kv_offset, t_q, t_kv, key_mask)
-        causal -> apply_causal_mask(scores, kv_offset, t_q, t_kv)
-        mask != nil -> apply_generic_mask(scores, mask)
-        true -> scores
+        causal and key_mask != nil ->
+          apply_causal_key_mask(scores, kv_offset, t_q, t_kv, key_mask)
+
+        causal ->
+          apply_causal_mask(scores, kv_offset, t_q, t_kv)
+
+        mask != nil ->
+          apply_generic_mask(scores, mask)
+
+        true ->
+          scores
       end
 
     scores =
@@ -1328,7 +1365,8 @@ defmodule EMLX.Fast do
   # in this never-evaluated reference formula.
   defp iota_bin(shape, type), do: Nx.iota(shape, type: type, backend: Nx.BinaryBackend)
 
-  defp neg_inf_like(scores), do: Nx.tensor(-1.0e9, type: Nx.type(scores), backend: Nx.BinaryBackend)
+  defp neg_inf_like(scores),
+    do: Nx.tensor(-1.0e9, type: Nx.type(scores), backend: Nx.BinaryBackend)
 
   # ── Einsum ────────────────────────────────────────────────────────────────
 

@@ -227,7 +227,15 @@ defmodule EMLX.Native.Expr do
   }
 
   @enforce_keys [:inputs, :captures, :constants, :instructions, :outputs]
-  defstruct [:inputs, :captures, :constants, :instructions, :outputs, hooks: [], runtime_calls: []]
+  defstruct [
+    :inputs,
+    :captures,
+    :constants,
+    :instructions,
+    :outputs,
+    hooks: [],
+    runtime_calls: []
+  ]
 
   @type node_ref :: reference()
   @type hook :: %{
@@ -2768,7 +2776,9 @@ defmodule EMLX.Native.Expr do
           sliced_shape = List.replace_at(reshaped_shape, axis_index, new_axis_size - interior)
           starts = List.duplicate(0, rank + 1)
           strides = List.duplicate(1, rank + 1)
-          {sliced_ref, st} = emit_static_slice(reshaped_ref, reshaped_shape, starts, sliced_shape, strides, st)
+
+          {sliced_ref, st} =
+            emit_static_slice(reshaped_ref, reshaped_shape, starts, sliced_shape, strides, st)
 
           {sliced_ref, sliced_shape, st}
       end)
@@ -2938,7 +2948,9 @@ defmodule EMLX.Native.Expr do
     {ref,
      %{
        state
-       | instructions: [{ref, :solve_triangular, [a_ref, b_ref], [upper_int]} | state.instructions]
+       | instructions: [
+           {ref, :solve_triangular, [a_ref, b_ref], [upper_int]} | state.instructions
+         ]
      }}
   end
 
