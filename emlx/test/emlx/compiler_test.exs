@@ -72,6 +72,7 @@ defmodule EMLX.CompilerTest do
       end
     end
 
+    @tag :metal
     test "valid opts :device and :max_concurrency do not raise" do
       defmodule IdentFn2 do
         import Nx.Defn

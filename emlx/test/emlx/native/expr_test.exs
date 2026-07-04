@@ -2633,7 +2633,11 @@ defmodule EMLX.Native.ExprTest do
           Nx.default_backend(prev)
         end
 
-      assert_in_delta(Nx.to_number(native), Nx.to_number(ref), 1.0)
+      # f32 LU accumulates rounding error proportional to the magnitude of
+      # the determinant (~2e5 here), so an absolute delta of 1.0 is too
+      # tight and flakes under normal f32 rounding — use a relative delta.
+      ref_num = Nx.to_number(ref)
+      assert_in_delta(Nx.to_number(native), ref_num, abs(ref_num) * 1.0e-4)
     end
   end
 
