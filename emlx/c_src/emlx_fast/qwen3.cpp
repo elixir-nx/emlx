@@ -1,80 +1,38 @@
 #include "qwen3.hpp"
 #include "../emlx_nif_shared.hpp"
+#include "../emlx_plugin_registry.hpp"
 #include "qwen3_plugin_abi.hpp"
 
-#include <dlfcn.h>
 #include <memory>
 
 // Qwen3 model accelerators used by emlx_axon. This file is the *host* side
 // of the qwen3 NIF/plugin split: it owns everything that touches Erlang
 // terms (decoding args, wrapping `mlx::core::array` results back into
-// tensor resources) and calls through to `libemlx_qwen3.so` — a standalone,
-// dynamically loaded shared library with no Erlang dependency at all — for
-// every actual MLX computation. See qwen3_plugin_abi.hpp for the ABI and
-// qwen3_plugin.cpp for the compute implementations.
+// tensor resources) and calls through to the standalone "qwen3" plugin — a
+// dynamically loaded shared library with no Erlang dependency at all,
+// living in emlx_axon (c_src/qwen3_plugin.cpp there) — for every actual MLX
+// computation. See qwen3_plugin_abi.hpp for the ABI.
 //
-// This split exists so the qwen3 compute can eventually move into
-// emlx_axon as its own build artifact without dragging erl_nif/resource-type
-// plumbing along with it — see `EMLX.NIF.load_qwen3_plugin/1`.
+// This split exists so the qwen3 compute can live in emlx_axon as its own
+// build artifact without dragging erl_nif/resource-type plumbing along
+// with it. The plugin is loaded generically via `EMLX.NIF.load_plugin/2`
+// (see emlx_plugin_registry.hpp) under the name `"qwen3"`; this file only
+// knows how to *decode* qwen3's specific argument shapes, not how a plugin
+// gets loaded.
 
-namespace {
-
-const emlx_qwen3_plugin::VTable *g_qwen3_plugin = nullptr;
-void *g_qwen3_plugin_handle = nullptr;
-
-} // namespace
-
-// qwen3_require_plugin — every qwen3_* NIF calls this first; the plugin
-// must be loaded via `EMLX.NIF.load_qwen3_plugin/1` before any of these can
-// run (see EMLX.Application, which loads it eagerly at boot).
-static bool qwen3_require_plugin(ErlNifEnv *env, ERL_NIF_TERM *out_error) {
-  if (g_qwen3_plugin != nullptr) {
-    return true;
+// qwen3_plugin — every qwen3_* NIF calls this first to fetch the "qwen3"
+// plugin's vtable; it must have been loaded via
+// `EMLX.NIF.load_plugin("qwen3", path)` before any of these can run (see
+// EMLXAxon.Application, which loads it eagerly at boot). Returns `nullptr`
+// (and fills `out_error`) if it hasn't been loaded (yet).
+static const emlx_qwen3_plugin::VTable *qwen3_plugin(ErlNifEnv *env, ERL_NIF_TERM *out_error) {
+  const void *vtable = emlx_get_plugin("qwen3");
+  if (vtable != nullptr) {
+    return reinterpret_cast<const emlx_qwen3_plugin::VTable *>(vtable);
   }
-  *out_error = nx::nif::error(
-      env, "qwen3 plugin not loaded — call EMLX.NIF.load_qwen3_plugin/1 first");
-  return false;
-}
-
-// load_qwen3_plugin — `dlopen`s the standalone qwen3 compute plugin and
-// resolves its vtable. Not worker-routed: `dlopen`/`dlsym` do not touch the
-// MLX graph, so this can run directly on the calling (BEAM scheduler)
-// thread, same as `command_queue_new`.
-NIF(load_qwen3_plugin) {
-  std::string path;
-  if (!nx::nif::get(env, argv[0], path)) {
-    return nx::nif::error(env, "load_qwen3_plugin expects a path string");
-  }
-
-  if (g_qwen3_plugin_handle != nullptr) {
-    dlclose(g_qwen3_plugin_handle);
-    g_qwen3_plugin_handle = nullptr;
-    g_qwen3_plugin = nullptr;
-  }
-
-  void *handle = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
-  if (handle == nullptr) {
-    std::ostringstream msg;
-    msg << "Failed to load qwen3 plugin at " << path << ": " << dlerror();
-    return nx::nif::error(env, msg.str().c_str());
-  }
-
-  using VTableFn = const emlx_qwen3_plugin::VTable *(*)();
-  auto get_vtable = reinterpret_cast<VTableFn>(dlsym(handle, "emlx_qwen3_plugin_vtable"));
-  if (get_vtable == nullptr) {
-    dlclose(handle);
-    return nx::nif::error(env, "qwen3 plugin is missing the emlx_qwen3_plugin_vtable symbol");
-  }
-
-  const emlx_qwen3_plugin::VTable *vtable = get_vtable();
-  if (vtable == nullptr) {
-    dlclose(handle);
-    return nx::nif::error(env, "qwen3 plugin returned a null vtable");
-  }
-
-  g_qwen3_plugin_handle = handle;
-  g_qwen3_plugin = vtable;
-  return nx::nif::ok(env);
+  *out_error =
+      nx::nif::error(env, "qwen3 plugin not loaded — call EMLX.NIF.load_plugin(\"qwen3\", path) first");
+  return nullptr;
 }
 
 // ── Term decoding helpers ─────────────────────────────────────────────────
@@ -329,7 +287,8 @@ static bool qwen3_require_rank2_positive(const mlx::core::array &tensor, const c
 // Returns {attn_out, k_upd, v_upd}.
 NIF(qwen3_kv_cache_attention) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -347,7 +306,7 @@ NIF(qwen3_kv_cache_attention) {
   try {
     mlx::core::array out(0), k_upd(0), v_upd(0);
     std::string error;
-    if (!g_qwen3_plugin->kv_cache_attention(*q, *new_k, *new_v, *k_cache, *v_cache, offset, scale,
+    if (!plugin->kv_cache_attention(*q, *new_k, *new_v, *k_cache, *v_cache, offset, scale,
                                              head_dim, theta, device, out, k_upd, v_upd, error)) {
       return nx::nif::error(env, error.c_str());
     }
@@ -366,7 +325,8 @@ ASYNC_NIF(qwen3_kv_cache_attention)
 // qwen3_mlp — dense Qwen3 MLP block: RMSNorm + gate/up + SwiGLU + down + residual.
 NIF(qwen3_mlp) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -381,7 +341,7 @@ NIF(qwen3_mlp) {
   try {
     mlx::core::array out(0);
     std::string error;
-    if (!g_qwen3_plugin->mlp(*hidden, *norm, *gate_proj, *up_proj, *down_proj, eps, device, out,
+    if (!plugin->mlp(*hidden, *norm, *gate_proj, *up_proj, *down_proj, eps, device, out,
                               error)) {
       return nx::nif::error(env, error.c_str());
     }
@@ -399,7 +359,8 @@ ASYNC_NIF(qwen3_mlp)
 // Returns {hidden_out, k_upd, v_upd}.
 NIF(qwen3_layer) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -431,7 +392,7 @@ NIF(qwen3_layer) {
 
     mlx::core::array out(0), k_upd(0), v_upd(0);
     std::string error;
-    if (!g_qwen3_plugin->layer_dense(*hidden, layer, kv, offset, scale, head_dim, theta, eps,
+    if (!plugin->layer_dense(*hidden, layer, kv, offset, scale, head_dim, theta, eps,
                                       device, out, k_upd, v_upd, error)) {
       return nx::nif::error(env, error.c_str());
     }
@@ -455,7 +416,8 @@ ASYNC_NIF(qwen3_layer)
 // Returns {hidden_out, k_upd, v_upd}.
 NIF(qwen3_layer_quantized) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -519,7 +481,7 @@ NIF(qwen3_layer_quantized) {
 
     mlx::core::array out(0), k_upd(0), v_upd(0);
     std::string error;
-    if (!g_qwen3_plugin->layer_quantized(*hidden, layer, kv, offset, scale, head_dim, theta, eps,
+    if (!plugin->layer_quantized(*hidden, layer, kv, offset, scale, head_dim, theta, eps,
                                           device, out, k_upd, v_upd, error)) {
       return nx::nif::error(env, error.c_str());
     }
@@ -551,7 +513,8 @@ static ERL_NIF_TERM qwen3_wrap_kv_terms(
 // shape {B}.
 NIF(qwen3_forward_greedy_ids) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -627,7 +590,7 @@ NIF(qwen3_forward_greedy_ids) {
     mlx::core::array token_out(0);
     int64_t token_id_out = 0;
     std::vector<mlx::core::array> k_out, v_out;
-    if (!g_qwen3_plugin->forward_greedy_from_hidden(
+    if (!plugin->forward_greedy_from_hidden(
             embedded, layers, kvs, *norm, *lm_head, offset, scale, head_dim, theta, eps, false,
             device, token_out, token_id_out, k_out, v_out, error)) {
       return nx::nif::error(env, error.c_str());
@@ -645,7 +608,8 @@ ASYNC_NIF(qwen3_forward_greedy_ids)
 // Returns {token_id_refs, kv_cache}.
 NIF(qwen3_forward_greedy_ids_chunk) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -711,7 +675,7 @@ NIF(qwen3_forward_greedy_ids_chunk) {
 
     std::string error;
     std::vector<mlx::core::array> token_out, k_out, v_out;
-    if (!g_qwen3_plugin->forward_greedy_ids_chunk(
+    if (!plugin->forward_greedy_ids_chunk(
             *input_ids, *embed_tokens, layers, initial_kv, *norm, *lm_head, offset, count, scale,
             head_dim, theta, eps, device, token_out, k_out, v_out, error)) {
       return nx::nif::error(env, error.c_str());
@@ -734,7 +698,8 @@ ASYNC_NIF(qwen3_forward_greedy_ids_chunk)
 // returns the sampled token id as a BEAM integer.
 NIF(qwen3_forward_greedy_ids_token_id) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -810,7 +775,7 @@ NIF(qwen3_forward_greedy_ids_token_id) {
     mlx::core::array token_out(0);
     int64_t token_id_out = 0;
     std::vector<mlx::core::array> k_out, v_out;
-    if (!g_qwen3_plugin->forward_greedy_from_hidden(
+    if (!plugin->forward_greedy_from_hidden(
             embedded, layers, kvs, *norm, *lm_head, offset, scale, head_dim, theta, eps, true,
             device, token_out, token_id_out, k_out, v_out, error)) {
       return nx::nif::error(env, error.c_str());
@@ -828,7 +793,8 @@ ASYNC_NIF(qwen3_forward_greedy_ids_token_id)
 // transfer for the single token greedy decode hot path.
 NIF(qwen3_forward_greedy_token_id) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -904,7 +870,7 @@ NIF(qwen3_forward_greedy_token_id) {
     mlx::core::array token_out(0);
     int64_t token_id_out = 0;
     std::vector<mlx::core::array> k_out, v_out;
-    if (!g_qwen3_plugin->forward_greedy_from_hidden(
+    if (!plugin->forward_greedy_from_hidden(
             embedded, layers, kvs, *norm, *lm_head, offset, scale, head_dim, theta, eps, true,
             device, token_out, token_id_out, k_out, v_out, error)) {
       return nx::nif::error(env, error.c_str());
@@ -920,7 +886,8 @@ ASYNC_NIF(qwen3_forward_greedy_token_id)
 // qwen3_final_greedy — final RMSNorm + dense lm_head + argmax for greedy decode.
 NIF(qwen3_final_greedy) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -933,7 +900,7 @@ NIF(qwen3_final_greedy) {
   try {
     mlx::core::array out(0);
     std::string error;
-    if (!g_qwen3_plugin->final_greedy(*hidden, *norm, *lm_head, eps, device, out, error)) {
+    if (!plugin->final_greedy(*hidden, *norm, *lm_head, eps, device, out, error)) {
       return nx::nif::error(env, error.c_str());
     }
 
@@ -946,7 +913,8 @@ ASYNC_NIF(qwen3_final_greedy)
 // qwen3_attention_residual — dense attention output projection + residual add.
 NIF(qwen3_attention_residual) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -958,7 +926,7 @@ NIF(qwen3_attention_residual) {
   try {
     mlx::core::array out(0);
     std::string error;
-    if (!g_qwen3_plugin->attention_residual(*hidden, *attn_out, *o_proj, device, out, error)) {
+    if (!plugin->attention_residual(*hidden, *attn_out, *o_proj, device, out, error)) {
       return nx::nif::error(env, error.c_str());
     }
 
@@ -975,7 +943,8 @@ ASYNC_NIF(qwen3_attention_residual)
 // Returns {hidden_out, k_upd, v_upd}.
 NIF(qwen3_attention_block) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -999,7 +968,7 @@ NIF(qwen3_attention_block) {
   try {
     mlx::core::array out(0), k_upd(0), v_upd(0);
     std::string error;
-    if (!g_qwen3_plugin->attention_block(*hidden, *norm, *q_proj, *k_proj, *v_proj, *o_proj,
+    if (!plugin->attention_block(*hidden, *norm, *q_proj, *k_proj, *v_proj, *o_proj,
                                           *q_norm, *k_norm, *k_cache, *v_cache, offset, scale,
                                           head_dim, theta, eps, device, out, k_upd, v_upd,
                                           error)) {
@@ -1025,7 +994,8 @@ ASYNC_NIF(qwen3_attention_block)
 // Returns {token_id_refs, kv_cache}.
 NIF(qwen3_forward_greedy_ids_chunk_quantized) {
   ERL_NIF_TERM plugin_error;
-  if (!qwen3_require_plugin(env, &plugin_error)) {
+  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
+  if (plugin == nullptr) {
     return plugin_error;
   }
 
@@ -1095,7 +1065,7 @@ NIF(qwen3_forward_greedy_ids_chunk_quantized) {
 
     std::string error;
     std::vector<mlx::core::array> token_out, k_out, v_out;
-    if (!g_qwen3_plugin->forward_greedy_ids_chunk_quantized(
+    if (!plugin->forward_greedy_ids_chunk_quantized(
             *input_ids, *embed_tokens, layers, initial_kv, *norm, lm_head, offset, count, scale,
             head_dim, theta, eps, device, token_out, k_out, v_out, error)) {
       return nx::nif::error(env, error.c_str());

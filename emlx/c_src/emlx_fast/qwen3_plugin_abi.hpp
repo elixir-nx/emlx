@@ -1,9 +1,14 @@
 #pragma once
 
-// ABI shared between the host NIF library (c_src/emlx_fast/qwen3.cpp,
+// ABI shared between the host NIF library (emlx's c_src/emlx_fast/qwen3.cpp,
 // statically linked into libemlx.so) and the standalone qwen3 compute
-// plugin (c_src/emlx_fast/qwen3_plugin.cpp, built as libemlx_qwen3.so and
-// loaded at runtime via `EMLX.NIF.load_qwen3_plugin/1`).
+// plugin (emlx_axon's c_src/qwen3_plugin.cpp, built as its own shared
+// library and loaded at runtime via `EMLX.NIF.load_plugin("qwen3", path)`).
+//
+// This header lives in emlx (not emlx_axon) because it is the contract the
+// *host* decode/encode side depends on — emlx_axon's plugin build adds
+// emlx's `c_src/emlx_fast` to its include path to pick it up (see
+// emlx_axon/Makefile).
 //
 // This header intentionally has NO dependency on erl_nif.h: every type here
 // is plain C++/MLX so the plugin can be built and `dlopen`'d without ever
@@ -12,9 +17,9 @@
 // through `VTable`, and re-encodes the `mlx::core::array` results back into
 // tensor resources afterwards. This split works only because the boundary
 // carries raw `mlx::core::array`/struct values, never Erlang resource
-// terms — see the "Can we have qwen3.cpp be loaded into EMLX.Native.Qwen3
-// as a NIF in itself?" design discussion for why a truly independent NIF
-// module can't share tensor resource types with the rest of EMLX.
+// terms — a truly independent NIF module can't share tensor resource types
+// with the rest of EMLX (Erlang ties resource types to the specific
+// module/`.so` that opened them).
 
 #include "mlx/mlx.h"
 
@@ -168,6 +173,7 @@ struct VTable {
 
 } // namespace emlx_qwen3_plugin
 
-// Sole exported entrypoint — `EMLX.NIF.load_qwen3_plugin/1` `dlopen`s the
-// plugin and `dlsym`s this symbol to obtain the vtable.
-extern "C" const emlx_qwen3_plugin::VTable *emlx_qwen3_plugin_vtable();
+// Sole exported entrypoint — `EMLX.NIF.load_plugin("qwen3", path)`
+// `dlopen`s the plugin and `dlsym`s the generic `emlx_plugin_vtable` symbol
+// (see emlx/c_src/emlx_plugin_registry.hpp) to obtain this vtable.
+extern "C" const emlx_qwen3_plugin::VTable *emlx_plugin_vtable();

@@ -5,10 +5,12 @@
 #include <sstream>
 
 // Qwen3 compute plugin — pure MLX graph-building code, no Erlang/erl_nif
-// dependency whatsoever. Built as its own shared library (libemlx_qwen3.so)
-// and `dlopen`'d by the host NIF library (c_src/emlx_fast/qwen3.cpp) via
-// `EMLX.NIF.load_qwen3_plugin/1`. See qwen3_plugin_abi.hpp for the ABI and
-// the rationale for this split.
+// dependency whatsoever. Built as its own shared library (libemlx_qwen3.so,
+// see this project's Makefile) and `dlopen`'d by emlx's host NIF library
+// (emlx's c_src/emlx_fast/qwen3.cpp) via
+// `EMLX.NIF.load_plugin("qwen3", path)`. See qwen3_plugin_abi.hpp (in
+// emlx's c_src/emlx_fast, pulled in via this project's include path) for
+// the ABI and the rationale for this split.
 
 using namespace emlx_qwen3_plugin;
 
@@ -1205,4 +1207,4 @@ const VTable kVTable = {
 
 } // namespace
 
-extern "C" const VTable *emlx_qwen3_plugin_vtable() { return &kVTable; }
+extern "C" const VTable *emlx_plugin_vtable() { return &kVTable; }

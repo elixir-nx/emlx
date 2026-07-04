@@ -343,13 +343,15 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
-  # load_qwen3_plugin — `dlopen`s the standalone qwen3 compute plugin
-  # (libemlx_qwen3.so, see emlx_fast/qwen3.cpp/qwen3_plugin.cpp) and caches
-  # its vtable. Every `qwen3_*` NIF above errors with `{:error, _}` until
-  # this has been called successfully — see `EMLX.Application`, which calls
-  # it eagerly at boot. Not worker-routed (no argv[0] worker ref): `dlopen`
-  # does no MLX graph work.
-  def load_qwen3_plugin(_path) do
+  # load_plugin — `dlopen`s a standalone, name-keyed native plugin (no
+  # erl_nif dependency) and caches its vtable under `name` (see
+  # emlx_plugin_registry.hpp). Callers that decode/dispatch into a
+  # specific plugin's ABI (e.g. `qwen3_*` NIFs above, which fetch the
+  # "qwen3" plugin) error with `{:error, _}` until this has been called
+  # successfully for that name — for qwen3, see `EMLXAxon.Application`,
+  # which calls it eagerly at boot. Not worker-routed (no argv[0] worker
+  # ref): `dlopen` does no MLX graph work.
+  def load_plugin(_name, _path) do
     :erlang.nif_error(:nif_not_loaded)
   end
 end

@@ -17,8 +17,3 @@ ERL_NIF_TERM qwen3_forward_greedy_token_id_async(ErlNifEnv *, int, const ERL_NIF
 ERL_NIF_TERM qwen3_final_greedy_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_attention_residual_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_attention_block_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
-
-// load_qwen3_plugin — `dlopen`s the standalone qwen3 compute plugin
-// (libemlx_qwen3.so). Not worker-routed: no `_async` wrapper/argv[0] worker
-// ref, same as `command_queue_new`.
-ERL_NIF_TERM load_qwen3_plugin(ErlNifEnv *, int, const ERL_NIF_TERM []);

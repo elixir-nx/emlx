@@ -1,6 +1,7 @@
 #include "emlx_compiler.hpp"
 #include "emlx_nif_shared.hpp"
 #include "emlx_fast/qwen3.hpp"
+#include "emlx_plugin_registry.hpp"
 
 #include <iostream>
 #include <map>
@@ -2013,8 +2014,9 @@ static ErlNifFunc nif_funcs[] = {
     {"qwen3_final_greedy", 6, qwen3_final_greedy_async},
     {"qwen3_attention_residual", 5, qwen3_attention_residual_async},
     {"qwen3_attention_block", 17, qwen3_attention_block_async},
-    // load_qwen3_plugin `dlopen`s libemlx_qwen3.so (see emlx_fast/qwen3.cpp);
-    // not worker-routed since it does no MLX graph work.
-    {"load_qwen3_plugin", 1, load_qwen3_plugin}};
+    // load_plugin `dlopen`s a named, standalone native plugin (see
+    // emlx_plugin_registry.hpp); not worker-routed since it does no MLX
+    // graph work.
+    {"load_plugin", 2, load_plugin}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)
