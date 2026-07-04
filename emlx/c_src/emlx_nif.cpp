@@ -1815,8 +1815,8 @@ NIF(eval_program) { return emlx::native::eval_program(env, argc, argv); }
 ASYNC_NIF(eval_program)
 
 static ErlNifFunc nif_funcs[] = {
-    {"eval", 2, eval_async},
-    {"eval_many", 2, eval_many_async},
+    {"eval", 2, eval_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"eval_many", 2, eval_many_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"to_device", 3, to_device_async},
     {"to_blob", 2, to_blob_async},
     {"to_blob", 3, to_blob_async},
@@ -1993,8 +1993,8 @@ static ErlNifFunc nif_funcs[] = {
     {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
 
     // ── Native compiler NIFs.
-    {"compile_program", 9, compile_program_async},
-    {"eval_program", 3, eval_program_async},
+    {"compile_program", 9, compile_program_async, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"eval_program", 3, eval_program_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
     // resolve_runtime_call is NOT worker-routed: it only decodes a reply and
     // memcpy's it into pre-registered buffers/notifies a condvar — no MLX
     // graph work, so it can run directly on the calling BEAM scheduler.
