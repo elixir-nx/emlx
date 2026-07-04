@@ -1088,7 +1088,7 @@ defmodule EMLX do
         {_dev_gate, ref_gate},
         {_dev_up, ref_up},
         {_dev_down, ref_down},
-        eps
+        eps 
       )
       when is_tensor(dev_h, ref_h) and is_float(eps) do
     device = dev_h
@@ -1208,6 +1208,74 @@ defmodule EMLX do
   end
 
   @doc """
+  Qwen3 generalized transformer layer helper: same fusion as `qwen3_layer/18`,
+  but each of the 7 projections (q/k/v/o/gate/up/down) independently accepts
+  a dense or quantized (`EMLX.quantize/2`) `Nx.Tensor`, collapsing the
+  quantized native lane's per-op NIF calls down to one fused call.
+
+  Accepts hidden states `{B, T, H}`, input RMSNorm weight, q/k/v/o projections
+  (dense or quantized), Q/K RMSNorm weights, owned KV cache refs, post-attention
+  RMSNorm weight, gate/up/down projections (dense or quantized), offset, scale,
+  RoPE parameters, and RMSNorm epsilon. Returns `{hidden_out, k_cache, v_cache}`.
+  """
+  @mlx_function {:qwen3_layer_quantized, 21}
+  def qwen3_layer_quantized(
+        {dev_h, ref_h},
+        norm1,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        {_dev_kc, ref_kc},
+        {_dev_vc, ref_vc},
+        norm2,
+        gate_proj,
+        up_proj,
+        down_proj,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      )
+      when is_tensor(dev_h, ref_h) and is_integer(offset) and is_float(scale) and
+             is_integer(head_dim) and is_number(theta) and is_float(eps) do
+    device = dev_h
+    {worker, effective_device} = resolve_worker(device)
+
+    {out_ref, k_upd_ref, v_upd_ref} =
+      EMLX.NIF.qwen3_layer_quantized(
+        worker,
+        ref_h,
+        tensor_ref!(norm1),
+        qwen3_linear_weight_term(q_proj),
+        qwen3_linear_weight_term(k_proj),
+        qwen3_linear_weight_term(v_proj),
+        qwen3_linear_weight_term(o_proj),
+        tensor_ref!(q_norm),
+        tensor_ref!(k_norm),
+        ref_kc,
+        ref_vc,
+        tensor_ref!(norm2),
+        qwen3_linear_weight_term(gate_proj),
+        qwen3_linear_weight_term(up_proj),
+        qwen3_linear_weight_term(down_proj),
+        offset,
+        scale,
+        head_dim,
+        theta * 1.0,
+        eps,
+        effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    {{effective_device, out_ref}, {effective_device, k_upd_ref}, {effective_device, v_upd_ref}}
+  end
+
+  @doc """
   Qwen3 embedding lookup plus dense forward through all layers and greedy token.
 
   This accepts token ids and embedding weights directly, so the dense greedy
@@ -1305,6 +1373,74 @@ defmodule EMLX do
         kv_refs,
         ref_norm,
         ref_lm_head,
+        offset,
+        count,
+        scale,
+        head_dim,
+        theta * 1.0,
+        eps,
+        effective_device
+      )
+      |> unwrap!()
+      |> await_worker()
+
+    tokens = Enum.map(token_refs, &{effective_device, &1})
+
+    kv_cache =
+      Enum.map(kv_updated_refs, fn {k_ref, v_ref} ->
+        {{effective_device, k_ref}, {effective_device, v_ref}}
+      end)
+
+    {tokens, kv_cache}
+  end
+
+  @doc """
+  Qwen3 generalized greedy decode chunk helper: same fusion as
+  `qwen3_forward_greedy_ids_chunk/12`, but every layer's 7 projections and the
+  final `lm_head` each independently accept a dense or quantized
+  (`EMLX.quantize/2`) `Nx.Tensor`. This lets the quantized native lane fuse a
+  whole multi-token decode chunk into 1 NIF call, matching dense's chunk fusion.
+
+  Starting from a `{1, 1}` token id tensor, runs `count` greedy decode steps
+  without returning to Elixir between steps. Returns `{token_refs, kv_cache}`,
+  where `token_refs` is a list of raw EMLX token refs in generation order and
+  `kv_cache` is the final updated raw cache.
+  """
+  @mlx_function {:qwen3_forward_greedy_ids_chunk_quantized, 14}
+  def qwen3_forward_greedy_ids_chunk_quantized(
+        {dev_ids, ref_ids},
+        {_dev_embed, ref_embed},
+        layers,
+        kv_cache,
+        {_dev_norm, ref_norm},
+        lm_head,
+        offset,
+        count,
+        scale,
+        head_dim,
+        theta,
+        eps
+      )
+      when is_tensor(dev_ids, ref_ids) and is_list(layers) and is_list(kv_cache) and
+             is_integer(offset) and is_integer(count) and count > 0 and is_float(scale) and
+             is_integer(head_dim) and is_number(theta) and is_float(eps) do
+    device = dev_ids
+    {worker, effective_device} = resolve_worker(device)
+
+    qwen3_assert_decode_ids!({dev_ids, ref_ids}, "qwen3_forward_greedy_ids_chunk_quantized")
+
+    layer_terms = Enum.map(layers, &qwen3_layer_weight_terms!/1)
+    kv_refs = qwen3_kv_refs(kv_cache)
+
+    {token_refs, kv_updated_refs} =
+      EMLX.NIF.qwen3_forward_greedy_ids_chunk_quantized(
+        worker,
+        ref_ids,
+        ref_embed,
+        layer_terms,
+        kv_refs,
+        ref_norm,
+        qwen3_linear_weight_term(lm_head),
         offset,
         count,
         scale,
@@ -1548,6 +1684,28 @@ defmodule EMLX do
     }
   end
 
+  # Generalized variant of `qwen3_layer_refs!/1`: q/k/v/o/gate/up/down each
+  # become a `qwen3_linear_weight_term/1` (dense or quantized) instead of a
+  # plain ref, for `qwen3_layer_quantized`/`qwen3_forward_greedy_ids_chunk_quantized`.
+  defp qwen3_layer_weight_terms!(
+         {norm1, norm2, q_norm, k_norm, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
+          down_proj}
+       ) do
+    {
+      tensor_ref!(norm1),
+      tensor_ref!(norm2),
+      tensor_ref!(q_norm),
+      tensor_ref!(k_norm),
+      qwen3_linear_weight_term(q_proj),
+      qwen3_linear_weight_term(k_proj),
+      qwen3_linear_weight_term(v_proj),
+      qwen3_linear_weight_term(o_proj),
+      qwen3_linear_weight_term(gate_proj),
+      qwen3_linear_weight_term(up_proj),
+      qwen3_linear_weight_term(down_proj)
+    }
+  end
+
   defp qwen3_kv_refs!({{_device_k, ref_k}, {_device_v, ref_v}})
        when is_reference(ref_k) and is_reference(ref_v),
        do: {ref_k, ref_v}
@@ -1592,6 +1750,37 @@ defmodule EMLX do
         raise ArgumentError,
               "#{function_name} expects rank-2 input ids, got shape #{inspect(shape)}"
     end
+  end
+
+  # Builds the weight-term tuple accepted by `qwen3_get_linear_weight` in
+  # emlx_fast/qwen3.cpp: `{:dense, ref}` for a plain tensor, or
+  # `{:quantized, weight_ref, scales_ref, biases_ref_or_nil, group_size, bits,
+  # mode, true}` for a tensor produced by `EMLX.quantize/2`. `transpose` is
+  # always `true` for quantized terms here — every Qwen3 projection and
+  # lm_head uses the {out,in} physical layout (same convention hardcoded by
+  # `EMLX.quantized_matmul/2` above); dense orientation is instead selected
+  # by the C++ call site (`dense_transpose` arg of `qwen3_get_linear_weight`).
+  defp qwen3_linear_weight_term(%Nx.Tensor{
+         data: %EMLX.Backend{ref: {_device, ref}, quantization_config: nil}
+       }) do
+    {:dense, ref}
+  end
+
+  defp qwen3_linear_weight_term(%Nx.Tensor{
+         data: %EMLX.Backend{
+           ref: {_device, ref},
+           quantization_config: %EMLX.Quantization.Config{} = cfg
+         }
+       }) do
+    {_scales_device, scales_ref} = EMLX.Backend.from_nx(cfg.scales)
+    biases_ref = cfg.biases && elem(EMLX.Backend.from_nx(cfg.biases), 1)
+
+    {:quantized, ref, scales_ref, biases_ref, cfg.group_size, cfg.bits, cfg.mode, true}
+  end
+
+  defp qwen3_linear_weight_term(tensor) do
+    {_device, ref} = EMLX.Backend.from_nx(tensor)
+    {:dense, ref}
   end
 
   defp tensor_ref!(%Nx.Tensor{data: %EMLX.Backend{ref: {_device, ref}}}), do: ref

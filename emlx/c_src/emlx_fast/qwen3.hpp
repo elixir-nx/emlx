@@ -8,8 +8,10 @@
 ERL_NIF_TERM qwen3_kv_cache_attention_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_mlp_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_layer_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM qwen3_layer_quantized_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_forward_greedy_ids_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_forward_greedy_ids_chunk_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
+ERL_NIF_TERM qwen3_forward_greedy_ids_chunk_quantized_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_forward_greedy_ids_token_id_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_forward_greedy_token_id_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
 ERL_NIF_TERM qwen3_final_greedy_async(ErlNifEnv *, int, const ERL_NIF_TERM []);

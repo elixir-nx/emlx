@@ -368,6 +368,57 @@ static mlx::core::array qwen3_linear_out_in(
       x, weight, std::vector<int>{static_cast<int>(x.ndim()) - 1}, std::vector<int>{1}, device);
 }
 
+// Qwen3LinearWeight — a dense-or-quantized projection, so fused Qwen3 NIFs can
+// support the quantized native lane (q/k/v/o/gate/up/down, and lm_head)
+// without duplicating the layer/chunk-decode control flow per weight kind.
+//
+// `weight` is either a dense tensor (logical {H,out} or, when `transpose` is
+// set, {out,H} — see `qwen3_apply_linear`), or the physical packed
+// `{out, in/pack}` u32 ref produced by `EMLX.quantize/2`. `scales`/`biases`
+// are quantized-only; `biases` is null for microscaled modes (mxfp4/mxfp8/
+// nvfp4), which have no biases term.
+struct Qwen3LinearWeight {
+  bool quantized = false;
+  mlx::core::array *weight = nullptr;
+  mlx::core::array *scales = nullptr;
+  mlx::core::array *biases = nullptr;
+  int group_size = 0;
+  int bits = 0;
+  std::string mode;
+  bool transpose = false;
+};
+
+// Applies a `Qwen3LinearWeight` to `x`, dispatching to `mx::quantized_matmul`
+// or the appropriate dense orientation (`qwen3_linear_in_out` for the usual
+// {H,out} projections, `qwen3_linear_out_in` when `transpose` selects the
+// {out,H} lm_head/embedding convention).
+static mlx::core::array qwen3_apply_linear(
+    const mlx::core::array &x,
+    const Qwen3LinearWeight &w,
+    const mlx::core::Device &device) {
+  if (w.quantized) {
+    std::optional<mlx::core::array> biases_opt =
+        w.biases != nullptr ? std::make_optional(*w.biases) : std::nullopt;
+    return mlx::core::quantized_matmul(
+        x, *w.weight, *w.scales, biases_opt, w.transpose, w.group_size, w.bits, w.mode, device);
+  }
+
+  return w.transpose ? qwen3_linear_out_in(x, *w.weight, device)
+                      : qwen3_linear_in_out(x, *w.weight, device);
+}
+
+// Logical output width of a `Qwen3LinearWeight`. For quantized weights this
+// is `scales.shape(0)` — MLX quantization always groups along the last
+// (input) axis, so scales/biases retain the un-packed `{out, in/group_size}`
+// shape regardless of the physical packed weight layout or `transpose`.
+static int qwen3_linear_weight_out_features(const Qwen3LinearWeight &w) {
+  if (w.quantized) {
+    return static_cast<int>(w.scales->shape(0));
+  }
+
+  return w.transpose ? static_cast<int>(w.weight->shape(0)) : static_cast<int>(w.weight->shape(1));
+}
+
 static int64_t qwen3_token_to_int64(mlx::core::array &token) {
   mlx::core::eval(token);
   auto dtype = token.dtype();
@@ -722,6 +773,101 @@ static bool qwen3_get_tensor_or_device_ref(
   return qwen3_get_tensor(env, items[1], out, handles, error);
 }
 
+// Decodes a linear weight term — either `{:dense, tensor_ref}` or
+// `{:quantized, weight_ref, scales_ref, biases_ref_or_nil, group_size, bits,
+// mode, transpose}` (mirrors the tuple built by `EMLX.qwen3_linear_weight_term/2`
+// in emlx.ex) — into a `Qwen3LinearWeight`. `dense_transpose` selects the
+// dense orientation when the term is `{:dense, ref}` (false for the usual
+// {H,out} q/k/v/o/gate/up/down projections, true for the {out,H} lm_head
+// convention); quantized terms carry their own explicit `transpose` flag.
+static bool qwen3_get_linear_weight(
+    ErlNifEnv *env,
+    ERL_NIF_TERM term,
+    bool dense_transpose,
+    Qwen3LinearWeight &out,
+    Qwen3TensorHandles &handles,
+    ERL_NIF_TERM *error) {
+  int arity = 0;
+  const ERL_NIF_TERM *items = nullptr;
+  if (!enif_get_tuple(env, term, &arity, &items) || arity < 2) {
+    return false;
+  }
+
+  std::string tag;
+  if (!nx::nif::get_atom(env, items[0], tag)) {
+    return false;
+  }
+
+  if (tag == "dense" && arity == 2) {
+    out.quantized = false;
+    out.transpose = dense_transpose;
+    return qwen3_get_tensor(env, items[1], &out.weight, handles, error);
+  }
+
+  if (tag == "quantized" && arity == 8) {
+    out.quantized = true;
+
+    if (!qwen3_get_tensor(env, items[1], &out.weight, handles, error) ||
+        !qwen3_get_tensor(env, items[2], &out.scales, handles, error)) {
+      return false;
+    }
+
+    std::string nil_atom;
+    bool biases_nil = nx::nif::get_atom(env, items[3], nil_atom) && nil_atom == "nil";
+    if (biases_nil) {
+      out.biases = nullptr;
+    } else if (!qwen3_get_tensor(env, items[3], &out.biases, handles, error)) {
+      return false;
+    }
+
+    return nx::nif::get(env, items[4], &out.group_size) &&
+           nx::nif::get(env, items[5], &out.bits) &&
+           nx::nif::get(env, items[6], out.mode) &&
+           nx::nif::get(env, items[7], &out.transpose);
+  }
+
+  return false;
+}
+
+// Best-effort logical input-width check for a `Qwen3LinearWeight`. Dense
+// weights are checked exactly; quantized weights are checked via the packed
+// width recovered from `bits` (packed columns = in_features * bits / 32) —
+// precise enough to catch wiring bugs, while true shape agreement is still
+// enforced by `mx::quantized_matmul` itself (caught by `CATCH()`).
+static bool qwen3_check_linear_weight_in(
+    const Qwen3LinearWeight &w, int expected_in, const char *name, std::string &error) {
+  if (w.quantized) {
+    if (!qwen3_check_rank2_positive(*w.weight, name, error) ||
+        !qwen3_check_rank2_positive(*w.scales, name, error)) {
+      return false;
+    }
+    if (w.bits <= 0 || w.bits > 32 || (32 % w.bits) != 0) {
+      error = std::string(name) + " has an invalid bits value";
+      return false;
+    }
+    int actual_in = static_cast<int>(w.weight->shape(1)) * (32 / w.bits);
+    if (actual_in != expected_in) {
+      std::ostringstream msg;
+      msg << name << " input width must be " << expected_in << ", got " << actual_in;
+      error = msg.str();
+      return false;
+    }
+    return true;
+  }
+
+  if (!qwen3_check_rank2_positive(*w.weight, name, error)) {
+    return false;
+  }
+  int actual_in = w.transpose ? static_cast<int>(w.weight->shape(1)) : static_cast<int>(w.weight->shape(0));
+  if (actual_in != expected_in) {
+    std::ostringstream msg;
+    msg << name << " input width must be " << expected_in << ", got " << actual_in;
+    error = msg.str();
+    return false;
+  }
+  return true;
+}
+
 static bool qwen3_get_layer(
     ErlNifEnv *env,
     ERL_NIF_TERM term,
@@ -771,6 +917,339 @@ static ERL_NIF_TERM qwen3_ref_error_or(
 
   return nx::nif::error(env, fallback);
 }
+
+// Qwen3LayerParamsQ — generalized per-layer params: norms stay plain tensors,
+// the 7 projections are each independently dense-or-quantized. This is a
+// strict superset of `Qwen3LayerParams`: an all-dense `Qwen3LayerParamsQ`
+// computes identically to `qwen3_dense_layer_impl`.
+struct Qwen3LayerParamsQ {
+  mlx::core::array *norm1;
+  mlx::core::array *norm2;
+  mlx::core::array *q_norm;
+  mlx::core::array *k_norm;
+  Qwen3LinearWeight q_proj;
+  Qwen3LinearWeight k_proj;
+  Qwen3LinearWeight v_proj;
+  Qwen3LinearWeight o_proj;
+  Qwen3LinearWeight gate_proj;
+  Qwen3LinearWeight up_proj;
+  Qwen3LinearWeight down_proj;
+};
+
+static bool qwen3_get_layer_generalized(
+    ErlNifEnv *env,
+    ERL_NIF_TERM term,
+    Qwen3LayerParamsQ &layer,
+    Qwen3TensorHandles &handles,
+    ERL_NIF_TERM *error) {
+  int arity = 0;
+  const ERL_NIF_TERM *items = nullptr;
+  if (!enif_get_tuple(env, term, &arity, &items) || arity != 11) {
+    return false;
+  }
+
+  return qwen3_get_tensor(env, items[0], &layer.norm1, handles, error) &&
+         qwen3_get_tensor(env, items[1], &layer.norm2, handles, error) &&
+         qwen3_get_tensor(env, items[2], &layer.q_norm, handles, error) &&
+         qwen3_get_tensor(env, items[3], &layer.k_norm, handles, error) &&
+         qwen3_get_linear_weight(env, items[4], false, layer.q_proj, handles, error) &&
+         qwen3_get_linear_weight(env, items[5], false, layer.k_proj, handles, error) &&
+         qwen3_get_linear_weight(env, items[6], false, layer.v_proj, handles, error) &&
+         qwen3_get_linear_weight(env, items[7], false, layer.o_proj, handles, error) &&
+         qwen3_get_linear_weight(env, items[8], false, layer.gate_proj, handles, error) &&
+         qwen3_get_linear_weight(env, items[9], false, layer.up_proj, handles, error) &&
+         qwen3_get_linear_weight(env, items[10], false, layer.down_proj, handles, error);
+}
+
+static bool qwen3_validate_generalized_layer(
+    const mlx::core::array &hidden,
+    const Qwen3LayerParamsQ &layer,
+    const Qwen3KVCache &kv,
+    int offset,
+    int head_dim,
+    std::string &error) {
+  if (!qwen3_check_rank3_positive(hidden, "hidden", error) ||
+      !qwen3_check_non_negative(offset, "offset", error) ||
+      !qwen3_check_positive(head_dim, "head_dim", error)) {
+    return false;
+  }
+
+  int B = hidden.shape(0);
+  int T_new = hidden.shape(1);
+  int H = hidden.shape(2);
+  int D = head_dim;
+
+  if (!qwen3_check_rank1_dim(*layer.norm1, H, "norm1", error) ||
+      !qwen3_check_rank1_dim(*layer.norm2, H, "norm2", error) ||
+      !qwen3_check_rank1_dim(*layer.q_norm, D, "q_norm", error) ||
+      !qwen3_check_rank1_dim(*layer.k_norm, D, "k_norm", error) ||
+      !qwen3_check_linear_weight_in(layer.q_proj, H, "q_proj", error) ||
+      !qwen3_check_linear_weight_in(layer.k_proj, H, "k_proj", error) ||
+      !qwen3_check_linear_weight_in(layer.v_proj, H, "v_proj", error) ||
+      !qwen3_check_linear_weight_in(layer.gate_proj, H, "gate_proj", error) ||
+      !qwen3_check_linear_weight_in(layer.up_proj, H, "up_proj", error)) {
+    return false;
+  }
+
+  int q_out = qwen3_linear_weight_out_features(layer.q_proj);
+  int k_out = qwen3_linear_weight_out_features(layer.k_proj);
+  int v_out = qwen3_linear_weight_out_features(layer.v_proj);
+
+  if ((q_out % D) != 0 || (k_out % D) != 0) {
+    error = "q_proj/k_proj output width must be divisible by head_dim";
+    return false;
+  }
+  if (v_out != k_out) {
+    error = "v_proj output width must match k_proj output width";
+    return false;
+  }
+
+  int N_q = q_out / D;
+  int N_kv = k_out / D;
+  if ((N_q % N_kv) != 0) {
+    error = "query heads must be divisible by key/value heads";
+    return false;
+  }
+
+  int attn_width = N_q * D;
+  if (!qwen3_check_linear_weight_in(layer.o_proj, attn_width, "o_proj", error)) {
+    return false;
+  }
+  if (qwen3_linear_weight_out_features(layer.o_proj) != H) {
+    error = "o_proj output width must match hidden width";
+    return false;
+  }
+
+  int gate_out = qwen3_linear_weight_out_features(layer.gate_proj);
+  int up_out = qwen3_linear_weight_out_features(layer.up_proj);
+  if (up_out != gate_out) {
+    error = "up_proj output width must match gate_proj output width";
+    return false;
+  }
+
+  if (!qwen3_check_linear_weight_in(layer.down_proj, gate_out, "down_proj", error)) {
+    return false;
+  }
+  if (qwen3_linear_weight_out_features(layer.down_proj) != H) {
+    error = "down_proj output width must match hidden width";
+    return false;
+  }
+
+  return qwen3_validate_kv_cache_bn(*kv.k, *kv.v, B, N_kv, offset, T_new, D, error);
+}
+
+// qwen3_layer_core_generalized — shared per-layer compute for the quantized
+// (or mixed dense/quantized) fast lane. Mirrors `qwen3_dense_layer_impl`
+// exactly, but threads every projection through `qwen3_apply_linear` instead
+// of assuming a dense `qwen3_linear_in_out` weight.
+static mlx::core::array qwen3_layer_core_generalized(
+    const mlx::core::array &hidden,
+    const Qwen3LayerParamsQ &layer,
+    Qwen3KVCache &kv,
+    int offset,
+    float scale,
+    int head_dim,
+    float theta,
+    float eps,
+    const mlx::core::Device &device,
+    mlx::core::array *k_out,
+    mlx::core::array *v_out) {
+  int B       = hidden.shape(0);
+  int T_new   = hidden.shape(1);
+  int D       = head_dim;
+  int N_q     = qwen3_linear_weight_out_features(layer.q_proj) / D;
+  int N_kv    = qwen3_linear_weight_out_features(layer.k_proj) / D;
+  int attn_width = N_q * D;
+  int valid_len = offset + T_new;
+
+  auto xn = mlx::core::fast::rms_norm(hidden, *layer.norm1, eps, device);
+  auto q_flat = qwen3_apply_linear(xn, layer.q_proj, device);
+  auto k_flat = qwen3_apply_linear(xn, layer.k_proj, device);
+  auto v_flat = qwen3_apply_linear(xn, layer.v_proj, device);
+
+  auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, device);
+  auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, device);
+  auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, device);
+
+  q = mlx::core::fast::rms_norm(q, *layer.q_norm, eps, device);
+  k = mlx::core::fast::rms_norm(k, *layer.k_norm, eps, device);
+
+  auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, device);
+  auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, device);
+  auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, device);
+
+  auto q_rope = mlx::core::fast::rope(
+      q_bn, D, false, theta, 1.0f, offset, std::nullopt, device);
+  auto k_rope = mlx::core::fast::rope(
+      k_bn, D, false, theta, 1.0f, offset, std::nullopt, device);
+
+  auto k_cache_owned = std::move(*kv.k);
+  auto v_cache_owned = std::move(*kv.v);
+
+  auto k_upd = mlx::core::slice_update(
+      k_cache_owned, k_rope,
+      to_shape({0, 0, offset, 0}),
+      to_shape({B, N_kv, valid_len, D}),
+      device);
+  auto v_upd = mlx::core::slice_update(
+      v_cache_owned, v_bn,
+      to_shape({0, 0, offset, 0}),
+      to_shape({B, N_kv, valid_len, D}),
+      device);
+
+  auto k_valid = mlx::core::slice(
+      k_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+  auto v_valid = mlx::core::slice(
+      v_upd, to_shape({0, 0, 0, 0}), to_shape({B, N_kv, valid_len, D}), device);
+
+  auto build_prefill_mask = [&]() -> mlx::core::array {
+    auto mask_dtype = q.dtype();
+    auto zero_val   = mlx::core::zeros({}, mask_dtype, device);
+    auto neginf_val = mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, device);
+    int kv_offset = valid_len - T_new;
+    auto row = mlx::core::reshape(
+        mlx::core::arange(T_new,     mlx::core::int32, device), {1, 1, T_new, 1},     device);
+    auto col = mlx::core::reshape(
+        mlx::core::arange(valid_len, mlx::core::int32, device), {1, 1, 1, valid_len}, device);
+    auto causal_bool = mlx::core::less_equal(
+        col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
+    return mlx::core::where(causal_bool, zero_val, neginf_val, device);
+  };
+
+  auto attn_out_bn = (T_new == 1)
+      ? mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, scale, "", std::nullopt, std::nullopt, device)
+      : mlx::core::fast::scaled_dot_product_attention(
+            q_rope, k_valid, v_valid, scale, "array", build_prefill_mask(), std::nullopt, device);
+  auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
+  auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, device);
+  auto attn_projected = qwen3_apply_linear(attn_out, layer.o_proj, device);
+  auto attn_hidden = mlx::core::add(hidden, attn_projected, device);
+
+  auto xn2 = mlx::core::fast::rms_norm(attn_hidden, *layer.norm2, eps, device);
+  auto gate = qwen3_apply_linear(xn2, layer.gate_proj, device);
+  auto up = qwen3_apply_linear(xn2, layer.up_proj, device);
+  auto mlp = mlx::core::multiply(
+      mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device),
+      up,
+      device);
+  auto mlp_out = qwen3_apply_linear(mlp, layer.down_proj, device);
+
+  if (k_out != nullptr) {
+    *k_out = k_upd;
+  }
+  if (v_out != nullptr) {
+    *v_out = v_upd;
+  }
+
+  return mlx::core::add(attn_hidden, mlp_out, device);
+}
+
+// qwen3_layer_quantized — generalized Qwen3 transformer layer: same fusion as
+// `qwen3_layer` (attention input RMSNorm + attention block + post-attention
+// RMSNorm + MLP + residual add), but each of the 7 projections
+// (q/k/v/o/gate/up/down) independently accepts a dense-or-quantized weight
+// term. Collapses the quantized native lane's ~13 per-layer NIF calls down
+// to 1, matching dense's fused `qwen3_layer`.
+//
+// Inputs:
+//   hidden    — {B, T_new, H}
+//   norm1     — {H}
+//   q_proj, k_proj, v_proj, o_proj — weight terms (see `qwen3_get_linear_weight`)
+//   q_norm    — {D}
+//   k_norm    — {D}
+//   k_cache   — {B, N_kv, T_max, D}
+//   v_cache   — {B, N_kv, T_max, D}
+//   norm2     — {H}
+//   gate_proj, up_proj, down_proj — weight terms
+//   offset    — int
+//   scale     — float
+//   head_dim  — int
+//   theta     — float
+//   eps       — RMSNorm epsilon
+//
+// Returns {hidden_out, k_upd, v_upd}.
+NIF(qwen3_layer_quantized) {
+  TENSOR_PARAM(0, hidden);
+
+  Qwen3TensorHandles handles;
+  ERL_NIF_TERM ref_error = 0;
+  Qwen3LayerParamsQ layer;
+  mlx::core::array *k_cache = nullptr;
+  mlx::core::array *v_cache = nullptr;
+
+  if (!qwen3_get_tensor(env, argv[1], &layer.norm1, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized expects norm1 tensor ref");
+  }
+  if (!qwen3_get_linear_weight(env, argv[2], false, layer.q_proj, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized got invalid q_proj weight term");
+  }
+  if (!qwen3_get_linear_weight(env, argv[3], false, layer.k_proj, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized got invalid k_proj weight term");
+  }
+  if (!qwen3_get_linear_weight(env, argv[4], false, layer.v_proj, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized got invalid v_proj weight term");
+  }
+  if (!qwen3_get_linear_weight(env, argv[5], false, layer.o_proj, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized got invalid o_proj weight term");
+  }
+  if (!qwen3_get_tensor(env, argv[6], &layer.q_norm, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized expects q_norm tensor ref");
+  }
+  if (!qwen3_get_tensor(env, argv[7], &layer.k_norm, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized expects k_norm tensor ref");
+  }
+  if (!qwen3_get_tensor(env, argv[8], &k_cache, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized expects k_cache tensor ref");
+  }
+  if (!qwen3_get_tensor(env, argv[9], &v_cache, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized expects v_cache tensor ref");
+  }
+  if (!qwen3_get_tensor(env, argv[10], &layer.norm2, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized expects norm2 tensor ref");
+  }
+  if (!qwen3_get_linear_weight(env, argv[11], false, layer.gate_proj, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized got invalid gate_proj weight term");
+  }
+  if (!qwen3_get_linear_weight(env, argv[12], false, layer.up_proj, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized got invalid up_proj weight term");
+  }
+  if (!qwen3_get_linear_weight(env, argv[13], false, layer.down_proj, handles, &ref_error)) {
+    return qwen3_ref_error_or(env, ref_error, "qwen3_layer_quantized got invalid down_proj weight term");
+  }
+
+  PARAM(14, int, offset);
+  PARAM(15, double, scale);
+  PARAM(16, int, head_dim);
+  PARAM(17, double, theta);
+  PARAM(18, double, eps);
+  DEVICE_PARAM(19, device);
+
+  try {
+    Qwen3KVCache kv{k_cache, v_cache};
+
+    std::string error;
+    if (!qwen3_validate_generalized_layer(*hidden, layer, kv, offset, head_dim, error)) {
+      return nx::nif::error(env, error.c_str());
+    }
+
+    mlx::core::array k_upd = mlx::core::array(0);
+    mlx::core::array v_upd = mlx::core::array(0);
+
+    auto out = qwen3_layer_core_generalized(
+        *hidden, layer, kv, offset, static_cast<float>(scale), head_dim,
+        static_cast<float>(theta), static_cast<float>(eps), device, &k_upd, &v_upd);
+
+    ERL_NIF_TERM result_tuple[3];
+    result_tuple[0] = create_tensor_resource(env, out);
+    result_tuple[1] = create_tensor_resource(env, k_upd);
+    result_tuple[2] = create_tensor_resource(env, v_upd);
+
+    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+  }
+  CATCH()
+}
+ASYNC_NIF(qwen3_layer_quantized)
 
 static bool qwen3_validate_dense_layer(
     const mlx::core::array &hidden,
@@ -1680,3 +2159,233 @@ NIF(qwen3_attention_block) {
   CATCH()
 }
 ASYNC_NIF(qwen3_attention_block)
+
+// qwen3_forward_greedy_ids_chunk_quantized — generalized variant of
+// `qwen3_forward_greedy_ids_chunk`: repeatedly decodes greedy tokens from a
+// single token id tensor without returning to Elixir between decode steps,
+// same as the dense chunk NIF, but every layer's 7 projections and the final
+// `lm_head` each independently accept a dense-or-quantized weight term (see
+// `qwen3_get_linear_weight`). This lets the quantized native lane fuse an
+// entire chunk (all layers x `count` decode steps) into 1 NIF call instead
+// of falling back to `count` per-token per-op Elixir/NIF round trips.
+//
+// Returns {token_id_refs, kv_cache}, where token_id_refs is a list of token
+// tensors in generation order and kv_cache is the final updated raw cache.
+NIF(qwen3_forward_greedy_ids_chunk_quantized) {
+  TENSOR_PARAM(0, input_ids);
+  TENSOR_PARAM(1, embed_tokens);
+  PARAM(6, int, offset);
+  PARAM(7, int, count);
+  PARAM(8, double, scale);
+  PARAM(9, int, head_dim);
+  PARAM(10, double, theta);
+  PARAM(11, double, eps);
+  DEVICE_PARAM(12, device);
+
+  try {
+    if (count <= 0) {
+      return nx::nif::error(
+          env, "qwen3_forward_greedy_ids_chunk_quantized expects positive count");
+    }
+
+    Qwen3TensorHandles handles;
+    ERL_NIF_TERM ref_error = 0;
+    mlx::core::array *norm = nullptr;
+    Qwen3LinearWeight lm_head;
+    if (!qwen3_get_tensor(env, argv[4], &norm, handles, &ref_error)) {
+      return qwen3_ref_error_or(
+          env, ref_error, "qwen3_forward_greedy_ids_chunk_quantized expects norm tensor ref");
+    }
+    if (!qwen3_get_linear_weight(env, argv[5], true, lm_head, handles, &ref_error)) {
+      return qwen3_ref_error_or(
+          env, ref_error,
+          "qwen3_forward_greedy_ids_chunk_quantized got invalid lm_head weight term");
+    }
+
+    unsigned int layer_count = 0;
+    unsigned int kv_count = 0;
+
+    if (!enif_get_list_length(env, argv[2], &layer_count)) {
+      return nx::nif::error(
+          env, "qwen3_forward_greedy_ids_chunk_quantized expects layers to be a list");
+    }
+    if (!enif_get_list_length(env, argv[3], &kv_count)) {
+      return nx::nif::error(
+          env, "qwen3_forward_greedy_ids_chunk_quantized expects kv_cache to be a list");
+    }
+    if (layer_count != kv_count) {
+      return nx::nif::error(
+          env,
+          "qwen3_forward_greedy_ids_chunk_quantized layers and kv_cache length mismatch");
+    }
+
+    std::vector<Qwen3LayerParamsQ> layers;
+    layers.reserve(layer_count);
+
+    ERL_NIF_TERM layer_head;
+    ERL_NIF_TERM layer_tail = argv[2];
+    while (enif_get_list_cell(env, layer_tail, &layer_head, &layer_tail)) {
+      Qwen3LayerParamsQ layer;
+      if (!qwen3_get_layer_generalized(env, layer_head, layer, handles, &ref_error)) {
+        return qwen3_ref_error_or(
+            env, ref_error,
+            "qwen3_forward_greedy_ids_chunk_quantized got invalid layer tuple");
+      }
+      layers.push_back(layer);
+    }
+
+    std::vector<Qwen3KVCache> initial_kv;
+    initial_kv.reserve(kv_count);
+
+    ERL_NIF_TERM kv_head;
+    ERL_NIF_TERM kv_tail = argv[3];
+    while (enif_get_list_cell(env, kv_tail, &kv_head, &kv_tail)) {
+      Qwen3KVCache kv;
+      if (!qwen3_get_kv(env, kv_head, kv, handles, &ref_error)) {
+        return qwen3_ref_error_or(
+            env, ref_error,
+            "qwen3_forward_greedy_ids_chunk_quantized got invalid kv_cache tuple");
+      }
+      initial_kv.push_back(kv);
+    }
+
+    std::string error;
+    if (!qwen3_check_rank2_positive(*input_ids, "input_ids", error) ||
+        !qwen3_check_rank2_positive(*embed_tokens, "embed_tokens", error) ||
+        !qwen3_check_non_negative(offset, "offset", error) ||
+        !qwen3_check_positive(head_dim, "head_dim", error) ||
+        !qwen3_check_rank1_dim(*norm, embed_tokens->shape(1), "norm", error) ||
+        !qwen3_check_linear_weight_in(lm_head, embed_tokens->shape(1), "lm_head", error)) {
+      return nx::nif::error(env, error.c_str());
+    }
+    if (input_ids->shape(0) != 1) {
+      return nx::nif::error(
+          env, "qwen3_forward_greedy_ids_chunk_quantized requires batch size 1");
+    }
+    if (input_ids->shape(1) != 1) {
+      return nx::nif::error(
+          env, "qwen3_forward_greedy_ids_chunk_quantized requires sequence length 1");
+    }
+
+    std::vector<mlx::core::array> k_cache;
+    std::vector<mlx::core::array> v_cache;
+    std::vector<mlx::core::array> next_k_cache;
+    std::vector<mlx::core::array> next_v_cache;
+    std::vector<ERL_NIF_TERM> token_terms;
+    std::vector<mlx::core::array> token_arrays;
+    k_cache.reserve(layer_count);
+    v_cache.reserve(layer_count);
+    next_k_cache.reserve(layer_count);
+    next_v_cache.reserve(layer_count);
+    token_terms.reserve(count);
+    token_arrays.reserve(count);
+
+    auto current_ids = *input_ids;
+    int current_offset = offset;
+
+    for (int step = 0; step < count; ++step) {
+      int B = current_ids.shape(0);
+      int T = current_ids.shape(1);
+
+      auto ids = mlx::core::reshape(current_ids, {B * T}, device);
+      auto current = mlx::core::reshape(
+          mlx::core::take(*embed_tokens, ids, 0, device),
+          {B, T, embed_tokens->shape(1)},
+          device);
+
+      next_k_cache.clear();
+      next_v_cache.clear();
+
+      for (unsigned int layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+        Qwen3KVCache kv =
+            (step == 0)
+                ? initial_kv[layer_idx]
+                : Qwen3KVCache{&k_cache[layer_idx], &v_cache[layer_idx]};
+
+        std::string layer_error;
+        if (!qwen3_validate_generalized_layer(
+                current, layers[layer_idx], kv, current_offset, head_dim, layer_error)) {
+          return nx::nif::error(env, layer_error.c_str());
+        }
+
+        auto k_new = *kv.k;
+        auto v_new = *kv.v;
+
+        current = qwen3_layer_core_generalized(
+            current,
+            layers[layer_idx],
+            kv,
+            current_offset,
+            static_cast<float>(scale),
+            head_dim,
+            static_cast<float>(theta),
+            static_cast<float>(eps),
+            device,
+            &k_new,
+            &v_new);
+
+        next_k_cache.push_back(k_new);
+        next_v_cache.push_back(v_new);
+      }
+
+      int B_out = current.shape(0);
+      int T_out = current.shape(1);
+      int H_out = current.shape(2);
+
+      auto last = (T_out == 1)
+          ? mlx::core::reshape(current, {B_out, H_out}, device)
+          : mlx::core::reshape(
+              mlx::core::slice(
+                  current,
+                  to_shape({0, T_out - 1, 0}),
+                  to_shape({B_out, T_out, H_out}),
+                  device),
+              {B_out, H_out},
+              device);
+
+      auto normed = mlx::core::fast::rms_norm(last, *norm, static_cast<float>(eps), device);
+      auto logits = qwen3_apply_linear(normed, lm_head, device);
+      auto token = mlx::core::argmax(logits, 1, false, device);
+
+      token_arrays.push_back(token);
+      token_terms.push_back(create_tensor_resource(env, token));
+      current_ids = mlx::core::reshape(token, {B_out, 1}, device);
+      k_cache.swap(next_k_cache);
+      v_cache.swap(next_v_cache);
+      current_offset += 1;
+    }
+
+    // Queue token materialisation and final cache ownership before Elixir
+    // starts copying/decoding tokens or returns the cache to the next chunk.
+    std::vector<mlx::core::array> eval_arrays;
+    eval_arrays.reserve(token_arrays.size() + (layer_count * 2));
+    eval_arrays.insert(eval_arrays.end(), token_arrays.begin(), token_arrays.end());
+
+    for (unsigned int layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+      eval_arrays.push_back(k_cache[layer_idx]);
+      eval_arrays.push_back(v_cache[layer_idx]);
+    }
+
+    mlx::core::async_eval(eval_arrays);
+
+    std::vector<ERL_NIF_TERM> kv_terms;
+    kv_terms.reserve(layer_count);
+
+    for (unsigned int layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+      kv_terms.push_back(
+          enif_make_tuple2(
+              env,
+              create_tensor_resource(env, k_cache[layer_idx]),
+              create_tensor_resource(env, v_cache[layer_idx])));
+    }
+
+    ERL_NIF_TERM token_list =
+        enif_make_list_from_array(env, token_terms.data(), token_terms.size());
+    ERL_NIF_TERM kv_list =
+        enif_make_list_from_array(env, kv_terms.data(), kv_terms.size());
+
+    return nx::nif::ok(env, enif_make_tuple2(env, token_list, kv_list));
+  }
+  CATCH()
+}
+ASYNC_NIF(qwen3_forward_greedy_ids_chunk_quantized)

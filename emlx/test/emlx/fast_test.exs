@@ -934,6 +934,128 @@ defmodule EMLX.FastTest do
       )
     end
 
+    # ── qwen3_layer_quantized (dense-or-quantized per-projection fusion) ──────
+
+    @qwen3_layer_quantized_modes [
+      {"affine", 32, 4},
+      {"mxfp4", 32, 4}
+    ]
+
+    for {mode, group_size, bits} <- @qwen3_layer_quantized_modes do
+      test "qwen3_layer_quantized (#{mode}) matches per-op quantized reference for prefill (T_new > 1)" do
+        fixtures =
+          qwen3_quantized_attention_fixtures(
+            [:q_proj, :k_proj, :v_proj, :o_proj, :gate_proj, :up_proj, :down_proj],
+            group_size: unquote(group_size),
+            bits: unquote(bits),
+            mode: unquote(mode)
+          )
+
+        {out_ref, k_ref, v_ref} = qwen3_layer_quantized_call(fixtures)
+        {expected, expected_k, expected_v} = qwen3_layer_quantized_reference(fixtures)
+
+        assert_all_close(
+          out_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+          expected,
+          atol: 5.0e-2,
+          rtol: 5.0e-2
+        )
+
+        assert_all_close(
+          k_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+          expected_k,
+          atol: 5.0e-2,
+          rtol: 5.0e-2
+        )
+
+        assert_all_close(
+          v_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+          expected_v,
+          atol: 5.0e-2,
+          rtol: 5.0e-2
+        )
+      end
+    end
+
+    test "qwen3_layer_quantized matches per-op quantized reference for decode (T_new == 1)" do
+      fixtures =
+        [:q_proj, :k_proj, :v_proj, :o_proj, :gate_proj, :up_proj, :down_proj]
+        |> qwen3_quantized_attention_fixtures()
+        |> Map.update!(:hidden, &Nx.slice_along_axis(&1, 0, 1, axis: 1))
+
+      {out_ref, k_ref, v_ref} = qwen3_layer_quantized_call(fixtures)
+      {expected, expected_k, expected_v} = qwen3_layer_quantized_reference(fixtures)
+
+      assert_all_close(
+        out_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected,
+        atol: 5.0e-2,
+        rtol: 5.0e-2
+      )
+
+      assert_all_close(
+        k_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected_k,
+        atol: 5.0e-2,
+        rtol: 5.0e-2
+      )
+
+      assert_all_close(
+        v_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected_v,
+        atol: 5.0e-2,
+        rtol: 5.0e-2
+      )
+    end
+
+    test "qwen3_layer_quantized matches per-op reference for a mixed dense/quantized layer" do
+      # Only the MLP projections are quantized; q/k/v/o stay dense — exercises
+      # `Qwen3LinearWeight`/`qwen3_apply_linear` picking the right branch
+      # independently per projection within one layer.
+      fixtures = qwen3_quantized_attention_fixtures([:gate_proj, :up_proj, :down_proj])
+
+      {out_ref, k_ref, v_ref} = qwen3_layer_quantized_call(fixtures)
+      {expected, expected_k, expected_v} = qwen3_layer_quantized_reference(fixtures)
+
+      assert_all_close(
+        out_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected,
+        atol: 5.0e-2,
+        rtol: 5.0e-2
+      )
+
+      assert_all_close(
+        k_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected_k,
+        atol: 1.0e-5,
+        rtol: 1.0e-5
+      )
+
+      assert_all_close(
+        v_ref |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend),
+        expected_v,
+        atol: 1.0e-5,
+        rtol: 1.0e-5
+      )
+    end
+
+    # ── qwen3_forward_greedy_ids_chunk_quantized (multi-step chunk fusion) ────
+
+    test "qwen3_forward_greedy_ids_chunk_quantized produces identical token ids to " <>
+           "running the quantized single-layer NIF + manual final step N times" do
+      # Each fused NIF call `std::move`s the k/v caches it receives (mirroring
+      # `qwen3_layer`'s existing move-and-return-updated-cache contract), so
+      # the two independent call paths below must not share the same
+      # underlying cache resource — build separate fixture instances rather
+      # than reusing one across both.
+      count = 3
+
+      chunk_tokens = qwen3_quantized_chunk_call(qwen3_quantized_chunk_fixtures(), count)
+      manual_tokens = qwen3_quantized_chunk_manual_tokens(qwen3_quantized_chunk_fixtures(), count)
+
+      assert chunk_tokens == manual_tokens
+    end
+
     test "qwen3_attention_residual matches pure Nx reference" do
       {hidden, attn_out, o_proj} =
         Nx.with_default_backend(Nx.BinaryBackend, fn ->
@@ -1344,6 +1466,271 @@ defmodule EMLX.FastTest do
         eps: 1.0e-6
       }
     end)
+  end
+
+  # Passes a tensor through unchanged if it's already GPU/EMLX-backed
+  # (quantized fixtures come back from `EMLX.quantize/2` that way); otherwise
+  # transfers it, mirroring the dense `gpu/1` helper above.
+  defp ensure_gpu(%Nx.Tensor{data: %EMLX.Backend{}} = tensor), do: tensor
+  defp ensure_gpu(tensor), do: gpu(tensor)
+
+  # Builds a Qwen3 single-layer fixture (H=32, head_dim=16, N_q=2, N_kv=1,
+  # intermediate=32 — all input widths are 32, satisfying `EMLX.quantize/2`'s
+  # supported group sizes {32, 64, 128} and every microscaled mode's fixed
+  # group_size) and quantizes the projections listed in `quantized_slots` via
+  # `EMLX.quantize/2`.
+  #
+  # For each quantized slot, also stashes a `<slot>_reference` dequantized
+  # tensor in the *same* {in, out} convention as the dense fixtures, so
+  # `qwen3_layer_quantized_reference/1` can reuse the existing dense-only
+  # `qwen3_attention_block_reference/1`/`qwen3_mlp_reference/6` helpers
+  # unchanged — isolating fusion correctness from quantization lossiness
+  # (both sides of the comparison use the same quantized-then-dequantized
+  # numbers).
+  defp qwen3_quantized_attention_fixtures(quantized_slots, opts \\ []) do
+    group_size = Keyword.get(opts, :group_size, 32)
+    bits = Keyword.get(opts, :bits, 4)
+    mode = Keyword.get(opts, :mode, "affine")
+
+    base =
+      Nx.with_default_backend(Nx.BinaryBackend, fn ->
+        %{
+          hidden: Nx.iota({1, 2, 32}, type: :f32) |> Nx.add(1) |> Nx.divide(400),
+          norm1: Nx.iota({32}, type: :f32) |> Nx.add(10) |> Nx.divide(10),
+          norm2: Nx.iota({32}, type: :f32) |> Nx.add(20) |> Nx.divide(10),
+          q_norm: Nx.iota({16}, type: :f32) |> Nx.add(30) |> Nx.divide(10),
+          k_norm: Nx.iota({16}, type: :f32) |> Nx.add(40) |> Nx.divide(10),
+          q_proj: Nx.iota({32, 32}, type: :f32) |> Nx.add(1) |> Nx.divide(900),
+          k_proj: Nx.iota({32, 16}, type: :f32) |> Nx.add(2) |> Nx.divide(900),
+          v_proj: Nx.iota({32, 16}, type: :f32) |> Nx.add(3) |> Nx.divide(900),
+          o_proj: Nx.iota({32, 32}, type: :f32) |> Nx.add(4) |> Nx.divide(900),
+          gate_proj: Nx.iota({32, 32}, type: :f32) |> Nx.add(5) |> Nx.divide(900),
+          up_proj: Nx.iota({32, 32}, type: :f32) |> Nx.add(6) |> Nx.divide(900),
+          down_proj: Nx.iota({32, 32}, type: :f32) |> Nx.add(7) |> Nx.divide(900),
+          k_cache: Nx.broadcast(0.0, {1, 1, 4, 16}) |> Nx.as_type(:f32),
+          v_cache: Nx.broadcast(0.0, {1, 1, 4, 16}) |> Nx.as_type(:f32),
+          offset: 0,
+          head_dim: 16,
+          theta: 10_000.0,
+          eps: 1.0e-6
+        }
+      end)
+
+    Enum.reduce(quantized_slots, base, fn slot, acc ->
+      dense_w = Map.fetch!(acc, slot)
+
+      qw =
+        dense_w
+        |> gpu()
+        |> Nx.transpose()
+        |> EMLX.quantize(type: {:s, bits}, group_size: group_size, mode: mode)
+
+      dequantized_in_out =
+        qw
+        |> EMLX.dequantize()
+        |> Nx.transpose()
+        |> Nx.backend_transfer(Nx.BinaryBackend)
+
+      acc
+      |> Map.put(slot, qw)
+      |> Map.put(:"#{slot}_reference", dequantized_in_out)
+    end)
+  end
+
+  defp qwen3_layer_quantized_call(fixtures) do
+    scale = 1.0 / :math.sqrt(fixtures.head_dim)
+
+    EMLX.qwen3_layer_quantized(
+      EMLX.Backend.from_nx(gpu(fixtures.hidden)),
+      ensure_gpu(fixtures.norm1),
+      ensure_gpu(fixtures.q_proj),
+      ensure_gpu(fixtures.k_proj),
+      ensure_gpu(fixtures.v_proj),
+      ensure_gpu(fixtures.o_proj),
+      ensure_gpu(fixtures.q_norm),
+      ensure_gpu(fixtures.k_norm),
+      EMLX.Backend.from_nx(gpu(fixtures.k_cache)),
+      EMLX.Backend.from_nx(gpu(fixtures.v_cache)),
+      ensure_gpu(fixtures.norm2),
+      ensure_gpu(fixtures.gate_proj),
+      ensure_gpu(fixtures.up_proj),
+      ensure_gpu(fixtures.down_proj),
+      fixtures.offset,
+      scale,
+      fixtures.head_dim,
+      fixtures.theta,
+      fixtures.eps
+    )
+  end
+
+  defp qwen3_layer_quantized_reference(fixtures) do
+    dense_fixtures =
+      Enum.reduce(
+        [:q_proj, :k_proj, :v_proj, :o_proj, :gate_proj, :up_proj, :down_proj],
+        fixtures,
+        fn slot, acc ->
+          case Map.fetch(fixtures, :"#{slot}_reference") do
+            {:ok, dequantized} -> Map.put(acc, slot, dequantized)
+            :error -> acc
+          end
+        end
+      )
+
+    {attn_expected, expected_k, expected_v} = qwen3_attention_block_reference(dense_fixtures)
+
+    expected =
+      qwen3_mlp_reference(
+        attn_expected,
+        dense_fixtures.norm2,
+        dense_fixtures.gate_proj,
+        dense_fixtures.up_proj,
+        dense_fixtures.down_proj,
+        dense_fixtures.eps
+      )
+
+    {expected, expected_k, expected_v}
+  end
+
+  # Single-layer fixture for `qwen3_forward_greedy_ids_chunk_quantized`
+  # determinism testing: same projection shapes as
+  # `qwen3_quantized_attention_fixtures/2`, plus a small embedding table and a
+  # quantized `lm_head` (`{vocab, H}`, already in the `{out, in}` convention
+  # `EMLX.quantize/2` expects — no transpose needed, unlike the projections).
+  defp qwen3_quantized_chunk_fixtures do
+    base =
+      qwen3_quantized_attention_fixtures([
+        :q_proj,
+        :k_proj,
+        :v_proj,
+        :o_proj,
+        :gate_proj,
+        :up_proj,
+        :down_proj
+      ])
+
+    embed_tokens =
+      Nx.iota({6, 32}, type: :f32) |> Nx.add(1) |> Nx.divide(900) |> gpu()
+
+    lm_head =
+      Nx.iota({6, 32}, type: :f32)
+      |> Nx.add(2)
+      |> Nx.divide(900)
+      |> gpu()
+      |> EMLX.quantize(type: {:s, 4}, group_size: 32, mode: "affine")
+
+    norm = Nx.iota({32}, type: :f32) |> Nx.add(50) |> Nx.divide(10) |> gpu()
+
+    # Enough KV cache capacity for `offset + count` across the test's decode
+    # steps (capacity 8 comfortably covers `count = 3`).
+    k_cache = Nx.broadcast(0.0, {1, 1, 8, 16}) |> Nx.as_type(:f32) |> gpu()
+    v_cache = Nx.broadcast(0.0, {1, 1, 8, 16}) |> Nx.as_type(:f32) |> gpu()
+
+    %{
+      base
+      | k_cache: k_cache,
+        v_cache: v_cache
+    }
+    |> Map.put(:embed_tokens, embed_tokens)
+    |> Map.put(:lm_head, lm_head)
+    |> Map.put(:norm, norm)
+    |> Map.put(:input_id, 0)
+  end
+
+  defp qwen3_quantized_chunk_call(fixtures, count) do
+    scale = 1.0 / :math.sqrt(fixtures.head_dim)
+    input_ids = Nx.tensor([[fixtures.input_id]], type: :s64) |> gpu()
+
+    layer = {
+      ensure_gpu(fixtures.norm1),
+      ensure_gpu(fixtures.norm2),
+      ensure_gpu(fixtures.q_norm),
+      ensure_gpu(fixtures.k_norm),
+      ensure_gpu(fixtures.q_proj),
+      ensure_gpu(fixtures.k_proj),
+      ensure_gpu(fixtures.v_proj),
+      ensure_gpu(fixtures.o_proj),
+      ensure_gpu(fixtures.gate_proj),
+      ensure_gpu(fixtures.up_proj),
+      ensure_gpu(fixtures.down_proj)
+    }
+
+    {token_refs, _kv_cache} =
+      EMLX.qwen3_forward_greedy_ids_chunk_quantized(
+        EMLX.Backend.from_nx(input_ids),
+        EMLX.Backend.from_nx(fixtures.embed_tokens),
+        [layer],
+        [{fixtures.k_cache, fixtures.v_cache}],
+        EMLX.Backend.from_nx(fixtures.norm),
+        fixtures.lm_head,
+        fixtures.offset,
+        count,
+        scale,
+        fixtures.head_dim,
+        fixtures.theta,
+        fixtures.eps
+      )
+
+    Enum.map(token_refs, &(&1 |> EMLX.Backend.to_nx() |> Nx.to_flat_list()))
+  end
+
+  # Manually replays the same `count` decode steps by calling the
+  # already-verified single-layer `qwen3_layer_quantized` NIF plus a manual
+  # final RMSNorm + `EMLX.quantized_matmul` lm_head + argmax step, once per
+  # step. Both paths run the exact same MLX ops (just organized as 1 fused
+  # NIF call vs `count` separate calls), so token ids should be bit-identical.
+  defp qwen3_quantized_chunk_manual_tokens(fixtures, count) do
+    scale = 1.0 / :math.sqrt(fixtures.head_dim)
+
+    {_ids, _kv, tokens_rev} =
+      Enum.reduce(1..count, {fixtures.input_id, {fixtures.k_cache, fixtures.v_cache}, []}, fn
+        step, {token_id, {k_cache, v_cache}, acc} ->
+          ids = Nx.tensor([token_id], type: :s64) |> gpu()
+
+          hidden =
+            fixtures.embed_tokens
+            |> Nx.take(ids, axis: 0)
+            |> Nx.new_axis(0)
+
+          {hidden_ref, k_ref, v_ref} =
+            EMLX.qwen3_layer_quantized(
+              EMLX.Backend.from_nx(hidden),
+              ensure_gpu(fixtures.norm1),
+              ensure_gpu(fixtures.q_proj),
+              ensure_gpu(fixtures.k_proj),
+              ensure_gpu(fixtures.v_proj),
+              ensure_gpu(fixtures.o_proj),
+              ensure_gpu(fixtures.q_norm),
+              ensure_gpu(fixtures.k_norm),
+              EMLX.Backend.from_nx(k_cache),
+              EMLX.Backend.from_nx(v_cache),
+              ensure_gpu(fixtures.norm2),
+              ensure_gpu(fixtures.gate_proj),
+              ensure_gpu(fixtures.up_proj),
+              ensure_gpu(fixtures.down_proj),
+              fixtures.offset + step - 1,
+              scale,
+              fixtures.head_dim,
+              fixtures.theta,
+              fixtures.eps
+            )
+
+          hidden_out = EMLX.Backend.to_nx(hidden_ref)
+          k_new = EMLX.Backend.to_nx(k_ref)
+          v_new = EMLX.Backend.to_nx(v_ref)
+
+          normed =
+            hidden_out
+            |> Nx.reshape({1, 32})
+            |> EMLX.Fast.rms_norm(fixtures.norm, fixtures.eps)
+
+          logits = EMLX.Quantization.quantized_matmul(normed, fixtures.lm_head)
+          token = Nx.argmax(logits, axis: 1)
+          token_id = token |> Nx.to_flat_list() |> hd()
+
+          {token_id, {k_new, v_new}, [Nx.to_flat_list(token) | acc]}
+      end)
+
+    Enum.reverse(tokens_rev)
   end
 
   defp qwen3_kv_cache_attention_reference(
