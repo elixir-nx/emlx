@@ -260,11 +260,12 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
-      expr =
-        Nx.Defn.debug_expr_apply(
-          fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end,
-          [Nx.template({3, 3}, :f32), Nx.template({3}, :f32)]
-        )
+      expr = %Nx.Tensor{
+        data: %Nx.Defn.Expr{id: make_ref(), op: :this_op_does_not_exist, args: [], context: nil},
+        type: {:f, 32},
+        shape: {},
+        names: []
+      }
 
       assert_raise ArgumentError, ~r/does not yet lower op/, fn -> Expr.lower(expr) end
     end
@@ -441,13 +442,12 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "unsupported op raises through the compiler seam (no Evaluator fallback)" do
-      f = fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end
+      f = fn a -> Nx.population_count(a) end
 
-      a = Nx.tensor([[3.0, 0.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]], backend: EMLX.Backend)
-      b = Nx.tensor([[1.0, 2.0, 3.0]], backend: EMLX.Backend)
+      a = Nx.tensor([1, 2, 3], type: :s32, backend: EMLX.Backend)
 
-      assert_raise ArgumentError, ~r/does not yet lower op :triangular_solve/, fn ->
-        Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      assert_raise ArgumentError, ~r/population_count is not supported by EMLX/, fn ->
+        Nx.Defn.jit(f, compiler: EMLX).(a)
       end
     end
 
@@ -3345,21 +3345,47 @@ defmodule EMLX.Native.ExprTest do
       assert Enum.all?(prog.instructions, fn {_id, op, _operands, _attrs} -> op != :while end)
     end
 
-    test "triangular_solve left_side: false is unaffected (still raises — separate gap)" do
+    test "triangular_solve left_side: false (2D b) vs EMLX.Backend" do
       a = Nx.tensor([[3.0, 0.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]], backend: EMLX.Backend)
       b = Nx.tensor([[1.0, 2.0, 3.0]], backend: EMLX.Backend)
 
-      templates = [Nx.template(a.shape, :f32), Nx.template(b.shape, :f32)]
+      f = fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
+    end
 
-      expr =
-        Nx.Defn.debug_expr_apply(
-          fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end,
-          templates
-        )
+    test "triangular_solve left_side: false (1D b) vs EMLX.Backend" do
+      a = Nx.tensor([[3.0, 0.0, 0.0], [2.0, 1.0, 0.0], [1.0, 1.0, 1.0]], backend: EMLX.Backend)
+      b = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
 
-      assert_raise ArgumentError, ~r/does not yet lower op :triangular_solve/, fn ->
-        Expr.lower(expr, 2)
+      f = fn a, b -> Nx.LinAlg.triangular_solve(a, b, left_side: false) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
+    end
+
+    test "triangular_solve transform_a: :transpose vs EMLX.Backend" do
+      a = Nx.tensor([[3.0, 1.0, 2.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]], backend: EMLX.Backend)
+      b = Nx.tensor([4.0, 5.0, 6.0], backend: EMLX.Backend)
+
+      f = fn a, b -> Nx.LinAlg.triangular_solve(a, b, lower: false, transform_a: :transpose) end
+      native = Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
+    end
+
+    test "triangular_solve left_side: false + transform_a: :transpose vs EMLX.Backend" do
+      a = Nx.tensor([[3.0, 1.0, 2.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]], backend: EMLX.Backend)
+      b = Nx.tensor([[4.0, 5.0, 6.0]], backend: EMLX.Backend)
+
+      f = fn a, b ->
+        Nx.LinAlg.triangular_solve(a, b, left_side: false, lower: false, transform_a: :transpose)
       end
+
+      native = Nx.Defn.jit(f, compiler: EMLX).(a, b)
+      eager = Nx.Defn.jit(f, compiler: Nx.Defn.Evaluator).(a, b)
+      assert_close(native, eager)
     end
   end
 

@@ -9,7 +9,9 @@ defmodule EMLX.Nx.LinalgTest do
   # Ops that use defn fallbacks and may differ from LAPACK doctests:
   # - matrix_power: pure defn
   # - least_squares: no MLX native
-  # - triangular_solve: small float differences from solve_triangular vs LAPACK reference
+  # - triangular_solve: small float differences vs LAPACK reference, plus a
+  #   handful of doctests using `Nx.vectorize/2`-batched inputs (unsupported —
+  #   separate pre-existing gap, not related to left_side/transform_a)
   # - cholesky: small float differences
   # - lu: MLX raises on singular matrices (doctest uses [[1,2,3],[4,5,6],[7,8,9]])
   # - qr: sign convention differences (-0.0 vs 0.0) and float precision

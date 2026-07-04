@@ -1721,8 +1721,13 @@ defmodule EMLX.Native.Expr do
   end
 
   # triangular_solve: single-output. Direct op node (not a block).
-  # args = [a, b, opts]. Only the common configuration (left_side + no transform)
-  # is lowered natively; other variants are a permanent hard-raise.
+  # args = [a, b, opts]. Mirrors EMLX.Backend.triangular_solve/4: left_side: false
+  # and transform_a: :transpose are handled by swapping the last two axes (via
+  # the generic :transpose instruction) around :solve_triangular, exactly like
+  # the eager backend does — there is no native MLX primitive for those
+  # variants, only this transpose trick. transform_a: :conjugate is a no-op
+  # here (pre-conjugating real entries, per Nx.BinaryBackend.Matrix.ts/8),
+  # since complex numbers aren't supported.
   defp expand_node(
          %T{
            type: out_type,
@@ -1733,25 +1738,41 @@ defmodule EMLX.Native.Expr do
     left_side = Keyword.get(opts, :left_side, true)
     transform_a = Keyword.get(opts, :transform_a, :none)
     lower = Keyword.get(opts, :lower, true)
-
-    unless left_side and transform_a == :none do
-      raise ArgumentError,
-            "does not yet lower op :triangular_solve with " <>
-              "left_side=#{inspect(left_side)} transform_a=#{inspect(transform_a)}"
-    end
+    upper = not lower
 
     a_ref = Map.fetch!(state.node_to_ref, a.data.id)
     b_ref = Map.fetch!(state.node_to_ref, b.data.id)
     {a_f, state} = emit_cast_if_needed(a_ref, a.type, {:f, 32}, state)
     {b_f, state} = emit_cast_if_needed(b_ref, b.type, {:f, 32}, state)
 
-    upper_int = if lower, do: 0, else: 1
-    ref = make_ref()
+    a_rank = tuple_size(a.shape)
 
-    state = %{
-      state
-      | instructions: [{ref, :solve_triangular, [a_f, b_f], [upper_int]} | state.instructions]
-    }
+    {a_op, effective_upper, state} =
+      case transform_a do
+        :transpose ->
+          {a_t, state} = emit_transpose_instr(a_f, swap_last_two_axes(a_rank), state)
+          {a_t, not upper, state}
+
+        _ ->
+          {a_f, upper, state}
+      end
+
+    {ref, state} =
+      if left_side do
+        emit_solve_triangular_instr(a_op, b_f, effective_upper, state)
+      else
+        # Solve XA = B → A^T x = b (works for both 1D and 2D b).
+        {a_t, state} = emit_transpose_instr(a_op, swap_last_two_axes(a_rank), state)
+        b_rank = tuple_size(b.shape)
+
+        if b_rank == 1 do
+          emit_solve_triangular_instr(a_t, b_f, not effective_upper, state)
+        else
+          {b_t, state} = emit_transpose_instr(b_f, swap_last_two_axes(b_rank), state)
+          {out_t, state} = emit_solve_triangular_instr(a_t, b_t, not effective_upper, state)
+          emit_transpose_instr(out_t, swap_last_two_axes(b_rank), state)
+        end
+      end
 
     {result_ref, state} = emit_cast_if_needed(ref, {:f, 32}, out_type, state)
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
@@ -2755,6 +2776,25 @@ defmodule EMLX.Native.Expr do
   defp emit_transpose_instr(operand_ref, perm, state) do
     ref = make_ref()
     {ref, %{state | instructions: [{ref, :transpose, [operand_ref], perm} | state.instructions]}}
+  end
+
+  # Non-negative permutation swapping the last two axes, identity elsewhere.
+  # rank 2 -> [1, 0]; rank 3 -> [0, 2, 1]; etc.
+  defp swap_last_two_axes(rank) do
+    {front, [x, y]} = Enum.split(Enum.to_list(0..(rank - 1)), rank - 2)
+    front ++ [y, x]
+  end
+
+  # Emit a :solve_triangular instruction; returns {result_ref, updated_state}.
+  defp emit_solve_triangular_instr(a_ref, b_ref, upper, state) do
+    ref = make_ref()
+    upper_int = if upper, do: 1, else: 0
+
+    {ref,
+     %{
+       state
+       | instructions: [{ref, :solve_triangular, [a_ref, b_ref], [upper_int]} | state.instructions]
+     }}
   end
 
   # Move the second element (channels) to the last position.

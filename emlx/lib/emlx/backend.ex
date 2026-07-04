@@ -2039,13 +2039,23 @@ defmodule EMLX.Backend do
     b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32}) |> EMLX.to_device(:cpu)
 
     upper = !opts[:lower]
+    a_axes_swap = swap_last_two_axes(Nx.rank(a))
 
     # Apply transform_a: transposing flips the upper/lower triangularity.
-    # For real types, :conjugate is equivalent to :transpose.
+    # :conjugate means "conjugate the entries" (a no-op for the real dtypes
+    # EMLX supports here — complex is rejected above), NOT a transpose. It is
+    # only equivalent to :transpose under LAPACK's conjugate-*transpose*
+    # convention, which is not what Nx.LinAlg.triangular_solve documents (see
+    # Nx.BinaryBackend.Matrix.ts/8: :conjugate pre-conjugates and is treated
+    # as :none).
+    #
+    # NB: axes must be a non-negative full permutation (e.g. [1, 0] for rank 2)
+    # here — a literal [-2, -1] normalizes to [0, 1] for rank 2, which is a
+    # silent no-op, not a swap.
     {a_mx, effective_upper} =
       case opts[:transform_a] do
-        :none -> {a_typed, upper}
-        t when t in [:transpose, :conjugate] -> {EMLX.transpose(a_typed, [-2, -1]), !upper}
+        :transpose -> {EMLX.transpose(a_typed, a_axes_swap), !upper}
+        _ -> {a_typed, upper}
       end
 
     out_mx =
@@ -2054,16 +2064,17 @@ defmodule EMLX.Backend do
         EMLX.linalg_solve_triangular(a_mx, b_mx, effective_upper)
       else
         # Solve XA = B → A^T x = b (works for both 1D and 2D b)
-        a_t = EMLX.transpose(a_mx, [-2, -1])
+        a_t = EMLX.transpose(a_mx, a_axes_swap)
 
         if Nx.rank(b) == 1 do
           # b is 1D: solve_triangular handles A^T x = b directly
           EMLX.linalg_solve_triangular(a_t, b_mx, !effective_upper)
         else
-          b_t = EMLX.transpose(b_mx, [-2, -1])
+          b_axes_swap = swap_last_two_axes(Nx.rank(b))
+          b_t = EMLX.transpose(b_mx, b_axes_swap)
 
           EMLX.linalg_solve_triangular(a_t, b_t, !effective_upper)
-          |> EMLX.transpose([-2, -1])
+          |> EMLX.transpose(b_axes_swap)
         end
       end
 
@@ -2071,6 +2082,13 @@ defmodule EMLX.Backend do
     |> EMLX.astype(to_mlx_type(out.type))
     |> EMLX.to_device(device)
     |> to_nx(out)
+  end
+
+  # Non-negative permutation swapping the last two axes, identity elsewhere.
+  # rank 2 -> [1, 0]; rank 3 -> [0, 2, 1]; etc.
+  defp swap_last_two_axes(rank) do
+    {front, [x, y]} = Enum.split(Enum.to_list(0..(rank - 1)), rank - 2)
+    front ++ [y, x]
   end
 
   cumulative_blocks = [
