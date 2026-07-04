@@ -44,7 +44,15 @@ jobs:
           echo "${ELIXIR_PATH}" >> $GITHUB_PATH
 
       - name: Install system dependencies
-        run: sudo apt-get install -y libopenblas0
+        run: |
+          sudo apt-get install -y libopenblas0 g++-10
+          # libmlx (cocoa-xu/mlx-build) bakes its CPU JIT preamble with
+          # gcc-10 headers; MLX invokes the bare `g++` at runtime for JIT
+          # kernel compiles, so a newer distro-default g++ (e.g. g++-13 on
+          # ubuntu-latest) causes builtin-type redeclaration errors
+          # (ml-explore/mlx#3430). Pin `g++` to match until upstream ships
+          # a release with ml-explore/mlx#3463.
+          sudo ln -sf "$(command -v g++-10)" /usr/local/bin/g++
 
       - name: Compile and check warnings
         working-directory: emlx
