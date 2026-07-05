@@ -1755,9 +1755,10 @@ defmodule EMLX do
   # is a structural split point (`Nx.Defn.Graph`) only when it can't be
   # natively lowered to a single `EMLXWhile` primitive (see
   # `EMLX.Native.Expr.native_while_eligible?/2` and `split_point?/1`) — e.g.
-  # it has a `:runtime_call`/hook in its condition or body, or is nested. An
-  # eligible `while` lowers in-graph like any other op, so the whole loop
-  # runs inside one `eval_program` NIF call instead of driving it from
+  # it has a `:runtime_call`/hook in its condition or body (nesting alone
+  # doesn't disqualify it: a nested `while` lowers to a nested `EMLXWhile`
+  # primitive). An eligible `while` lowers in-graph like any other op, so the
+  # whole loop runs inside one `eval_program` NIF call instead of driving it from
   # Elixir. `:runtime_call` outside a `while` never splits the graph either:
   # it lowers in-graph to a real `:runtime_call` opcode backed by a genuine
   # `mx::core::Primitive` (see `EMLX.Native.Expr`'s moduledoc "Runtime
@@ -1832,9 +1833,10 @@ defmodule EMLX do
   # A `while` is only a split point when it can't be natively lowered to a
   # single `EMLXWhile` primitive (see `EMLX.Native.Expr.native_while_eligible?/2`
   # and its `:while` moduledoc section) -- e.g. it has a `:runtime_call` or a
-  # hook in its condition/body, or a nested `while`. An eligible `while` is
-  # left in place: `EMLX.Native.Expr.lower/1` (via `expand_node`) lowers it
-  # straight into a flat native program below, no split needed.
+  # hook in its condition/body (a nested `while` alone is fine -- it lowers to
+  # a nested `EMLXWhile`). An eligible `while` is left in place:
+  # `EMLX.Native.Expr.lower/1` (via `expand_node`) lowers it straight into a
+  # flat native program below, no split needed.
   defp split_point?(%Nx.Tensor{
          data: %Nx.Defn.Expr{op: :while, args: [_initial, _arg, condition, body]}
        }) do

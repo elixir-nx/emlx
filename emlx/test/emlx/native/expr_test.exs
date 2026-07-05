@@ -1,3 +1,29 @@
+defmodule EMLX.Native.ExprTest.NestedWhileAst do
+  @moduledoc false
+  # Builds a `depth`-levels-deep `while`-inside-`while` `defn` body (AST),
+  # used by `EMLX.Native.ExprTest` to generate `deeply_nested_while_*` defns
+  # -- exercising nesting depths well beyond what's practical to hand-write,
+  # to pin both "deep nesting still works" and "the defensive depth cap in
+  # `EMLX.Native.Expr`'s `expand_while_native/6` actually fires". Must live
+  # in its own module: a `defp` helper can't be called from `ExprTest`'s own
+  # top-level `for`/`Code.eval_quoted` (its own functions aren't callable
+  # until the module finishes compiling).
+  def build(0, leaf), do: leaf
+
+  def build(depth, leaf) do
+    inner = build(depth - 1, quote(do: acc))
+
+    quote do
+      {acc, _} =
+        while {acc = unquote(leaf), i = 0}, Nx.less(i, 1) do
+          {unquote(inner), Nx.add(i, 1)}
+        end
+
+      acc
+    end
+  end
+end
+
 defmodule EMLX.Native.ExprTest do
   @moduledoc """
   Tests for the EMLX native defn compiler:
@@ -92,9 +118,23 @@ defmodule EMLX.Native.ExprTest do
     result
   end
 
-  # A `while` whose body contains another `while` — not natively lowerable
-  # (see `EMLX.Native.Expr.native_while_eligible?/2`'s nested-`:while`
-  # exclusion), so the outer loop must still take the host-driven fallback.
+  # Generates `deeply_nested_while_20`/`deeply_nested_while_over_cap` defns
+  # from `EMLX.Native.ExprTest.NestedWhileAst.build/2` (see its moduledoc).
+  for {name, depth} <- [deeply_nested_while_20: 20, deeply_nested_while_over_cap: 70] do
+    body = EMLX.Native.ExprTest.NestedWhileAst.build(depth, quote(do: x))
+
+    Code.eval_quoted(
+      quote do
+        defn unquote(name)(x), do: unquote(body)
+      end,
+      [],
+      __ENV__
+    )
+  end
+
+  # A `while` whose body contains another `while` — natively lowerable: the
+  # inner `while` lowers to its own `EMLXWhile` primitive, nested inside the
+  # outer body's sub-program (see `EMLX.Native.Expr.native_while_eligible?/2`).
   defn nested_while_top_level(x) do
     {out, _i} =
       while {out = x, i = 0}, Nx.less(i, 2) do
@@ -2231,7 +2271,7 @@ defmodule EMLX.Native.ExprTest do
       refute Expr.native_while_eligible?(condition, body)
     end
 
-    test "native_while_eligible?/2: false when the body contains a nested while" do
+    test "native_while_eligible?/2: true when the body contains a nested while" do
       expr = Nx.Defn.debug_expr_apply(&nested_while_top_level/1, [Nx.template({3}, :f32)])
 
       while_node =
@@ -2240,7 +2280,79 @@ defmodule EMLX.Native.ExprTest do
         |> Enum.find(&(&1.data.op == :while))
 
       [_initial, _arg, condition, body] = while_node.data.args
-      refute Expr.native_while_eligible?(condition, body)
+      assert Expr.native_while_eligible?(condition, body)
+    end
+
+    # Pins that a nested `while` lowers to a genuinely nested wire `:while`
+    # instruction (a `:while` `Instruction` inside another `:while`'s body
+    # `SubProgram`), not merely "correct end-to-end result via some fallback"
+    # — see `EMLX.Native.Expr`'s `:while` moduledoc section for why this is
+    # safe (validated 2- and 3-level nesting against the checkpoint (a) spike).
+    test "while: nested dynamic while lowers to a nested native :while instruction" do
+      expr = Nx.Defn.debug_expr_apply(&nested_while_top_level/1, [Nx.template({3}, :f32)])
+      wire = expr |> Expr.lower() |> Expr.to_native()
+
+      assert [%EMLX.Native.Instruction{op: :while, subprograms: [_outer_cond, outer_body]}] =
+               wire.instructions
+
+      assert %EMLX.Native.SubProgram{instructions: outer_body_instructions} = outer_body
+
+      assert Enum.any?(
+               outer_body_instructions,
+               &match?(%EMLX.Native.Instruction{op: :while, subprograms: [_, _]}, &1)
+             )
+    end
+
+    test "while: nested dynamic while matches eager evaluation" do
+      x = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&nested_while_top_level/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&nested_while_top_level/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native, eager)
+    end
+
+    # Two independent top-level native `:while`s (not nested inside each
+    # other) each get their own `EMLXWhile` primitive instance sharing the
+    # same read-only captures/constants tables (see `EMLXWhile`'s moduledoc
+    # in emlx_compiler.cpp) -- pins that there's no cross-instance mutable
+    # state that could leak between sibling loops.
+    defn sibling_whiles(x) do
+      {a, _} = while {a = x, i = 0}, Nx.less(i, 3), do: {a + 1.0, i + 1}
+      {b, _} = while {b = x, j = 0}, Nx.less(j, 5), do: {b * 2.0, j + 1}
+      {a, b}
+    end
+
+    test "while: two sibling top-level whiles don't share mutable state" do
+      x = Nx.tensor([1.0, 2.0], type: :f32, backend: EMLX.Backend)
+
+      {native_a, native_b} = Nx.Defn.jit(&sibling_whiles/1, compiler: EMLX).(x)
+      {eager_a, eager_b} = Nx.Defn.jit(&sibling_whiles/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native_a, eager_a)
+      assert_close(native_b, eager_b)
+    end
+
+    # Defensive depth cap (`@max_while_nesting_depth` in `EMLX.Native.Expr`):
+    # protects against unbounded native C++ call-stack recursion from
+    # pathologically deep (e.g. generated) `while`-inside-`while` nesting --
+    # not a realistic hand-written shape, so it's exercised via the
+    # `deeply_nested_while_20`/`deeply_nested_while_over_cap` defns generated
+    # near the top of this module (see `NestedWhileAst.build/2`).
+    test "while: deeply nested (20-level) while still lowers and evaluates correctly" do
+      x = Nx.tensor([0.0, 1.0], type: :f32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&deeply_nested_while_20/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&deeply_nested_while_20/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native, eager)
+    end
+
+    test "while: nesting beyond the depth cap raises a clear error" do
+      x = Nx.tensor([0.0, 1.0], type: :f32, backend: EMLX.Backend)
+
+      assert_raise ArgumentError, ~r/nested.*64 levels deep/, fn ->
+        Nx.Defn.jit(&deeply_nested_while_over_cap/1, compiler: EMLX).(x)
+      end
     end
   end
 

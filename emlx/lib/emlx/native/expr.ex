@@ -65,7 +65,8 @@ defmodule EMLX.Native.Expr do
       hooks: [],
       runtime_calls: [],
       top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new(),
-      quant_signature: quant_signature
+      quant_signature: quant_signature,
+      while_nesting_depth: 0
     }
 
     state = Enum.reduce(ordered, state, &expand_node/2)
@@ -2025,14 +2026,22 @@ defmodule EMLX.Native.Expr do
 
   # A `:while` loop is native-lowerable when neither its condition nor its
   # body contains a `:runtime_call` (would fire an Elixir callback on every
-  # native iteration -- unsupported), a `:token`/hook (same side-effect
-  # concern), or a nested `:while` (not yet supported -- EMLXWhile's
-  # reentrant `mlx::core::eval()` likely tolerates it, but this hasn't been
-  # validated, so nested dynamic loops still fall back to the host-driven
-  # split path, which recurses through the same splitting machinery for the
-  # inner loop). Shared between here and `EMLX.ex`'s `split_point?/1` so the
-  # eligibility criteria can't drift between the two call sites (each does
-  # its own cheap traversal; only the *logic* is required to stay in sync).
+  # native iteration -- unsupported) or a `:token`/hook (same side-effect
+  # concern). Nested `:while` *is* supported: EMLXWhile's cond/body
+  # sub-programs are interpreted by the same generic `interpret_instructions`
+  # helper used for the top-level program, so a nested `:while` instruction
+  # just recurses into another `EMLXWhile` primitive from inside the outer
+  # one's `eval()` -- validated safe (2- and 3-level nesting, both default
+  # CPU and GPU devices) against the checkpoint (a) spike's reentrant-`eval()`
+  # finding, which generalizes because C++ call-stack depth here scales with
+  # *lexical* nesting depth (fixed at compile time), not iteration count.
+  # `expand_while_native/6` below still guards against pathologically deep
+  # (e.g. generated) nesting with `@max_while_nesting_depth`, purely to turn
+  # a native stack overflow into a clean Elixir error -- not because
+  # correctness is in doubt at any realistic depth. Shared between here and
+  # `EMLX.ex`'s `split_point?/1` so the eligibility criteria can't drift
+  # between the two call sites (each does its own cheap traversal; only the
+  # *logic* is required to stay in sync).
   @doc false
   def native_while_eligible?(condition, body) do
     Enum.all?([condition, body], &while_scope_native_eligible?/1)
@@ -2045,12 +2054,29 @@ defmodule EMLX.Native.Expr do
   end
 
   defp native_eligible_node?(%T{data: %Nx.Defn.Expr{op: op}})
-       when op in [:runtime_call, :token, :while],
+       when op in [:runtime_call, :token],
        do: false
 
   defp native_eligible_node?(%T{}), do: true
 
+  # Defensive cap on lexical `:while`-inside-`:while` nesting depth: each
+  # extra level adds a handful of native C++ call-stack frames (outer
+  # `EMLXWhile::eval` -> `interpret_instructions` -> inner `EMLXWhile::eval`,
+  # reentered via `mlx::core::eval()`), so unbounded nesting from generated
+  # code could in principle exhaust the stack. 64 levels is far beyond any
+  # hand-written loop nest while leaving ample stack headroom.
+  @max_while_nesting_depth 64
+
   defp expand_while_native(id, initial, arg, condition, body, state) do
+    depth = state.while_nesting_depth
+
+    if depth >= @max_while_nesting_depth do
+      raise ArgumentError,
+            "while loops nested #{@max_while_nesting_depth} levels deep exceed EMLX's " <>
+              "native lowering depth limit (a defensive guard against unbounded native " <>
+              "C++ call-stack recursion -- not a real Nx.Defn.while restriction)"
+    end
+
     initial_list = while_leaf_list(initial)
     arg_list = while_leaf_list(arg)
     body_list = while_leaf_list(body)
@@ -2063,8 +2089,18 @@ defmodule EMLX.Native.Expr do
       |> Enum.zip(carry_refs)
       |> Map.new(fn {param, ref} -> {hd(param.data.args), ref} end)
 
-    {cond_sub, state} = lower_while_subprogram([condition], carry_refs, param_ref_by_pos, state)
-    {body_sub, state} = lower_while_subprogram(body_list, carry_refs, param_ref_by_pos, state)
+    nested_state = %{state | while_nesting_depth: depth + 1}
+
+    {cond_sub, state} =
+      lower_while_subprogram([condition], carry_refs, param_ref_by_pos, nested_state)
+
+    {body_sub, state} =
+      lower_while_subprogram(body_list, carry_refs, param_ref_by_pos, %{
+        state
+        | while_nesting_depth: depth + 1
+      })
+
+    state = %{state | while_nesting_depth: depth}
 
     result_refs = Enum.map(init_refs, fn _ -> make_ref() end)
     result_id = if match?([_], result_refs), do: hd(result_refs), else: result_refs
