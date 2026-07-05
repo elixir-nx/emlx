@@ -60,6 +60,13 @@ Nx.Defn.default_options(compiler: EMLX)
 config :nx, :default_defn_options, compiler: EMLX
 ```
 
+### Compile-time debug flags
+
+Development-only assertion flags (`:enable_bounds_check`, `:detect_non_finites`,
+`:compiler_debug`) are read at compile time via `Application.compile_env/3`.
+See the [EMLX moduledoc](https://hexdocs.pm/emlx/EMLX.html#module-compile-time-debug-flags)
+and `config/dev.exs` for how to enable them and what each flag does.
+
 ### MLX binaries
 
 EMLX relies on the [MLX](https://github.com/ml-explore/mlx) library to function, and currently EMLX will download precompiled builds from [mlx-build](https://github.com/cocoa-xu/mlx-build).

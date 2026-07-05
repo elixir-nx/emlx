@@ -176,6 +176,31 @@ defmodule EMLX do
   `Nx.Defn.compile/3` closure is always cheaper still, since it skips
   retracing entirely.
 
+  ## Compile-time debug flags
+
+  Several development-only checks are gated by `Application.compile_env/3`
+  at compile time — when a flag is `false`, the check is erased entirely
+  (no BEAM opcodes, zero runtime cost). After changing a flag, run
+  `mix compile --force`; values are baked in at compile time, not read at
+  runtime. See `config/dev.exs` for commented examples.
+
+      config :emlx, enable_bounds_check: true
+      config :emlx, detect_non_finites: true
+      config :emlx, compiler_debug: true
+
+  * `:enable_bounds_check` — raises on out-of-bounds indices in gather,
+    take, take_along_axis, indexed_add, and indexed_put.
+  * `:detect_non_finites` — raises when dot, conv, or `EMLX.Fast` fused
+    kernels produce NaN or Inf. Forces extra `EMLX.eval` syncs and breaks
+    MLX lazy-graph fusion; never enable in production.
+  * `:compiler_debug` — raises on internal `EMLX.Native.Expr` lowering /
+    `to_wire` invariant violations that would otherwise silently miscompile.
+    Cheap (no extra eval syncs); off by default.
+
+  WARNING: `:enable_bounds_check` and `:detect_non_finites` break MLX
+  lazy-graph fusion. On non-unified-memory targets (Linux GPU),
+  `:enable_bounds_check` also incurs an extra GPU→CPU copy per indexed op.
+
   ## CPU JIT compilation and SIGCHLD
 
   On the CPU backend, MLX JIT-compiles fused kernels the first time it sees
