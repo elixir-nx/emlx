@@ -3034,6 +3034,30 @@ defmodule EMLX.Native.Expr do
 
     ref_to_packed = Map.merge(input_map, Map.merge(capture_map, constant_map))
 
+    # Defensive: `Map.merge/2` silently lets a later map's key win over an
+    # earlier one. `input_map`/`capture_map`/`constant_map` are keyed by
+    # distinct id shapes in the common case (a `:parameter` node's id is a
+    # `make_ref()`, a `:constant` node's id is a content-addressed
+    # `{value, type, shape}` tuple -- see `EMLX.Native.Expr`'s node id
+    # scheme), but if any two ever coincide, one ref's *real* category
+    # silently vanishes from `ref_to_packed` and every instruction that
+    # references it resolves to the *wrong* vector (and, worst case, an
+    # in-bounds-looking-but-wrong index) at the C++ layer instead of
+    # failing loudly here. A mismatched merged size is the tell.
+    expected_size = map_size(input_map) + map_size(capture_map) + map_size(constant_map)
+
+    if map_size(ref_to_packed) != expected_size do
+      raise ArgumentError,
+            "EMLX.Native.Expr.to_wire: ref id collision across inputs/captures/constants -- " <>
+              "#{map_size(input_map)} input(s), #{map_size(capture_map)} capture(s), " <>
+              "#{map_size(constant_map)} constant(s) should merge to #{expected_size} distinct " <>
+              "refs, but only #{map_size(ref_to_packed)} survived Map.merge/2. This means two " <>
+              "refs of different categories share the same id, silently dropping one from the " <>
+              "wire map -- inputs: #{inspect(Map.keys(input_map))}, " <>
+              "captures: #{inspect(Map.keys(capture_map))}, " <>
+              "constants: #{inspect(Map.keys(constant_map))}"
+    end
+
     # Walk instructions in order, building the wire arrays and extending the map.
     # A `result` ref is indexed into the C++ flat results accumulator. Each
     # instruction contributes one entry (single-output) or several (multi-output
@@ -3063,6 +3087,22 @@ defmodule EMLX.Native.Expr do
                   "flat results accumulator, but only #{flat} result(s) have been produced " <>
                   "so far -- this is a forward/self reference bug in program lowering, not " <>
                   "a valid program. Full instruction list: #{inspect(prog.instructions)}"
+        end
+
+        # Defensive: an instruction's own result ref must not already be a
+        # key in `rmap` -- that would mean this id was already bound to an
+        # input/capture/constant/earlier-instruction's slot, and this
+        # `Map.put` would silently overwrite it, corrupting every operand
+        # reference to the *original* binding built before this point in
+        # the reduce (they keep the id, but the id now resolves to this
+        # new, wrong slot instead).
+        for one <- List.wrap(id), Map.has_key?(rmap, one) do
+          raise ArgumentError,
+                "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} produces result ref " <>
+                  "#{inspect(one)}, but that ref is already bound (to " <>
+                  "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
+                  "silently overwriting its earlier binding for every prior instruction that " <>
+                  "already referenced it. Full instruction list: #{inspect(prog.instructions)}"
         end
 
         {rmap2, flat2} =
