@@ -5,9 +5,9 @@ defmodule EMLX.DebugFlagsFunctionalTest do
   Functional (raise-on-violation) counterpart to `debug_flags_test.exs`'s
   zero-cost-when-off opcode checks.
 
-  Both `:enable_bounds_check` and `:detect_non_finites` are
-  `Application.compile_env/3`-gated, so neither can be toggled at runtime —
-  these tests only pass against a build compiled with both flags on. Run:
+  `:enable_bounds_check`, `:detect_non_finites`, and `:compiler_debug` are all
+  `Application.compile_env/3`-gated, so none can be toggled at runtime —
+  these tests only pass against a build compiled with all three flags on. Run:
 
       EMLX_DEBUG_FLAGS=1 mix test --force --include debug_flags_functional
 
@@ -18,6 +18,8 @@ defmodule EMLX.DebugFlagsFunctionalTest do
 
   @moduletag :debug_flags_functional
 
+  alias EMLX.Native.Expr
+
   setup_all do
     # `Application.get_env/3` here (not `compile_env/3`): the flags below are
     # genuinely compile-time-baked into the *lib* code under test, but this
@@ -26,7 +28,8 @@ defmodule EMLX.DebugFlagsFunctionalTest do
     # literal `false` in a default build) into a "warnings-as-errors" hit.
     flags_on? =
       Application.get_env(:emlx, :enable_bounds_check, false) and
-        Application.get_env(:emlx, :detect_non_finites, false)
+        Application.get_env(:emlx, :detect_non_finites, false) and
+        Application.get_env(:emlx, :compiler_debug, false)
 
     unless flags_on? do
       flunk("""
@@ -74,6 +77,38 @@ defmodule EMLX.DebugFlagsFunctionalTest do
 
     assert_raise ArgumentError, ~r/rms_norm produced NaN or Inf/, fn ->
       EMLX.Fast.rms_norm(x, w, 1.0e-5)
+    end
+  end
+
+  test "EMLX.Native.Expr.to_wire raises on a ref id collision across categories (:compiler_debug)" do
+    ref = make_ref()
+
+    prog = %Expr{
+      inputs: [ref],
+      captures: [{ref, Nx.tensor(1.0)}],
+      constants: [],
+      instructions: [],
+      outputs: [ref]
+    }
+
+    assert_raise ArgumentError, ~r/ref id collision across inputs\/captures\/constants/, fn ->
+      Expr.to_wire(prog)
+    end
+  end
+
+  test "EMLX.Native.Expr.to_wire raises when an instruction's result ref is already bound (:compiler_debug)" do
+    ref = make_ref()
+
+    prog = %Expr{
+      inputs: [ref],
+      captures: [],
+      constants: [],
+      instructions: [{ref, :add, [], []}],
+      outputs: [ref]
+    }
+
+    assert_raise ArgumentError, ~r/that ref is already bound/, fn ->
+      Expr.to_wire(prog)
     end
   end
 end

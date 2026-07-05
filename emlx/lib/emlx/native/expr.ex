@@ -190,6 +190,20 @@ defmodule EMLX.Native.Expr do
   alias Nx.Defn.Composite
   alias Nx.Tensor, as: T
 
+  @compiler_debug Application.compile_env(:emlx, :compiler_debug, false)
+  # Emits internal-invariant checks (see "Defensive:"-commented call sites)
+  # only when `config :emlx, :compiler_debug, true` is set at compile time;
+  # otherwise expands to `:ok` with zero runtime cost. These checks catch
+  # lowering/to_wire bugs that would otherwise silently miscompile instead
+  # of raising, so enable them in tests/dev, not on the hot compile path.
+  defmacrop maybe_debug_check(do: block) do
+    if @compiler_debug do
+      block
+    else
+      :ok
+    end
+  end
+
   # Kind tag bits used when packing refs for the NIF wire format.
   # Only referenced in to_wire/1; not part of the public struct.
   @kind_input 0
@@ -3034,28 +3048,31 @@ defmodule EMLX.Native.Expr do
 
     ref_to_packed = Map.merge(input_map, Map.merge(capture_map, constant_map))
 
-    # Defensive: `Map.merge/2` silently lets a later map's key win over an
-    # earlier one. `input_map`/`capture_map`/`constant_map` are keyed by
-    # distinct id shapes in the common case (a `:parameter` node's id is a
-    # `make_ref()`, a `:constant` node's id is a content-addressed
-    # `{value, type, shape}` tuple -- see `EMLX.Native.Expr`'s node id
-    # scheme), but if any two ever coincide, one ref's *real* category
-    # silently vanishes from `ref_to_packed` and every instruction that
-    # references it resolves to the *wrong* vector (and, worst case, an
-    # in-bounds-looking-but-wrong index) at the C++ layer instead of
-    # failing loudly here. A mismatched merged size is the tell.
-    expected_size = map_size(input_map) + map_size(capture_map) + map_size(constant_map)
+    maybe_debug_check do
+      # Defensive: `Map.merge/2` silently lets a later map's key win over an
+      # earlier one. `input_map`/`capture_map`/`constant_map` are keyed by
+      # distinct id shapes in the common case (a `:parameter` node's id is a
+      # `make_ref()`, a `:constant` node's id is a content-addressed
+      # `{value, type, shape}` tuple -- see `EMLX.Native.Expr`'s node id
+      # scheme), but if any two ever coincide, one ref's *real* category
+      # silently vanishes from `ref_to_packed` and every instruction that
+      # references it resolves to the *wrong* vector (and, worst case, an
+      # in-bounds-looking-but-wrong index) at the C++ layer instead of
+      # failing loudly here. A mismatched merged size is the tell. Gated
+      # behind `maybe_debug_check` (see its definition above).
+      expected_size = map_size(input_map) + map_size(capture_map) + map_size(constant_map)
 
-    if map_size(ref_to_packed) != expected_size do
-      raise ArgumentError,
-            "EMLX.Native.Expr.to_wire: ref id collision across inputs/captures/constants -- " <>
-              "#{map_size(input_map)} input(s), #{map_size(capture_map)} capture(s), " <>
-              "#{map_size(constant_map)} constant(s) should merge to #{expected_size} distinct " <>
-              "refs, but only #{map_size(ref_to_packed)} survived Map.merge/2. This means two " <>
-              "refs of different categories share the same id, silently dropping one from the " <>
-              "wire map -- inputs: #{inspect(Map.keys(input_map))}, " <>
-              "captures: #{inspect(Map.keys(capture_map))}, " <>
-              "constants: #{inspect(Map.keys(constant_map))}"
+      if map_size(ref_to_packed) != expected_size do
+        raise ArgumentError,
+              "EMLX.Native.Expr.to_wire: ref id collision across inputs/captures/constants -- " <>
+                "#{map_size(input_map)} input(s), #{map_size(capture_map)} capture(s), " <>
+                "#{map_size(constant_map)} constant(s) should merge to #{expected_size} distinct " <>
+                "refs, but only #{map_size(ref_to_packed)} survived Map.merge/2. This means two " <>
+                "refs of different categories share the same id, silently dropping one from the " <>
+                "wire map -- inputs: #{inspect(Map.keys(input_map))}, " <>
+                "captures: #{inspect(Map.keys(capture_map))}, " <>
+                "constants: #{inspect(Map.keys(constant_map))}"
+      end
     end
 
     # Walk instructions in order, building the wire arrays and extending the map.
@@ -3069,40 +3086,46 @@ defmodule EMLX.Native.Expr do
                                                         {ops, ors, ias, rmap, flat} ->
         wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
 
-        # Defensive: a `@kind_instr` operand must reference a *prior*
-        # instruction's already-pushed result (the C++ interpreter's flat
-        # `results` accumulator only contains entries for instructions
-        # processed so far -- see emlx_compiler.cpp's `resolve` lambda). A
-        # forward/self reference here would silently pass this Elixir-side
-        # map lookup (the ref exists in `rmap`) but crash the NIF with an
-        # opaque `vector::_M_range_check` once C++ tries to index into a
-        # `results` vector that isn't that big yet. Catching it here turns
-        # that into an actionable error pointing at the offending op.
-        for packed <- wire_operands,
-            (packed >>> @kind_shift) == @kind_instr,
-            (packed &&& (1 <<< @kind_shift) - 1) >= flat do
-          raise ArgumentError,
-                "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
-                  "references result index #{packed &&& (1 <<< @kind_shift) - 1} of the " <>
-                  "flat results accumulator, but only #{flat} result(s) have been produced " <>
-                  "so far -- this is a forward/self reference bug in program lowering, not " <>
-                  "a valid program. Full instruction list: #{inspect(prog.instructions)}"
+        maybe_debug_check do
+          # Defensive: a `@kind_instr` operand must reference a *prior*
+          # instruction's already-pushed result (the C++ interpreter's flat
+          # `results` accumulator only contains entries for instructions
+          # processed so far -- see emlx_compiler.cpp's `resolve` lambda). A
+          # forward/self reference here would silently pass this Elixir-side
+          # map lookup (the ref exists in `rmap`) but crash the NIF with an
+          # opaque `vector::_M_range_check` once C++ tries to index into a
+          # `results` vector that isn't that big yet. Catching it here turns
+          # that into an actionable error pointing at the offending op. Gated
+          # behind `maybe_debug_check` (see its definition above).
+          for packed <- wire_operands,
+              (packed >>> @kind_shift) == @kind_instr,
+              (packed &&& (1 <<< @kind_shift) - 1) >= flat do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
+                    "references result index #{packed &&& (1 <<< @kind_shift) - 1} of the " <>
+                    "flat results accumulator, but only #{flat} result(s) have been produced " <>
+                    "so far -- this is a forward/self reference bug in program lowering, not " <>
+                    "a valid program. Full instruction list: #{inspect(prog.instructions)}"
+          end
         end
 
-        # Defensive: an instruction's own result ref must not already be a
-        # key in `rmap` -- that would mean this id was already bound to an
-        # input/capture/constant/earlier-instruction's slot, and this
-        # `Map.put` would silently overwrite it, corrupting every operand
-        # reference to the *original* binding built before this point in
-        # the reduce (they keep the id, but the id now resolves to this
-        # new, wrong slot instead).
-        for one <- List.wrap(id), Map.has_key?(rmap, one) do
-          raise ArgumentError,
-                "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} produces result ref " <>
-                  "#{inspect(one)}, but that ref is already bound (to " <>
-                  "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
-                  "silently overwriting its earlier binding for every prior instruction that " <>
-                  "already referenced it. Full instruction list: #{inspect(prog.instructions)}"
+        maybe_debug_check do
+          # Defensive: an instruction's own result ref must not already be a
+          # key in `rmap` -- that would mean this id was already bound to an
+          # input/capture/constant/earlier-instruction's slot, and this
+          # `Map.put` would silently overwrite it, corrupting every operand
+          # reference to the *original* binding built before this point in
+          # the reduce (they keep the id, but the id now resolves to this
+          # new, wrong slot instead). Gated behind `maybe_debug_check` (see
+          # its definition above).
+          for one <- List.wrap(id), Map.has_key?(rmap, one) do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} produces result ref " <>
+                    "#{inspect(one)}, but that ref is already bound (to " <>
+                    "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
+                    "silently overwriting its earlier binding for every prior instruction that " <>
+                    "already referenced it. Full instruction list: #{inspect(prog.instructions)}"
+          end
         end
 
         {rmap2, flat2} =

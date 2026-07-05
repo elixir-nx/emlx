@@ -8,6 +8,6 @@ if config_env() == :test do
   # compile_env is baked in at compile time, so this can't be toggled at
   # runtime — see that file's moduledoc for the invocation.
   if System.get_env("EMLX_DEBUG_FLAGS") == "1" do
-    config :emlx, detect_non_finites: true, enable_bounds_check: true
+    config :emlx, detect_non_finites: true, enable_bounds_check: true, compiler_debug: true
   end
 end

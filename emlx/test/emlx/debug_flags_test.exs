@@ -21,10 +21,12 @@ defmodule EMLX.DebugFlagsTest do
 
   @enable_bounds_check Application.compile_env(:emlx, :enable_bounds_check, false)
   @detect_non_finites Application.compile_env(:emlx, :detect_non_finites, false)
+  @compiler_debug Application.compile_env(:emlx, :compiler_debug, false)
 
   test "debug flags default to false" do
     assert @enable_bounds_check == false
     assert @detect_non_finites == false
+    assert @compiler_debug == false
   end
 
   test "assert_in_bounds! call is absent from BEAM opcodes of gather/4 when flag is off" do
