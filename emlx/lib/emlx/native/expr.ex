@@ -1,201 +1,11 @@
 defmodule EMLX.Native.Expr do
-  @moduledoc """
-  The `EMLX.Native.Expr` IR for EMLX's single-mode `defn` compiler.
-
-  Each node in the graph is identified by an Erlang ref (`make_ref()`), making
-  the program easy to inspect and manipulate without worrying about index arithmetic.
-  Opcodes are atoms (`:add`, `:mul`, …) for readability.
-
-  The integer wire format required by the C++ `compile_program` NIF is produced
-  by `to_wire/1`, which runs once per cache miss and never on the hot path.
-
-  ## Structure
-
-  - `inputs`   — one ref per `defn` parameter, in position order.
-  - `captures` — `[{ref, %Nx.Tensor{}}]` for tensors closed over at compile time.
-  - `constants`     — `[{ref, number, Nx.Type.t()}]` for compile-time scalar literals.
-  - `instructions`  — `[{result_ref, opcode_atom, [operand_ref], [integer_attr]}]`
-                       in dependency order. The integer-attr list is opcode-specific;
-                       for `:astype` it carries a single dtype integer (see `@mlx_type_to_int`).
-  - `outputs`  — list of refs identifying the return values.
-  - `hooks`    — `[%{name, callback, template, refs}]` for `Nx.Defn.Kernel.hook/2,3`
-                 observers reached from the top-level scope (see "Hooks" below).
-  - `runtime_calls` — `[%{index, callback, args_template, arg_param_positions, opts}]`
-                 for `Nx.runtime_call/4` sites lowered in-graph as a genuine
-                 `:runtime_call` opcode (see "Runtime calls" below), indexed
-                 by the `callback_index` baked into each site's `iattrs`.
-
-  ## iattrs encoding per opcode
-
-  The integer attribute list (`attrs`) is opcode-specific. The encoding is the
-  source of truth shared with `emlx_compiler.cpp`; keep them in sync.
-
-  | Opcode       | `attrs` layout                                          |
-  |-------------|----------------------------------------------------------|
-  | `:astype`   | `[dtype_int]` — target MLX dtype (see `@mlx_type_to_int`) |
-  | `:bitcast`  | `[dtype_int]` — target MLX dtype                        |
-  | `:reshape`  | `[d0, d1, …]` — new shape dims (flat)                   |
-  | `:squeeze`  | `[a0, a1, …]` — axes to remove (non-negative)           |
-  | `:transpose`| `[p0, p1, …]` — axis permutation (non-negative)         |
-  | `:broadcast`| `[n, d0..dn-1, m, a0..am-1]` — `n` shape dims then `m` axes (length-delimited) |
-  | `:pad`      | `[n_dims, lo0, hi0, int0, lo1, hi1, int1, …]` — n_dims triples per dim |
-  | `:reverse`  | `[a0, a1, …]` — axes to flip (non-negative)             |
-  | `:concatenate` | `[axis]` — concat axis; all input tensors in `operands` |
-  | `:stack`    | `[axis]` — stack axis; all input tensors in `operands`  |
-  | `:sum`, `:product`, `:all`, `:any`, `:reduce_max`, `:reduce_min` | `[keep_axes_int, a0, a1, …]` — 0/1 keep-axes flag then explicit axis list |
-  | `:argmax`, `:argmin` | `[axis, keep_axis_int]` — axis index (−1 = global/no-axis) then 0/1 keep flag |
-  | `:dot`      | `[n_ca, ca…, n_cb, cb…, n_ba, ba…, n_bb, bb…]` — four length-delimited axis lists: contract-left, contract-right, batch-left, batch-right |
-  | `:conv_general` | `[n_dims, s0..sn-1, pl0, ph0, pl1, ph1, …, kd0..kdn-1, id0..idn-1, fgs]` — spatial dims count, strides, padding lo/hi pairs, kernel dilation, input dilation, feature group count |
-  | `:select`       | (no attrs) — operands are `[pred, on_true, on_false]`               |
-  | `:clip`         | (no attrs) — operands are `[tensor, min, max]`                       |
-  | `:slice`        | `[n_dims, dyn_mask, d0..dn-1, l0..ln-1, str0..strn-1, sv0..svn-1]` — rank, dynamic bitmask, input shape, lengths, strides, static starts (0 for dynamic). Dynamic tensor starts are operands after the tensor. |
-  | `:put_slice`    | `[n_dims, dyn_mask, d0..dn-1, l0..ln-1, sv0..svn-1]` — rank, dynamic bitmask, input shape, slice shape, static starts (0 for dynamic). Operands are `[input, slice, dyn_starts…]`. |
-  | `:gather`       | `[n_gather_axes, a0…, n_tensor_dims, ss0…, n_out_dims, od0…]` — axes, slice_sizes, output shape. Operands: `[tensor, indices]`. |
-  | `:take`         | `[axis]` — operands are `[tensor, indices]`                           |
-  | `:take_along_axis` | `[axis]` — operands are `[tensor, indices]`                      |
-  | `:indexed_add`  | `[n_axes, a0…, n_updates_shape, us0…]` — axes and reshaped-updates dims. Operands: `[target, indices, updates]`. |
-  | `:indexed_put`  | same as `:indexed_add`                                               |
-  | `:sort`         | `[axis, asc_int]` — axis (non-negative), 1=asc / 0=desc. NaN-aware (matches EMLX.Backend). |
-  | `:argsort`      | `[axis, asc_int]` — same; C++ returns sorted uint32 indices.         |
-  | `:window_sum`, `:window_product`, `:window_max`, `:window_min` | `[n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]` — op_int: 0=sum 1=product 2=max 3=min; then n_dims lo/hi pairs, strides, window dims, window dilations. Operands: `[tensor]`. |
-  | `:window_scatter_max`, `:window_scatter_min` | `[n_dims, lo0, hi0, …, s0, …, w0, …]` — n_dims lo/hi pairs, strides, window dims. Operands: `[tensor_t, source, init_value]`. |
-  | `:cumulative_sum`, `:cumulative_product`, `:cumulative_min`, `:cumulative_max` | `[axis, reverse_int]` — axis (non-negative), 0/1 reverse. Always inclusive. |
-  | `:fft`, `:ifft` | `[axis, n]` — axis and FFT length.                                  |
-  | `:fft2`, `:ifft2` | `[ax0, ax1, n0, n1]` — two axes and two lengths.                |
-  | `:iota`   | `[dtype_int, n_dims, axis_int, d0..dn-1]` — dtype, rank, axis (−1=flat), shape dims. No operands. |
-  | `:eye`    | `[dtype_int, m, n]` — dtype and the two shape dims. No operands.    |
-  | `:quantized_matmul` | `[group_size, bits, transpose_int, mode_int, has_bias_int]` — see "Quantized dot specialization" below. Operands: `[activation, weight, scales, biases?]` (biases omitted when `has_bias_int` is 0). |
-  | `:fast_rms_norm`, `:fast_layer_norm`, `:fast_layer_norm_no_bias`, `:fast_swiglu`, `:fast_sdpa*`, `:fast_rope*` | `EMLX.Fast.*`'s fused `mlx::core::fast::*`-backed opcodes. Emitted for a `:metadata` node carrying a `:__EMLX__` key (see the `:metadata` `expand_node` clause and `EMLX.Fast`'s moduledoc). |
-  | `:runtime_call` | `[callback_index, n_outputs, dtype0, n_dims0, d0.., dtype1, n_dims1, d1.., ...]` — index into the program's `runtime_calls` field, output count, then one `[dtype_int, n_dims, dims...]` group per output (see "Runtime calls" below). Operands are the flattened leaves of the callback's argument container, in order. |
-
-  Non-negative axes: the lowerer normalises negative axis values before encoding
-  so C++ handlers can use them directly as 0-based indices.
-
-  `:pad` raises for `interior > 0` or negative `lo`/`hi` (not yet lowered).
-  `:reduce` / `:window_reduce` (custom-fun reductions) lower by static
-  trace-time unrolling: the reducer body is re-lowered inline once per
-  reduce-extent (resp. per within-window offset) element (Stages 12–13).
-  Unrecognized `Nx.Block.*` structs descend into `default_expr` (primitive decomposition).
-  `Nx.Random.*` functions decompose via `threefry2x32` into primitive ops (bitwise, add, iota)
-  and work automatically once `:iota` is lowered.
-
-  ## Hooks (`token` / `attach_token`)
-
-  `Nx.Defn.Kernel.hook/2,3` is fire-and-forget, not control flow:
-  `attach_token(token, expr)`'s runtime value is `expr` unchanged (the token's
-  own eval result is discarded — see `Nx.Defn.Evaluator.eval_apply/5`'s
-  `:attach_token` clause), and a hook's callback return value is never read
-  back into the graph. So no host round-trip is needed (unlike `while`):
-  `:attach_token` lowers as a pure passthrough (zero instructions, its ref
-  aliases its wrapped expr's), and `:token` contributes zero instructions but
-  records each hook's already-lowered ref(s) + callback into the program's
-  `hooks` field. `EMLX.__compile__` fires each callback host-side, once, right
-  after the single `eval_program` NIF call returns — still one NIF call per
-  `defn` invocation. A hook with neither a trace-time callback nor a runtime
-  override (`hooks:` jit option, not yet threaded through the native path —
-  descoped) is skipped, mirroring the Evaluator's skip-if-unhandled rule.
-
-  A hook reachable only from inside a `cond` branch — not the shared/parent
-  scope, per `Nx.Defn.Tree.scope_ids/1` — raises instead of lowering: EMLX's
-  `cond` lowers by unconditionally evaluating every branch and `:select`-ing
-  the result, so such a hook would fire on every call regardless of which
-  branch was actually taken, a genuine behavior divergence from
-  `Nx.Defn.Evaluator` (which only fires the selected branch's hook). A hook
-  inside a bare `while` body needs no such guard: the body is always
-  recompiled by re-entering this same compiler as its own top-level scope,
-  so it fires once per host loop iteration exactly like the
-  Evaluator — and `lower/2`'s `top_scope_ids` (computed once, from
-  `Nx.Defn.Tree.scope_ids/1` over the pristine top-level tree) correctly
-  reflects that fresh scope.
-
-  A custom-fun `reduce`/`window_reduce` body (static unroll) and a
-  statically-unrolled nested `while` under a `:block` are the same
-  "always executes in full, not conditionally" shape as a `while` body, but
-  are lowered *inline* within the same `lower/2` call (`lower_fun_body/3` /
-  `lower_tuple_body/3`) rather than by re-entering `lower/2` fresh — so a hook
-  in one of these would wrongly look cond-branch-local to the top-level
-  `top_scope_ids` set (`Nx.Defn.Tree.scope_ids/1`'s `:scope`-mode traversal
-  deliberately never walks into a `:fun`/`:while` body — that's the scope
-  boundary).   Both helpers extend `top_scope_ids` with a fresh `scope_ids` pass
-  over just that body before lowering it (`merge_scope_ids/2`) — which still
-  correctly excludes any `cond` nested *inside* that body, so a genuinely
-  cond-branch-local hook a level deeper still raises.
-
-  ## Runtime calls (`Nx.runtime_call/4`)
-
-  Unlike a hook, `Nx.runtime_call/4`'s callback return value *is* threaded
-  back into the graph (`Nx.Defn.Evaluator.eval_apply/5`'s `:runtime_call`
-  clause feeds `fun`'s result straight back as the node's value), so it
-  cannot be a fire-and-forget passthrough like `:token` — it lowers to a
-  real `:runtime_call` opcode with real output(s). At eval time the compiled
-  MLX graph's `EMLXRuntimeCall` primitive (`emlx_compiler.cpp`) blocks the
-  worker OS thread, `enif_send`s a request (callback index + encoded operand
-  bytes) to the calling BEAM process, and waits on a mutex/condvar handle for
-  `EMLX.NIF.resolve_runtime_call/3` to deliver the reply — see
-  `EMLX.await_worker/2`'s `:emlx_runtime_call` receive clause, which runs the
-  real callback and replies. This one primitive genuinely re-executes on
-  every replay of the compiled tape (unlike the interpreter lambda itself,
-  which MLX's `compile()` only ever runs once to build said tape — see the
-  plan doc this was implemented from for why a plain closure call inside the
-  lambda would not have worked).
-
-  Single-tensor vs. tuple/container output are both single `:runtime_call`
-  instructions: a single-tensor result stores one ref in `node_to_ref`; a
-  tuple/container result stores a list of refs (the multi-output linalg
-  convention `:elem` already reads from — see qr/eigh/svd/lu above), one per
-  flattened output leaf.
-
-  Same cond-branch-locality hazard as a hook (see "Hooks" above) applies
-  identically here: EMLX's `cond` unconditionally evaluates every branch and
-  `:select`s, so a `:runtime_call` reachable only from inside a `cond`
-  branch — not the shared/parent scope, per `top_scope_ids` — would fire its
-  callback on every call regardless of which branch "won", diverging from
-  `Nx.Defn.Evaluator` (which only ever calls the selected branch's callback).
-  Such a call raises instead of lowering, exactly like the hook guard.
-
-  `while`-body-nested and custom-fun-reduction-body-nested `:runtime_call`
-  need no special guard, for the same reasons documented for hooks above.
-
-  A bare-`:parameter` operand leaf's original bound value is substituted
-  back in place of the raw bytes MLX sent over the wire whenever that
-  value carries `quantization_config` (`arg_param_positions`, set by this
-  clause) — see `EMLX.handle_runtime_call/5`'s doc for why (mirrors the
-  identical output-side substitution in `EMLX.build_native_eval_fn/7`).
-
-  ## Quantized dot specialization
-
-  A quantized `Nx.dot` right-operand is invisible at trace time: the bound
-  tensor's `quantization_config` only exists once a real tensor is
-  materialized, after tracing/lowering has already produced a plain
-  `:parameter` template. `lower/3`'s optional `quant_signature` — a
-  `%{param_position => EMLX.Quantization.Config.t()}` map built at call time
-  from the actually-bound inputs (see `EMLX.build_native_eval_fn/3`) — lets
-  the caller request a *specialized* program: a `:dot` node whose `right`
-  operand is exactly a `:parameter` at a signature position lowers to
-  `:quantized_matmul` instead of plain `:dot`, mirroring
-  `EMLX.Backend.quantized_dot/4`'s runtime dispatch exactly. `scales`/
-  `biases` are not part of the traced `Expr` at all (they're metadata on the
-  bound tensor, not graph nodes) — they become ordinary compile-time
-  `captures`, since a specialized program is itself only built once real
-  values (and hence real scale/bias tensors) are known; `group_size`/`bits`/
-  `transpose`/`mode` ride the int64 iattr channel. A quantized position used
-  as `left` (either operand) raises, matching `EMLX.Backend.dot/7`'s
-  quantized-left-operand raise. A quantized position never reached by a
-  `:dot` node at all (used by some other op) is not specially validated —
-  same gap the eager `EMLX.Backend` path has always had; out of scope here.
-  """
-
+  @moduledoc false
   import Bitwise
 
   alias Nx.Defn.Composite
   alias Nx.Tensor, as: T
 
   @compiler_debug Application.compile_env(:emlx, :compiler_debug, false)
-  # Emits internal-invariant checks (see "Defensive:"-commented call sites)
-  # only when `config :emlx, :compiler_debug, true` is set at compile time;
-  # otherwise expands to `:ok` with zero runtime cost. These checks catch
-  # lowering/to_wire bugs that would otherwise silently miscompile instead
-  # of raising, so enable them in tests/dev, not on the hot compile path.
   defmacrop maybe_debug_check(do: block) do
     if @compiler_debug do
       block
@@ -204,15 +14,12 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # Kind tag bits used when packing refs for the NIF wire format.
-  # Only referenced in to_wire/1; not part of the public struct.
   @kind_input 0
   @kind_capture 1
   @kind_const 2
   @kind_instr 3
   @kind_shift 60
 
-  # Stable integer encoding for MLX dtype atoms, used in :astype iattrs.
   # Must stay in sync with int_to_dtype() in emlx_compiler.cpp.
   @mlx_type_to_int %{
     bool: 0,
@@ -230,9 +37,7 @@ defmodule EMLX.Native.Expr do
     complex64: 12
   }
 
-  # Stable integer encoding for EMLX.Quantization.Config's mode strings, used
-  # in :quantized_matmul iattrs. Must stay in sync with int_to_quant_mode()
-  # in emlx_compiler.cpp.
+  # Must stay in sync with int_to_quant_mode() in emlx_compiler.cpp.
   @quant_mode_to_int %{
     "affine" => 0,
     "mxfp4" => 1,
@@ -277,32 +82,7 @@ defmodule EMLX.Native.Expr do
 
   # ── lowering ──────────────────────────────────────────────────────────────
 
-  @doc """
-  Lowers a traced `Nx.Defn.Expr` output to an `EMLX.Native.Expr` program.
-
-  `output` is any `Nx.Container.t()` — the result of `fun.(vars)`.
-
-  `num_inputs`, when given, is the true parameter arity of the call that
-  produced `output` (e.g. `length(Composite.flatten_list(vars))`). It exists
-  because `output` need not reference every parameter position — e.g. a
-  `while` condition sub-expression commonly ignores carry slots it doesn't
-  read. Without a hint, the wire input list is built only from *referenced*
-  positions, compacted/renumbered by ascending position; a caller that still
-  supplies the full, dense argument list (as `EMLX.__compile__`'s runtime
-  dispatch does) would then bind values to the wrong wire slots. Passing
-  `num_inputs` pads `inputs_list` to that arity, with unreferenced positions
-  filled by placeholder refs that no instruction ever reads, so wire index
-  == original parameter position always.
-
-  Raises `ArgumentError` with message `"does not yet lower op :foo"` for any
-  op not yet implemented. Single-mode: the compiler seam in
-  `EMLX.__compile__/4` does not catch this — it propagates straight to the
-  caller. There is no whole-`defn` `Nx.Defn.Evaluator` fallback lane.
-
-  `quant_signature`, when non-empty, requests a specialization for quantized
-  `Nx.dot` operands — see the moduledoc's "Quantized dot specialization"
-  section.
-  """
+  @doc false
   @spec lower(
           Nx.Container.t(),
           non_neg_integer() | nil,
@@ -320,10 +100,6 @@ defmodule EMLX.Native.Expr do
       node_to_ref: %{},
       hooks: [],
       runtime_calls: [],
-      # A hook (`:token`/`:attach_token`) or a `:runtime_call` is only
-      # lowerable from the shared/parent scope — see the moduledoc's "Hooks"
-      # / "Runtime calls" sections for why a cond-branch-local one must raise
-      # instead.
       top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new(),
       quant_signature: quant_signature
     }
@@ -333,9 +109,6 @@ defmodule EMLX.Native.Expr do
     max_referenced_pos = state.inputs |> Map.keys() |> Enum.max(fn -> -1 end)
     arity = max(num_inputs || 0, max_referenced_pos + 1)
 
-    # Dense 0..arity-1: a position not referenced by `output` (e.g. a
-    # while-cond ignoring a carry slot) gets a fresh, never-instruction-
-    # referenced placeholder ref, so it still occupies its wire slot.
     inputs_list =
       for pos <- 0..(arity - 1)//1 do
         Map.get_lazy(state.inputs, pos, &make_ref/0)
@@ -358,14 +131,6 @@ defmodule EMLX.Native.Expr do
   # ── node expansion ────────────────────────────────────────────────────────
 
   @doc false
-  # `:__EMLX__`-tagged metadata (see `EMLX.Fast`) marks a node whose *real*
-  # dependencies are its `operands` list, not whatever plain-Nx composite
-  # `inner` expr it wraps — `inner` is a reference formula this compiler
-  # never evaluates (see the `:metadata` `expand_node` clause below), so its
-  # internal subgraph must stay out of the ordering entirely; otherwise those
-  # nodes would still get lowered as dead instructions. Passed as the
-  # `scope_dependencies` callback to every `EMLX.Defn.Tree.post_order/2` call in this
-  # module (and in `emlx.ex`).
   def scope_dependencies(%T{
         data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: %{operands: operands}}]}
       }) do
@@ -384,11 +149,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # The wire format's `constants` list only carries scalars (one Elixir
-  # number per constant, see `to_wire/1`). A non-scalar `:constant` node
-  # shows up when Nx's tracer folds `Nx.broadcast(scalar, shape)` into a
-  # single wider constant (e.g. under a `revectorize` wrapper in
-  # Nx.LinAlg.SVD's default_expr) — emit the scalar and broadcast it out.
   defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :constant, args: [number]}} = node, state) do
     ref = make_ref()
 
@@ -425,17 +185,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # `:__EMLX__`-tagged metadata (see `EMLX.Fast`) marks a node whose *real*
-  # value is a fused native op, not whatever plain-Nx composite formula
-  # `inner` computes. `inner` exists only so non-EMLX consumers (any other
-  # `Nx.Defn.Compiler`, or `Nx.Defn.Evaluator`) get a genuine, correct
-  # (if slower) fallback, and so `operands` are ordinary reachable
-  # dependencies for `EMLX.Defn.Tree.post_order/2` (see `scope_dependencies/1` above)
-  # to visit — this compiler never lowers `inner` itself. `operands` are the
-  # same `%Nx.Tensor{}` values embedded in `inner`'s own subtree (so
-  # `state.node_to_ref` already has an entry for each by the time this clause
-  # runs); `attrs` is the int-attr list, already encoded (see `EMLX.Fast`'s
-  # `f64_bits/1` uses).
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -456,11 +205,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # `inner` is a tuple (not a single %T{}) when `Nx.Defn.Expr.metadata/2` is
-  # called on a container expr (e.g. a `cond`'s tuple result) — the metadata
-  # node itself carries a `tuple_out` placeholder type and wraps the raw
-  # tuple of tensors. Mirror the multi-output convention: store a list of
-  # refs so `:elem` can index into it.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :metadata, args: [inner, _meta]}},
          state
@@ -564,8 +308,6 @@ defmodule EMLX.Native.Expr do
 
   # ── binary elementwise ops ────────────────────────────────────────────────
 
-  # Arithmetic group: add, subtract, multiply, pow, left_shift
-  # Binary coercion: maybe_upcast(l, r), op, astype(result, out.type)
   @binary_arithmetic_ops [:add, :subtract, :multiply, :pow, :left_shift]
 
   for op <- @binary_arithmetic_ops do
@@ -577,8 +319,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # Binary group 2: divide, quotient, atan2, right_shift, bitwise_and/or/xor,
-  # compare (equal/not_equal/…), logical (and/or/xor)
   @binary_generic_ops [
     :divide,
     :quotient,
@@ -720,14 +460,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # pad: the wire :pad opcode only ever carries non-negative lo/hi with
-  # interior=0 (MLX's own pad primitive has no interior-pad or crop support —
-  # see emit_pad_with/5). Interior padding and/or negative lo/hi decompose here,
-  # in Elixir, into a sequence of already-supported opcodes (reshape/pad/slice/
-  # squeeze) that mirrors EMLX.Backend.pad/4's own eager algorithm exactly
-  # (interior_padding_mlx/3 then slice_negative_padding/2 then a plain pad) —
-  # reusing an already-correct, already-tested implementation instead of a
-  # second one. iattrs (wire :pad only) = [n_dims, lo0, hi0, int0, lo1, hi1, int1, …].
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :pad, args: [tensor, pad_value, config]}},
          state
@@ -766,8 +498,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # concatenate / stack: variadic — args is [list_of_tensors, axis].
-  # iattrs = [axis], all tensor refs go into operands.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :concatenate, args: [tensors, axis]}},
          state
@@ -802,8 +532,6 @@ defmodule EMLX.Native.Expr do
 
   # ── reductions ──────────────────────────────────────────────────────────────
 
-  # sum, product: emit reduction then cast to out_type.
-  # all, any: MLX returns bool_; always cast to out_type (u8).
   @reduction_cast_ops [:sum, :product, :all, :any]
 
   for op <- @reduction_cast_ops do
@@ -849,8 +577,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # argmax / argmin: axis = nil → -1 (global), otherwise normalised non-negative.
-  # MLX returns uint32; always cast to out_type.
   @argreduce_ops [:argmax, :argmin]
 
   for op <- @argreduce_ops do
@@ -882,12 +608,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # custom-fun reduce: lowered by static trace-time unrolling.
-  # The reduce axes have a trace-time-known extent, so we fold the user's scalar
-  # reducer `fun` over that extent, vectorized across the kept axes — each fold
-  # step re-lowers the reducer body inline (acc ← prev result). Graph-equivalent
-  # to a held child-program fold but reuses existing primitive opcodes, so no C++
-  # change is needed.  See workdir/native-compiler/12-childprogram-spike.md.
   defp expand_node(
          %T{
            type: out_type,
@@ -901,11 +621,6 @@ defmodule EMLX.Native.Expr do
 
   # ── dot ─────────────────────────────────────────────────────────────────────
 
-  # dot: args = [left, c_left, b_left, right, c_right, b_right]. A `right`
-  # operand bound to a quantized parameter position (per `state.quant_signature`
-  # — see the moduledoc's "Quantized dot specialization" section) specializes
-  # to `:quantized_matmul`; otherwise cast both operands to computation_type,
-  # emit plain `:dot` with 4-axis-list iattrs, cast result to out_type.
   defp expand_node(
          %T{
            type: out_type,
@@ -934,13 +649,6 @@ defmodule EMLX.Native.Expr do
 
   # ── conv ─────────────────────────────────────────────────────────────────────
 
-  # conv: expanded into existing astype/transpose instructions + a single
-  # :conv_general op.  This mirrors EMLX.Backend.conv exactly:
-  #   1. Cast input + kernel to out_type.
-  #   2. Apply input_permutation then channels-last transpose to input.
-  #   3. Apply kernel_permutation then channels-last transpose to kernel.
-  #   4. Emit :conv_general with strides/padding/dilations/fgs.
-  #   5. Apply channels-first then inverse-output-permutation transpose.
   defp expand_node(
          %T{
            type: out_type,
@@ -1073,16 +781,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # slice: start_indices can be integers (static) or tensors (dynamic).
-  #
-  # iattrs = [n_dims, dynamic_mask, d0..dn-1, l0..ln-1, str0..strn-1, sv0..svn-1]
-  #   n_dims       = rank of the input tensor
-  #   dynamic_mask = n-bit integer, bit i = 1 if start index i is a tensor
-  #   d0..dn-1     = input shape dims (for clamping)
-  #   l0..ln-1     = slice lengths (always static)
-  #   str0..strn-1 = strides (always static)
-  #   sv0..svn-1   = static start values (0 for dynamic dims)
-  # Operands = [tensor_ref, dyn_ref_0, dyn_ref_1, ...] — dynamic starts in axis order.
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -1125,10 +823,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # put_slice: start_indices can be integers (static) or tensors (dynamic).
-  #
-  # iattrs = [n_dims, dynamic_mask, d0..dn-1, l0..ln-1, sv0..svn-1]
-  # Operands = [input_ref, slice_ref, dyn_ref_0, ...] — dynamic starts in axis order.
   defp expand_node(
          %T{
            type: out_type,
@@ -1168,19 +862,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # gather: args = [tensor, indices, opts], opts has axes: [...].
-  #
-  # Mirrors EMLX.Backend.gather: decomposes the indices tensor along its last axis
-  # into per-axis index arrays; calls mlx::core::gather + reshape.
-  #
-  # iattrs = [n_gather_axes, a0, a1, ..., n_tensor_dims, ss0, ss1, ..., n_out_dims, od0, od1, ...]
-  #   n_gather_axes = number of indexed axes
-  #   a0..          = axis indices
-  #   n_tensor_dims = rank of tensor
-  #   ss0..         = slice_sizes (1 for gathered axes, full dim size for others)
-  #   n_out_dims    = rank of out tensor
-  #   od0..         = output shape dims
-  # Operands = [tensor_ref, indices_ref]
   defp expand_node(
          %T{
            shape: out_shape,
@@ -1262,12 +943,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # indexed_add / indexed_put: scatter_add / scatter.
-  # Mirrors EMLX.Backend.indexed_op: decomposes indices along last axis,
-  # reshapes updates, then emits :indexed_add/:indexed_put.
-  #
-  # iattrs = [n_axes, a0, a1, ..., n_updates_shape_dims, us0, us1, ...]
-  # Operands = [target_ref, indices_ref, updates_ref]
   defp expand_node(
          %T{
            type: out_type,
@@ -1290,9 +965,6 @@ defmodule EMLX.Native.Expr do
 
   # ── sort / argsort ────────────────────────────────────────────────────────
 
-  # sort: args = [tensor, opts], opts has :axis and :direction.
-  # iattrs = [axis, asc_int]  (1 = ascending, 0 = descending)
-  # C++ replicates EMLX.Backend.sort NaN-aware algorithm.
   defp expand_node(
          %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :sort, args: [tensor, opts]}},
          state
@@ -1312,9 +984,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
-  # argsort: args = [tensor, opts], opts has :axis and :direction.
-  # iattrs = [axis, asc_int]
-  # MLX returns uint32; always cast to out_type.
   defp expand_node(
          %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :argsort, args: [tensor, opts]}},
          state
@@ -1336,16 +1005,6 @@ defmodule EMLX.Native.Expr do
 
   # ── window reductions ─────────────────────────────────────────────────────
 
-  # window_sum/max/min/product: args = [tensor, window_dims_tuple, opts].
-  # opts has :padding (list of {lo, hi} per dim), :strides, :window_dilations.
-  #
-  # iattrs = [n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]
-  #   op_int: 0=sum, 1=product, 2=max, 3=min
-  #   lo/hi pairs: padding per dim (2*n_dims values)
-  #   s0…: strides per dim
-  #   w0…: window dims per dim
-  #   wd0…: window dilations per dim
-  # Operands: [tensor_ref]
   @window_op_int %{window_sum: 0, window_product: 1, window_max: 2, window_min: 3}
 
   for op <- [:window_sum, :window_product, :window_max, :window_min] do
@@ -1386,12 +1045,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # window_scatter_max / window_scatter_min:
-  # args = [tensor_t, source, init_value, window_dims_tuple, opts].
-  # opts has :padding, :strides.
-  #
-  # iattrs = [n_dims, lo0, hi0, …, s0, …, w0, …]
-  # Operands: [tensor_t_ref, source_ref, init_value_ref]
   for op <- [:window_scatter_max, :window_scatter_min] do
     defp expand_node(
            %T{
@@ -1430,14 +1083,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # window_reduce (custom fun): args = [tensor, acc, window_dims_tuple, opts, fun].
-  # MLX has no arbitrary-fun window reduce, so we static-unroll like :reduce: pad
-  # the input with `acc` per the padding config, then for each of the
-  # W = prod(window_dims) within-window offsets (row-major, last window dim
-  # varying fastest) emit a strided :slice yielding an out-shaped tensor, and
-  # fold the reducer over those W slices seeded with `acc`. This mirrors
-  # Nx.BinaryBackend.window_reduce, which pads with acc and folds fun(element,
-  # acc) over the window in row-major order. Reuses lower_fun_body/3.
   defp expand_node(
          %T{
            type: out_type,
@@ -1489,14 +1134,10 @@ defmodule EMLX.Native.Expr do
 
     out_dims = Tuple.to_list(out_shape)
 
-    # Seed acc broadcast to the output shape, then fold the reducer over each of
-    # the W within-window offsets.
     {acc_ref, state} = emit_broadcast_to(acc_scalar_ref, out_dims, state)
     extent = Enum.product(window_dims)
 
     # :slice takes a span (stop = start + length); with a stride it yields
-    # ceil(span/stride) elements, so the span for out_dim outputs is
-    # (out_dim - 1)*stride + 1.
     spans = Enum.zip_with(out_dims, strides, fn d, s -> (d - 1) * s + 1 end)
 
     {final_ref, state} =
@@ -1511,13 +1152,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── Nx.Block.Cumulative* — recognize-struct path ─────────────────────────
-  #
-  # Cumulative ops surface as Nx.Block.Cumulative{Sum,Product,Min,Max}.
-  # The struct carries :axis and :reverse (both already resolved to non-negative
-  # axis and boolean by Nx.cumulative_op).
-  #
-  # iattrs = [axis, reverse_int]  (0/1 booleans)
-  # inclusive is always 1 (MLX inclusive mode matches Nx semantics).
   for {block_mod, op} <- [
         {Nx.Block.CumulativeSum, :cumulative_sum},
         {Nx.Block.CumulativeProduct, :cumulative_product},
@@ -1554,8 +1188,6 @@ defmodule EMLX.Native.Expr do
 
   # ── fft / ifft ────────────────────────────────────────────────────────────
 
-  # fft/ifft: args = [tensor, opts], opts has :length and :axis (already resolved).
-  # iattrs = [axis, n]  where n is the FFT length (positive int).
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :fft, args: [tensor, opts]}},
          state
@@ -1589,9 +1221,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── Nx.Block.FFT2 / IFFT2 — recognize-struct path ─────────────────────────
-  #
-  # fft2/ifft2: Nx.Block.FFT2/IFFT2{lengths: [n0, n1], axes: [ax0, ax1]}.
-  # iattrs = [ax0, ax1, n0, n1]
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -1643,13 +1272,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── Nx.Block.LinAlg.* — recognize-struct native path ─────────────────────
-  #
-  # MLX provides native (CPU-only) linalg primitives. We emit a native op that
-  # mirrors EMLX.Backend's eager path: cast the operand(s) to f32, run the
-  # primitive, cast the result back to the block's output type. The op runs on
-  # the CPU stream in C++ (pinned), so it composes inside the compiled graph.
-  #
-  # cholesky: single-output. operands = [a]; no attrs.
   defp expand_node(
          %T{
            type: out_type,
@@ -1695,8 +1317,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
-  # qr (reduced mode): multi-output [q, r]. operands = [a]; no attrs.
-  # :complete mode descends into default_expr (Householder + while) — falls back.
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -1746,8 +1366,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, [w_ref, v_ref])}
   end
 
-  # svd (full matrices): multi-output [u, s, vt]. operands = [a]; no attrs.
-  # full_matrices?: false descends into default_expr (Jacobi + while) — falls back.
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -1773,9 +1391,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, [u_ref, s_ref, vt_ref])}
   end
 
-  # lu: multi-output {P, L, U}. operands = [a]; no attrs.
-  # MLX returns a pivot index vector; we rebuild the permutation matrix in-graph
-  # via eye + take (mirroring EMLX.Backend.block/4 for LU).
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -1817,14 +1432,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, [p_ref, l_ref, u_ref])}
   end
 
-  # triangular_solve: single-output. Direct op node (not a block).
-  # args = [a, b, opts]. Mirrors EMLX.Backend.triangular_solve/4: left_side: false
-  # and transform_a: :transpose are handled by swapping the last two axes (via
-  # the generic :transpose instruction) around :solve_triangular, exactly like
-  # the eager backend does — there is no native MLX primitive for those
-  # variants, only this transpose trick. transform_a: :conjugate is a no-op
-  # here (pre-conjugating real entries, per Nx.BinaryBackend.Matrix.ts/8),
-  # since complex numbers aren't supported.
   defp expand_node(
          %T{
            type: out_type,
@@ -1876,14 +1483,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── block fallback: descend into default_expr ─────────────────────────────
-  #
-  # For any Nx.Block.* struct not specifically recognized above (e.g. RFFT,
-  # IRFFT, AllClose, Phase, unrecognized future blocks), lower the block's
-  # traced default implementation instead of raising.
-  #
-  # The default_expr was traced by expr_block using fresh :parameter nodes as
-  # stand-ins for the in_args. We map those inner params to the parent-scope
-  # refs for in_args, then expand the inner scope's nodes inline.
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -1898,18 +1497,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── cond: lower as nested :select ops ────────────────────────────────────
-  #
-  # All cond predicates and bodies are in the parent scope: Nx's apply_args
-  # for :cond traverses everything (no :scope vs :all distinction), so every
-  # pred and body tensor is already in node_to_ref when we reach the :cond
-  # node in the topo order.
-  #
-  # Strategy: for each output element index i, right-fold the clauses:
-  #   select(pred1, body1_i, select(pred2, body2_i, ..., select(predN, bodyN_i, last_i)))
-  #
-  # Single-tensor output  → store one ref in node_to_ref.
-  # Tuple output (type {:tuple, n}) → store a list of n refs in node_to_ref.
-  # :elem nodes that follow pick the correct element from that list.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :cond, args: [clauses, last]}},
          state
@@ -1952,9 +1539,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── elem: extract element from a tuple-output op (cond/while) ─────────────
-  #
-  # Tuple-output ops (e.g. a :cond or :while with tuple carry) store a LIST of
-  # refs in node_to_ref. :elem picks the pos-th element from that list.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :elem, args: [tuple_node, pos]}},
          state
@@ -1972,9 +1556,6 @@ defmodule EMLX.Native.Expr do
 
   # ── creation ops ─────────────────────────────────────────────────────────
 
-  # iota: no tensor operands; all info in iattrs.
-  # iattrs = [dtype_int, n_dims, axis_int, d0..dn-1]
-  # axis_int = -1 encodes nil (flat enumeration across all dims).
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :iota, args: [axis]}} = node,
          state
@@ -1994,12 +1575,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # eye: no tensor operands; iattrs = [dtype_int, m, n]. The native `:eye`
-  # opcode (mlx::core::eye) is always rank-2 — callers under a `revectorize`
-  # wrapper (e.g. Nx.LinAlg.qr/svd's default_expr, which unconditionally
-  # collapses vectorized axes into a leading batch dim, even a size-1 one for
-  # non-batched input) request a shape like {b0, .., m, n}. Emit the rank-2
-  # eye and broadcast it across the leading dims.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :eye, args: []}} = node,
          state
@@ -2030,20 +1605,8 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # :fun nodes surface as opaque leaves in the parent ordering (post_order does
-  # not descend their bodies).  They carry no value on their own — the owning op
-  # (e.g. :reduce) reaches into `fun.data.args` and lowers the body itself — so
-  # the leaf is a no-op here.
   defp expand_node(%T{data: %Nx.Defn.Expr{op: :fun}}, state), do: state
 
-  # Hooks — see the moduledoc's "Hooks" section. `:token` never
-  # produces a value anything else reads (only `attach_token`'s wrapped expr
-  # is used downstream), so this clause contributes zero instructions; it
-  # only records each hook's already-lowered ref(s) as an extra program
-  # output for `EMLX.__compile__` to fire host-side after the single NIF
-  # call returns. A `nil` callback (no trace-time fn, and no runtime `hooks:`
-  # override — not yet threaded through the native path) is a no-op, mirroring
-  # `Nx.Defn.Evaluator`'s skip-if-unhandled rule.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}},
          state
@@ -2073,9 +1636,6 @@ defmodule EMLX.Native.Expr do
     end)
   end
 
-  # `attach_token(token, expr)`'s runtime value is `expr` unchanged (see the
-  # moduledoc); the token's side effect is fully handled by the `:token`
-  # clause above, already visited as this node's dependency.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :attach_token, args: [_token, expr]}},
          state
@@ -2084,13 +1644,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
   end
 
-  # `:runtime_call` — see the moduledoc's "Runtime calls" section. `args`
-  # is `[tensor_expr, callback, out_template, opts]`
-  # (`Nx.Defn.Expr.runtime_call/4`): `out_template` is a plain `%Nx.Tensor{}`
-  # for a single-tensor result, or any other `Nx.Container.t()` (tuple, list,
-  # map, custom struct) for a multi-output result — both cases lower to one
-  # `:runtime_call` instruction, storing either a single ref or a list of
-  # refs (the multi-output linalg convention) in `node_to_ref`.
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -2114,20 +1667,6 @@ defmodule EMLX.Native.Expr do
 
     operand_refs = Enum.map(operand_leaves, &Map.fetch!(state.node_to_ref, &1.data.id))
 
-    # A bare `:parameter` leaf's position, or `nil` — parallel to
-    # `operand_refs`/`args_template`'s leaf order. Lets `EMLX.handle_runtime_call/5`
-    # substitute back the *original* bound tensor for a leaf whose real bound
-    # value turns out to carry `quantization_config` (see
-    # `EMLX.Quantization.dequantize/1`): a quantized tensor's Nx-visible
-    # `.type`/`.shape` is a logical fiction over a differently-shaped, scale/
-    # bias-stripped physical MLX array (see `EMLX.build_native_eval_fn/7`'s
-    # doc for the identical output-side case), so naively rebuilding the
-    # callback's argument from the raw bytes MLX actually sent over the wire
-    # via `leaf.type`/`leaf.shape` would corrupt it. A leaf that isn't a bare
-    # parameter can never be quantized in the first place (quantization_config
-    # is real backend metadata that cannot survive being produced by an MLX
-    # op — only a directly-bound tensor carries it), so `nil` there is exact,
-    # not just a fallback.
     arg_param_positions =
       Enum.map(operand_leaves, fn
         %T{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos
@@ -2172,17 +1711,6 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # while (statically-counted range loop, unrolled) — see block-descent helper
-  # section below. `:while` only ever reaches `expand_node` when nested inside
-  # a block's default_expr (a top-level parent-scope `:while` is intercepted
-  # earlier by `EMLX.build_eval_fn`'s host-driven chain, never lowered here).
-  # `Nx.Defn.Kernel.while`'s range-generator form (used e.g. by Nx.LinAlg.qr's
-  # Householder loop) always produces a real `:while` node — even for a range
-  # with a compile-time-known trip count — because `unroll:` defaults to
-  # `false`. Detect that shape (integer index counted against a constant
-  # bound by a constant step) and statically unroll; anything else raises, so
-  # a genuinely data-dependent nested loop still surfaces a clear "not yet
-  # lowered" error instead of a silently wrong result.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :while, args: [initial, arg, condition, body]}},
          state
@@ -2197,25 +1725,7 @@ defmodule EMLX.Native.Expr do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
 
-  @doc """
-  Returns `true` if an `Nx.Block.*` `struct` (with the given `in_args`
-  operands) is lowered by `expand_node` above to a native op *without ever
-  consulting the block's `default_expr` fallback* — i.e. `default_expr`'s
-  content cannot affect the output of lowering this exact block instance.
-
-  This is the single source of truth for that fact, consulted both here
-  (implicitly, via the `expand_node` clauses above) and by
-  `EMLX.dispatch_key/3` (`lib/emlx.ex`), which uses it to decide whether
-  hashing `default_expr` is necessary for cache-key correctness — skipping it
-  for recognized native blocks avoids paying to hash a large, unused fallback
-  graph (e.g. `Nx.LinAlg.svd/1`'s ~100-iteration Jacobi rotation `default_expr`)
-  on every dispatch-key computation. Must be kept in sync with the
-  `expand_node` clauses above: a struct/shape combination that returns `true`
-  here but starts consulting `default_expr` in `expand_node` (e.g. a future
-  dtype-specific fallback) would let the dispatch key under-specify the
-  computation. Conservatively defaults to `false` (full hash) for anything
-  not explicitly proven native-lowerable here.
-  """
+  @doc false
   @spec native_lowerable_block?(struct(), [Nx.Tensor.t()]) :: boolean()
   def native_lowerable_block?(%Nx.Block.LogicalNot{}, _in_args), do: true
   def native_lowerable_block?(%Nx.Block.Take{}, _in_args), do: true
@@ -2267,9 +1777,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
-  # Quantized right operand: mirrors EMLX.Backend.quantized_dot/4's runtime
-  # dispatch. `scales`/`biases` become compile-time captures (see the
-  # moduledoc); group_size/bits/transpose/mode ride the iattr channel.
   defp expand_quantized_dot(
          id,
          out_type,
@@ -2332,7 +1839,6 @@ defmodule EMLX.Native.Expr do
     }
 
     # mx::quantized_matmul returns the activation's dtype (matching the eager
-    # EMLX.Backend.quantized_dot path); cast to out_type if they differ.
     {result_ref, state} = emit_cast_if_needed(qmm_ref, left.type, out_type, state)
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
@@ -2344,9 +1850,6 @@ defmodule EMLX.Native.Expr do
 
   # ── indexing helpers ──────────────────────────────────────────────────────
 
-  # Shared lowering for indexed_add / indexed_put.
-  # Computes the reshaped updates shape (same as EMLX.Backend.indexed_op), emits
-  # astype casts for target and updates, then emits the opcode.
   defp expand_indexed_node(id, op, out_type, target, indices, updates, opts, state) do
     ref = make_ref()
     axes = opts[:axes] || Nx.axes(target)
@@ -2386,18 +1889,6 @@ defmodule EMLX.Native.Expr do
 
   # ── block-descent helper ──────────────────────────────────────────────────
 
-  # Lower a :block node via its traced default_expr (the primitive decomposition).
-  #
-  # Nx.Defn.Expr.expr_block creates fresh :parameter nodes for the block's fun
-  # and passes them into the fun instead of the real in_args.  The default_expr
-  # therefore has inner :parameter nodes (at positions 0, 1, …) whose IDs are
-  # distinct from the parent-scope in_args IDs.
-  #
-  # We:
-  #   1. topo-sort the inner scope from default_expr.
-  #   2. Find the inner :parameter nodes and map them → parent-scope refs.
-  #   3. Expand the inner scope nodes (skipping the already-mapped params).
-  #   4. Alias the block node's output to the default_expr's result ref.
   defp expand_block_via_default(id, in_args, default_expr, state) do
     inner_ordered = EMLX.Defn.Tree.post_order(default_expr, &scope_dependencies/1)
 
@@ -2436,12 +1927,6 @@ defmodule EMLX.Native.Expr do
         end
       end)
 
-    # Tuple-output blocks (e.g. Nx.Block.TopK's {values, indices}) carry
-    # default_expr as a raw Elixir tuple of %T{} nodes (see Nx.Defn.Expr.expr_block/3),
-    # not a single tensor with a `.data.id`. Mirror the multi-output linalg
-    # convention: store a list of refs, one per tuple element, so the :elem
-    # node handler (which already supports list-valued node_to_ref entries)
-    # can index into it.
     result_ref =
       if is_tuple(default_expr) do
         flat_refs(default_expr, inner_state)
@@ -2453,13 +1938,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── while (static unroll for counted range loops) ──────────────────────────
-  #
-  # Matches the exact shape `Nx.Defn.Expr.while_range/7` (`unroll: false`,
-  # the default for `while acc, i <- first..last//step do ... end`) always
-  # produces: `initial[0]` is a constant start index, `arg[0]` is the
-  # scalar-integer index parameter, `condition` is `index <=/>= constant_bound`,
-  # and `body[0]` is `add(index, constant_step)` (in either operand order).
-  # All four are known at trace time, so the trip count is too.
   defp detect_static_while_trip_count(initial, arg, condition, body) when is_tuple(arg) do
     index_param = elem(arg, 0)
 
@@ -2475,9 +1953,6 @@ defmodule EMLX.Native.Expr do
 
   defp detect_static_while_trip_count(_initial, _arg, _condition, _body), do: :error
 
-  # `le?` (condition is `<=`) implies an ascending loop (step > 0); a `>=`
-  # condition implies a descending loop (step < 0). Anything else either
-  # never iterates as traced or isn't the mechanical `while_range` shape.
   defp static_trip_count(start, bound, step, true) when step > 0 and bound >= start,
     do: {:ok, div(bound - start, step) + 1}
 
@@ -2517,12 +1992,6 @@ defmodule EMLX.Native.Expr do
 
   defp constant_value(_node), do: :error
 
-  # Unrolls a counted `:while` `count` times. Each iteration re-lowers `body`
-  # (a tuple of expr roots) with its `arg` parameters bound to the previous
-  # iteration's output refs (the first iteration binds to `initial`'s refs,
-  # already expanded as parent-scope deps before this node was reached). The
-  # node's own ref becomes the list of the final iteration's output refs, one
-  # per loop-carried slot — same multi-output convention `:elem` reads from.
   defp expand_while_unroll(id, initial, arg, body, count, state) do
     initial_list = Tuple.to_list(initial)
     arg_list = Tuple.to_list(arg)
@@ -2543,9 +2012,6 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, final_refs)}
   end
 
-  # Like `lower_fun_body/3`, but for a tuple of body roots (a `:while` body's
-  # loop-carried tuple) instead of a single tensor — returns a list of refs,
-  # one per tuple element, instead of a single ref.
   defp lower_tuple_body(body_list, param_ref_by_pos, state) do
     body_tuple = List.to_tuple(body_list)
     state = merge_scope_ids(state, body_tuple)
@@ -2578,13 +2044,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── custom-fun reduce (static unroll) ──────────────────────────────────────
-  #
-  # `reduce` folds a user scalar reducer `fun(element, acc)` over the reduce
-  # axes.  Their extent is known at trace time, so we transpose the reduce axes
-  # last, collapse them into one trailing axis of size `extent`, slice that axis
-  # into `extent` kept-shape elements, and fold the reducer over them —
-  # vectorised across the kept axes.  Each fold step re-lowers the reducer body
-  # inline with `acc` bound to the previous step's result.
   defp expand_reduce_unroll(id, out_type, out_shape, tensor, acc, opts, fun, state) do
     in_rank = tuple_size(tensor.shape)
 
@@ -2643,28 +2102,12 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, out_ref)}
   end
 
-  # `state.top_scope_ids` (computed once, in `lower/2`, over the pristine
-  # top-level `output`) never sees inside a `:fun`/`:while` body — `apply_args`
-  # walks those in `:scope` mode precisely to skip them (they're separate
-  # lowering scopes, like `while`). So a hook nested directly in a reducer or
-  # statically-unrolled-while body — never itself inside a `cond` — would
-  # wrongly look cond-branch-local to the `:token` clause's membership check
-  # and raise. Reducer/while-unroll bodies always execute in full (no
-  # conditional skipping, unlike `cond`'s branches), so before lowering such a
-  # body inline, we extend `top_scope_ids` with a fresh `scope_ids` pass over
-  # just that body — which still correctly excludes any `cond` nested *inside*
-  # the body, so a genuinely cond-branch-local hook in there still raises.
+  # Inline fun/while bodies sit outside top-level scope_ids; extend before lowering hooks.
   defp merge_scope_ids(state, body) do
     extra = body |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new()
     %{state | top_scope_ids: MapSet.union(state.top_scope_ids, extra)}
   end
 
-  # Lower a reducer `:fun` body inline, binding its scalar parameters (by
-  # position) to the given refs.  Each call expands the body afresh — body node
-  # ids are constant across fold iterations, so the body-local `node_to_ref`
-  # must NOT leak back into the parent state, otherwise iteration 1+ would reuse
-  # iteration 0's results instead of re-lowering with the new acc/element refs.
-  # Returns {result_ref, state} with the body's instructions appended.
   defp lower_fun_body(body, param_ref_by_pos, state) do
     state = merge_scope_ids(state, body)
     inner_ordered = EMLX.Defn.Tree.post_order(body, &scope_dependencies/1)
@@ -2716,7 +2159,6 @@ defmodule EMLX.Native.Expr do
   end
 
   # Slice element `i` along the collapsed trailing axis then squeeze it away,
-  # yielding a kept-shape element.
   defp emit_reduce_slice(ref, combined_shape, kept_shape, i, state) do
     n_dims = length(combined_shape)
     last_axis = n_dims - 1
@@ -2736,8 +2178,6 @@ defmodule EMLX.Native.Expr do
      }}
   end
 
-  # Emit a :pad instruction padding `ref` by lo/hi per dim (interior 0), using
-  # `pad_value_ref` (a scalar operand) as the fill value. Returns {new_ref, state}.
   defp emit_pad_with(ref, pad_value_ref, low_pads, high_pads, state) do
     new_ref = make_ref()
     n_dims = length(low_pads)
@@ -2752,8 +2192,6 @@ defmodule EMLX.Native.Expr do
      }}
   end
 
-  # Emit a static (non-dynamic) :slice; mirrors the :slice expand_node wire format
-  # `[n_dims, dynamic_mask=0] ++ input_shape ++ lengths ++ strides ++ starts`.
   defp emit_static_slice(ref, input_shape, starts, lengths, strides, state) do
     new_ref = make_ref()
     n_dims = length(input_shape)
@@ -2762,10 +2200,6 @@ defmodule EMLX.Native.Expr do
     {new_ref, %{state | instructions: [{new_ref, :slice, [ref], iattrs} | state.instructions]}}
   end
 
-  # General :pad (interior padding and/or negative lo/hi), decomposed into
-  # existing opcodes. Order mirrors EMLX.Backend.pad/4 exactly: interior first
-  # (on the original shape), then crop the negative sides, then a plain
-  # non-negative pad for whatever's left.
   defp expand_pad_general(tensor_ref, pad_value_ref, in_dims, config, state) do
     interior_list = Enum.map(config, fn {_lo, _hi, interior} -> interior end)
 
@@ -2797,17 +2231,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  # Interior padding via EMLX.Backend's own trick (interior_padding_mlx/3):
-  # append a size-1 trailing spacer dim, then for each axis in turn, pad the
-  # *next* axis (an original dim, or the trailing spacer for the last axis)
-  # by `next_axis_size * interior` on its high side with `pad_value_ref`,
-  # reshape to fold that padding into the current axis (row-major reinterpret
-  # turns each padded chunk into `interior` extra all-pad "rows" after every
-  # original row, including the last), then slice off the trailing-row excess
-  # (only `interior` gaps are wanted between `axis_size` rows, not `axis_size`
-  # of them). The next iteration's spacer is the axis this one just restored
-  # to its original size, so the spacer role rotates forward one axis at a
-  # time. Squeeze the trailing dim away at the end.
   defp emit_interior_padding(ref, pad_value_ref, in_dims, interior_list, state) do
     rank = length(in_dims)
     shape0 = in_dims ++ [1]
@@ -2854,8 +2277,6 @@ defmodule EMLX.Native.Expr do
      %{state | instructions: [{squeeze_ref, :squeeze, [final_ref], [rank]} | state.instructions]}}
   end
 
-  # Crop negative lo/hi by slicing them off (EMLX.Backend.slice_negative_padding/2's
-  # decomposition — MLX's :pad primitive can only grow a tensor, never crop it).
   defp emit_negative_crop(ref, shape, config, state) do
     starts = Enum.map(config, fn {lo, _hi, _interior} -> max(-lo, 0) end)
 
@@ -2871,8 +2292,6 @@ defmodule EMLX.Native.Expr do
     {new_ref, lengths, state}
   end
 
-  # Decompose a flat window index `k` into per-dim offsets in row-major order
-  # (last window dim varies fastest), matching Nx.BinaryBackend's window traversal.
   defp window_offsets(k, dims) do
     {digits, _} =
       dims
@@ -2882,21 +2301,7 @@ defmodule EMLX.Native.Expr do
     digits
   end
 
-  @doc """
-  Returns the set of defn parameter positions that appear as either
-  operand of a `:dot` node somewhere in `output`'s post-order traversal —
-  the only positions `lower/3`'s `quant_signature` argument can ever act
-  on (see `expand_node`'s `:dot` clause and `quantized_param_config/2`
-  above: the right operand specializes to `:quantized_matmul`, the left
-  operand raises a clear `ArgumentError` instead of silently miscomputing
-  on packed bits). `EMLX.quant_signature/2` intersects a call's bound
-  quantized tensors against this set before building a dispatch-cache key,
-  so a quantized tensor merely *passed through* to
-  something else (e.g. an `EMLX.Fast.*` fused kernel's `:__EMLX__`
-  metadata `operands`, or `EMLX.Quantization.dequantize/1`'s own
-  `:runtime_call` split-point operand) doesn't fragment the cache with
-  one dead-weight entry per distinct tensor identity.
-  """
+  @doc false
   @spec quantizable_param_positions(Nx.Container.t()) :: MapSet.t(non_neg_integer())
   def quantizable_param_positions(output) do
     output
@@ -2918,8 +2323,6 @@ defmodule EMLX.Native.Expr do
 
   defp maybe_put_param_position(acc, _node), do: acc
 
-  # Float opts ride the int-attr channel as their IEEE-754 double bits
-  # (reinterpreted as a signed int64). The C++ side reverses it via memcpy.
   @doc false
   @spec f64_bits(number()) :: integer()
   def f64_bits(v) when is_number(v) do
@@ -2936,8 +2339,6 @@ defmodule EMLX.Native.Expr do
 
   # ── cond helper ───────────────────────────────────────────────────────────
 
-  # Flatten a composite (single tensor or Elixir tuple of tensors) to a list
-  # of refs looked up in node_to_ref, one per leaf tensor.
   defp flat_refs(composite, state) do
     Composite.flatten_list([composite])
     |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
@@ -2945,11 +2346,6 @@ defmodule EMLX.Native.Expr do
 
   # ── binary lowering helpers ────────────────────────────────────────────────
 
-  # Implements EMLX.Backend's maybe_upcast + op + astype(out.type) pattern:
-  #   1. Cast both inputs to merge_type if their types differ.
-  #   2. Emit the op instruction.
-  #   3. Cast result to out_type (no-op when merge_type == out_type, e.g. arithmetic;
-  #      needed for compare ops where result is MLX bool_ but out_type is {:u,8}).
   defp expand_binary_node(id, op, out_type, left, right, state) do
     merge_type = Nx.Type.merge(left.type, right.type)
     left_ref0 = Map.fetch!(state.node_to_ref, left.data.id)
@@ -2998,8 +2394,6 @@ defmodule EMLX.Native.Expr do
     {ref, %{state | instructions: [{ref, :transpose, [operand_ref], perm} | state.instructions]}}
   end
 
-  # Non-negative permutation swapping the last two axes, identity elsewhere.
-  # rank 2 -> [1, 0]; rank 3 -> [0, 2, 1]; etc.
   defp swap_last_two_axes(rank) do
     {front, [x, y]} = Enum.split(Enum.to_list(0..(rank - 1)), rank - 2)
     front ++ [y, x]
@@ -3020,31 +2414,13 @@ defmodule EMLX.Native.Expr do
   end
 
   # Move the second element (channels) to the last position.
-  # [0, 1, 2, 3] → [0, 2, 3, 1]  (NCHW → NHWC permutation)
-  # Mirrors EMLX.Backend.move_channels_last/1.
   defp move_channels_last([head | [second | rest]]) do
     [head | rest] ++ [second]
   end
 
   # ── wire serialisation ────────────────────────────────────────────────────
 
-  @doc """
-  Translates an `EMLX.Native.Expr` to the wire format expected by
-  `EMLX.NIF.compile_program/9`.
-
-  Returns an 8-tuple:
-  `{num_inputs, capture_nif_refs, constant_values, constant_types,
-    op_names, operands, iattrs, output_packed_refs}`
-
-  `output_packed_refs` is `prog.outputs` followed by every hook's refs
-  (flattened, in `prog.hooks` order) — see the moduledoc "Hooks" section.
-
-  `op_names` is a list of strings (e.g. `"add"`) that map directly to entries
-  in the C++ `op_registry`; no integer opcode table is required.
-
-  This runs once per compilation cache miss; it has no effect on hot-path
-  performance.
-  """
+  @doc false
   @spec to_wire(t()) ::
           {non_neg_integer(), list(), list(), list(), list(), list(), list(), list()}
   def to_wire(%__MODULE__{} = prog) do
@@ -3067,17 +2443,6 @@ defmodule EMLX.Native.Expr do
     ref_to_packed = Map.merge(input_map, Map.merge(capture_map, constant_map))
 
     maybe_debug_check do
-      # Defensive: `Map.merge/2` silently lets a later map's key win over an
-      # earlier one. `input_map`/`capture_map`/`constant_map` are keyed by
-      # distinct id shapes in the common case (a `:parameter` node's id is a
-      # `make_ref()`, a `:constant` node's id is a content-addressed
-      # `{value, type, shape}` tuple -- see `EMLX.Native.Expr`'s node id
-      # scheme), but if any two ever coincide, one ref's *real* category
-      # silently vanishes from `ref_to_packed` and every instruction that
-      # references it resolves to the *wrong* vector (and, worst case, an
-      # in-bounds-looking-but-wrong index) at the C++ layer instead of
-      # failing loudly here. A mismatched merged size is the tell. Gated
-      # behind `maybe_debug_check` (see its definition above).
       expected_size = map_size(input_map) + map_size(capture_map) + map_size(constant_map)
 
       if map_size(ref_to_packed) != expected_size do
@@ -3093,11 +2458,6 @@ defmodule EMLX.Native.Expr do
       end
     end
 
-    # Walk instructions in order, building the wire arrays and extending the map.
-    # A `result` ref is indexed into the C++ flat results accumulator. Each
-    # instruction contributes one entry (single-output) or several (multi-output
-    # ops whose result field is a list of refs), so the flat index is tracked
-    # separately from the instruction position.
     {op_names, operands, iattrs, ref_to_packed, _flat} =
       prog.instructions
       |> Enum.reduce({[], [], [], ref_to_packed, 0}, fn {id, op, operand_refs, attrs},
@@ -3105,16 +2465,6 @@ defmodule EMLX.Native.Expr do
         wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
 
         maybe_debug_check do
-          # Defensive: a `@kind_instr` operand must reference a *prior*
-          # instruction's already-pushed result (the C++ interpreter's flat
-          # `results` accumulator only contains entries for instructions
-          # processed so far -- see emlx_compiler.cpp's `resolve` lambda). A
-          # forward/self reference here would silently pass this Elixir-side
-          # map lookup (the ref exists in `rmap`) but crash the NIF with an
-          # opaque `vector::_M_range_check` once C++ tries to index into a
-          # `results` vector that isn't that big yet. Catching it here turns
-          # that into an actionable error pointing at the offending op. Gated
-          # behind `maybe_debug_check` (see its definition above).
           for packed <- wire_operands,
               packed >>> @kind_shift == @kind_instr,
               (packed &&& (1 <<< @kind_shift) - 1) >= flat do
@@ -3128,14 +2478,6 @@ defmodule EMLX.Native.Expr do
         end
 
         maybe_debug_check do
-          # Defensive: an instruction's own result ref must not already be a
-          # key in `rmap` -- that would mean this id was already bound to an
-          # input/capture/constant/earlier-instruction's slot, and this
-          # `Map.put` would silently overwrite it, corrupting every operand
-          # reference to the *original* binding built before this point in
-          # the reduce (they keep the id, but the id now resolves to this
-          # new, wrong slot instead). Gated behind `maybe_debug_check` (see
-          # its definition above).
           for one <- List.wrap(id), Map.has_key?(rmap, one) do
             raise ArgumentError,
                   "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} produces result ref " <>
@@ -3160,9 +2502,6 @@ defmodule EMLX.Native.Expr do
         {[op | ops], [wire_operands | ors], [attrs | ias], rmap2, flat2}
       end)
 
-    # Hook refs ride along as extra outputs (see moduledoc "Hooks"), appended
-    # after the real outputs; `EMLX.__compile__` knows the split point from
-    # `length(prog.outputs)` and slices them back apart post-`eval_program`.
     hook_refs = Enum.flat_map(prog.hooks, & &1.refs)
     wire_outputs = Enum.map(prog.outputs ++ hook_refs, &Map.fetch!(ref_to_packed, &1))
 
