@@ -1787,12 +1787,14 @@ defmodule EMLX do
     end
   end
 
-  # True when the parent scope contains a `while` split point. `post_order/1`
+  # True when the parent scope contains a `while` split point. `post_order/2`
   # treats it as an opaque leaf, so this only sees parent-scope split
   # points — a nested one inside a sub-scope surfaces when that sub-scope is
   # compiled.
   defp contains_split_point?(output_expr) do
-    output_expr |> EMLX.Defn.Tree.post_order() |> Enum.any?(&split_point?/1)
+    output_expr
+    |> EMLX.Defn.Tree.post_order(&EMLX.Native.Expr.scope_dependencies/1)
+    |> Enum.any?(&split_point?/1)
   end
 
   defp split_point?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :while}}), do: true
@@ -2105,7 +2107,7 @@ defmodule EMLX do
   # layers (or the same layer across decode steps) share one compiled
   # program instead of recompiling per call. Coarser than a bit-identical
   # `Expr` hash (deliberately): tensor-valued args are replaced by their position in
-  # `EMLX.Defn.Tree.post_order/1`'s dependency-first listing (itself
+  # `EMLX.Defn.Tree.post_order/2`'s dependency-first listing (itself
   # id-independent and structurally stable across identical call sites),
   # not by the referenced node's `id`.
   # `sanitize_key_term/2`'s opaque-scope fallback (below) recurses into a
@@ -2155,15 +2157,15 @@ defmodule EMLX do
     end
   end
 
-  # Computes `{node_sigs, output_sigs}` for one `EMLX.Defn.Tree.post_order/1`
+  # Computes `{node_sigs, output_sigs}` for one `EMLX.Defn.Tree.post_order/2`
   # scope. Split out from `dispatch_key/3` so `sanitize_key_term/2` can
   # recurse into an *opaque* scope root (a `while` condition/body, a
-  # `block`'s `default_expr`, a `fun` body — see `EMLX.Defn.Tree.post_order/1`'s
+  # `block`'s `default_expr`, a `fun` body — see `EMLX.Defn.Tree.post_order/2`'s
   # "Sub-scope handling" doc) with a fresh, self-contained position map,
   # instead of assuming every tensor reachable from a visited node's `args`
   # was itself visited at this level.
   defp expr_structural_signature(expr_or_container) do
-    nodes = EMLX.Defn.Tree.post_order(expr_or_container)
+    nodes = EMLX.Defn.Tree.post_order(expr_or_container, &EMLX.Native.Expr.scope_dependencies/1)
     positions = nodes |> Enum.with_index() |> Map.new(fn {t, i} -> {t.data.id, i} end)
 
     node_sigs =
@@ -2172,8 +2174,9 @@ defmodule EMLX do
             t
         when map_size(meta) == 1 ->
           # `_inner` (the plain-Nx reference formula) is deliberately excluded
-          # from the signature, not just skipped like `EMLX.Defn.Tree.post_order/1`
-          # does for lowering: `_inner` closes over real upstream operands (e.g.
+          # from the signature, not just skipped like `EMLX.Defn.Tree.post_order/2`
+          # (via `EMLX.Native.Expr.scope_dependencies/1`) does for lowering: `_inner`
+          # closes over real upstream operands (e.g.
           # `x` in `rms_norm_reference/3`), so treating it like any other arg
           # here would make `sanitize_key_term/2` fall into its "opaque
           # sub-scope" fallback below and re-walk `_inner`'s *entire* transitive
@@ -2387,7 +2390,7 @@ defmodule EMLX do
 
   defp find_while_node(output_expr) do
     output_expr
-    |> EMLX.Defn.Tree.post_order()
+    |> EMLX.Defn.Tree.post_order(&EMLX.Native.Expr.scope_dependencies/1)
     |> Enum.find(&(&1.data.op == :while))
   end
 

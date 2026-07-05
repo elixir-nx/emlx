@@ -4,7 +4,10 @@ defmodule EMLX.Defn.Tree do
 
   This module is an upstream candidate for `Nx.Defn.Tree`; the only change
   needed to upstream it is a rename. It has **zero EMLX dependencies** — it
-  only uses `Nx.Defn.{Tree, Composite}` and `Nx.Tensor`.
+  only uses `Nx.Defn.{Tree, Composite}` and `Nx.Tensor`. Callers needing
+  compiler-specific scope handling (e.g. EMLX's `:__EMLX__` metadata nodes,
+  see `EMLX.Native.Expr.scope_dependencies/1`) inject it via `post_order/2`'s
+  `scope_dependencies` argument instead of this module knowing about it.
 
   ## Scope model
 
@@ -13,7 +16,7 @@ defmodule EMLX.Defn.Tree do
   the parent ordering. `cond` clauses share the parent scope and are traversed
   normally.
 
-  `post_order/1` respects these boundaries: `while`, `fun`, and `block` nodes
+  `post_order/2` respects these boundaries: `while`, `fun`, and `block` nodes
   are treated as **opaque leaves** in the parent ordering — their inner-scope
   sub-graphs do not appear in the result.
   """
@@ -33,6 +36,18 @@ defmodule EMLX.Defn.Tree do
 
   Each node appears **exactly once**, deduplicated by `node.data.id`.
 
+  `scope_dependencies` lets a caller override which nodes count as a given node's
+  same-scope dependencies, without this module needing to know about
+  compiler-specific node shapes. For each visited node it is called as
+  `scope_dependencies.(node)` and must return either:
+
+    * `{:ok, deps}` — treat `deps` (a list of `%Nx.Tensor{}`) as the node's
+      *only* same-scope dependencies, recursing into them instead of the
+      node's own `args`. Use this to redirect traversal away from a node's
+      literal `args` (e.g. a node wrapping an inner sub-expression that
+      should stay out of the ordering entirely).
+    * `:default` — fall back to the default traversal below.
+
   ## Sub-scope handling
 
   `while`, `fun`, and `block` nodes are returned **opaque**: their inner-scope
@@ -41,58 +56,50 @@ defmodule EMLX.Defn.Tree do
   relevant inner scope can be accessed from its `args`:
 
     * `:while` — `args = [initial, arg, condition, body]`; `arg`, `condition`,
-      and `body` belong to the while scope. Call `post_order/1` on `condition`
+      and `body` belong to the while scope. Call `post_order/2` on `condition`
       or `body` to obtain their orderings independently.
     * `:fun` — `args = [params, body, mfa]`; `body` is the function scope.
     * `:block` — `args = [struct, in_args, default_expr, callback]`;
       `default_expr` is the block's inner scope.
   """
-  @spec post_order(Nx.Container.t()) :: [Nx.Tensor.t()]
-  def post_order(output) do
+  @spec post_order(Nx.Container.t(), (Nx.Tensor.t() -> {:ok, [Nx.Tensor.t()]} | :default)) ::
+          [Nx.Tensor.t()]
+  def post_order(output, scope_dependencies \\ fn _node -> :default end) do
     roots = Composite.flatten_list([output])
-    {_visited, rev} = Enum.reduce(roots, {MapSet.new(), []}, &visit/2)
+    {_visited, rev} = Enum.reduce(roots, {MapSet.new(), []}, &visit(&1, &2, scope_dependencies))
     Enum.reverse(rev)
   end
 
   # --- recursive post-order DFS ---
 
-  defp visit(%T{data: %Nx.Defn.Expr{id: id}} = node, {visited, output}) do
+  defp visit(%T{data: %Nx.Defn.Expr{id: id}} = node, {visited, output}, scope_dependencies) do
     if MapSet.member?(visited, id) do
       {visited, output}
     else
       # Mark visited before recursing to handle shared subexpressions correctly.
       visited = MapSet.put(visited, id)
-      {visited, output} = visit_scope_deps(node, {visited, output})
+      {visited, output} = visit_scope_deps(node, {visited, output}, scope_dependencies)
       {visited, [node | output]}
     end
   end
 
   # fun's args[0] contains inner-scope parameter templates — no parent-scope deps.
-  defp visit_scope_deps(%T{data: %Nx.Defn.Expr{op: :fun}}, acc), do: acc
+  defp visit_scope_deps(%T{data: %Nx.Defn.Expr{op: :fun}}, acc, _scope_dependencies), do: acc
 
-  # `:__EMLX__`-tagged metadata (see `EMLX.Fast`) marks a node whose *real*
-  # dependencies are its `operands` list, not whatever plain-Nx composite
-  # `inner` expr it wraps — `inner` is a reference formula the EMLX compiler
-  # never evaluates (see `EMLX.Native.Expr`'s `:metadata` `expand_node`
-  # clause), so its internal subgraph must stay out of the ordering entirely;
-  # otherwise those nodes would still get lowered as dead instructions.
-  defp visit_scope_deps(
-         %T{
-           data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: %{operands: operands}}]}
-         },
-         acc
-       ) do
-    Enum.reduce(operands, acc, &visit/2)
-  end
+  defp visit_scope_deps(node, acc, scope_dependencies) do
+    case scope_dependencies.(node) do
+      {:ok, deps} ->
+        Enum.reduce(deps, acc, &visit(&1, &2, scope_dependencies))
 
-  # For all other ops (including while and block, which expose parent-scope deps
-  # via apply_args :scope), recurse into same-scope operands before emitting.
-  defp visit_scope_deps(node, acc) do
-    {_, acc} =
-      Tree.apply_args(node, :scope, acc, fn dep, a ->
-        {dep, visit(dep, a)}
-      end)
+      :default ->
+        # For all other ops (including while and block, which expose parent-scope
+        # deps via apply_args :scope), recurse into same-scope operands before emitting.
+        {_, acc} =
+          Tree.apply_args(node, :scope, acc, fn dep, a ->
+            {dep, visit(dep, a, scope_dependencies)}
+          end)
 
-    acc
+        acc
+    end
   end
 end

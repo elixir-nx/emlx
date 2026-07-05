@@ -23,7 +23,7 @@ defmodule EMLX.Fast do
     `Nx.runtime_call/4` of the *same* eager callback used above (`inner`) —
     this compiler never evaluates it (it's discarded in favor of the
     `:__EMLX__` payload); it exists only so (a) the operand tensors are
-    ordinary reachable dependencies for `EMLX.Defn.Tree.post_order/1` to
+    ordinary reachable dependencies for `EMLX.Defn.Tree.post_order/2` to
     visit, and (b) any other `Nx.Defn.Compiler` — notably the default
     `Nx.Defn.Evaluator` and `Nx.Defn.Grad` — still gets a correct fallback:
     `runtime_call` just runs the real NIF against concrete tensors, so it's

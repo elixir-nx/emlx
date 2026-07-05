@@ -309,7 +309,7 @@ defmodule EMLX.Native.Expr do
           %{non_neg_integer() => EMLX.Quantization.Config.t()}
         ) :: t()
   def lower(output, num_inputs \\ nil, quant_signature \\ %{}) do
-    ordered = EMLX.Defn.Tree.post_order(output)
+    ordered = EMLX.Defn.Tree.post_order(output, &scope_dependencies/1)
 
     # inputs is a map of pos → ref during lowering; densified to a list at the end.
     state = %{
@@ -356,6 +356,23 @@ defmodule EMLX.Native.Expr do
   end
 
   # ── node expansion ────────────────────────────────────────────────────────
+
+  @doc false
+  # `:__EMLX__`-tagged metadata (see `EMLX.Fast`) marks a node whose *real*
+  # dependencies are its `operands` list, not whatever plain-Nx composite
+  # `inner` expr it wraps — `inner` is a reference formula this compiler
+  # never evaluates (see the `:metadata` `expand_node` clause below), so its
+  # internal subgraph must stay out of the ordering entirely; otherwise those
+  # nodes would still get lowered as dead instructions. Passed as the
+  # `scope_dependencies` callback to every `EMLX.Defn.Tree.post_order/2` call in this
+  # module (and in `emlx.ex`).
+  def scope_dependencies(%T{
+        data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: %{operands: operands}}]}
+      }) do
+    {:ok, operands}
+  end
+
+  def scope_dependencies(_node), do: :default
 
   defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :parameter, args: [pos]}}, state) do
     ref = make_ref()
@@ -413,11 +430,12 @@ defmodule EMLX.Native.Expr do
   # `inner` computes. `inner` exists only so non-EMLX consumers (any other
   # `Nx.Defn.Compiler`, or `Nx.Defn.Evaluator`) get a genuine, correct
   # (if slower) fallback, and so `operands` are ordinary reachable
-  # dependencies for `EMLX.Defn.Tree.post_order/1` to visit — this compiler
-  # never lowers `inner` itself. `operands` are the same `%Nx.Tensor{}`
-  # values embedded in `inner`'s own subtree (so `state.node_to_ref` already
-  # has an entry for each by the time this clause runs); `attrs` is the
-  # int-attr list, already encoded (see `EMLX.Fast`'s `f64_bits/1` uses).
+  # dependencies for `EMLX.Defn.Tree.post_order/2` (see `scope_dependencies/1` above)
+  # to visit — this compiler never lowers `inner` itself. `operands` are the
+  # same `%Nx.Tensor{}` values embedded in `inner`'s own subtree (so
+  # `state.node_to_ref` already has an entry for each by the time this clause
+  # runs); `attrs` is the int-attr list, already encoded (see `EMLX.Fast`'s
+  # `f64_bits/1` uses).
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -2381,7 +2399,7 @@ defmodule EMLX.Native.Expr do
   #   3. Expand the inner scope nodes (skipping the already-mapped params).
   #   4. Alias the block node's output to the default_expr's result ref.
   defp expand_block_via_default(id, in_args, default_expr, state) do
-    inner_ordered = EMLX.Defn.Tree.post_order(default_expr)
+    inner_ordered = EMLX.Defn.Tree.post_order(default_expr, &scope_dependencies/1)
 
     # Collect inner :parameter nodes; sort by position (args[0]).
     inner_params =
@@ -2531,7 +2549,7 @@ defmodule EMLX.Native.Expr do
   defp lower_tuple_body(body_list, param_ref_by_pos, state) do
     body_tuple = List.to_tuple(body_list)
     state = merge_scope_ids(state, body_tuple)
-    inner_ordered = EMLX.Defn.Tree.post_order(body_tuple)
+    inner_ordered = EMLX.Defn.Tree.post_order(body_tuple, &scope_dependencies/1)
 
     param_id_to_ref =
       inner_ordered
@@ -2649,7 +2667,7 @@ defmodule EMLX.Native.Expr do
   # Returns {result_ref, state} with the body's instructions appended.
   defp lower_fun_body(body, param_ref_by_pos, state) do
     state = merge_scope_ids(state, body)
-    inner_ordered = EMLX.Defn.Tree.post_order(body)
+    inner_ordered = EMLX.Defn.Tree.post_order(body, &scope_dependencies/1)
 
     param_id_to_ref =
       inner_ordered
@@ -2882,7 +2900,7 @@ defmodule EMLX.Native.Expr do
   @spec quantizable_param_positions(Nx.Container.t()) :: MapSet.t(non_neg_integer())
   def quantizable_param_positions(output) do
     output
-    |> EMLX.Defn.Tree.post_order()
+    |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
     |> Enum.reduce(MapSet.new(), fn
       %T{data: %Nx.Defn.Expr{op: :dot, args: [left, _c_left, _b_left, right, _c_right, _b_right]}},
       acc ->
