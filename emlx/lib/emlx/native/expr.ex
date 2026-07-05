@@ -2116,8 +2116,7 @@ defmodule EMLX.Native.Expr do
     new_ref = make_ref()
     attrs = [length(shape_list) | shape_list] ++ [0]
 
-    {new_ref,
-     %{state | instructions: [{new_ref, :broadcast, [ref], attrs} | state.instructions]}}
+    {new_ref, %{state | instructions: [{new_ref, :broadcast, [ref], attrs} | state.instructions]}}
   end
 
   # Slice element `i` along the collapsed trailing axis then squeeze it away,

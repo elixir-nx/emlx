@@ -12,10 +12,11 @@ defmodule EMLX.Native.Instruction do
   # A reference to an already-produced value, resolved on the C++ side against
   # the runtime inputs / closed-over captures / closed-over constants / the
   # flat per-eval results accumulator (in that order).
-  @type ref :: {:input, non_neg_integer()}
-              | {:capture, non_neg_integer()}
-              | {:const, non_neg_integer()}
-              | {:result, non_neg_integer()}
+  @type ref ::
+          {:input, non_neg_integer()}
+          | {:capture, non_neg_integer()}
+          | {:const, non_neg_integer()}
+          | {:result, non_neg_integer()}
 
   # Most attrs are plain integers (shapes, axes, flags, f64_bits-encoded
   # floats); a few are MLX dtype atoms or quantized_matmul mode atoms (see

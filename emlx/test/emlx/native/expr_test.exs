@@ -3433,7 +3433,10 @@ defmodule EMLX.Native.ExprTest do
       a1 = Nx.iota(shape, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
 
       a2 =
-        Nx.iota(shape, type: :f32) |> Nx.divide(7) |> Nx.add(1) |> Nx.backend_transfer(EMLX.Backend)
+        Nx.iota(shape, type: :f32)
+        |> Nx.divide(7)
+        |> Nx.add(1)
+        |> Nx.backend_transfer(EMLX.Backend)
 
       fun = fn t -> Nx.LinAlg.svd(t, full_matrices?: true) end
 

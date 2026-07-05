@@ -1,4 +1,3 @@
-
 defmodule EMLX.Native.Program do
   @moduledoc false
   @enforce_keys [:num_inputs, :captures, :constants, :instructions, :outputs]
