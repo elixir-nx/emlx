@@ -2409,7 +2409,6 @@ defmodule EMLX.Native.ExprTest do
 
   describe "fused kernels vs eager + primitive (Metal)" do
     @describetag :metal
-    @describetag :stage10
 
     test "rms_norm: fused replay matches eager and hand-written primitive" do
       fun = fn x, w -> EMLX.Fast.rms_norm(x, w, 1.0e-5) end
@@ -2700,19 +2699,12 @@ defmodule EMLX.Native.ExprTest do
       fused_us = bench_us(200, fn -> fused_c.(q, k, v, w) |> Nx.backend_transfer() end)
       prim_us = bench_us(200, fn -> prim_c.(q, k, v, w) |> Nx.backend_transfer() end)
 
-      IO.puts(
-        "\ndecode block: fused #{Float.round(fused_us, 2)} µs/call vs " <>
-          "primitive #{Float.round(prim_us, 2)} µs/call " <>
-          "(#{Float.round(prim_us / fused_us, 2)}×)"
-      )
-
       assert fused_us <= prim_us * 1.1
     end
   end
 
   describe "prefill RoPE (Metal)" do
     @describetag :metal
-    @describetag :stage15
 
     test "rope_with_positions (T>1, sequential positions): native matches eager" do
       fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, 64, false, 10_000.0, 1.0) end
@@ -3340,7 +3332,7 @@ defmodule EMLX.Native.ExprTest do
       # Unlike dequantize's single bare-tensor operand, quantized_matmul's
       # runtime_call operand is a tuple {activation, qw} -- the same
       # multi-tensor-container shape as the real target use case
-      # (EMLXAxon.native_kv_attn_callback/2), which no other :stage31 test
+      # (EMLXAxon.native_kv_attn_callback/2), which no other test here
       # exercises.
       w = Nx.iota({4, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
       qw = EMLX.quantize(w, [])
