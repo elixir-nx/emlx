@@ -295,6 +295,31 @@ template <> struct Decoder<mlx::core::Device> {
   }
 };
 
+// Dtype atom (`:float32`, `:bool`, …) -> mlx::core::Dtype. Lets NIF argument
+// types (e.g. emlx_compiler.hpp's `Program::constants`) decode dtypes
+// directly instead of going through an int<->dtype lookup table shared with
+// Elixir (see EMLX.Native.to_mlx_type/1 on the Elixir side).
+template <> struct Decoder<mlx::core::Dtype> {
+  static mlx::core::Dtype decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+    std::string atom_val;
+    if (!nx::nif::get_atom(env, term, atom_val)) {
+      throw std::invalid_argument("Unable to get dtype atom in NIF");
+    }
+    return string2dtype(atom_val);
+  }
+};
+
+// Plain mlx::core::array argument (as opposed to TensorArg, which also keeps
+// the TensorP RAII wrapper alive for the duration of the call) — a straight
+// copy of the resource's array value, matching the pre-`fine` LIST_PARAM(...,
+// std::vector<mlx::core::array>, ...) semantics used e.g. for compile_program's
+// captures.
+template <> struct Decoder<mlx::core::array> {
+  static mlx::core::array decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+    return *Decoder<TensorArg>::decode(env, term);
+  }
+};
+
 // `int` — fine only ships int64_t/uint64_t decoders; match the existing
 // nx::nif::get(..., int*)/enif_get_int semantics exactly (used for e.g.
 // RoPE `dims`/`offset` params).

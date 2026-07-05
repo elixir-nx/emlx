@@ -8,7 +8,6 @@ defmodule EMLX.Native.ExprTest do
     - Unary + binary + compare/logical equivalence vs EMLX.Backend
   """
   use ExUnit.Case, async: false
-  import Bitwise
   import Nx.Defn
 
   alias EMLX.Native.Expr
@@ -293,29 +292,24 @@ defmodule EMLX.Native.ExprTest do
     test "identity program: n_inputs=1, no instructions, output encodes input ref" do
       expr = Nx.Defn.debug_expr_apply(&identity/1, [Nx.template({3}, :f32)])
       prog = Expr.lower(expr)
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = Expr.to_wire(prog)
+      wire = Expr.to_wire(prog)
 
-      assert n_inputs == 1
-      assert caps == []
-      assert cvs == []
-      assert cts == []
-      assert ops == []
-      assert ors == []
-      assert ias == []
-      # output must encode kind=input (0), idx=0 → packed = 0
-      assert outs == [0]
+      assert %EMLX.Native.Wire.Program{} = wire
+      assert wire.num_inputs == 1
+      assert wire.captures == []
+      assert wire.constants == []
+      assert wire.instructions == []
+      assert wire.outputs == [{:input, 0}]
     end
 
     test "add program: op_name is :add, operands encode the two inputs" do
       expr = Nx.Defn.debug_expr_apply(&add_two/2, [Nx.template({}, :f32), Nx.template({}, :f32)])
       prog = Expr.lower(expr)
-      {_n, _caps, _cvs, _cts, [op_name], [operands], [_ia], [output]} = Expr.to_wire(prog)
+      %EMLX.Native.Wire.Program{instructions: [instr], outputs: [output]} = Expr.to_wire(prog)
 
-      assert op_name == :add
-      # inputs packed as kind=0 (bits 61:60 = 0), so just the index
-      assert operands == [0, 1]
-      # output is the first instruction (kind=3, idx=0): 3 <<< 60 ||| 0
-      assert output == 3 <<< 60
+      assert instr.op == :add
+      assert instr.operands == [{:input, 0}, {:input, 1}]
+      assert output == {:result, 0}
     end
   end
 
@@ -331,9 +325,9 @@ defmodule EMLX.Native.ExprTest do
     test "identity program via to_wire: output equals input", %{worker: worker, device: device} do
       expr = Nx.Defn.debug_expr_apply(&identity/1, [Nx.template({3}, :f32)])
       prog = Expr.lower(expr)
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = Expr.to_wire(prog)
+      wire = Expr.to_wire(prog)
 
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+      prog_ref = compile_nif!(worker, wire)
 
       x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
       %EMLX.Backend{ref: {_, input_ref}} = x.data
@@ -347,9 +341,9 @@ defmodule EMLX.Native.ExprTest do
     test "add program via to_wire: correct result", %{worker: worker, device: device} do
       expr = Nx.Defn.debug_expr_apply(&add_two/2, [Nx.template({}, :f32), Nx.template({}, :f32)])
       prog = Expr.lower(expr)
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = Expr.to_wire(prog)
+      wire = Expr.to_wire(prog)
 
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+      prog_ref = compile_nif!(worker, wire)
 
       a = Nx.tensor(3.0, backend: EMLX.Backend)
       b = Nx.tensor(4.0, backend: EMLX.Backend)
@@ -1479,8 +1473,8 @@ defmodule EMLX.Native.ExprTest do
 
   # ── private helpers ───────────────────────────────────────────────────────
 
-  defp compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs) do
-    EMLX.NIF.compile_program(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
+  defp compile_nif!(worker, %EMLX.Native.Wire.Program{} = wire) do
+    EMLX.NIF.compile_program(worker, wire)
     |> unwrap!()
     |> await_worker!()
   end
@@ -3550,12 +3544,12 @@ defmodule EMLX.Native.ExprTest do
   defp run_nif(%Expr{} = prog, inputs) do
     device = EMLX.default_device()
     {worker, _} = EMLX.resolve_worker(device)
-    {n_inputs, cap_refs, cvs, cts, ops, ors, ias, outs} = Expr.to_wire(prog)
+    wire = Expr.to_wire(prog)
 
     input_refs =
       Enum.map(inputs, fn %Nx.Tensor{data: %EMLX.Backend{ref: {_, r}}} -> r end)
 
-    prog_ref = compile_nif!(worker, n_inputs, cap_refs, cvs, cts, ops, ors, ias, outs)
+    prog_ref = compile_nif!(worker, wire)
     out_refs = eval_nif!(worker, prog_ref, input_refs)
 
     Enum.map(out_refs, fn ref -> EMLX.Backend.to_nx({device, ref}) end)

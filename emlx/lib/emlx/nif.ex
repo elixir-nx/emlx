@@ -110,19 +110,12 @@ defmodule EMLX.NIF do
   # ── Native.Expr compiler NIFs ─────────────────────────────────────────────
   # compile_program — builds an opaque ProgramResource from the Native.Expr IR
   # and a set of captured arrays. Worker-routed (argv[0] = worker).
-  # op_names is a list of strings matching C++ op_registry keys (e.g. "add").
-  # Arity = 1 (worker) + 8 args = 9 registered.
-  def compile_program(
-        _worker,
-        _num_inputs,
-        _capture_refs,
-        _const_values,
-        _const_types,
-        _op_names,
-        _operands,
-        _iattrs,
-        _output_refs
-      ) do
+  # `program` is an `EMLX.Native.Wire.Program.t()` (see
+  # EMLX.Native.Expr.to_wire/1), decoded directly by `fine` on the C++ side
+  # (emlx_compiler.hpp's `Program`/`Instruction` structs) instead of manually
+  # parsed positional args.
+  # Arity = 1 (worker) + 1 = 2 registered.
+  def compile_program(_worker, _program) do
     :erlang.nif_error(:nif_not_loaded)
   end
 

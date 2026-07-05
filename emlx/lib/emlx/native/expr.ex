@@ -14,37 +14,6 @@ defmodule EMLX.Native.Expr do
     end
   end
 
-  @kind_input 0
-  @kind_capture 1
-  @kind_const 2
-  @kind_instr 3
-  @kind_shift 60
-
-  # Must stay in sync with int_to_dtype() in emlx_compiler.cpp.
-  @mlx_type_to_int %{
-    bool: 0,
-    uint8: 1,
-    uint16: 2,
-    uint32: 3,
-    uint64: 4,
-    int8: 5,
-    int16: 6,
-    int32: 7,
-    int64: 8,
-    float16: 9,
-    bfloat16: 10,
-    float32: 11,
-    complex64: 12
-  }
-
-  # Must stay in sync with int_to_quant_mode() in emlx_compiler.cpp.
-  @quant_mode_to_int %{
-    "affine" => 0,
-    "mxfp4" => 1,
-    "mxfp8" => 2,
-    "nvfp4" => 3
-  }
-
   @enforce_keys [:inputs, :captures, :constants, :instructions, :outputs]
   defstruct [
     :inputs,
@@ -162,11 +131,11 @@ defmodule EMLX.Native.Expr do
     else
       broadcast_ref = make_ref()
       shape_list = Tuple.to_list(node.shape)
-      iattrs = [length(shape_list) | shape_list] ++ [0]
+      attrs = [length(shape_list) | shape_list] ++ [0]
 
       %{
         state
-        | instructions: [{broadcast_ref, :broadcast, [ref], iattrs} | state.instructions],
+        | instructions: [{broadcast_ref, :broadcast, [ref], attrs} | state.instructions],
           node_to_ref: Map.put(state.node_to_ref, id, broadcast_ref)
       }
     end
@@ -372,7 +341,7 @@ defmodule EMLX.Native.Expr do
 
   # ── shape / movement ops ──────────────────────────────────────────────────────
 
-  # reshape: iattrs = new shape dims (flat list); shape from the output tensor.
+  # reshape: attrs = new shape dims (flat list); shape from the output tensor.
   defp expand_node(
          %T{shape: out_shape, data: %Nx.Defn.Expr{id: id, op: :reshape, args: [tensor]}},
          state
@@ -388,7 +357,7 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # squeeze: iattrs = axes to remove (non-negative).
+  # squeeze: attrs = axes to remove (non-negative).
   defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :squeeze, args: [tensor, axes]}}, state) do
     ref = make_ref()
     operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
@@ -401,7 +370,7 @@ defmodule EMLX.Native.Expr do
     }
   end
 
-  # transpose: iattrs = axis permutation (non-negative).
+  # transpose: attrs = axis permutation (non-negative).
   defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :transpose, args: [tensor, axes]}}, state) do
     ref = make_ref()
     operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
@@ -424,7 +393,7 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
-  # bitcast: iattrs = [target_dtype_int]. Target type from the output tensor.
+  # bitcast: attrs = [target_dtype]. Target type from the output tensor.
   defp expand_node(
          %T{type: out_type, data: %Nx.Defn.Expr{id: id, op: :bitcast, args: [tensor]}},
          state
@@ -432,16 +401,15 @@ defmodule EMLX.Native.Expr do
     ref = make_ref()
     operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
     mlx_type = EMLX.Native.to_mlx_type(out_type)
-    type_int = Map.fetch!(@mlx_type_to_int, mlx_type)
 
     %{
       state
-      | instructions: [{ref, :bitcast, [operand_ref], [type_int]} | state.instructions],
+      | instructions: [{ref, :bitcast, [operand_ref], [mlx_type]} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
   end
 
-  # broadcast: iattrs = [n_shape, d0…, n_axes, a0…] (both shape and axes, length-delimited).
+  # broadcast: attrs = [n_shape, d0…, n_axes, a0…] (both shape and axes, length-delimited).
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :broadcast, args: [tensor, shape, axes]}},
          state
@@ -451,11 +419,11 @@ defmodule EMLX.Native.Expr do
     shape_list = Tuple.to_list(shape)
     n_shape = length(shape_list)
     n_axes = length(axes)
-    iattrs = [n_shape | shape_list] ++ [n_axes | axes]
+    attrs = [n_shape | shape_list] ++ [n_axes | axes]
 
     %{
       state
-      | instructions: [{ref, :broadcast, [operand_ref], iattrs} | state.instructions],
+      | instructions: [{ref, :broadcast, [operand_ref], attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
   end
@@ -473,19 +441,19 @@ defmodule EMLX.Native.Expr do
       else
         ref = make_ref()
         n_dims = length(config)
-        iattrs = [n_dims | Enum.flat_map(config, fn {lo, hi, interior} -> [lo, hi, interior] end)]
+        attrs = [n_dims | Enum.flat_map(config, fn {lo, hi, interior} -> [lo, hi, interior] end)]
 
         {ref,
          %{
            state
-           | instructions: [{ref, :pad, [tensor_ref, pad_value_ref], iattrs} | state.instructions]
+           | instructions: [{ref, :pad, [tensor_ref, pad_value_ref], attrs} | state.instructions]
          }}
       end
 
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
-  # reverse: iattrs = axes to flip (non-negative).
+  # reverse: attrs = axes to flip (non-negative).
   defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :reverse, args: [tensor, axes]}}, state) do
     ref = make_ref()
     operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
@@ -543,11 +511,11 @@ defmodule EMLX.Native.Expr do
       operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
       axes = opts[:axes] || Nx.axes(tensor)
       keep_axes = if opts[:keep_axes], do: 1, else: 0
-      iattrs = [keep_axes | normalize_axes(axes, tuple_size(tensor.shape))]
+      attrs = [keep_axes | normalize_axes(axes, tuple_size(tensor.shape))]
 
       state = %{
         state
-        | instructions: [{ref, unquote(op), [operand_ref], iattrs} | state.instructions]
+        | instructions: [{ref, unquote(op), [operand_ref], attrs} | state.instructions]
       }
 
       {result_ref, state} = emit_cast_to(ref, out_type, state)
@@ -567,11 +535,11 @@ defmodule EMLX.Native.Expr do
       operand_ref = Map.fetch!(state.node_to_ref, tensor.data.id)
       axes = opts[:axes] || Nx.axes(tensor)
       keep_axes = if opts[:keep_axes], do: 1, else: 0
-      iattrs = [keep_axes | normalize_axes(axes, tuple_size(tensor.shape))]
+      attrs = [keep_axes | normalize_axes(axes, tuple_size(tensor.shape))]
 
       %{
         state
-        | instructions: [{ref, unquote(op), [operand_ref], iattrs} | state.instructions],
+        | instructions: [{ref, unquote(op), [operand_ref], attrs} | state.instructions],
           node_to_ref: Map.put(state.node_to_ref, id, ref)
       }
     end
@@ -807,7 +775,7 @@ defmodule EMLX.Native.Expr do
           {mask ||| 1 <<< i, statics ++ [0], dyn_refs ++ [dyn_ref], st}
       end)
 
-    iattrs =
+    attrs =
       [n_dims, dynamic_mask] ++
         input_shape ++
         lengths ++
@@ -818,7 +786,7 @@ defmodule EMLX.Native.Expr do
 
     %{
       state
-      | instructions: [{ref, :slice, operands, iattrs} | state.instructions],
+      | instructions: [{ref, :slice, operands, attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
   end
@@ -852,12 +820,12 @@ defmodule EMLX.Native.Expr do
           {mask ||| 1 <<< i, statics ++ [0], dyn_refs ++ [dyn_ref], st}
       end)
 
-    iattrs = [n_dims, dynamic_mask] ++ input_shape ++ lengths ++ static_vals
+    attrs = [n_dims, dynamic_mask] ++ input_shape ++ lengths ++ static_vals
     operands = [input_ref, slice_ref | dyn_operand_refs]
 
     %{
       state
-      | instructions: [{ref, :put_slice, operands, iattrs} | state.instructions],
+      | instructions: [{ref, :put_slice, operands, attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
   end
@@ -883,14 +851,14 @@ defmodule EMLX.Native.Expr do
 
     out_shape_list = Tuple.to_list(out_shape)
 
-    iattrs =
+    attrs =
       [n_gather_axes | axes] ++
         [n_tensor_dims | slice_sizes] ++
         [length(out_shape_list) | out_shape_list]
 
     %{
       state
-      | instructions: [{ref, :gather, [tensor_ref, indices_ref], iattrs} | state.instructions],
+      | instructions: [{ref, :gather, [tensor_ref, indices_ref], attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
   end
@@ -1028,7 +996,7 @@ defmodule EMLX.Native.Expr do
       window_dilations = opts[:window_dilations] || List.duplicate(1, n_dims)
       op_int = @window_op_int[unquote(op)]
 
-      iattrs =
+      attrs =
         [n_dims, op_int] ++
           Enum.flat_map(0..(n_dims - 1), fn i ->
             [Enum.at(low_pads, i), Enum.at(high_pads, i)]
@@ -1037,7 +1005,7 @@ defmodule EMLX.Native.Expr do
 
       state = %{
         state
-        | instructions: [{ref, unquote(op), [tensor_ref], iattrs} | state.instructions]
+        | instructions: [{ref, unquote(op), [tensor_ref], attrs} | state.instructions]
       }
 
       {result_ref, state} = emit_cast_if_needed(ref, tensor.type, out_type, state)
@@ -1066,7 +1034,7 @@ defmodule EMLX.Native.Expr do
       {low_pads, high_pads} = Enum.unzip(opts[:padding])
       strides = opts[:strides] || List.duplicate(1, n_dims)
 
-      iattrs =
+      attrs =
         [n_dims] ++
           Enum.flat_map(0..(n_dims - 1), fn i ->
             [Enum.at(low_pads, i), Enum.at(high_pads, i)]
@@ -1076,7 +1044,7 @@ defmodule EMLX.Native.Expr do
       %{
         state
         | instructions: [
-            {ref, unquote(op), [t_ref, src_ref, init_ref], iattrs} | state.instructions
+            {ref, unquote(op), [t_ref, src_ref, init_ref], attrs} | state.instructions
           ],
           node_to_ref: Map.put(state.node_to_ref, id, ref)
       }
@@ -1415,7 +1383,7 @@ defmodule EMLX.Native.Expr do
 
     # P = take(eye(n), pivots, axis: 0). n is the trailing matrix dimension.
     n = elem(tensor.shape, tuple_size(tensor.shape) - 1)
-    f32_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type({:f, 32}))
+    f32_int = EMLX.Native.to_mlx_type({:f, 32})
 
     eye_ref = make_ref()
     p_ref = make_ref()
@@ -1563,7 +1531,7 @@ defmodule EMLX.Native.Expr do
     ref = make_ref()
     shape = Tuple.to_list(node.shape)
     n_dims = length(shape)
-    dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(node.type))
+    dtype_int = EMLX.Native.to_mlx_type(node.type)
     axis_int = if axis == nil, do: -1, else: axis
 
     %{
@@ -1583,7 +1551,7 @@ defmodule EMLX.Native.Expr do
     shape_list = Tuple.to_list(node.shape)
     n_dims = length(shape_list)
     [m, n] = Enum.take(shape_list, -2)
-    dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(node.type))
+    dtype_int = EMLX.Native.to_mlx_type(node.type)
 
     state = %{
       state
@@ -1595,11 +1563,11 @@ defmodule EMLX.Native.Expr do
     else
       broadcast_ref = make_ref()
       axes = [n_dims - 2, n_dims - 1]
-      iattrs = [n_dims | shape_list] ++ [length(axes) | axes]
+      attrs = [n_dims | shape_list] ++ [length(axes) | axes]
 
       %{
         state
-        | instructions: [{broadcast_ref, :broadcast, [ref], iattrs} | state.instructions],
+        | instructions: [{broadcast_ref, :broadcast, [ref], attrs} | state.instructions],
           node_to_ref: Map.put(state.node_to_ref, id, broadcast_ref)
       }
     end
@@ -1681,10 +1649,10 @@ defmodule EMLX.Native.Expr do
 
     callback_index = length(state.runtime_calls)
 
-    iattrs =
+    attrs =
       [callback_index, length(output_templates)] ++
         Enum.flat_map(output_templates, fn t ->
-          dtype_int = Map.fetch!(@mlx_type_to_int, EMLX.Native.to_mlx_type(t.type))
+          dtype_int = EMLX.Native.to_mlx_type(t.type)
           shape = Tuple.to_list(t.shape)
           [dtype_int, length(shape) | shape]
         end)
@@ -1705,7 +1673,7 @@ defmodule EMLX.Native.Expr do
 
     %{
       state
-      | instructions: [{result_ref, :runtime_call, operand_refs, iattrs} | state.instructions],
+      | instructions: [{result_ref, :runtime_call, operand_refs, attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, result_ref),
         runtime_calls: [runtime_call | state.runtime_calls]
     }
@@ -1760,7 +1728,7 @@ defmodule EMLX.Native.Expr do
     {left_ref, state} = emit_cast_if_needed(left_ref0, left.type, computation_type, state)
     {right_ref, state} = emit_cast_if_needed(right_ref0, right.type, computation_type, state)
 
-    iattrs =
+    attrs =
       [length(c_left) | c_left] ++
         [length(c_right) | c_right] ++
         [length(b_left) | b_left] ++
@@ -1770,7 +1738,7 @@ defmodule EMLX.Native.Expr do
 
     state = %{
       state
-      | instructions: [{dot_ref, :dot, [left_ref, right_ref], iattrs} | state.instructions]
+      | instructions: [{dot_ref, :dot, [left_ref, right_ref], attrs} | state.instructions]
     }
 
     {result_ref, state} = emit_cast_if_needed(dot_ref, computation_type, out_type, state)
@@ -1827,15 +1795,15 @@ defmodule EMLX.Native.Expr do
         {[left_ref, right_ref, scales_ref], 0, state}
       end
 
-    mode_int = Map.fetch!(@quant_mode_to_int, cfg.mode)
+    mode_int = String.to_atom(cfg.mode)
     transpose_int = if transpose, do: 1, else: 0
-    iattrs = [cfg.group_size, cfg.bits, transpose_int, mode_int, has_bias]
+    attrs = [cfg.group_size, cfg.bits, transpose_int, mode_int, has_bias]
 
     qmm_ref = make_ref()
 
     state = %{
       state
-      | instructions: [{qmm_ref, :quantized_matmul, operands, iattrs} | state.instructions]
+      | instructions: [{qmm_ref, :quantized_matmul, operands, attrs} | state.instructions]
     }
 
     # mx::quantized_matmul returns the activation's dtype (matching the eager
@@ -1876,12 +1844,12 @@ defmodule EMLX.Native.Expr do
     {target_ref, state} = emit_cast_if_needed(target_ref0, target.type, out_type, state)
     {updates_ref, state} = emit_cast_if_needed(updates_ref0, updates.type, out_type, state)
 
-    iattrs = [length(axes) | axes] ++ [length(updates_shape) | updates_shape]
+    attrs = [length(axes) | axes] ++ [length(updates_shape) | updates_shape]
 
     %{
       state
       | instructions: [
-          {ref, op, [target_ref, indices_ref, updates_ref], iattrs} | state.instructions
+          {ref, op, [target_ref, indices_ref, updates_ref], attrs} | state.instructions
         ],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
@@ -2152,10 +2120,10 @@ defmodule EMLX.Native.Expr do
 
   defp emit_broadcast_to(ref, shape_list, state) do
     new_ref = make_ref()
-    iattrs = [length(shape_list) | shape_list] ++ [0]
+    attrs = [length(shape_list) | shape_list] ++ [0]
 
     {new_ref,
-     %{state | instructions: [{new_ref, :broadcast, [ref], iattrs} | state.instructions]}}
+     %{state | instructions: [{new_ref, :broadcast, [ref], attrs} | state.instructions]}}
   end
 
   # Slice element `i` along the collapsed trailing axis then squeeze it away,
@@ -2165,10 +2133,10 @@ defmodule EMLX.Native.Expr do
     lengths = kept_shape ++ [1]
     strides = List.duplicate(1, n_dims)
     starts = List.duplicate(0, length(kept_shape)) ++ [i]
-    iattrs = [n_dims, 0] ++ combined_shape ++ lengths ++ strides ++ starts
+    attrs = [n_dims, 0] ++ combined_shape ++ lengths ++ strides ++ starts
 
     slice_ref = make_ref()
-    state = %{state | instructions: [{slice_ref, :slice, [ref], iattrs} | state.instructions]}
+    state = %{state | instructions: [{slice_ref, :slice, [ref], attrs} | state.instructions]}
     squeeze_ref = make_ref()
 
     {squeeze_ref,
@@ -2182,22 +2150,22 @@ defmodule EMLX.Native.Expr do
     new_ref = make_ref()
     n_dims = length(low_pads)
 
-    iattrs =
+    attrs =
       [n_dims | Enum.flat_map(Enum.zip(low_pads, high_pads), fn {lo, hi} -> [lo, hi, 0] end)]
 
     {new_ref,
      %{
        state
-       | instructions: [{new_ref, :pad, [ref, pad_value_ref], iattrs} | state.instructions]
+       | instructions: [{new_ref, :pad, [ref, pad_value_ref], attrs} | state.instructions]
      }}
   end
 
   defp emit_static_slice(ref, input_shape, starts, lengths, strides, state) do
     new_ref = make_ref()
     n_dims = length(input_shape)
-    iattrs = [n_dims, 0] ++ input_shape ++ lengths ++ strides ++ starts
+    attrs = [n_dims, 0] ++ input_shape ++ lengths ++ strides ++ starts
 
-    {new_ref, %{state | instructions: [{new_ref, :slice, [ref], iattrs} | state.instructions]}}
+    {new_ref, %{state | instructions: [{new_ref, :slice, [ref], attrs} | state.instructions]}}
   end
 
   defp expand_pad_general(tensor_ref, pad_value_ref, in_dims, config, state) do
@@ -2369,8 +2337,7 @@ defmodule EMLX.Native.Expr do
   defp emit_cast_to(ref, nx_type, state) do
     cast_ref = make_ref()
     mlx_type = EMLX.Native.to_mlx_type(nx_type)
-    type_int = Map.fetch!(@mlx_type_to_int, mlx_type)
-    instr = {cast_ref, :astype, [ref], [type_int]}
+    instr = {cast_ref, :astype, [ref], [mlx_type]}
     {cast_ref, %{state | instructions: [instr | state.instructions]}}
   end
 
@@ -2421,36 +2388,37 @@ defmodule EMLX.Native.Expr do
   # ── wire serialisation ────────────────────────────────────────────────────
 
   @doc false
-  @spec to_wire(t()) ::
-          {non_neg_integer(), list(), list(), list(), list(), list(), list(), list()}
+  @spec to_wire(t()) :: EMLX.Native.Wire.Program.t()
   def to_wire(%__MODULE__{} = prog) do
-    # Build ref → packed_int map for all non-instruction nodes.
+    # Build ref → wire-ref map for all non-instruction nodes. A wire ref is a
+    # tagged tuple ({:input, i} / {:capture, i} / {:const, i} / {:result, i})
+    # instead of a bit-packed int — see EMLX.Native.Wire.Instruction.ref/0.
     input_map =
       prog.inputs
       |> Enum.with_index()
-      |> Map.new(fn {ref, i} -> {ref, @kind_input <<< @kind_shift ||| i} end)
+      |> Map.new(fn {ref, i} -> {ref, {:input, i}} end)
 
     capture_map =
       prog.captures
       |> Enum.with_index()
-      |> Map.new(fn {{ref, _t}, i} -> {ref, @kind_capture <<< @kind_shift ||| i} end)
+      |> Map.new(fn {{ref, _t}, i} -> {ref, {:capture, i}} end)
 
     constant_map =
       prog.constants
       |> Enum.with_index()
-      |> Map.new(fn {{ref, _v, _t}, i} -> {ref, @kind_const <<< @kind_shift ||| i} end)
+      |> Map.new(fn {{ref, _v, _t}, i} -> {ref, {:const, i}} end)
 
-    ref_to_packed = Map.merge(input_map, Map.merge(capture_map, constant_map))
+    ref_to_wire = Map.merge(input_map, Map.merge(capture_map, constant_map))
 
     maybe_debug_check do
       expected_size = map_size(input_map) + map_size(capture_map) + map_size(constant_map)
 
-      if map_size(ref_to_packed) != expected_size do
+      if map_size(ref_to_wire) != expected_size do
         raise ArgumentError,
               "EMLX.Native.Expr.to_wire: ref id collision across inputs/captures/constants -- " <>
                 "#{map_size(input_map)} input(s), #{map_size(capture_map)} capture(s), " <>
                 "#{map_size(constant_map)} constant(s) should merge to #{expected_size} distinct " <>
-                "refs, but only #{map_size(ref_to_packed)} survived Map.merge/2. This means two " <>
+                "refs, but only #{map_size(ref_to_wire)} survived Map.merge/2. This means two " <>
                 "refs of different categories share the same id, silently dropping one from the " <>
                 "wire map -- inputs: #{inspect(Map.keys(input_map))}, " <>
                 "captures: #{inspect(Map.keys(capture_map))}, " <>
@@ -2458,22 +2426,20 @@ defmodule EMLX.Native.Expr do
       end
     end
 
-    {op_names, operands, iattrs, ref_to_packed, _flat} =
+    {instructions, ref_to_wire, _flat} =
       prog.instructions
-      |> Enum.reduce({[], [], [], ref_to_packed, 0}, fn {id, op, operand_refs, attrs},
-                                                        {ops, ors, ias, rmap, flat} ->
+      |> Enum.reduce({[], ref_to_wire, 0}, fn {id, op, operand_refs, attrs},
+                                              {instrs, rmap, flat} ->
         wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
 
         maybe_debug_check do
-          for packed <- wire_operands,
-              packed >>> @kind_shift == @kind_instr,
-              (packed &&& (1 <<< @kind_shift) - 1) >= flat do
+          for {:result, idx} <- wire_operands, idx >= flat do
             raise ArgumentError,
                   "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
-                    "references result index #{packed &&& (1 <<< @kind_shift) - 1} of the " <>
-                    "flat results accumulator, but only #{flat} result(s) have been produced " <>
-                    "so far -- this is a forward/self reference bug in program lowering, not " <>
-                    "a valid program. Full instruction list: #{inspect(prog.instructions)}"
+                    "references result index #{idx} of the flat results accumulator, but only " <>
+                    "#{flat} result(s) have been produced so far -- this is a forward/self " <>
+                    "reference bug in program lowering, not a valid program. Full instruction " <>
+                    "list: #{inspect(prog.instructions)}"
           end
         end
 
@@ -2492,28 +2458,34 @@ defmodule EMLX.Native.Expr do
           case id do
             ids when is_list(ids) ->
               Enum.reduce(ids, {rmap, flat}, fn one, {m, f} ->
-                {Map.put(m, one, @kind_instr <<< @kind_shift ||| f), f + 1}
+                {Map.put(m, one, {:result, f}), f + 1}
               end)
 
             one ->
-              {Map.put(rmap, one, @kind_instr <<< @kind_shift ||| flat), flat + 1}
+              {Map.put(rmap, one, {:result, flat}), flat + 1}
           end
 
-        {[op | ops], [wire_operands | ors], [attrs | ias], rmap2, flat2}
+        instr = %EMLX.Native.Wire.Instruction{op: op, operands: wire_operands, attrs: attrs}
+        {[instr | instrs], rmap2, flat2}
       end)
 
     hook_refs = Enum.flat_map(prog.hooks, & &1.refs)
-    wire_outputs = Enum.map(prog.outputs ++ hook_refs, &Map.fetch!(ref_to_packed, &1))
+    wire_outputs = Enum.map(prog.outputs ++ hook_refs, &Map.fetch!(ref_to_wire, &1))
 
     capture_nif_refs =
       Enum.map(prog.captures, fn {_ref, %Nx.Tensor{data: %EMLX.Backend{ref: {_, nif_ref}}}} ->
         nif_ref
       end)
 
-    constant_values = Enum.map(prog.constants, fn {_, v, _} -> v * 1.0 end)
-    constant_types = Enum.map(prog.constants, fn {_, _, t} -> EMLX.Native.to_mlx_type(t) end)
+    wire_constants =
+      Enum.map(prog.constants, fn {_, v, t} -> {v * 1.0, EMLX.Native.to_mlx_type(t)} end)
 
-    {length(prog.inputs), capture_nif_refs, constant_values, constant_types,
-     Enum.reverse(op_names), Enum.reverse(operands), Enum.reverse(iattrs), wire_outputs}
+    %EMLX.Native.Wire.Program{
+      num_inputs: length(prog.inputs),
+      captures: capture_nif_refs,
+      constants: wire_constants,
+      instructions: Enum.reverse(instructions),
+      outputs: wire_outputs
+    }
   end
 end

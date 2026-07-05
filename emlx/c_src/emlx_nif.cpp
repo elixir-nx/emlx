@@ -1806,10 +1806,12 @@ ASYNC_NIF(tensordot)
 ASYNC_NIF(window_scatter_max)
 ASYNC_NIF(window_scatter_min)
 
-// ── Native compiler NIFs (thin wrappers — logic lives in emlx_compiler.cpp) ──
-
-NIF(compile_program) { return emlx::native::compile_program(env, argc, argv); }
-ASYNC_NIF(compile_program)
+// ── Native compiler NIFs (logic lives in emlx_compiler.cpp) ──────────────────
+//
+// compile_program is defined directly in emlx_compiler.cpp via
+// FINE_ASYNC_NIF(compile_program) (see emlx_compiler.hpp for the
+// compile_program/compile_program_async declarations); referenced fully
+// qualified in nif_funcs[] below, same as resolve_runtime_call.
 
 NIF(eval_program) { return emlx::native::eval_program(env, argc, argv); }
 ASYNC_NIF(eval_program)
@@ -1993,7 +1995,8 @@ static ErlNifFunc nif_funcs[] = {
     {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
 
     // ── Native compiler NIFs.
-    {"compile_program", 9, compile_program_async, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"compile_program", 2, emlx::native::compile_program_async,
+     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"eval_program", 3, eval_program_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
     // resolve_runtime_call is NOT worker-routed: it only decodes a reply and
     // memcpy's it into pre-registered buffers/notifies a condvar — no MLX

@@ -38,31 +38,7 @@ namespace native {
 
 using OpFn = std::function<
     mlx::core::array(const std::vector<mlx::core::array> &ops,
-                     const std::vector<int64_t> &attrs)>;
-
-// Maps the dtype integer (from EMLX.Native.Expr.@mlx_type_to_int) to mlx Dtype.
-// Must stay in sync with the @mlx_type_to_int map in emlx/lib/emlx/native/expr.ex.
-static mlx::core::Dtype int_to_dtype(int64_t val) {
-  static const mlx::core::Dtype table[] = {
-      mlx::core::bool_,    // 0
-      mlx::core::uint8,    // 1
-      mlx::core::uint16,   // 2
-      mlx::core::uint32,   // 3
-      mlx::core::uint64,   // 4
-      mlx::core::int8,     // 5
-      mlx::core::int16,    // 6
-      mlx::core::int32,    // 7
-      mlx::core::int64,    // 8
-      mlx::core::float16,  // 9
-      mlx::core::bfloat16, // 10
-      mlx::core::float32,  // 11
-      mlx::core::complex64 // 12
-  };
-  if (val < 0 || val > 12)
-    throw std::runtime_error("int_to_dtype: invalid dtype int " +
-                             std::to_string(val));
-  return table[static_cast<size_t>(val)];
-}
+                     const std::vector<Attr> &attrs)>;
 
 // Float opts (eps/scale/base) ride the int64 attr channel as their IEEE-754
 // double bits (see EMLX.Native.Expr.f64_bits/1).  Reverse the reinterpret here.
@@ -70,17 +46,6 @@ static inline float attr_to_float(int64_t bits) {
   double d;
   std::memcpy(&d, &bits, sizeof(double));
   return static_cast<float>(d);
-}
-
-// Maps the quantization mode integer (from EMLX.Native.Expr.@quant_mode_to_int)
-// to its mx::quantized_matmul mode string.  Must stay in sync with
-// int_to_quant_mode/1 in emlx/lib/emlx/native/expr.ex.
-static std::string int_to_quant_mode(int64_t val) {
-  static const char *table[] = {"affine", "mxfp4", "mxfp8", "nvfp4"};
-  if (val < 0 || val > 3)
-    throw std::runtime_error("int_to_quant_mode: invalid mode int " +
-                             std::to_string(val));
-  return table[static_cast<size_t>(val)];
 }
 
 // ── Prefill-RoPE helper ──────────────────────────────────────────────────
@@ -172,7 +137,7 @@ static mlx::core::array compiler_sliding_window_view(const mlx::core::array &pad
 // op_code: 0=sum, 1=product, 2=max, 3=min.
 // attrs = [n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]
 static mlx::core::array window_reduce_impl(const mlx::core::array &t,
-                                           const std::vector<int64_t> &attrs,
+                                           const std::vector<Attr> &attrs,
                                            int op_code) {
   int n = static_cast<int>(attrs[0]);
   // attrs[1] is op_int — matches op_code parameter; keep in sync.
@@ -318,7 +283,7 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
 static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &tensor_t,
                                                      const mlx::core::array &tensor_source,
                                                      const mlx::core::array &tensor_init_value,
-                                                     const std::vector<int64_t> &attrs,
+                                                     const std::vector<Attr> &attrs,
                                                      bool scatter_max) {
   int n = static_cast<int>(attrs[0]);
   std::vector<int> low_pad(n), high_pad(n), strides(n), window(n);
@@ -419,7 +384,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
     {"astype",
      [](const auto &ops, const auto &attrs) {
-       return mlx::core::astype(ops[0], int_to_dtype(attrs[0]));
+       return mlx::core::astype(ops[0], attrs[0].as_dtype());
      }},
 
     // ── unary ops ─────────────────────────────────────────────────────────
@@ -588,7 +553,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
     {"bitcast",
      [](const auto &ops, const auto &attrs) {
-       return mlx::core::view(ops[0], int_to_dtype(attrs[0]));
+       return mlx::core::view(ops[0], attrs[0].as_dtype());
      }},
 
     // broadcast: reshape input to place source dims at the axis positions, then broadcast_to.
@@ -835,7 +800,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        int group_size = static_cast<int>(attrs[0]);
        int bits = static_cast<int>(attrs[1]);
        bool transpose = attrs[2] != 0;
-       std::string mode = int_to_quant_mode(attrs[3]);
+       std::string mode = attrs[3].as_mode();
        bool has_bias = attrs[4] != 0;
        std::optional<mlx::core::array> biases_opt =
            has_bias ? std::make_optional(ops[3]) : std::nullopt;
@@ -1269,7 +1234,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // No operands.  axis_int = -1 means flat enumeration (no axis).
     {"iota",
      [](const auto & /*ops*/, const auto &attrs) {
-       auto dtype = int_to_dtype(attrs[0]);
+       auto dtype = attrs[0].as_dtype();
        int n = static_cast<int>(attrs[1]);
        int axis = static_cast<int>(attrs[2]);
 
@@ -1305,7 +1270,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // eye: attrs = [dtype_int, m, n].  No operands.
     {"eye",
      [](const auto & /*ops*/, const auto &attrs) {
-       auto dtype = int_to_dtype(attrs[0]);
+       auto dtype = attrs[0].as_dtype();
        int m = static_cast<int>(attrs[1]);
        int n = static_cast<int>(attrs[2]);
        return mlx::core::eye(m, n, 0, dtype);
@@ -1646,7 +1611,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 // refs (see to_wire/1's list-result handling).  Pinned to the CPU device.
 using MultiOpFn = std::function<
     std::vector<mlx::core::array>(const std::vector<mlx::core::array> &ops,
-                                  const std::vector<int64_t> &attrs)>;
+                                  const std::vector<Attr> &attrs)>;
 
 // Force each linalg output to contiguous layout (on the CPU stream).  MLX's
 // factorizations can return strided views; if such a view is a program output
@@ -1717,7 +1682,7 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
        dtypes.reserve(static_cast<size_t>(n_outputs));
 
        for (int64_t i = 0; i < n_outputs; i++) {
-         dtypes.push_back(int_to_dtype(attrs[off++]));
+         dtypes.push_back(attrs[off++].as_dtype());
          int64_t n_dims = attrs[off++];
          std::vector<int> dims(static_cast<size_t>(n_dims));
          for (int64_t d = 0; d < n_dims; d++) {
@@ -1794,208 +1759,117 @@ Expr::~Expr() {
   }
 }
 
-// ── Packed-ref helpers ────────────────────────────────────────────────────────
-//
-// Ref encoding: kind in bits [61:60], index in bits [59:0].
-// Mirrors to_wire/1 in lib/emlx/native/expr.ex.
-//
-//   kind=0  input    — indexed into the runtime inputs vector
-//   kind=1  capture  — indexed into closed-over captures
-//   kind=2  constant — indexed into closed-over constants
-//   kind=3  result   — indexed into the per-eval results accumulator
-
-static constexpr uint64_t KIND_SHIFT = 60;
-static constexpr uint64_t IDX_MASK = (uint64_t(1) << KIND_SHIFT) - 1;
-
-static int ref_kind(int64_t packed) {
-  return static_cast<int>((static_cast<uint64_t>(packed) >> KIND_SHIFT) & 3);
-}
-
-static int64_t ref_idx(int64_t packed) {
-  return static_cast<int64_t>(static_cast<uint64_t>(packed) & IDX_MASK);
-}
-
-// ── NIF argument parsing helpers ──────────────────────────────────────────────
-
-static bool parse_nested_int64_list(ErlNifEnv *env, ERL_NIF_TERM list,
-                                    std::vector<std::vector<int64_t>> &out) {
-  unsigned length;
-  if (!enif_get_list_length(env, list, &length))
-    return false;
-  out.reserve(length);
-  ERL_NIF_TERM head, tail;
-  while (enif_get_list_cell(env, list, &head, &tail)) {
-    std::vector<int64_t> inner;
-    if (!nx::nif::get_list(env, head, inner))
-      return false;
-    out.push_back(std::move(inner));
-    list = tail;
-  }
-  return true;
-}
-
 // ── NIF implementations ───────────────────────────────────────────────────────
 
-// compile_program — decodes the serialised EMLX.Native.Expr wire format, builds
-// a capturing interpreter lambda backed by the op registry, wraps it with
-// mlx::core::compile(), and stores the result as an opaque Expr BEAM resource.
-//
-// argv[0] : num_inputs    (int)
-// argv[1] : capture_refs  (list of MLX array resource refs)
-// argv[2] : const_values  (list of doubles or ints)
-// argv[3] : const_types   (list of dtype atoms, e.g. :float32)
-// argv[4] : op_names      (list of strings — atom names matching op_registry keys)
-// argv[5] : operands      (list of list of int64 — packed refs per instr)
-// argv[6] : attrs         (list of list of int64 — integer attrs per instr)
-// argv[7] : output_refs   (list of int64 — packed output refs)
-ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
-                             const ERL_NIF_TERM argv[]) {
-  try {
-    PARAM(0, int, num_inputs_val);
-    LIST_PARAM(1, std::vector<mlx::core::array>, captures);
+// compile_program — decodes the wire Program (see EMLX.Native.Wire.Program /
+// EMLX.Native.Expr.to_wire/1, decoded directly by fine::Decoder<Program> in
+// emlx_compiler.hpp), builds a capturing interpreter lambda backed by the op
+// registry, wraps it with mlx::core::compile(), and stores the result as an
+// opaque Expr BEAM resource.
+fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
+  // Validate all op names against the registry up front so that any unknown
+  // op surfaces here rather than inside the lambda at (first) eval time.
+  bool has_runtime_call = false;
+  for (const auto &instr : program.instructions) {
+    const std::string &name = instr.op.to_string();
+    if (op_registry.find(name) == op_registry.end() &&
+        multi_op_registry.find(name) == multi_op_registry.end())
+      throw std::runtime_error("emlx::native: unknown op \"" + name + "\"");
+    if (name == "runtime_call")
+      has_runtime_call = true;
+  }
 
-    // Parse const_values: doubles (or integers coerced to double).
-    unsigned const_count;
-    if (!enif_get_list_length(env, argv[2], &const_count))
-      return nx::nif::error(env, "Unable to get const_values length");
-    std::vector<double> const_values;
-    const_values.reserve(const_count);
-    {
-      ERL_NIF_TERM head, tail, clist = argv[2];
-      while (enif_get_list_cell(env, clist, &head, &tail)) {
-        double v;
-        if (!enif_get_double(env, head, &v)) {
-          int64_t iv;
-          if (!enif_get_int64(env, head, reinterpret_cast<ErlNifSInt64 *>(&iv)))
-            return nx::nif::error(env,
-                                  "Unable to parse const value as double or int");
-          v = static_cast<double>(iv);
-        }
-        const_values.push_back(v);
-        clist = tail;
+  // Build constant arrays on the current (worker) thread using its default stream.
+  std::vector<mlx::core::array> constants;
+  constants.reserve(program.constants.size());
+  for (const auto &[value, dtype] : program.constants) {
+    constants.push_back(mlx::core::full({}, value, dtype));
+  }
+
+  int num_inputs_val = program.num_inputs;
+
+  // Build the interpreter lambda capturing all program data, then pass it
+  // through mlx::core::compile().  MLX traces the lambda on the first
+  // eval_program call (building a compiled computation graph) and replays
+  // the cached graph on every subsequent call — no repeated graph construction.
+  emlx::function fn =
+      [captures = std::move(program.captures),
+       constants = std::move(constants),
+       instructions = std::move(program.instructions),
+       output_refs = std::move(program.outputs)](
+          const std::vector<mlx::core::array> &inputs)
+      -> std::vector<mlx::core::array> {
+    std::vector<mlx::core::array> results;
+    results.reserve(instructions.size());
+
+    auto resolve = [&](const Ref &ref) -> mlx::core::array {
+      switch (ref.kind) {
+      case RefKind::Input:
+        return inputs.at(static_cast<size_t>(ref.index));
+      case RefKind::Capture:
+        return captures.at(static_cast<size_t>(ref.index));
+      case RefKind::Const:
+        return constants.at(static_cast<size_t>(ref.index));
+      case RefKind::Result:
+        return results.at(static_cast<size_t>(ref.index));
       }
-    }
-
-    LIST_PARAM(3, std::vector<std::string>, const_types);
-    LIST_PARAM(4, std::vector<std::string>, op_names);
-
-    std::vector<std::vector<int64_t>> operands;
-    if (!parse_nested_int64_list(env, argv[5], operands))
-      return nx::nif::error(env, "Unable to get operands nested list");
-
-    std::vector<std::vector<int64_t>> attrs;
-    if (!parse_nested_int64_list(env, argv[6], attrs))
-      return nx::nif::error(env, "Unable to get attrs nested list");
-
-    LIST_PARAM(7, std::vector<int64_t>, output_refs);
-
-    // Validate all op names against the registry at compile time so that any
-    // unknown op surfaces here rather than inside the lambda at eval time.
-    bool has_runtime_call = false;
-    for (const auto &name : op_names) {
-      if (op_registry.find(name) == op_registry.end() &&
-          multi_op_registry.find(name) == multi_op_registry.end())
-        return nx::nif::error(
-            env, ("emlx::native: unknown op \"" + name + "\"").c_str());
-      if (name == "runtime_call")
-        has_runtime_call = true;
-    }
-
-    // Build constant arrays on the current (worker) thread using its default stream.
-    std::vector<mlx::core::array> constants;
-    constants.reserve(const_values.size());
-    for (size_t i = 0; i < const_values.size(); i++) {
-      auto dtype = string2dtype(const_types[i]);
-      constants.push_back(mlx::core::full({}, const_values[i], dtype));
-    }
-
-    // Build the interpreter lambda capturing all program data, then pass it
-    // through mlx::core::compile().  MLX traces the lambda on the first
-    // eval_program call (building a compiled computation graph) and replays
-    // the cached graph on every subsequent call — no repeated graph construction.
-    emlx::function fn =
-        [captures = std::move(captures),
-         constants = std::move(constants),
-         op_names = std::move(op_names),
-         operands = std::move(operands),
-         attrs = std::move(attrs),
-         output_refs = std::move(output_refs)](
-            const std::vector<mlx::core::array> &inputs)
-        -> std::vector<mlx::core::array> {
-      std::vector<mlx::core::array> results;
-      results.reserve(op_names.size());
-
-      auto resolve = [&](int64_t packed) -> mlx::core::array {
-        int kind = ref_kind(packed);
-        int64_t idx = ref_idx(packed);
-        switch (kind) {
-        case 0:
-          return inputs.at(static_cast<size_t>(idx));
-        case 1:
-          return captures.at(static_cast<size_t>(idx));
-        case 2:
-          return constants.at(static_cast<size_t>(idx));
-        case 3:
-          return results.at(static_cast<size_t>(idx));
-        default:
-          throw std::runtime_error("emlx::native: invalid ref kind " +
-                                   std::to_string(kind));
-        }
-      };
-
-      for (size_t i = 0; i < op_names.size(); i++) {
-        std::vector<mlx::core::array> op_inputs;
-        op_inputs.reserve(operands[i].size());
-        for (int64_t ref : operands[i]) {
-          op_inputs.push_back(resolve(ref));
-        }
-        auto multi_it = multi_op_registry.find(op_names[i]);
-        if (multi_it != multi_op_registry.end()) {
-          // Multi-output op: append each result in order to the flat accumulator.
-          auto outs = multi_it->second(op_inputs, attrs[i]);
-          for (auto &o : outs)
-            results.push_back(o);
-        } else {
-          results.push_back(op_registry.at(op_names[i])(op_inputs, attrs[i]));
-        }
-      }
-
-      std::vector<mlx::core::array> outputs;
-      outputs.reserve(output_refs.size());
-      for (int64_t ref : output_refs) {
-        outputs.push_back(resolve(ref));
-      }
-      return outputs;
+      throw std::runtime_error("emlx::native: invalid ref kind");
     };
 
-    // Allocate the program resource.
-    auto *ptr = static_cast<Expr *>(
-        enif_alloc_resource(resource_object<Expr>::type, sizeof(Expr)));
-    if (!ptr)
-      return nx::nif::error(env, "Failed to allocate Expr resource");
+    for (const auto &instr : instructions) {
+      std::vector<mlx::core::array> op_inputs;
+      op_inputs.reserve(instr.operands.size());
+      for (const auto &ref : instr.operands) {
+        op_inputs.push_back(resolve(ref));
+      }
 
-    // Assign a unique ID so MLX's global compile cache has a distinct entry per
-    // Expr resource.  All our lambdas share the same C++ type (same capture
-    // types), so the public mlx::core::compile() would map them all to the same
-    // cache key — causing stale graph reuse across different compiled programs.
-    static std::atomic<std::uintptr_t> next_id{1};
-    std::uintptr_t unique_id = next_id.fetch_add(1, std::memory_order_relaxed);
-
-    new (ptr) Expr();
-    ptr->num_inputs = num_inputs_val;
-    ptr->compile_id = unique_id;
-    ptr->has_runtime_call = has_runtime_call;
-    {
-      std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
-      ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
+      const std::string &name = instr.op.to_string();
+      auto multi_it = multi_op_registry.find(name);
+      if (multi_it != multi_op_registry.end()) {
+        // Multi-output op: append each result in order to the flat accumulator.
+        auto outs = multi_it->second(op_inputs, instr.attrs);
+        for (auto &o : outs)
+          results.push_back(o);
+      } else {
+        results.push_back(op_registry.at(name)(op_inputs, instr.attrs));
+      }
     }
 
-    ERL_NIF_TERM ret = enif_make_resource(env, ptr);
-    enif_release_resource(ptr);
-    return nx::nif::ok(env, ret);
+    std::vector<mlx::core::array> outputs;
+    outputs.reserve(output_refs.size());
+    for (const auto &ref : output_refs) {
+      outputs.push_back(resolve(ref));
+    }
+    return outputs;
+  };
+
+  // Allocate the program resource.
+  auto *ptr = static_cast<Expr *>(
+      enif_alloc_resource(resource_object<Expr>::type, sizeof(Expr)));
+  if (!ptr)
+    throw std::runtime_error("Failed to allocate Expr resource");
+
+  // Assign a unique ID so MLX's global compile cache has a distinct entry per
+  // Expr resource.  All our lambdas share the same C++ type (same capture
+  // types), so the public mlx::core::compile() would map them all to the same
+  // cache key — causing stale graph reuse across different compiled programs.
+  static std::atomic<std::uintptr_t> next_id{1};
+  std::uintptr_t unique_id = next_id.fetch_add(1, std::memory_order_relaxed);
+
+  new (ptr) Expr();
+  ptr->num_inputs = num_inputs_val;
+  ptr->compile_id = unique_id;
+  ptr->has_runtime_call = has_runtime_call;
+  {
+    std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
+    ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
   }
-  CATCH()
+
+  ERL_NIF_TERM ret = enif_make_resource(env, ptr);
+  enif_release_resource(ptr);
+  return fine::Term(ret);
 }
+FINE_ASYNC_NIF(compile_program)
 
 // eval_program — calls the MLX-compiled function against runtime inputs.
 // MLX traces on the first call and replays the cached graph on subsequent calls.

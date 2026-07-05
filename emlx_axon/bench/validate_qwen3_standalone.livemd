@@ -70,7 +70,7 @@ defmodule PeerBench do
     end
   end
 
-  @apps [:nx, :emlx, :axon, :bumblebee, :emily]
+  @apps [:nx, :emlx, :emlx_axon, :axon, :bumblebee, :emily]
 
   def run(modules, mod, fun, args) do
     peer_args = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
@@ -96,6 +96,11 @@ end
 :ok
 ```
 
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
 
 ## Benchmark helpers
 
@@ -176,6 +181,11 @@ end
 :ok
 ```
 
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
 
 ## Emily lanes
 
@@ -316,6 +326,11 @@ end
 :ok
 ```
 
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
 
 ## Checkpoint runner
 
@@ -504,6 +519,11 @@ end
 :ok
 ```
 
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
 
 ## Summary rendering
 
@@ -594,6 +614,11 @@ end
 :ok
 ```
 
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
 
 ## Configuration
 
@@ -685,7 +710,19 @@ seq_len:  #{cfg.seq_len}
 :ok
 ```
 
+<!-- livebook:{"output":true} -->
 
+```
+max_new:  60  bench_runs: 5  warmup_runs: 2
+seq_len:  1024
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
 
 ## Run benchmarks
 
@@ -705,7 +742,753 @@ results =
 :ok
 ```
 
+<!-- livebook:{"output":true} -->
 
+```
+
+################################################################################
+=== Qwen3-0.6B-MLX-4bit — {:local, "/Users/valente/models/Qwen3-0.6B-MLX-4bit"} ===
+################################################################################
+
+
+==> Spawning isolated peer for lane :bb_base ...
+
+09:15:23.657 [debug] the following PyTorch parameters were unused:
+
+  * model.embed_tokens.biases
+  * model.embed_tokens.scales
+  * model.layers.0.mlp.down_proj.biases
+  * model.layers.0.mlp.down_proj.scales
+  * model.layers.0.mlp.gate_proj.biases
+  * model.layers.0.mlp.gate_proj.scales
+  * model.layers.0.mlp.up_proj.biases
+  * model.layers.0.mlp.up_proj.scales
+  * model.layers.0.self_attn.k_proj.biases
+  * model.layers.0.self_attn.k_proj.scales
+  * model.layers.0.self_attn.o_proj.biases
+  * model.layers.0.self_attn.o_proj.scales
+  * model.layers.0.self_attn.q_proj.biases
+  * model.layers.0.self_attn.q_proj.scales
+  * model.layers.0.self_attn.v_proj.biases
+  * model.layers.0.self_attn.v_proj.scales
+  * model.layers.1.mlp.down_proj.biases
+  * model.layers.1.mlp.down_proj.scales
+  * model.layers.1.mlp.gate_proj.biases
+  * model.layers.1.mlp.gate_proj.scales
+  * model.layers.1.mlp.up_proj.biases
+  * model.layers.1.mlp.up_proj.scales
+  * model.layers.1.self_attn.k_proj.biases
+  * model.layers.1.self_attn.k_proj.scales
+  * model.layers.1.self_attn.o_proj.biases
+  * model.layers.1.self_attn.o_proj.scales
+  * model.layers.1.self_attn.q_proj.biases
+  * model.layers.1.self_attn.q_proj.scales
+  * model.layers.1.self_attn.v_proj.biases
+  * model.layers.1.self_attn.v_proj.scales
+  * model.layers.10.mlp.down_proj.biases
+  * model.layers.10.mlp.down_proj.scales
+  * model.layers.10.mlp.gate_proj.biases
+  * model.layers.10.mlp.gate_proj.scales
+  * model.layers.10.mlp.up_proj.biases
+  * model.layers.10.mlp.up_proj.scales
+  * model.layers.10.self_attn.k_proj.biases
+  * model.layers.10.self_attn.k_proj.scales
+  * model.layers.10.self_attn.o_proj.biases
+  * model.layers.10.self_attn.o_proj.scales
+  * model.layers.10.self_attn.q_proj.biases
+  * model.layers.10.self_attn.q_proj.scales
+  * model.layers.10.self_attn.v_proj.biases
+  * model.layers.10.self_attn.v_proj.scales
+  * model.layers.11.mlp.down_proj.biases
+  * model.layers.11.mlp.down_proj.scales
+  * model.layers.11.mlp.gate_proj.biases
+  * model.layers.11.mlp.gate_proj.scales
+  * model.layers.11.mlp.up_proj.biases
+  * model.layers.11.mlp.up_proj.scales
+  * model.layers.11.self_attn.k_proj.biases
+  * model.layers.11.self_attn.k_proj.scales
+  * model.layers.11.self_attn.o_proj.biases
+  * model.layers.11.self_attn.o_proj.scales
+  * model.layers.11.self_attn.q_proj.biases
+  * model.layers.11.self_attn.q_proj.scales
+  * model.layers.11.self_attn.v_proj.biases
+  * model.layers.11.self_attn.v_proj.scales
+  * model.layers.12.mlp.down_proj.biases
+  * model.layers.12.mlp.down_proj.scales
+  * model.layers.12.mlp.gate_proj.biases
+  * model.layers.12.mlp.gate_proj.scales
+  * model.layers.12.mlp.up_proj.biases
+  * model.layers.12.mlp.up_proj.scales
+  * model.layers.12.self_attn.k_proj.biases
+  * model.layers.12.self_attn.k_proj.scales
+  * model.layers.12.self_attn.o_proj.biases
+  * model.layers.12.self_attn.o_proj.scales
+  * model.layers.12.self_attn.q_proj.biases
+  * model.layers.12.self_attn.q_proj.scales
+  * model.layers.12.self_attn.v_proj.biases
+  * model.layers.12.self_attn.v_proj.scales
+  * model.layers.13.mlp.down_proj.biases
+  * model.layers.13.mlp.down_proj.scales
+  * model.layers.13.mlp.gate_proj.biases
+  * model.layers.13.mlp.gate_proj.scales
+  * model.layers.13.mlp.up_proj.biases
+  * model.layers.13.mlp.up_proj.scales
+  * model.layers.13.self_attn.k_proj.biases
+  * model.layers.13.self_attn.k_proj.scales
+  * model.layers.13.self_attn.o_proj.biases
+  * model.layers.13.self_attn.o_proj.scales
+  * model.layers.13.self_attn.q_proj.biases
+  * model.layers.13.self_attn.q_proj.scales
+  * model.layers.13.self_attn.v_proj.biases
+  * model.layers.13.self_attn.v_proj.scales
+  * model.layers.14.mlp.down_proj.biases
+  * model.layers.14.mlp.down_proj.scales
+  * model.layers.14.mlp.gate_proj.biases
+  * model.layers.14.mlp.gate_proj.scales
+  * model.layers.14.mlp.up_proj.biases
+  * model.layers.14.mlp.up_proj.scales
+  * model.layers.14.self_attn.k_proj.biases
+  * model.layers.14.self_attn.k_proj.scales
+  * model.layers.14.self_attn.o_proj.biases
+  * model.layers.14.self_attn.o_proj.scales
+  * model.layers.14.self_attn.q_proj.biases
+  * model.layers.14.self_attn.q_proj.scales
+  * model.layers.14.self_attn.v_proj.biases
+  * model.layers.14.self_attn.v_proj.scales
+  * model.layers.15.mlp.down_proj.biases
+  * model.layers.15.mlp.down_proj.scales
+  * model.layers.15.mlp.gate_proj.biases
+  * model.layers.15.mlp.gate_proj.scales
+  * model.layers.15.mlp.up_proj.biases
+  * model.layers.15.mlp.up_proj.scales
+  * model.layers.15.self_attn.k_proj.biases
+  * model.layers.15.self_attn.k_proj.scales
+  * model.layers.15.self_attn.o_proj.biases
+  * model.layers.15.self_attn.o_proj.scales
+  * model.layers.15.self_attn.q_proj.biases
+  * model.layers.15.self_attn.q_proj.scales
+  * model.layers.15.self_attn.v_proj.biases
+  * model.layers.15.self_attn.v_proj.scales
+  * model.layers.16.mlp.down_proj.biases
+  * model.layers.16.mlp.down_proj.scales
+  * model.layers.16.mlp.gate_proj.biases
+  * model.layers.16.mlp.gate_proj.scales
+  * model.layers.16.mlp.up_proj.biases
+  * model.layers.16.mlp.up_proj.scales
+  * model.layers.16.self_attn.k_proj.biases
+  * model.layers.16.self_attn.k_proj.scales
+  * model.layers.16.self_attn.o_proj.biases
+  * model.layers.16.self_attn.o_proj.scales
+  * model.layers.16.self_attn.q_proj.biases
+  * model.layers.16.self_attn.q_proj.scales
+  * model.layers.16.self_attn.v_proj.biases
+  * model.layers.16.self_attn.v_proj.scales
+  * model.layers.17.mlp.down_proj.biases
+  * model.layers.17.mlp.down_proj.scales
+  * model.layers.17.mlp.gate_proj.biases
+  * model.layers.17.mlp.gate_proj.scales
+  * model.layers.17.mlp.up_proj.biases
+  * model.layers.17.mlp.up_proj.scales
+  * model.layers.17.self_attn.k_proj.biases
+  * model.layers.17.self_attn.k_proj.scales
+  * model.layers.17.self_attn.o_proj.biases
+  * model.layers.17.self_attn.o_proj.scales
+  * model.layers.17.self_attn.q_proj.biases
+  * model.layers.17.self_attn.q_proj.scales
+  * model.layers.17.self_attn.v_proj.biases
+  * model.layers.17.self_attn.v_proj.scales
+  * model.layers.18.mlp.down_proj.biases
+  * model.layers.18.mlp.down_proj.scales
+  * model.layers.18.mlp.gate_proj.biases
+  * model.layers.18.mlp.gate_proj.scales
+  * model.layers.18.mlp.up_proj.biases
+  * model.layers.18.mlp.up_proj.scales
+  * model.layers.18.self_attn.k_proj.biases
+  * model.layers.18.self_attn.k_proj.scales
+  * model.layers.18.self_attn.o_proj.biases
+  * model.layers.18.self_attn.o_proj.scales
+  * model.layers.18.self_attn.q_proj.biases
+  * model.layers.18.self_attn.q_proj.scales
+  * model.layers.18.self_attn.v_proj.biases
+  * model.layers.18.self_attn.v_proj.scales
+  * model.layers.19.mlp.down_proj.biases
+  * model.layers.19.mlp.down_proj.scales
+  * model.layers.19.mlp.gate_proj.biases
+  * model.layers.19.mlp.gate_proj.scales
+  * model.layers.19.mlp.up_proj.biases
+  * model.layers.19.mlp.up_proj.scales
+  * model.layers.19.self_attn.k_proj.biases
+  * model.layers.19.self_attn.k_proj.scales
+  * model.layers.19.self_attn.o_proj.biases
+  * model.layers.19.self_attn.o_proj.scales
+  * model.layers.19.self_attn.q_proj.biases
+  * model.layers.19.self_attn.q_proj.scales
+  * model.layers.19.self_attn.v_proj.biases
+  * model.layers.19.self_attn.v_proj.scales
+  * model.layers.2.mlp.down_proj.biases
+  * model.layers.2.mlp.down_proj.scales
+  * model.layers.2.mlp.gate_proj.biases
+  * model.layers.2.mlp.gate_proj.scales
+  * model.layers.2.mlp.up_proj.biases
+  * model.layers.2.mlp.up_proj.scales
+  * model.layers.2.self_attn.k_proj.biases
+  * model.layers.2.self_attn.k_proj.scales
+  * model.layers.2.self_attn.o_proj.biases
+  * model.layers.2.self_attn.o_proj.scales
+  * model.layers.2.self_attn.q_proj.biases
+  * model.layers.2.self_attn.q_proj.scales
+  * model.layers.2.self_attn.v_proj.biases
+  * model.layers.2.self_attn.v_proj.scales
+  * model.layers.20.mlp.down_proj.biases
+  * model.layers.20.mlp.down_proj.scales
+  * model.layers.20.mlp.gate_proj.biases
+  * model.layers.20.mlp.gate_proj.scales
+  * model.layers.20.mlp.up_proj.biases
+  * model.layers.20.mlp.up_proj.scales
+  * model.layers.20.self_attn.k_proj.biases
+  * model.layers.20.sel (truncated)
+==> Loading MLX-4bit params (dequantize → Bumblebee layout → re-quantize) ...
+
+09:15:23.661 [debug] the following parameters were ignored, because of non-matching shape:
+
+  * decoder.blocks.19.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.17.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.0.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.7.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.11.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.17.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.21.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.6.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.16.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.16.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.8.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.16.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.3.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.20.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.13.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.2.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.26.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.8.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.16.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.7.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.12.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.14.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.18.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.20.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.19.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.2.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.23.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.18.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * language_modeling_head.output.kernel (expected {151936, 1024}, got: {151936, 128})
+  * decoder.blocks.27.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.0.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.23.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.11.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.9.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.4.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.7.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.21.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.2.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.15.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.6.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.22.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.22.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.ffn.intermediate.kernel (expect (truncated)
+    params loaded in 97 ms
+==> Building Bumblebee.Text.generation serving (base — no rewrite) ...
+
+==> [Qwen3-0.6B-MLX-4bit / bb base] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 1261 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 954 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / bb base] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 1034 ms = 58.0 tok/s
+    run 2: 60 tokens / 1028 ms = 58.4 tok/s
+    run 3: 60 tokens / 958 ms = 62.6 tok/s
+    run 4: 60 tokens / 942 ms = 63.7 tok/s
+    run 5: 60 tokens / 969 ms = 61.9 tok/s
+    bb base           (Bumblebee, no rewrite)        : median=61.9  mean=60.9±2.3  min/max=58.0/63.7 tok/s
+
+==> Spawning isolated peer for lane :bb_rewrite ...
+
+09:15:35.284 [debug] the following PyTorch parameters were unused:
+
+  * model.embed_tokens.biases
+  * model.embed_tokens.scales
+  * model.layers.0.mlp.down_proj.biases
+  * model.layers.0.mlp.down_proj.scales
+  * model.layers.0.mlp.gate_proj.biases
+  * model.layers.0.mlp.gate_proj.scales
+  * model.layers.0.mlp.up_proj.biases
+  * model.layers.0.mlp.up_proj.scales
+  * model.layers.0.self_attn.k_proj.biases
+  * model.layers.0.self_attn.k_proj.scales
+  * model.layers.0.self_attn.o_proj.biases
+  * model.layers.0.self_attn.o_proj.scales
+  * model.layers.0.self_attn.q_proj.biases
+  * model.layers.0.self_attn.q_proj.scales
+  * model.layers.0.self_attn.v_proj.biases
+  * model.layers.0.self_attn.v_proj.scales
+  * model.layers.1.mlp.down_proj.biases
+  * model.layers.1.mlp.down_proj.scales
+  * model.layers.1.mlp.gate_proj.biases
+  * model.layers.1.mlp.gate_proj.scales
+  * model.layers.1.mlp.up_proj.biases
+  * model.layers.1.mlp.up_proj.scales
+  * model.layers.1.self_attn.k_proj.biases
+  * model.layers.1.self_attn.k_proj.scales
+  * model.layers.1.self_attn.o_proj.biases
+  * model.layers.1.self_attn.o_proj.scales
+  * model.layers.1.self_attn.q_proj.biases
+  * model.layers.1.self_attn.q_proj.scales
+  * model.layers.1.self_attn.v_proj.biases
+  * model.layers.1.self_attn.v_proj.scales
+  * model.layers.10.mlp.down_proj.biases
+  * model.layers.10.mlp.down_proj.scales
+  * model.layers.10.mlp.gate_proj.biases
+  * model.layers.10.mlp.gate_proj.scales
+  * model.layers.10.mlp.up_proj.biases
+  * model.layers.10.mlp.up_proj.scales
+  * model.layers.10.self_attn.k_proj.biases
+  * model.layers.10.self_attn.k_proj.scales
+  * model.layers.10.self_attn.o_proj.biases
+  * model.layers.10.self_attn.o_proj.scales
+  * model.layers.10.self_attn.q_proj.biases
+  * model.layers.10.self_attn.q_proj.scales
+  * model.layers.10.self_attn.v_proj.biases
+  * model.layers.10.self_attn.v_proj.scales
+  * model.layers.11.mlp.down_proj.biases
+  * model.layers.11.mlp.down_proj.scales
+  * model.layers.11.mlp.gate_proj.biases
+  * model.layers.11.mlp.gate_proj.scales
+  * model.layers.11.mlp.up_proj.biases
+  * model.layers.11.mlp.up_proj.scales
+  * model.layers.11.self_attn.k_proj.biases
+  * model.layers.11.self_attn.k_proj.scales
+  * model.layers.11.self_attn.o_proj.biases
+  * model.layers.11.self_attn.o_proj.scales
+  * model.layers.11.self_attn.q_proj.biases
+  * model.layers.11.self_attn.q_proj.scales
+  * model.layers.11.self_attn.v_proj.biases
+  * model.layers.11.self_attn.v_proj.scales
+  * model.layers.12.mlp.down_proj.biases
+  * model.layers.12.mlp.down_proj.scales
+  * model.layers.12.mlp.gate_proj.biases
+  * model.layers.12.mlp.gate_proj.scales
+  * model.layers.12.mlp.up_proj.biases
+  * model.layers.12.mlp.up_proj.scales
+  * model.layers.12.self_attn.k_proj.biases
+  * model.layers.12.self_attn.k_proj.scales
+  * model.layers.12.self_attn.o_proj.biases
+  * model.layers.12.self_attn.o_proj.scales
+  * model.layers.12.self_attn.q_proj.biases
+  * model.layers.12.self_attn.q_proj.scales
+  * model.layers.12.self_attn.v_proj.biases
+  * model.layers.12.self_attn.v_proj.scales
+  * model.layers.13.mlp.down_proj.biases
+  * model.layers.13.mlp.down_proj.scales
+  * model.layers.13.mlp.gate_proj.biases
+  * model.layers.13.mlp.gate_proj.scales
+  * model.layers.13.mlp.up_proj.biases
+  * model.layers.13.mlp.up_proj.scales
+  * model.layers.13.self_attn.k_proj.biases
+  * model.layers.13.self_attn.k_proj.scales
+  * model.layers.13.self_attn.o_proj.biases
+  * model.layers.13.self_attn.o_proj.scales
+  * model.layers.13.self_attn.q_proj.biases
+  * model.layers.13.self_attn.q_proj.scales
+  * model.layers.13.self_attn.v_proj.biases
+  * model.layers.13.self_attn.v_proj.scales
+  * model.layers.14.mlp.down_proj.biases
+  * model.layers.14.mlp.down_proj.scales
+  * model.layers.14.mlp.gate_proj.biases
+  * model.layers.14.mlp.gate_proj.scales
+  * model.layers.14.mlp.up_proj.biases
+  * model.layers.14.mlp.up_proj.scales
+  * model.layers.14.self_attn.k_proj.biases
+  * model.layers.14.self_attn.k_proj.scales
+  * model.layers.14.self_attn.o_proj.biases
+  * model.layers.14.self_attn.o_proj.scales
+  * model.layers.14.self_attn.q_proj.biases
+  * model.layers.14.self_attn.q_proj.scales
+  * model.layers.14.self_attn.v_proj.biases
+  * model.layers.14.self_attn.v_proj.scales
+  * model.layers.15.mlp.down_proj.biases
+  * model.layers.15.mlp.down_proj.scales
+  * model.layers.15.mlp.gate_proj.biases
+  * model.layers.15.mlp.gate_proj.scales
+  * model.layers.15.mlp.up_proj.biases
+  * model.layers.15.mlp.up_proj.scales
+  * model.layers.15.self_attn.k_proj.biases
+  * model.layers.15.self_attn.k_proj.scales
+  * model.layers.15.self_attn.o_proj.biases
+  * model.layers.15.self_attn.o_proj.scales
+  * model.layers.15.self_attn.q_proj.biases
+  * model.layers.15.self_attn.q_proj.scales
+  * model.layers.15.self_attn.v_proj.biases
+  * model.layers.15.self_attn.v_proj.scales
+  * model.layers.16.mlp.down_proj.biases
+  * model.layers.16.mlp.down_proj.scales
+  * model.layers.16.mlp.gate_proj.biases
+  * model.layers.16.mlp.gate_proj.scales
+  * model.layers.16.mlp.up_proj.biases
+  * model.layers.16.mlp.up_proj.scales
+  * model.layers.16.self_attn.k_proj.biases
+  * model.layers.16.self_attn.k_proj.scales
+  * model.layers.16.self_attn.o_proj.biases
+  * model.layers.16.self_attn.o_proj.scales
+  * model.layers.16.self_attn.q_proj.biases
+  * model.layers.16.self_attn.q_proj.scales
+  * model.layers.16.self_attn.v_proj.biases
+  * model.layers.16.self_attn.v_proj.scales
+  * model.layers.17.mlp.down_proj.biases
+  * model.layers.17.mlp.down_proj.scales
+  * model.layers.17.mlp.gate_proj.biases
+  * model.layers.17.mlp.gate_proj.scales
+  * model.layers.17.mlp.up_proj.biases
+  * model.layers.17.mlp.up_proj.scales
+  * model.layers.17.self_attn.k_proj.biases
+  * model.layers.17.self_attn.k_proj.scales
+  * model.layers.17.self_attn.o_proj.biases
+  * model.layers.17.self_attn.o_proj.scales
+  * model.layers.17.self_attn.q_proj.biases
+  * model.layers.17.self_attn.q_proj.scales
+  * model.layers.17.self_attn.v_proj.biases
+  * model.layers.17.self_attn.v_proj.scales
+  * model.layers.18.mlp.down_proj.biases
+  * model.layers.18.mlp.down_proj.scales
+  * model.layers.18.mlp.gate_proj.biases
+  * model.layers.18.mlp.gate_proj.scales
+  * model.layers.18.mlp.up_proj.biases
+  * model.layers.18.mlp.up_proj.scales
+  * model.layers.18.self_attn.k_proj.biases
+  * model.layers.18.self_attn.k_proj.scales
+  * model.layers.18.self_attn.o_proj.biases
+  * model.layers.18.self_attn.o_proj.scales
+  * model.layers.18.self_attn.q_proj.biases
+  * model.layers.18.self_attn.q_proj.scales
+  * model.layers.18.self_attn.v_proj.biases
+  * model.layers.18.self_attn.v_proj.scales
+  * model.layers.19.mlp.down_proj.biases
+  * model.layers.19.mlp.down_proj.scales
+  * model.layers.19.mlp.gate_proj.biases
+  * model.layers.19.mlp.gate_proj.scales
+  * model.layers.19.mlp.up_proj.biases
+  * model.layers.19.mlp.up_proj.scales
+  * model.layers.19.self_attn.k_proj.biases
+  * model.layers.19.self_attn.k_proj.scales
+  * model.layers.19.self_attn.o_proj.biases
+  * model.layers.19.self_attn.o_proj.scales
+  * model.layers.19.self_attn.q_proj.biases
+  * model.layers.19.self_attn.q_proj.scales
+  * model.layers.19.self_attn.v_proj.biases
+  * model.layers.19.self_attn.v_proj.scales
+  * model.layers.2.mlp.down_proj.biases
+  * model.layers.2.mlp.down_proj.scales
+  * model.layers.2.mlp.gate_proj.biases
+  * model.layers.2.mlp.gate_proj.scales
+  * model.layers.2.mlp.up_proj.biases
+  * model.layers.2.mlp.up_proj.scales
+  * model.layers.2.self_attn.k_proj.biases
+  * model.layers.2.self_attn.k_proj.scales
+  * model.layers.2.self_attn.o_proj.biases
+  * model.layers.2.self_attn.o_proj.scales
+  * model.layers.2.self_attn.q_proj.biases
+  * model.layers.2.self_attn.q_proj.scales
+  * model.layers.2.self_attn.v_proj.biases
+  * model.layers.2.self_attn.v_proj.scales
+  * model.layers.20.mlp.down_proj.biases
+  * model.layers.20.mlp.down_proj.scales
+  * model.layers.20.mlp.gate_proj.biases
+  * model.layers.20.mlp.gate_proj.scales
+  * model.layers.20.mlp.up_proj.biases
+  * model.layers.20.mlp.up_proj.scales
+  * model.layers.20.self_attn.k_proj.biases
+  * model.layers.20.sel (truncated)
+==> Loading MLX-4bit params (dequantize → Bumblebee layout → re-quantize) ...
+
+09:15:35.289 [debug] the following parameters were ignored, because of non-matching shape:
+
+  * decoder.blocks.19.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.17.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.0.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.7.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.11.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.17.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.21.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.6.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.16.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.16.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.8.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.16.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.3.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.20.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.13.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.2.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.26.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.8.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.16.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.7.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.12.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.14.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.18.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.20.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.19.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.2.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.23.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.18.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * language_modeling_head.output.kernel (expected {151936, 1024}, got: {151936, 128})
+  * decoder.blocks.27.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.0.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.23.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.11.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.9.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.4.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.7.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.21.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.2.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.15.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.6.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.22.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.22.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.ffn.intermediate.kernel (expect (truncated)
+    params loaded in 103 ms
+==> Applying EMLXAxon.rewrite/1 (all rewrites — best performing path) ...
+
+==> [Qwen3-0.6B-MLX-4bit / bb+rewrite] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 897 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 708 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / bb+rewrite] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 762 ms = 78.7 tok/s
+    run 2: 60 tokens / 766 ms = 78.3 tok/s
+    run 3: 60 tokens / 683 ms = 87.8 tok/s
+    run 4: 60 tokens / 718 ms = 83.6 tok/s
+    run 5: 60 tokens / 754 ms = 79.6 tok/s
+    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=79.6  mean=81.6±3.6  min/max=78.3/87.8 tok/s
+
+==> Spawning isolated peer for lane :native ...
+
+==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...
+    loaded in 120 ms
+
+==> [Qwen3-0.6B-MLX-4bit / native] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 399 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 483 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / native] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 465 ms = 129.0 tok/s
+    run 2: 60 tokens / 432 ms = 138.9 tok/s
+    run 3: 60 tokens / 385 ms = 155.8 tok/s
+    run 4: 60 tokens / 452 ms = 132.7 tok/s
+    run 5: 60 tokens / 378 ms = 158.7 tok/s
+    native            (EMLXAxon.TextGeneration)       : median=138.9  mean=143.0±12.1  min/max=129.0/158.7 tok/s
+
+==> Spawning isolated peer for lane :emily_quantized ...
+
+==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Loading model on Emily.Backend ...
+    quantizing every Axon.dense node (bits=4, group_size=64) ...
+
+==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 1824 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 1758 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 1707 ms = 35.1 tok/s
+    run 2: 60 tokens / 1742 ms = 34.4 tok/s
+    run 3: 60 tokens / 1727 ms = 34.7 tok/s
+    run 4: 60 tokens / 1702 ms = 35.3 tok/s
+    run 5: 60 tokens / 1775 ms = 33.8 tok/s
+    emily-quantized   (Emily int4, native: true)      : median=34.7  mean=34.7±0.5  min/max=33.8/35.3 tok/s
+
+################################################################################
+=== Qwen3-0.6B (dense bf16) — {:local, "/Users/valente/models/Qwen3-0.6B"} ===
+################################################################################
+
+
+==> Spawning isolated peer for lane :bb_base ...
+==> Building Bumblebee.Text.generation serving (base — no rewrite) ...
+
+==> [Qwen3-0.6B (dense bf16) / bb base] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 1162 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 990 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / bb base] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 1001 ms = 59.9 tok/s
+    run 2: 60 tokens / 1018 ms = 58.9 tok/s
+    run 3: 60 tokens / 1025 ms = 58.5 tok/s
+    run 4: 60 tokens / 986 ms = 60.9 tok/s
+    run 5: 60 tokens / 989 ms = 60.7 tok/s
+    bb base           (Bumblebee, no rewrite)        : median=59.9  mean=59.8±1.0  min/max=58.5/60.9 tok/s
+
+==> Spawning isolated peer for lane :bb_rewrite ...
+==> Applying EMLXAxon.rewrite/1 (all rewrites — best performing path) ...
+
+==> [Qwen3-0.6B (dense bf16) / bb+rewrite] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 848 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 739 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / bb+rewrite] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 770 ms = 77.9 tok/s
+    run 2: 60 tokens / 730 ms = 82.2 tok/s
+    run 3: 60 tokens / 764 ms = 78.5 tok/s
+    run 4: 60 tokens / 728 ms = 82.4 tok/s
+    run 5: 60 tokens / 730 ms = 82.2 tok/s
+    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=82.2  mean=80.6±2.0  min/max=77.9/82.4 tok/s
+
+==> Spawning isolated peer for lane :native ...
+
+==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...
+    loaded in 207 ms
+
+==> [Qwen3-0.6B (dense bf16) / native] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 790 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 708 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / native] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 707 ms = 84.9 tok/s
+    run 2: 60 tokens / 716 ms = 83.8 tok/s
+    run 3: 60 tokens / 702 ms = 85.5 tok/s
+    run 4: 60 tokens / 701 ms = 85.6 tok/s
+    run 5: 60 tokens / 709 ms = 84.6 tok/s
+    native            (EMLXAxon.TextGeneration)       : median=84.9  mean=84.9±0.7  min/max=83.8/85.6 tok/s
+
+==> Spawning isolated peer for lane :emily_eager ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-eager] Loading model on Emily.Backend ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-eager] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 6632 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 6448 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / emily-eager] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 6391 ms = 9.4 tok/s
+    run 2: 60 tokens / 6139 ms = 9.8 tok/s
+    run 3: 60 tokens / 6240 ms = 9.6 tok/s
+    run 4: 60 tokens / 6828 ms = 8.8 tok/s
+    run 5: 60 tokens / 6318 ms = 9.5 tok/s
+    emily-eager       (Evaluator + Emily.Backend)      : median=9.5  mean=9.4±0.3  min/max=8.8/9.8 tok/s
+
+==> Spawning isolated peer for lane :emily_native ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-native] Loading model on Emily.Backend ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-native] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 793 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 888 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / emily-native] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 776 ms = 77.3 tok/s
+    run 2: 60 tokens / 838 ms = 71.6 tok/s
+    run 3: 60 tokens / 722 ms = 83.1 tok/s
+    run 4: 60 tokens / 851 ms = 70.5 tok/s
+    run 5: 60 tokens / 923 ms = 65.0 tok/s
+    emily-native      (Emily.Compiler, native: true)   : median=71.6  mean=73.5±6.2  min/max=65.0/83.1 tok/s
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
 
 ## Results
 
@@ -724,3 +1507,8 @@ results
 |> Kino.DataTable.new(name: "Per-lane tok/s stats")
 ```
 
+<!-- livebook:{"output":true} -->
+
+```text
+[%{stddev: 2.3, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb base", median_tok_s: 61.9, mean_tok_s: 60.9, min_tok_s: 58.0, max_tok_s: 63.7}, %{stddev: 3.6, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb+rewrite", median_tok_s: 79.6, mean_tok_s: 81.6, min_tok_s: 78.3, max_tok_s: 87.8}, %{stddev: 12.1, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "native", median_tok_s: 138.9, mean_tok_s: 143.0, min_tok_s: 129.0, max_tok_s: 158.7}, %{stddev: 0.5, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "emily-quantized", median_tok_s: 34.7, mean_tok_s: 34.7, min_tok_s: 33.8, max_tok_s: 35.3}, %{stddev: 1.0, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb base", median_tok_s: 59.9, mean_tok_s: 59.8, min_tok_s: 58.5, max_tok_s: 60.9}, %{stddev: 2.0, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb+rewrite", median_tok_s: 82.2, mean_tok_s: 80.6, min_tok_s: 77.9, max_tok_s: 82.4}, %{stddev: 0.7, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "native", median_tok_s: 84.9, mean_tok_s: 84.9, min_tok_s: 83.8, max_tok_s: 85.6}, %{stddev: 0.3, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-eager", median_tok_s: 9.5, mean_tok_s: 9.4, min_tok_s: 8.8, max_tok_s: 9.8}, %{stddev: 6.2, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-native", median_tok_s: 71.6, mean_tok_s: 73.5, min_tok_s: 65.0, max_tok_s: 83.1}]
+```

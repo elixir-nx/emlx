@@ -1831,21 +1831,9 @@ defmodule EMLX do
   # backend, so it must be moved to EMLX before `to_wire` can extract its ref.
   defp compile_native_program(worker, device, %EMLX.Native.Expr{} = program) do
     program = ensure_emlx_captures(program, device)
+    wire_program = EMLX.Native.Expr.to_wire(program)
 
-    {num_inputs, capture_nif_refs, constant_values, constant_types, opcodes, operands, iattrs,
-     wire_outputs} = EMLX.Native.Expr.to_wire(program)
-
-    EMLX.NIF.compile_program(
-      worker,
-      num_inputs,
-      capture_nif_refs,
-      constant_values,
-      constant_types,
-      opcodes,
-      operands,
-      iattrs,
-      wire_outputs
-    )
+    EMLX.NIF.compile_program(worker, wire_program)
     |> unwrap!()
     |> await_worker()
   end
