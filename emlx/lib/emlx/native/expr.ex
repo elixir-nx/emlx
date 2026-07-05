@@ -3098,7 +3098,7 @@ defmodule EMLX.Native.Expr do
           # that into an actionable error pointing at the offending op. Gated
           # behind `maybe_debug_check` (see its definition above).
           for packed <- wire_operands,
-              (packed >>> @kind_shift) == @kind_instr,
+              packed >>> @kind_shift == @kind_instr,
               (packed &&& (1 <<< @kind_shift) - 1) >= flat do
             raise ArgumentError,
                   "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
