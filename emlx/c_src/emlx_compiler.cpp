@@ -380,52 +380,6 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
 // stream — validated to work for both :cpu and :gpu default devices.
 static const mlx::core::Device k_linalg_cpu(mlx::core::Device::DeviceType::cpu, 0);
 
-// ── SPIKE: EMLXWhileSpike ─────────────────────────────────────────────────
-//
-// TEMPORARY — de-risking spike for native `:while` lowering (see
-// EMLX.Native.Expr's `:while` TODO). Proves that a `mlx::core::Primitive`
-// pinned to the CPU stream can safely call `mlx::core::eval()` *from inside*
-// its own `eval_cpu`, while that primitive's own evaluation is itself
-// reached via an outer `mlx::core::eval(outputs)` call in `eval_program`
-// (i.e. a nested/reentrant eval on the same worker OS thread) — the same
-// question EMLXRuntimeCall's design deliberately avoids (it never calls
-// mlx::core::eval itself; it only blocks on a condvar). If this spike
-// deadlocks, crashes, or produces wrong results, native `:while` needs a
-// different execution strategy than "loop + eval() each iteration inside
-// eval_cpu". Not reachable from any real Elixir lowering path — wired
-// directly via a hand-built `EMLX.Native.Instruction{op: :while_spike}` in
-// a throwaway test. Remove once the real EMLXWhile primitive lands.
-class EMLXWhileSpike : public mlx::core::Primitive {
-public:
-  explicit EMLXWhileSpike(mlx::core::Stream stream) : mlx::core::Primitive(stream) {}
-
-  void eval_cpu(const std::vector<mlx::core::array> &inputs,
-               std::vector<mlx::core::array> &outputs) override {
-    eval(inputs, outputs);
-  }
-  void eval_gpu(const std::vector<mlx::core::array> &inputs,
-               std::vector<mlx::core::array> &outputs) override {
-    eval(inputs, outputs);
-  }
-
-  bool is_equivalent(const mlx::core::Primitive &) const override { return false; }
-  const char *name() const override { return "EMLXWhileSpike"; }
-
-private:
-  void eval(const std::vector<mlx::core::array> &inputs,
-           std::vector<mlx::core::array> &outputs) {
-    mlx::core::array current = inputs[0];
-    for (int i = 0; i < 5; i++) {
-      mlx::core::array next =
-          mlx::core::add(current, mlx::core::array(1, current.dtype()));
-      // The nested/reentrant eval() call under test.
-      mlx::core::eval(next);
-      current = next;
-    }
-    outputs[0].copy_shared_buffer(current);
-  }
-};
-
 static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
     {"astype",
@@ -1377,16 +1331,6 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            mlx::core::linalg::solve_triangular(ops[0], ops[1], upper, k_linalg_cpu),
            false, k_linalg_cpu);
      }},
-
-    // ── SPIKE: while_spike (see EMLXWhileSpike above) ────────────────────
-    {"while_spike",
-     [](const auto &ops, const auto &) {
-       auto primitive = std::make_shared<EMLXWhileSpike>(
-           mlx::core::default_stream(k_linalg_cpu));
-       return mlx::core::array::make_arrays({ops[0].shape()}, {ops[0].dtype()},
-                                            primitive, ops)[0];
-     }},
-
     // ── EMLX.Fast fused kernels (mlx::core::fast) ──────────────────────────
     //
     // Recognized from `EMLX.Fast.*`'s `:__EMLX__`-tagged `Nx.Defn.Expr.metadata`
@@ -1761,6 +1705,109 @@ contiguous_all(std::vector<mlx::core::array> arrs) {
 // once ever. `eval()` blocks the calling worker OS thread inside
 // `invoke_runtime_call` (emlx_runtime_call_bridge.hpp) until the Elixir side
 // replies via `EMLX.NIF.resolve_runtime_call/3`.
+// Forward declaration: EMLXWhile::eval (below) recurses into this to
+// interpret its cond/body SubPrograms; the free function's own definition
+// (further below) constructs EMLXWhile instances for nested/top-level
+// `:while` instructions, hence the mutual forward reference.
+static std::vector<mlx::core::array> interpret_instructions(
+    const std::vector<Instruction> &instructions,
+    const std::vector<Ref> &output_refs,
+    const std::shared_ptr<const std::vector<mlx::core::array>> &captures,
+    const std::shared_ptr<const std::vector<mlx::core::array>> &constants,
+    const std::vector<mlx::core::array> *inputs,
+    const std::vector<mlx::core::array> *carry);
+
+// ── EMLXWhile ────────────────────────────────────────────────────────────
+//
+// Native lowering of a dynamic-trip-count `Nx.Defn.while` loop (see
+// EMLX.Native.Expr's `:while` moduledoc section). Interprets the `cond`/
+// `body` SubPrograms (emlx_compiler.hpp) directly here in C++, iterating
+// until `cond` evaluates false — all inside a single eval_cpu call, so an
+// N-iteration loop costs one eval_program NIF round-trip instead of the old
+// Elixir-driven split-point path's 2N (`run_while_loop` in emlx.ex).
+//
+// Pinned to the CPU stream (like MLX's linalg factorizations and
+// EMLXRuntimeCall above) so the internal `mlx::core::eval()` calls below —
+// needed every iteration to force `cond`'s boolean result and to bound each
+// iteration's graph depth (see the loop comment) — never reenter MLX's GPU
+// command buffer scheduling from inside eval_gpu. This nested/reentrant
+// eval-inside-a-CPU-pinned-primitive's-eval_cpu pattern (itself reached via
+// eval_program's outer mlx::core::eval(outputs)) was validated safe by an
+// earlier de-risking spike (a hardcoded-iteration-count primitive, since
+// removed — see git history on pv-feat/lower-while for the original spike).
+//
+// `captures_`/`constants_` are shared with the enclosing Program's own
+// interpreter (never duplicated per SubProgram — see EMLX.Native.SubProgram
+// on the Elixir side); `Nx.Defn.while`'s closure rules mean cond/body only
+// ever need the *global* captures/constants tables plus the carry, never
+// anything computed mid-loop outside the carry.
+class EMLXWhile : public mlx::core::Primitive {
+public:
+  EMLXWhile(mlx::core::Stream stream, SubProgram cond, SubProgram body,
+            std::shared_ptr<const std::vector<mlx::core::array>> captures,
+            std::shared_ptr<const std::vector<mlx::core::array>> constants)
+      : mlx::core::Primitive(stream), cond_(std::move(cond)),
+        body_(std::move(body)), captures_(std::move(captures)),
+        constants_(std::move(constants)) {}
+
+  void eval_cpu(const std::vector<mlx::core::array> &inputs,
+               std::vector<mlx::core::array> &outputs) override {
+    eval(inputs, outputs);
+  }
+  void eval_gpu(const std::vector<mlx::core::array> &inputs,
+               std::vector<mlx::core::array> &outputs) override {
+    eval(inputs, outputs);
+  }
+
+  // Side-effecting in the general case (a body may itself contain
+  // `:runtime_call`) and, regardless, cheap to keep simple — never dedup/CSE.
+  bool is_equivalent(const mlx::core::Primitive &) const override { return false; }
+
+  const char *name() const override { return "EMLXWhile"; }
+
+private:
+  void eval(const std::vector<mlx::core::array> &inputs,
+           std::vector<mlx::core::array> &outputs) {
+    std::vector<mlx::core::array> carry = inputs;
+
+    while (true) {
+      auto cond_outs = interpret_instructions(cond_.instructions, cond_.outputs,
+                                              captures_, constants_,
+                                              /*inputs=*/nullptr, &carry);
+      if (cond_outs.size() != 1)
+        throw std::runtime_error(
+            "emlx::native: :while condition sub-program must produce exactly "
+            "one output, got " +
+            std::to_string(cond_outs.size()));
+
+      // Force the condition to a concrete boolean now: this is the only way
+      // to make the host-side control-flow decision (loop again or stop).
+      mlx::core::eval(cond_outs[0]);
+      if (!cond_outs[0].item<bool>())
+        break;
+
+      carry = interpret_instructions(body_.instructions, body_.outputs,
+                                     captures_, constants_,
+                                     /*inputs=*/nullptr, &carry);
+      // Force the new carry every iteration rather than chaining lazy graphs
+      // across a data-dependent number of iterations: unevaluated chaining
+      // would grow the traced graph unboundedly *per eval_program call*
+      // (this loop runs after mlx::core::compile()'s one-time trace, so the
+      // growth would recur on every single call, not just once).
+      mlx::core::eval(carry);
+    }
+
+    for (size_t i = 0; i < outputs.size(); i++) {
+      outputs[i].copy_shared_buffer(carry.at(i));
+    }
+  }
+
+  SubProgram cond_;
+  SubProgram body_;
+  std::shared_ptr<const std::vector<mlx::core::array>> captures_;
+  std::shared_ptr<const std::vector<mlx::core::array>> constants_;
+};
+
 class EMLXRuntimeCall : public mlx::core::Primitive {
 public:
   EMLXRuntimeCall(mlx::core::Stream stream, int64_t callback_index)
@@ -1861,6 +1908,101 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
      }},
 };
 
+// ── interpret_instructions ────────────────────────────────────────────────
+//
+// Shared flat-instruction-list interpreter used both for a top-level
+// Program's own instructions (called from compile_program_impl's traced
+// lambda, with `inputs` set and `carry` null) and, recursively, for a
+// `:while` instruction's `cond`/`body` SubPrograms (called from
+// EMLXWhile::eval, with `carry` set and `inputs` null — SubPrograms never
+// contain `{:input, _}` refs, see emlx_compiler.hpp). `results` is always a
+// fresh local accumulator: a SubProgram's `{:result, i}` numbering is local
+// to that interpretation, distinct from the parent program's own.
+static std::vector<mlx::core::array> interpret_instructions(
+    const std::vector<Instruction> &instructions,
+    const std::vector<Ref> &output_refs,
+    const std::shared_ptr<const std::vector<mlx::core::array>> &captures,
+    const std::shared_ptr<const std::vector<mlx::core::array>> &constants,
+    const std::vector<mlx::core::array> *inputs,
+    const std::vector<mlx::core::array> *carry) {
+  std::vector<mlx::core::array> results;
+  results.reserve(instructions.size());
+
+  auto resolve = [&](const Ref &ref) -> mlx::core::array {
+    switch (ref.kind) {
+    case RefKind::Input:
+      if (!inputs)
+        throw std::runtime_error(
+            "emlx::native: {:input, _} ref found inside a :while sub-program");
+      return inputs->at(static_cast<size_t>(ref.index));
+    case RefKind::Capture:
+      return captures->at(static_cast<size_t>(ref.index));
+    case RefKind::Const:
+      return constants->at(static_cast<size_t>(ref.index));
+    case RefKind::Result:
+      return results.at(static_cast<size_t>(ref.index));
+    case RefKind::Carry:
+      if (!carry)
+        throw std::runtime_error(
+            "emlx::native: {:carry, _} ref found outside a :while sub-program");
+      return carry->at(static_cast<size_t>(ref.index));
+    }
+    throw std::runtime_error("emlx::native: invalid ref kind");
+  };
+
+  for (const auto &instr : instructions) {
+    std::vector<mlx::core::array> op_inputs;
+    op_inputs.reserve(instr.operands.size());
+    for (const auto &ref : instr.operands) {
+      op_inputs.push_back(resolve(ref));
+    }
+
+    const std::string &name = instr.op.to_string();
+
+    // `:while` isn't in op_registry/multi_op_registry (its behavior depends
+    // on instr.subprograms, which those registries' OpFn/MultiOpFn
+    // signatures have no access to) — dispatched here instead.
+    if (name == "while") {
+      const SubProgram &cond = instr.subprograms.at(0);
+      const SubProgram &body = instr.subprograms.at(1);
+      auto primitive = std::make_shared<EMLXWhile>(
+          mlx::core::default_stream(k_linalg_cpu), cond, body, captures,
+          constants);
+
+      std::vector<mlx::core::Shape> shapes;
+      std::vector<mlx::core::Dtype> dtypes;
+      shapes.reserve(op_inputs.size());
+      dtypes.reserve(op_inputs.size());
+      for (const auto &a : op_inputs) {
+        shapes.push_back(a.shape());
+        dtypes.push_back(a.dtype());
+      }
+
+      auto outs = mlx::core::array::make_arrays(shapes, dtypes, primitive, op_inputs);
+      for (auto &o : outs)
+        results.push_back(o);
+      continue;
+    }
+
+    auto multi_it = multi_op_registry.find(name);
+    if (multi_it != multi_op_registry.end()) {
+      // Multi-output op: append each result in order to the flat accumulator.
+      auto outs = multi_it->second(op_inputs, instr.attrs);
+      for (auto &o : outs)
+        results.push_back(o);
+    } else {
+      results.push_back(op_registry.at(name)(op_inputs, instr.attrs));
+    }
+  }
+
+  std::vector<mlx::core::array> outputs;
+  outputs.reserve(output_refs.size());
+  for (const auto &ref : output_refs) {
+    outputs.push_back(resolve(ref));
+  }
+  return outputs;
+}
+
 // ── Global compile-cache mutex ────────────────────────────────────────────────
 //
 // mlx::core::detail::compile and compile_erase both mutate MLX's process-wide
@@ -1893,18 +2035,38 @@ Expr::~Expr() {
 // emlx_compiler.hpp), builds a capturing interpreter lambda backed by the op
 // registry, wraps it with mlx::core::compile(), and stores the result as an
 // opaque Expr BEAM resource.
-fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
-  // Validate all op names against the registry up front so that any unknown
-  // op surfaces here rather than inside the lambda at (first) eval time.
-  bool has_runtime_call = false;
-  for (const auto &instr : program.instructions) {
+// Validates op names against the registries up front (recursing into
+// `:while` SubPrograms) so that any unknown op surfaces at compile time
+// rather than inside the interpreter at (first) eval time. `:while` itself
+// is valid despite never appearing in op_registry/multi_op_registry — see
+// interpret_instructions.
+static void validate_instructions(const std::vector<Instruction> &instructions,
+                                  bool &has_runtime_call) {
+  for (const auto &instr : instructions) {
     const std::string &name = instr.op.to_string();
+
+    if (name == "while") {
+      if (instr.subprograms.size() != 2)
+        throw std::runtime_error(
+            "emlx::native: :while instruction must have exactly 2 "
+            "subprograms (cond, body), got " +
+            std::to_string(instr.subprograms.size()));
+      validate_instructions(instr.subprograms[0].instructions, has_runtime_call);
+      validate_instructions(instr.subprograms[1].instructions, has_runtime_call);
+      continue;
+    }
+
     if (op_registry.find(name) == op_registry.end() &&
         multi_op_registry.find(name) == multi_op_registry.end())
       throw std::runtime_error("emlx::native: unknown op \"" + name + "\"");
     if (name == "runtime_call")
       has_runtime_call = true;
   }
+}
+
+fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
+  bool has_runtime_call = false;
+  validate_instructions(program.instructions, has_runtime_call);
 
   // Build constant arrays on the current (worker) thread using its default stream.
   std::vector<mlx::core::array> constants;
@@ -1919,61 +2081,20 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   // through mlx::core::compile().  MLX traces the lambda on the first
   // eval_program call (building a compiled computation graph) and replays
   // the cached graph on every subsequent call — no repeated graph construction.
+  // captures/constants are shared_ptr-wrapped so a `:while` instruction's
+  // EMLXWhile primitive (see interpret_instructions) can hold onto the same
+  // tables independently of this lambda's own stack frame/lifetime.
   emlx::function fn =
-      [captures = std::move(program.captures),
-       constants = std::move(constants),
+      [captures = std::make_shared<const std::vector<mlx::core::array>>(
+           std::move(program.captures)),
+       constants = std::make_shared<const std::vector<mlx::core::array>>(
+           std::move(constants)),
        instructions = std::move(program.instructions),
        output_refs = std::move(program.outputs)](
           const std::vector<mlx::core::array> &inputs)
       -> std::vector<mlx::core::array> {
-    std::vector<mlx::core::array> results;
-    results.reserve(instructions.size());
-
-    auto resolve = [&](const Ref &ref) -> mlx::core::array {
-      switch (ref.kind) {
-      case RefKind::Input:
-        return inputs.at(static_cast<size_t>(ref.index));
-      case RefKind::Capture:
-        return captures.at(static_cast<size_t>(ref.index));
-      case RefKind::Const:
-        return constants.at(static_cast<size_t>(ref.index));
-      case RefKind::Result:
-        return results.at(static_cast<size_t>(ref.index));
-      case RefKind::Carry:
-        // Only valid inside a `:while` instruction's SubProgram, resolved by
-        // EMLXWhile's own (sub-program) interpreter loop — never at the top
-        // level of a Program's own instruction list.
-        throw std::runtime_error(
-            "emlx::native: {:carry, _} ref found outside a :while sub-program");
-      }
-      throw std::runtime_error("emlx::native: invalid ref kind");
-    };
-
-    for (const auto &instr : instructions) {
-      std::vector<mlx::core::array> op_inputs;
-      op_inputs.reserve(instr.operands.size());
-      for (const auto &ref : instr.operands) {
-        op_inputs.push_back(resolve(ref));
-      }
-
-      const std::string &name = instr.op.to_string();
-      auto multi_it = multi_op_registry.find(name);
-      if (multi_it != multi_op_registry.end()) {
-        // Multi-output op: append each result in order to the flat accumulator.
-        auto outs = multi_it->second(op_inputs, instr.attrs);
-        for (auto &o : outs)
-          results.push_back(o);
-      } else {
-        results.push_back(op_registry.at(name)(op_inputs, instr.attrs));
-      }
-    }
-
-    std::vector<mlx::core::array> outputs;
-    outputs.reserve(output_refs.size());
-    for (const auto &ref : output_refs) {
-      outputs.push_back(resolve(ref));
-    }
-    return outputs;
+    return interpret_instructions(instructions, output_refs, captures,
+                                  constants, &inputs, /*carry=*/nullptr);
   };
 
   // Allocate the program resource.

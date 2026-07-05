@@ -356,57 +356,17 @@ defmodule EMLX.Native.ExprTest do
       assert_in_delta Nx.to_number(out), 7.0, 1.0e-6
     end
 
-    # SPIKE (temporary): de-risks native `:while` lowering by proving that a
-    # `mlx::core::Primitive` (`EMLXWhileSpike`, emlx_compiler.cpp) can safely
-    # call `mlx::core::eval()` *inside* its own `eval_cpu`, itself reached via
-    # `eval_program`'s outer `mlx::core::eval(outputs)` — i.e. a
-    # nested/reentrant eval on the same worker OS thread. Hand-built
-    # instruction (no Elixir lowering path emits `:while_spike` — see
-    # EMLXWhileSpike's own doc comment). Bounded by a generous-but-finite
-    # test timeout: a deadlock here should fail loudly, not hang the suite.
-    @tag timeout: 15_000
-    test "SPIKE: nested eval() inside a Primitive's eval_cpu does not deadlock", %{
-      worker: worker,
-      device: device
-    } do
-      wire = %EMLX.Native.Program{
-        num_inputs: 1,
-        captures: [],
-        constants: [],
-        instructions: [
-          %EMLX.Native.Instruction{op: :while_spike, operands: [{:input, 0}], attrs: []}
-        ],
-        outputs: [{:result, 0}]
-      }
-
-      prog_ref = compile_nif!(worker, wire)
-
-      x = Nx.tensor(10, type: :s32, backend: EMLX.Backend)
-      %EMLX.Backend{ref: {_, ref_x}} = x.data
-
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
-      out = EMLX.Backend.to_nx({device, out_ref}, x)
-
-      assert Nx.to_number(out) == 15
-    end
-
-    # Wire-format extension for native `:while` lowering (checkpoint b — see
-    # EMLX.Native.Expr's `:while` TODO): `RefKind::Carry` and the
-    # `EMLX.Native.Instruction.subprograms` field (decoded into
-    # `emlx_compiler.hpp`'s `SubProgram` struct) let a `:while` instruction
-    # carry two nested, self-contained instruction lists (`cond`/`body`)
-    # instead of splicing them into the parent program.
-    #
-    # `:while` itself isn't registered in the op registry yet (that's
-    # checkpoint c — the actual `EMLXWhile` primitive), so this only proves
-    # the wire format round-trips through the NIF boundary intact: a Program
-    # whose sole instruction is `op: :while` with two SubPrograms (using
-    # `{:carry, _}` refs, matching real future `:while` shape) decodes
-    # cleanly and reaches the "unknown op" registry check — as opposed to
-    # failing earlier with a decode/argument error, which would indicate a
-    # bug in the `Ref`/`Instruction`/`SubProgram` decoders.
-    test "wire format: :while instruction with nested cond/body sub-programs round-trips",
-         %{worker: worker} do
+    # Native `:while` lowering (checkpoint c — see EMLX.Native.Expr's
+    # `:while` TODO / EMLXWhile in emlx_compiler.cpp): a hand-built wire
+    # `:while` instruction (no Elixir lowering path emits this yet — that's
+    # checkpoint d) with `RefKind::Carry` refs inside its cond/body
+    # `EMLX.Native.SubProgram`s. Exercises the whole native interpreter loop
+    # end to end: `EMLXWhile::eval` calls `interpret_instructions`
+    # recursively for cond (`carry < 5`) and body (`carry + 1`) each
+    # iteration, forcing the carry via `mlx::core::eval` every time, until
+    # cond goes false.
+    test "wire format: :while instruction with nested cond/body sub-programs runs natively",
+         %{worker: worker, device: device} do
       cond_subprogram = %EMLX.Native.SubProgram{
         instructions: [
           %EMLX.Native.Instruction{
@@ -444,9 +404,78 @@ defmodule EMLX.Native.ExprTest do
         outputs: [{:result, 0}]
       }
 
-      assert_raise EMLX.NIFError, ~r/unknown op "while"/, fn ->
-        compile_nif!(worker, wire)
-      end
+      prog_ref = compile_nif!(worker, wire)
+
+      x = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      %EMLX.Backend{ref: {_, ref_x}} = x.data
+
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
+      out = EMLX.Backend.to_nx({device, out_ref}, x)
+
+      assert Nx.to_number(out) == 5
+    end
+
+    # Same native `:while` interpreter, but with two independent carry
+    # slots — proves multi-slot carry indexing (`{:carry, 0}`/`{:carry, 1}`)
+    # and multi-output EMLXWhile arity (one output array per input carry
+    # slot) both work, matching how a real `Nx.Defn.while` over a tuple
+    # accumulator would flatten to several carry leaves.
+    test "wire format: :while with two independent carry slots", %{worker: worker, device: device} do
+      cond_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :less,
+            operands: [{:carry, 0}, {:const, 0}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      body_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :add,
+            operands: [{:carry, 0}, {:const, 1}],
+            attrs: []
+          },
+          %EMLX.Native.Instruction{
+            op: :multiply,
+            operands: [{:carry, 1}, {:const, 2}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}, {:result, 1}]
+      }
+
+      wire = %EMLX.Native.Program{
+        num_inputs: 2,
+        captures: [],
+        constants: [{5.0, :int32}, {1.0, :int32}, {2.0, :int32}],
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :while,
+            operands: [{:input, 0}, {:input, 1}],
+            attrs: [],
+            subprograms: [cond_subprogram, body_subprogram]
+          }
+        ],
+        outputs: [{:result, 0}, {:result, 1}]
+      }
+
+      prog_ref = compile_nif!(worker, wire)
+
+      counter = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      acc = Nx.tensor(1, type: :s32, backend: EMLX.Backend)
+      %EMLX.Backend{ref: {_, ref_counter}} = counter.data
+      %EMLX.Backend{ref: {_, ref_acc}} = acc.data
+
+      [out_counter_ref, out_acc_ref] = eval_nif!(worker, prog_ref, [ref_counter, ref_acc])
+      out_counter = EMLX.Backend.to_nx({device, out_counter_ref}, counter)
+      out_acc = EMLX.Backend.to_nx({device, out_acc_ref}, acc)
+
+      assert Nx.to_number(out_counter) == 5
+      assert Nx.to_number(out_acc) == 32
     end
   end
 
