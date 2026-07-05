@@ -1751,10 +1751,14 @@ defmodule EMLX do
     end)
   end
 
-  # Routes a traced expression to the right eval-closure builder. `while` is
-  # the only remaining structural split point (`Nx.Defn.Graph`) — the loop
-  # runs from Elixir while every straight-line segment still compiles to a
-  # single-NIF native program. `:runtime_call` no longer splits the graph:
+  # Routes a traced expression to the right eval-closure builder. A `while`
+  # is a structural split point (`Nx.Defn.Graph`) only when it can't be
+  # natively lowered to a single `EMLXWhile` primitive (see
+  # `EMLX.Native.Expr.native_while_eligible?/2` and `split_point?/1`) — e.g.
+  # it has a `:runtime_call`/hook in its condition or body, or is nested. An
+  # eligible `while` lowers in-graph like any other op, so the whole loop
+  # runs inside one `eval_program` NIF call instead of driving it from
+  # Elixir. `:runtime_call` outside a `while` never splits the graph either:
   # it lowers in-graph to a real `:runtime_call` opcode backed by a genuine
   # `mx::core::Primitive` (see `EMLX.Native.Expr`'s moduledoc "Runtime
   # calls" section and `emlx_compiler.cpp`'s `EMLXRuntimeCall`), whose
@@ -1766,17 +1770,23 @@ defmodule EMLX do
   # fused opcode (`EMLX.Native.Expr`'s `:metadata` clause).
   #
   #   * no split point in the parent scope -> one flat native program
-  #     (possibly containing one or more inlined `:runtime_call` nodes).
-  #   * a bare tail `while` (base case) -> host-driven; the condition/body
-  #     run by re-entering this compiler, so a nested split point recurses
-  #     through the same path.
+  #     (possibly containing one or more inlined `:runtime_call` nodes
+  #     and/or native `:while` loops).
+  #   * a bare tail `while` that still needs a split (base case) ->
+  #     host-driven; the condition/body run by re-entering this compiler, so
+  #     a nested split point recurses through the same path.
   #   * a split point with surrounding work -> `Nx.Defn.Graph.split/2` on
-  #     every `while`, replayed by `Nx.Defn.Graph.run/3` with
-  #     `compiler: EMLX`; each stage re-enters this compiler (flat stages
-  #     compile flat, isolated split-point stages hit the base case above).
+  #     every non-native-lowerable `while`, replayed by `Nx.Defn.Graph.run/3`
+  #     with `compiler: EMLX`; each stage re-enters this compiler (flat
+  #     stages compile flat, isolated split-point stages hit the base case
+  #     above).
   defp build_eval_fn(output_expr, worker, effective_device, num_inputs, fun, vars) do
     cond do
-      bare_while?(output_expr) ->
+      # Only the legacy host-driven path when the bare tail `while` still
+      # needs a split (i.e. isn't natively lowerable) -- an eligible bare
+      # `while` falls through to the flat native path below instead, same as
+      # any other native-lowerable expression.
+      bare_while?(output_expr) and contains_split_point?(output_expr) ->
         build_while_base_eval_fn(output_expr, effective_device)
 
       not contains_split_point?(output_expr) ->
@@ -1819,7 +1829,18 @@ defmodule EMLX do
     |> Enum.any?(&split_point?/1)
   end
 
-  defp split_point?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :while}}), do: true
+  # A `while` is only a split point when it can't be natively lowered to a
+  # single `EMLXWhile` primitive (see `EMLX.Native.Expr.native_while_eligible?/2`
+  # and its `:while` moduledoc section) -- e.g. it has a `:runtime_call` or a
+  # hook in its condition/body, or a nested `while`. An eligible `while` is
+  # left in place: `EMLX.Native.Expr.lower/1` (via `expand_node`) lowers it
+  # straight into a flat native program below, no split needed.
+  defp split_point?(%Nx.Tensor{
+         data: %Nx.Defn.Expr{op: :while, args: [_initial, _arg, condition, body]}
+       }) do
+    not EMLX.Native.Expr.native_while_eligible?(condition, body)
+  end
+
   defp split_point?(%Nx.Tensor{}), do: false
 
   # Compiles an `EMLX.Native.Expr` program to a NIF resource on `worker`.

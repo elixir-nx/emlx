@@ -92,6 +92,23 @@ defmodule EMLX.Native.ExprTest do
     result
   end
 
+  # A `while` whose body contains another `while` — not natively lowerable
+  # (see `EMLX.Native.Expr.native_while_eligible?/2`'s nested-`:while`
+  # exclusion), so the outer loop must still take the host-driven fallback.
+  defn nested_while_top_level(x) do
+    {out, _i} =
+      while {out = x, i = 0}, Nx.less(i, 2) do
+        {inner, _j} =
+          while {inner = out, j = 0}, Nx.less(j, 2) do
+            {Nx.add(inner, 1.0), j + 1}
+          end
+
+        {inner, i + 1}
+      end
+
+    out
+  end
+
   # Exercises the Nx.Defn.Graph.split-chain path (hook before AND after a
   # non-bare `while`, i.e. the while has surrounding work on both sides) --
   # this is the shape that surfaced the `Nx.Defn.Graph` `:token` rewrite gap
@@ -2153,6 +2170,77 @@ defmodule EMLX.Native.ExprTest do
       assert_close(nx, ex)
       assert Nx.to_number(ni) == Nx.to_number(ei)
       assert Nx.to_number(ni) == 4
+    end
+
+    # Pins that a plain dynamic `while` actually takes the native lowering
+    # path (a single `:while` wire instruction, no raise) rather than merely
+    # "happening to still produce a correct result via the old host-driven
+    # fallback" -- the two are indistinguishable from a native-vs-eager
+    # equivalence assertion alone, so this checks the lowered wire program
+    # directly. See EMLX.Native.Expr's `:while` moduledoc section /
+    # `native_while_eligible?/2`.
+    test "while: dynamic trip count lowers to a single native :while instruction" do
+      expr = Nx.Defn.debug_expr_apply(&count_to_10/1, [Nx.template({}, :s32)])
+      wire = expr |> Expr.lower() |> Expr.to_native()
+
+      assert [%EMLX.Native.Instruction{op: :while, subprograms: [cond_sub, body_sub]}] =
+               wire.instructions
+
+      assert %EMLX.Native.SubProgram{outputs: [{:result, _}]} = cond_sub
+      assert %EMLX.Native.SubProgram{outputs: [{:result, _}]} = body_sub
+    end
+
+    test "native_while_eligible?/2: plain condition/body (no runtime_call, hook, or nesting)" do
+      expr = Nx.Defn.debug_expr_apply(&count_to_10/1, [Nx.template({}, :s32)])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      assert Expr.native_while_eligible?(condition, body)
+    end
+
+    test "native_while_eligible?/2: false when the body contains a runtime_call" do
+      weight = Nx.iota({2, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      qw = EMLX.quantize(weight, [])
+      x0 = Nx.broadcast(Nx.tensor(0.0, type: :f32, backend: EMLX.Backend), {2, 64})
+      n = Nx.tensor(3, type: :s32, backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&runtime_call_inside_while/3, [x0, n, qw])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      refute Expr.native_while_eligible?(condition, body)
+    end
+
+    test "native_while_eligible?/2: false when the body contains a hook" do
+      expr = Nx.Defn.debug_expr_apply(&hook_in_while_body/1, [Nx.template({}, :s32)])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      refute Expr.native_while_eligible?(condition, body)
+    end
+
+    test "native_while_eligible?/2: false when the body contains a nested while" do
+      expr = Nx.Defn.debug_expr_apply(&nested_while_top_level/1, [Nx.template({3}, :f32)])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      refute Expr.native_while_eligible?(condition, body)
     end
   end
 

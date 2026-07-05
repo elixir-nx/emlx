@@ -1679,8 +1679,15 @@ defmodule EMLX.Native.Expr do
          state
        ) do
     case detect_static_while_trip_count(initial, arg, condition, body) do
-      {:ok, count} -> expand_while_unroll(id, initial, arg, body, count, state)
-      :error -> raise ArgumentError, "does not yet lower op :while"
+      {:ok, count} ->
+        expand_while_unroll(id, initial, arg, body, count, state)
+
+      :error ->
+        if native_while_eligible?(condition, body) do
+          expand_while_native(id, initial, arg, condition, body, state)
+        else
+          raise ArgumentError, "does not yet lower op :while"
+        end
     end
   end
 
@@ -1999,6 +2006,127 @@ defmodule EMLX.Native.Expr do
        state
        | instructions: inner_state.instructions,
          captures: inner_state.captures,
+         constants: inner_state.constants,
+         inputs: inner_state.inputs,
+         hooks: inner_state.hooks
+     }}
+  end
+
+  # ── while (native lowering for dynamic-trip-count loops) ───────────────────
+  #
+  # See emlx_compiler.cpp's EMLXWhile primitive and emlx_compiler.hpp's
+  # SubProgram/RefKind::Carry. Instead of unrolling (impossible: the trip
+  # count is data-dependent) or splitting the graph and driving the loop
+  # from Elixir (the old `emlx.ex` `build_while_base_eval_fn`/`run_while_loop`
+  # path, still used as a fallback -- see `native_while_eligible?/2`), this
+  # lowers straight to a single `:while` instruction carrying two
+  # self-contained cond/body sub-programs, so the whole loop runs natively
+  # inside one `eval_program` NIF call.
+
+  # A `:while` loop is native-lowerable when neither its condition nor its
+  # body contains a `:runtime_call` (would fire an Elixir callback on every
+  # native iteration -- unsupported), a `:token`/hook (same side-effect
+  # concern), or a nested `:while` (not yet supported -- EMLXWhile's
+  # reentrant `mlx::core::eval()` likely tolerates it, but this hasn't been
+  # validated, so nested dynamic loops still fall back to the host-driven
+  # split path, which recurses through the same splitting machinery for the
+  # inner loop). Shared between here and `EMLX.ex`'s `split_point?/1` so the
+  # eligibility criteria can't drift between the two call sites (each does
+  # its own cheap traversal; only the *logic* is required to stay in sync).
+  @doc false
+  def native_while_eligible?(condition, body) do
+    Enum.all?([condition, body], &while_scope_native_eligible?/1)
+  end
+
+  defp while_scope_native_eligible?(container) do
+    container
+    |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
+    |> Enum.all?(&native_eligible_node?/1)
+  end
+
+  defp native_eligible_node?(%T{data: %Nx.Defn.Expr{op: op}})
+       when op in [:runtime_call, :token, :while],
+       do: false
+
+  defp native_eligible_node?(%T{}), do: true
+
+  defp expand_while_native(id, initial, arg, condition, body, state) do
+    initial_list = while_leaf_list(initial)
+    arg_list = while_leaf_list(arg)
+    body_list = while_leaf_list(body)
+
+    init_refs = Enum.map(initial_list, &Map.fetch!(state.node_to_ref, &1.data.id))
+    carry_refs = Enum.map(arg_list, fn _ -> make_ref() end)
+
+    param_ref_by_pos =
+      arg_list
+      |> Enum.zip(carry_refs)
+      |> Map.new(fn {param, ref} -> {hd(param.data.args), ref} end)
+
+    {cond_sub, state} = lower_while_subprogram([condition], carry_refs, param_ref_by_pos, state)
+    {body_sub, state} = lower_while_subprogram(body_list, carry_refs, param_ref_by_pos, state)
+
+    result_refs = Enum.map(init_refs, fn _ -> make_ref() end)
+    result_id = if match?([_], result_refs), do: hd(result_refs), else: result_refs
+
+    instr = {result_id, :while, init_refs, [], [cond_sub, body_sub]}
+
+    %{
+      state
+      | instructions: [instr | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, result_id)
+    }
+  end
+
+  defp while_leaf_list(container) when is_tuple(container), do: Tuple.to_list(container)
+  defp while_leaf_list(leaf), do: [leaf]
+
+  # Lowers a `:while` sub-scope (the condition wrapped in a 1-element list,
+  # or the body leaf list) into an isolated internal sub-program: unlike
+  # `lower_tuple_body/3` (used for *unrolling*, which splices the inner
+  # instructions into the outer `state.instructions` stream once per
+  # iteration), the inner instructions here stay local to the returned
+  # sub-program map -- they're converted to a wire `EMLX.Native.SubProgram`
+  # later, in `to_native_subprogram/3`. Only captures/constants/inputs/hooks
+  # merge back into the outer state, since those are shared global tables
+  # (see EMLX.Native.SubProgram's moduledoc note on shared captures/consts).
+  # `carry_refs` (this while's fresh per-slot refs, positionally matching
+  # `arg`/`initial`) is stashed on the returned map so `to_native_subprogram/3`
+  # knows which internal refs become `{:carry, i}` on the wire.
+  defp lower_while_subprogram(exprs, carry_refs, param_ref_by_pos, state) do
+    exprs_tuple = List.to_tuple(exprs)
+    state = merge_scope_ids(state, exprs_tuple)
+    inner_ordered = EMLX.Defn.Tree.post_order(exprs_tuple, &scope_dependencies/1)
+
+    param_id_to_ref =
+      inner_ordered
+      |> Enum.filter(&(&1.data.op == :parameter))
+      |> Map.new(fn p -> {p.data.id, Map.fetch!(param_ref_by_pos, hd(p.data.args))} end)
+
+    param_id_set = MapSet.new(Map.keys(param_id_to_ref))
+    local_base = Map.merge(state.node_to_ref, param_id_to_ref)
+
+    inner_state =
+      Enum.reduce(
+        inner_ordered,
+        %{state | node_to_ref: local_base, instructions: []},
+        fn node, st ->
+          if MapSet.member?(param_id_set, node.data.id), do: st, else: expand_node(node, st)
+        end
+      )
+
+    output_refs = Enum.map(exprs, &Map.fetch!(inner_state.node_to_ref, &1.data.id))
+
+    sub_program = %{
+      carry_refs: carry_refs,
+      instructions: Enum.reverse(inner_state.instructions),
+      outputs: output_refs
+    }
+
+    {sub_program,
+     %{
+       state
+       | captures: inner_state.captures,
          constants: inner_state.constants,
          inputs: inner_state.inputs,
          hooks: inner_state.hooks
@@ -2416,47 +2544,7 @@ defmodule EMLX.Native.Expr do
     end
 
     {instructions, ref_to_wire, _flat} =
-      prog.instructions
-      |> Enum.reduce({[], ref_to_wire, 0}, fn {id, op, operand_refs, attrs},
-                                              {instrs, rmap, flat} ->
-        wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
-
-        maybe_debug_check do
-          for {:result, idx} <- wire_operands, idx >= flat do
-            raise ArgumentError,
-                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
-                    "references result index #{idx} of the flat results accumulator, but only " <>
-                    "#{flat} result(s) have been produced so far -- this is a forward/self " <>
-                    "reference bug in program lowering, not a valid program. Full instruction " <>
-                    "list: #{inspect(prog.instructions)}"
-          end
-        end
-
-        maybe_debug_check do
-          for one <- List.wrap(id), Map.has_key?(rmap, one) do
-            raise ArgumentError,
-                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} produces result ref " <>
-                    "#{inspect(one)}, but that ref is already bound (to " <>
-                    "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
-                    "silently overwriting its earlier binding for every prior instruction that " <>
-                    "already referenced it. Full instruction list: #{inspect(prog.instructions)}"
-          end
-        end
-
-        {rmap2, flat2} =
-          case id do
-            ids when is_list(ids) ->
-              Enum.reduce(ids, {rmap, flat}, fn one, {m, f} ->
-                {Map.put(m, one, {:result, f}), f + 1}
-              end)
-
-            one ->
-              {Map.put(rmap, one, {:result, flat}), flat + 1}
-          end
-
-        instr = %EMLX.Native.Instruction{op: op, operands: wire_operands, attrs: attrs}
-        {[instr | instrs], rmap2, flat2}
-      end)
+      to_native_instructions(prog.instructions, ref_to_wire, capture_map, constant_map)
 
     hook_refs = Enum.flat_map(prog.hooks, & &1.refs)
     wire_outputs = Enum.map(prog.outputs ++ hook_refs, &Map.fetch!(ref_to_wire, &1))
@@ -2476,5 +2564,123 @@ defmodule EMLX.Native.Expr do
       instructions: Enum.reverse(instructions),
       outputs: wire_outputs
     }
+  end
+
+  # Converts one flat internal instruction list (a Program's top-level
+  # `instructions`, or -- recursively -- a `:while` sub-program's own local
+  # `instructions`, see to_native_subprogram/3) into wire
+  # `EMLX.Native.Instruction`s, threading a `ref_to_wire` map + flat
+  # `{:result, i}` counter that starts wherever `seed_ref_to_wire` leaves off
+  # (0 for a fresh sub-program interpretation, matching emlx_compiler.hpp's
+  # SubProgram semantics). `capture_map`/`constant_map` are always the
+  # *outer* Program's tables, threaded down unchanged: a `:while`
+  # sub-program's `{:capture, i}`/`{:const, i}` refs resolve against the same
+  # shared tables as the parent program, never a duplicated per-sub-program
+  # copy (see EMLX.Native.SubProgram).
+  defp to_native_instructions(instructions, seed_ref_to_wire, capture_map, constant_map) do
+    Enum.reduce(instructions, {[], seed_ref_to_wire, 0}, fn
+      {id, :while, operand_refs, attrs, [cond_sub, body_sub]}, {instrs, rmap, flat} ->
+        wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
+        wire_cond = to_native_subprogram(cond_sub, capture_map, constant_map)
+        wire_body = to_native_subprogram(body_sub, capture_map, constant_map)
+
+        maybe_debug_check do
+          for one <- List.wrap(id), Map.has_key?(rmap, one) do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_native: instruction :while produces result ref " <>
+                    "#{inspect(one)}, but that ref is already bound (to " <>
+                    "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
+                    "silently overwriting its earlier binding for every prior instruction that " <>
+                    "already referenced it."
+          end
+        end
+
+        {rmap2, flat2} = register_result_refs(id, rmap, flat)
+
+        instr = %EMLX.Native.Instruction{
+          op: :while,
+          operands: wire_operands,
+          attrs: attrs,
+          subprograms: [wire_cond, wire_body]
+        }
+
+        {[instr | instrs], rmap2, flat2}
+
+      {id, op, operand_refs, attrs}, {instrs, rmap, flat} ->
+        wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
+
+        maybe_debug_check do
+          for {:result, idx} <- wire_operands, idx >= flat do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
+                    "references result index #{idx} of the flat results accumulator, but only " <>
+                    "#{flat} result(s) have been produced so far -- this is a forward/self " <>
+                    "reference bug in program lowering, not a valid program. Full instruction " <>
+                    "list: #{inspect(instructions)}"
+          end
+        end
+
+        maybe_debug_check do
+          for one <- List.wrap(id), Map.has_key?(rmap, one) do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} produces result ref " <>
+                    "#{inspect(one)}, but that ref is already bound (to " <>
+                    "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
+                    "silently overwriting its earlier binding for every prior instruction that " <>
+                    "already referenced it."
+          end
+        end
+
+        {rmap2, flat2} = register_result_refs(id, rmap, flat)
+
+        instr = %EMLX.Native.Instruction{op: op, operands: wire_operands, attrs: attrs}
+        {[instr | instrs], rmap2, flat2}
+    end)
+  end
+
+  # Registers `id` (a single ref, or a list of refs for a multi-output
+  # instruction) into `rmap` as the next `{:result, i}` slot(s), advancing
+  # the flat counter by one per ref. Shared between the top-level Program
+  # walk and the `:while` sub-program walk in to_native_instructions/4.
+  defp register_result_refs(id, rmap, flat) do
+    case id do
+      ids when is_list(ids) ->
+        Enum.reduce(ids, {rmap, flat}, fn one, {m, f} ->
+          {Map.put(m, one, {:result, f}), f + 1}
+        end)
+
+      one ->
+        {Map.put(rmap, one, {:result, flat}), flat + 1}
+    end
+  end
+
+  # Converts a `:while` instruction's internal cond/body sub-scope (built by
+  # lower_while_subprogram/3) into a wire `EMLX.Native.SubProgram`. Its own
+  # `{:result, i}` numbering starts fresh at 0 (local to this sub-program,
+  # matching emlx_compiler.hpp's SubProgram semantics) -- the seed map only
+  # ever contains `{:carry, i}` (the sub-scope's own carry parameters) plus
+  # the outer program's shared `{:capture, i}`/`{:const, i}` entries, never
+  # the outer `{:input, i}`/`{:result, i}` entries: `Nx.Defn.while`'s closure
+  # rules guarantee cond/body never reference anything else from the parent
+  # scope, so this also structurally enforces that rule rather than merely
+  # trusting it.
+  defp to_native_subprogram(
+         %{carry_refs: carry_refs, instructions: instructions, outputs: outputs},
+         capture_map,
+         constant_map
+       ) do
+    carry_map =
+      carry_refs
+      |> Enum.with_index()
+      |> Map.new(fn {ref, i} -> {ref, {:carry, i}} end)
+
+    seed_ref_to_wire = Map.merge(capture_map, Map.merge(constant_map, carry_map))
+
+    {wire_instructions, local_ref_to_wire, _flat} =
+      to_native_instructions(instructions, seed_ref_to_wire, capture_map, constant_map)
+
+    wire_outputs = Enum.map(outputs, &Map.fetch!(local_ref_to_wire, &1))
+
+    %EMLX.Native.SubProgram{instructions: Enum.reverse(wire_instructions), outputs: wire_outputs}
   end
 end
