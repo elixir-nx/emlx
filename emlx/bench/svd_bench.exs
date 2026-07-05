@@ -1,48 +1,99 @@
 # bench/svd_bench.exs
 #
-# Compares EMLX's SVD (a heavy, multi-output LAPACK-style kernel) across:
+# Benchmarks `Nx.LinAlg.svd/1` across two MLX-backed Nx stacks — EMLX and Emily
+# (ausimian/emily) — and, within each, across:
 #
 #   - device:    :cpu vs :gpu (GPU skipped automatically if Metal is unavailable)
-#   - execution: :eager            — direct EMLX.Backend calls, one NIF round-trip per op
-#                :defn_evaluator    — same computation wrapped in `defn`, run via the
-#                                     default `Nx.Defn.Evaluator` (interprets the graph,
-#                                     still one NIF round-trip per op)
-#                :defn_compiled     — same `defn`, jitted with `compiler: EMLX`, which
-#                                     lowers the whole graph to a single fused native
-#                                     `compile_program`/`eval_program` NIF call
+#   - compiler:  :defn_evaluator   — `compiler: Nx.Defn.Evaluator`, dispatching op-by-op
+#                                    onto whichever backend the input already lives on
+#                                    (EMLX.Backend or Emily.Backend)
+#                :defn_compiled    — `compiler: EMLX`, which lowers the whole graph to
+#                                    a single fused native call
+#                :defn_native      — `compiler: Emily.Compiler, native: true`, Emily's
+#                                    equivalent single-NIF fused replay
 #
-# This isolates two independent costs: device (CPU vs GPU/Metal) and dispatch overhead
-# (per-op NIF round-trips vs one fused native call).
+# Every lane is built *once* per `{n, device}` via `Nx.Defn.compile/3` and that
+# one closure is replayed across all Benchee-measured iterations — the
+# realistic "compile once, run many" pattern (see `EMLX`'s moduledoc), not a
+# fresh retrace (and, pre-`native_lowerable_block?/2`, dispatch-key rehash) on
+# every call, which is what repeated `Nx.Defn.jit_apply/3` would measure.
 #
-# Run with:
-#   cd emlx
-#   mix run bench/svd_bench.exs
+# This isolates two independent costs: library (EMLX vs Emily) and dispatch overhead
+# (per-op NIF round-trips vs one fused native call), on both CPU and GPU/Metal.
+#
+# This script is standalone — it does not need to run inside the `emlx` Mix project.
+# `Mix.install/2` pulls in EMLX from this checkout (via a `path:` dependency) and
+# Emily from Hex (Apple Silicon only), plus Benchee for the actual measurement.
+#
+# Run with (from anywhere):
+#   elixir bench/svd_bench.exs
 #
 # Tunables (env vars):
 #   EMLX_SVD_SIZES=128,256,512,1024   (default: 128,256,512,1024)
-#   EMLX_SVD_ITERS=5                  (timed iterations per combination)
-#   EMLX_SVD_WARMUP=2                 (untimed warmup iterations; also primes the
-#                                      defn_compiled JIT cache)
-#   EMLX_SVD_TIMEOUT_MS=15000         (per-call timeout; :eager/:defn_evaluator fall
-#                                      back to Nx.LinAlg.SVD's generic composite
-#                                      while-loop algorithm — since EMLX.Backend has
-#                                      no native eager `svd` op — which can be very
-#                                      slow, or hang, especially on the GPU device)
+#   EMLX_SVD_TIME=2                   (Benchee measurement time per lane, in seconds)
+#   EMLX_SVD_WARMUP_TIME=1            (Benchee warmup time per lane, in seconds; also
+#                                       primes the defn_compiled/defn_native JIT caches)
+
+apple_silicon? =
+  match?({:unix, :darwin}, :os.type()) and
+    :erlang.system_info(:system_architecture)
+    |> to_string()
+    |> String.starts_with?("aarch64")
+
+# Emily's precompiled NIFs are Apple Silicon macOS only (see its README's
+# Prerequisites section), so it's only added to the install list there — on any
+# other host this script benchmarks EMLX alone.
+deps =
+  [
+    {:emlx, path: Path.expand("..", __DIR__)},
+    # Pin the same `nx` source as `emlx`'s own mix.exs (git main), overriding
+    # Emily's Hex-sourced `~> 0.12` requirement, which main satisfies.
+    {:nx, github: "elixir-nx/nx", branch: "main", sparse: "nx", override: true},
+    {:benchee, "~> 1.3"}
+  ] ++ if(apple_silicon?, do: [{:emily, "~> 0.7"}], else: [])
+
+Mix.install(deps)
 
 # MLX's CPU backend JIT-compiles fused kernels via `popen`/`pclose`, which fails with
 # `ECHILD` under the BEAM's default SIGCHLD=SIG_IGN disposition — see
-# `EMLX.Application`'s moduledoc. `mix run` scripts own this trade-off just like our
+# `EMLX.Application`'s moduledoc. `elixir` scripts own this trade-off just like our
 # test suite does.
 :os.set_signal(:sigchld, :default)
 
-defmodule EMLX.Bench.SVD do
-  import Nx.Defn
+defmodule Bench.SVD do
+  # The benchmarked computation is always exactly `Nx.LinAlg.svd/1`
+  # (`full_matrices?: true`) — every lane only varies the `Nx.Defn.compile/3`
+  # `opts` (`:compiler`, `:device`, `:native`). Each lane's runner is built
+  # *once* via `compile/3` (see `build/2`) and replayed across every
+  # Benchee-measured iteration, mirroring the "compile once, run many" pattern
+  # `EMLX`'s moduledoc recommends — not a fresh retrace per iteration, which
+  # is the worst case `Nx.Defn.jit_apply/3` would otherwise measure.
+  #
+  # The compiled closure is stashed in `:persistent_term` (keyed by `key`)
+  # rather than returned directly, because Benchee runs each job in its own
+  # process: closing over the closure itself would make the *spawn* copy it
+  # into that process, and `Nx.Defn.compile/3`'s closure keeps a reference to
+  # the full (un-lowered) `Nx.Block` computation graph — including any
+  # `default_expr` fallback, e.g. `Nx.LinAlg.svd/1`'s ~100-iteration
+  # Jacobi-rotation algorithm, a DAG whose nodes heavily share
+  # sub-expressions across iterations. Erlang's term-copy path doesn't
+  # preserve that sharing, so flattening the DAG into a tree to copy it
+  # blows up combinatorially and the spawn effectively never finishes.
+  # `:persistent_term` values are read by reference (no copy), so fetching
+  # the closure from inside the already-spawned job process sidesteps this
+  # entirely.
+  def build(key, template, opts) do
+    compiled = Nx.Defn.compile(&Nx.LinAlg.svd(&1, full_matrices?: true), [template], opts)
+    :persistent_term.put(key, compiled)
+    key
+  end
 
-  # Sums every output so the whole decomposition is materialized (and the
-  # comparison isn't skewed by a fused-but-unused output being elided).
-  defn run(a) do
-    {u, s, vt} = Nx.LinAlg.svd(a)
-    Nx.sum(u) + Nx.sum(s) + Nx.sum(vt)
+  # The `Nx.sum`/`Nx.to_number` calls aren't part of the compiled closure;
+  # they just force materialization of all three outputs so a lazily-elided,
+  # fused-but-unused output can't skew the timing.
+  def run(key, a) do
+    {u, s, vt} = :persistent_term.get(key).(a)
+    Nx.to_number(Nx.sum(u)) + Nx.to_number(Nx.sum(s)) + Nx.to_number(Nx.sum(vt))
   end
 end
 
@@ -52,9 +103,12 @@ sizes =
     csv -> csv |> String.split(",") |> Enum.map(&String.to_integer(String.trim(&1)))
   end
 
-iters = String.to_integer(System.get_env("EMLX_SVD_ITERS", "5"))
-warmup = String.to_integer(System.get_env("EMLX_SVD_WARMUP", "2"))
-timeout_ms = String.to_integer(System.get_env("EMLX_SVD_TIMEOUT_MS", "15000"))
+parse_seconds = fn env, default -> {f, ""} = Float.parse(System.get_env(env, default)); f end
+
+bench_time = parse_seconds.("EMLX_SVD_TIME", "2")
+warmup_time = parse_seconds.("EMLX_SVD_WARMUP_TIME", "1")
+
+emily_available? = apple_silicon? and Code.ensure_loaded?(Emily.Backend)
 
 devices =
   case EMLX.NIF.command_queue_new(:gpu) do
@@ -66,140 +120,136 @@ devices =
       [:cpu]
   end
 
-modes = [:eager, :defn_evaluator, :defn_compiled]
+engines = [:emlx] ++ if(emily_available?, do: [:emily], else: [])
 
-# Deterministic input, generated once on the host and transferred per-device below —
-# keeps the matrix identical across every {device, mode} combination.
+unless emily_available? do
+  IO.puts("==> Emily unavailable on this host (Apple Silicon macOS only), skipping.\n")
+end
+
+# Deterministic input, generated once on the host and transferred per-{engine,device}
+# below — keeps the matrix identical across every combination.
 random_matrix = fn n ->
   key = Nx.Random.key(42)
   {t, _key} = Nx.Random.uniform(key, shape: {n, n}, type: :f32)
   t
 end
 
-sync! = fn %Nx.Tensor{} = scalar -> Nx.to_number(scalar) end
-
-eager_fun = fn a ->
-  {u, s, vt} = Nx.LinAlg.svd(a)
-  Nx.sum(u) |> Nx.add(Nx.sum(s)) |> Nx.add(Nx.sum(vt))
+backend_for = fn
+  :emlx, device -> {EMLX.Backend, device: device}
+  :emily, device -> {Emily.Backend, device: device}
 end
 
-build_runner = fn device, mode ->
-  case mode do
-    :eager ->
-      eager_fun
+compiled_opts_for = fn
+  :emlx, device -> [compiler: EMLX, device: device]
+  :emily, device -> [compiler: Emily.Compiler, native: true, device: device]
+end
 
-    :defn_evaluator ->
-      Nx.Defn.jit(&EMLX.Bench.SVD.run/1, compiler: Nx.Defn.Evaluator)
+# `emlx defn_evaluator` on `:gpu` has no native `full_matrices?: true` kernel
+# (see `EMLX.Backend.block/4`'s `:gpu` clause), so `Nx.Defn.Evaluator` runs the
+# `default_expr` fallback (a ~100-iteration Jacobi-rotation algorithm) fully
+# eagerly, one NIF round-trip per op. That's *correct* but tens of seconds
+# slow even at `n=128` and grows with `n`, so it's skipped by default — a
+# single stuck-looking lane otherwise dominates the whole suite's wall time.
+# Set `EMLX_SVD_INCLUDE_SLOW_GPU_EVALUATOR=1` to include it anyway.
+include_slow_gpu_evaluator? = System.get_env("EMLX_SVD_INCLUDE_SLOW_GPU_EVALUATOR") == "1"
 
-    :defn_compiled ->
-      Nx.Defn.jit(&EMLX.Bench.SVD.run/1, compiler: EMLX, device: device)
+# Each lane builds its `Nx.Defn.compile/3` closure once (for `n`'s template)
+# and returns a runner that replays it — the benchmarked function itself
+# always lives in `Bench.SVD`, never as an inline anonymous function.
+# (`defn_evaluator` has no comparable per-call compile cost to amortize, but
+# building it the same way keeps lane-construction code uniform.)
+lanes_for = fn engine, device, n ->
+  native_key = {:svd_bench, engine, device, n, :native}
+  template = Nx.template({n, n}, {:f, 32})
+  Bench.SVD.build(native_key, template, compiled_opts_for.(engine, device))
+
+  native_lane = [
+    {(if engine == :emlx, do: :defn_compiled, else: :defn_native),
+     &Bench.SVD.run(native_key, &1)}
+  ]
+
+  if engine == :emlx and device == :gpu and not include_slow_gpu_evaluator? do
+    native_lane
+  else
+    evaluator_key = {:svd_bench, engine, device, n, :defn_evaluator}
+    Bench.SVD.build(evaluator_key, template, compiler: Nx.Defn.Evaluator)
+    [{:defn_evaluator, &Bench.SVD.run(evaluator_key, &1)} | native_lane]
   end
 end
 
-median = fn list ->
-  sorted = Enum.sort(list)
-  n = length(sorted)
-  Enum.at(sorted, div(n, 2))
-end
-
-bench_one = fn a, runner ->
-  task =
-    Task.async(fn ->
-      try do
-        for _ <- 1..warmup, do: sync!.(runner.(a))
-
-        times_ms =
-          for _ <- 1..iters do
-            t0 = System.monotonic_time(:microsecond)
-            sync!.(runner.(a))
-            t1 = System.monotonic_time(:microsecond)
-            (t1 - t0) / 1000.0
-          end
-
-        Float.round(median.(times_ms), 3)
-      rescue
-        e -> {:error, Exception.format(:error, e, []) |> String.split("\n") |> hd()}
-      catch
-        kind, reason -> {:error, "#{kind}: #{inspect(reason)}"}
-      end
-    end)
-
-  case Task.yield(task, timeout_ms) || Task.shutdown(task, :brutal_kill) do
-    {:ok, result} -> result
-    nil -> {:error, "timeout after #{timeout_ms}ms"}
-  end
-end
-
-IO.puts("==> EMLX SVD benchmark")
+IO.puts("==> SVD benchmark (EMLX vs Emily)")
 IO.puts("    sizes:   #{Enum.join(sizes, ", ")}")
-IO.puts("    iters:   #{iters} (warmup: #{warmup})")
-IO.puts("    devices: #{Enum.join(devices, ", ")}\n")
+IO.puts("    time:    #{bench_time}s per lane (warmup: #{warmup_time}s)")
+IO.puts("    devices: #{Enum.join(devices, ", ")}")
+IO.puts("    engines: #{Enum.join(engines, ", ")}")
 
-results =
-  for n <- sizes, device <- devices do
-    a = Nx.backend_transfer(random_matrix.(n), {EMLX.Backend, device: device})
-
-    row =
-      for mode <- modes do
-        runner = build_runner.(device, mode)
-        result = bench_one.(a, runner)
-
-        case result do
-          {:error, msg} -> IO.puts("    n=#{n} device=#{device} mode=#{mode}: ERROR (#{msg})")
-          ms -> IO.puts("    n=#{n} device=#{device} mode=#{mode}: #{ms} ms")
-        end
-
-        {mode, result}
-      end
-
-    {n, device, Map.new(row)}
-  end
-
-IO.puts("\n=== Summary (median ms over #{iters} runs) ===\n")
-
-header =
-  "| size | device | eager | defn_evaluator | defn_compiled | evaluator/eager | compiled/eager |"
-
-sep = "|------|--------|-------|----------------|----------------|------------------|-----------------|"
-
-IO.puts(header)
-IO.puts(sep)
-
-fmt = fn
-  {:error, _} -> "error"
-  ms -> ms
+unless include_slow_gpu_evaluator? do
+  IO.puts(
+    "    (skipping emlx defn_evaluator on :gpu — eager Jacobi fallback, tens of " <>
+      "seconds+ per call; set EMLX_SVD_INCLUDE_SLOW_GPU_EVALUATOR=1 to include it)"
+  )
 end
 
-ratio = fn a, b -> if is_number(a) and is_number(b) and b > 0, do: Float.round(a / b, 2) end
+IO.puts("")
 
-Enum.each(results, fn {n, device, by_mode} ->
-  eager = by_mode[:eager]
-  evaluator = by_mode[:defn_evaluator]
-  compiled = by_mode[:defn_compiled]
+suites =
+  for n <- sizes, device <- devices, into: %{} do
+    IO.puts("--- n=#{n} device=#{device} " <> String.duplicate("-", 40))
 
-  IO.puts(
-    "| #{n} | #{device} | #{fmt.(eager)} | #{fmt.(evaluator)} | #{fmt.(compiled)} | " <>
-      "#{ratio.(evaluator, eager)} | #{ratio.(compiled, eager)} |"
-  )
-end)
+    jobs =
+      for engine <- engines,
+          {mode, runner} <- lanes_for.(engine, device, n),
+          reduce: %{} do
+        jobs ->
+          a = Nx.backend_transfer(random_matrix.(n), backend_for.(engine, device))
+          label = "#{engine} #{mode}"
+          Map.put(jobs, label, fn -> runner.(a) end)
+      end
+
+    suite =
+      Benchee.run(jobs,
+        time: bench_time,
+        warmup: warmup_time,
+        memory_time: 0,
+        print: [benchmarking: false, fast_warning: false],
+        formatters: [Benchee.Formatters.Console]
+      )
+
+    {{n, device}, suite}
+  end
+
+# Cross-device speedup for the fused/native lane of each engine — Benchee only
+# compares jobs within a single run, so CPU vs GPU (two separate runs) is
+# summarized here from each run's own statistics.
+median_ms = fn suite, job_name ->
+  case suite && Enum.find(suite.scenarios, &(&1.job_name == job_name)) do
+    nil -> nil
+    scenario -> scenario.run_time_data.statistics.median / 1_000_000
+  end
+end
 
 if :cpu in devices and :gpu in devices do
-  IO.puts("\n=== CPU vs GPU speedup (compiled/fused mode) ===\n")
+  IO.puts("\n=== CPU vs GPU speedup (fused/native lane, median ms) ===\n")
 
-  by_size =
-    results
-    |> Enum.group_by(fn {n, _device, _} -> n end)
+  Enum.each(engines, fn engine ->
+    mode = if engine == :emlx, do: "defn_compiled", else: "defn_native"
+    job_name = "#{engine} #{mode}"
 
-  Enum.each(sizes, fn n ->
-    case Map.get(by_size, n) do
-      [{_, :cpu, cpu_row}, {_, :gpu, gpu_row}] ->
-        cpu_ms = cpu_row[:defn_compiled]
-        gpu_ms = gpu_row[:defn_compiled]
-        speedup = ratio.(cpu_ms, gpu_ms)
-        IO.puts("    n=#{n}: cpu=#{fmt.(cpu_ms)} ms, gpu=#{fmt.(gpu_ms)} ms, speedup=#{speedup}x")
+    Enum.each(sizes, fn n ->
+      cpu_ms = median_ms.(suites[{n, :cpu}], job_name)
+      gpu_ms = median_ms.(suites[{n, :gpu}], job_name)
 
-      _ ->
-        :ok
-    end
+      case {cpu_ms, gpu_ms} do
+        {c, g} when is_number(c) and is_number(g) and g > 0 ->
+          speedup = Float.round(c / g, 2)
+
+          IO.puts(
+            "    #{engine} n=#{n}: cpu=#{Float.round(c, 3)} ms, gpu=#{Float.round(g, 3)} ms, speedup=#{speedup}x"
+          )
+
+        _ ->
+          :ok
+      end
+    end)
   end)
 end

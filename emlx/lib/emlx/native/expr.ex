@@ -2179,6 +2179,39 @@ defmodule EMLX.Native.Expr do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
 
+  @doc """
+  Returns `true` if an `Nx.Block.*` `struct` (with the given `in_args`
+  operands) is lowered by `expand_node` above to a native op *without ever
+  consulting the block's `default_expr` fallback* — i.e. `default_expr`'s
+  content cannot affect the output of lowering this exact block instance.
+
+  This is the single source of truth for that fact, consulted both here
+  (implicitly, via the `expand_node` clauses above) and by
+  `EMLX.dispatch_key/3` (`lib/emlx.ex`), which uses it to decide whether
+  hashing `default_expr` is necessary for cache-key correctness — skipping it
+  for recognized native blocks avoids paying to hash a large, unused fallback
+  graph (e.g. `Nx.LinAlg.svd/1`'s ~100-iteration Jacobi rotation `default_expr`)
+  on every dispatch-key computation. Must be kept in sync with the
+  `expand_node` clauses above: a struct/shape combination that returns `true`
+  here but starts consulting `default_expr` in `expand_node` (e.g. a future
+  dtype-specific fallback) would let the dispatch key under-specify the
+  computation. Conservatively defaults to `false` (full hash) for anything
+  not explicitly proven native-lowerable here.
+  """
+  @spec native_lowerable_block?(struct(), [Nx.Tensor.t()]) :: boolean()
+  def native_lowerable_block?(%Nx.Block.LogicalNot{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.Take{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.TakeAlongAxis{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.FFT2{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.IFFT2{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.LinAlg.Cholesky{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.LinAlg.Solve{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.LinAlg.QR{mode: :reduced}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.LinAlg.Eigh{}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.LinAlg.SVD{full_matrices?: true}, _in_args), do: true
+  def native_lowerable_block?(%Nx.Block.LinAlg.LU{}, _in_args), do: true
+  def native_lowerable_block?(_struct, _in_args), do: false
+
   # ── dot helpers ────────────────────────────────────────────────────────────
 
   defp quantized_param_config(

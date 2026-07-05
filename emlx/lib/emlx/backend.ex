@@ -2183,7 +2183,7 @@ defmodule EMLX.Backend do
         to_nx(cholesky, out)
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
@@ -2207,14 +2207,14 @@ defmodule EMLX.Backend do
         {to_nx(q, out_q), to_nx(r, out_r)}
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
   @impl true
   def block(%Nx.Block.LinAlg.QR{mode: :complete} = struct, _output, args, fun) do
     # MLX only supports reduced QR; fall back to defn for :complete mode
-    apply(fun, [struct | args])
+    eager_fallback(struct, args, fun)
   end
 
   @impl true
@@ -2228,7 +2228,7 @@ defmodule EMLX.Backend do
         {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
@@ -2248,7 +2248,7 @@ defmodule EMLX.Backend do
         {to_nx(u, out_u), to_nx(s, out_s), to_nx(vt, out_v)}
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
@@ -2268,7 +2268,32 @@ defmodule EMLX.Backend do
 
   @impl true
   def block(struct, _output, args, fun) do
-    apply(fun, [struct | args])
+    eager_fallback(struct, args, fun)
+  end
+
+  # Runs a block's plain-Nx composite `fun` (the traced `default_expr`
+  # implementation) with `Nx.default_backend/1` pinned to `tensor`'s own
+  # backend/device for the duration of the call.
+  #
+  # Without this, a literal tensor `fun` creates internally without an
+  # explicit `:backend` (e.g. `Nx.LinAlg.SVD.svd/2`'s `qdwh/2` helper does
+  # `Nx.iota({}, type: :u8, ...) + 1` to seed its `while` loop's condition
+  # state) is allocated on `Nx.default_backend()` — `Nx.BinaryBackend` unless
+  # configured otherwise — regardless of which backend/device the real
+  # operand (`tensor`) lives on. Mixing that literal with `tensor` inside the
+  # composite's own control flow (e.g. the `while` loop's per-iteration
+  # state) then crashes some `Nx.BinaryBackend` ops (e.g. `put_slice/5`,
+  # which assumes all its operands are already `Nx.BinaryBackend`) with a
+  # `FunctionClauseError` instead of raising a clean cross-backend error.
+  # Pinning the default backend to `tensor`'s keeps every literal `fun`
+  # creates on the same backend/device, avoiding the mismatch entirely.
+  defp eager_fallback(device, struct, args, fun) when is_atom(device) do
+    Nx.with_default_backend({Backend, device: device}, fn -> apply(fun, [struct | args]) end)
+  end
+
+  defp eager_fallback(struct, [tensor | _] = args, fun) do
+    {device, _ref} = from_nx(tensor)
+    eager_fallback(device, struct, args, fun)
   end
 
   for {op, arity} <- [

@@ -144,6 +144,38 @@ defmodule EMLX do
 
       Nx.Defn.default_options(compiler: EMLX)
 
+  ## Compile once, replay many times
+
+  `Nx.Defn.jit/2` and `Nx.Defn.jit_apply/3` **retrace** the given function
+  from scratch on every call. For most ops that's cheap relative to the
+  actual computation, but for a hot loop (e.g. a decode step, or any call
+  site invoked with the same input shapes/types repeatedly) it means paying
+  full retrace + dispatch-key computation cost on every single call — for
+  some ops (e.g. `Nx.LinAlg.svd/1`, which traces a large, normally-unused
+  fallback algorithm as part of every trace) this cost can dominate over the
+  actual native computation.
+
+  If you know you'll call the same function repeatedly with the same input
+  shapes/types, prefer `Nx.Defn.compile/3`, which traces and lowers **once**
+  and returns a plain closure that replays the already-compiled program on
+  every subsequent call — no retrace, no re-lowering, no dispatch-key
+  recomputation:
+
+      svd = Nx.Defn.compile(&Nx.LinAlg.svd/1, [Nx.template({128, 128}, {:f, 32})], compiler: EMLX)
+      # Hold onto `svd` (e.g. in a GenServer, or a module attribute at startup)
+      # and call it repeatedly — each call below is pure replay:
+      {u, s, vt} = svd.(a)
+
+  This is exactly the strategy `Nx.Serving` and Bumblebee already rely on for
+  other compilers, and it works identically here — no `EMLX`-specific code
+  needed. EMLX additionally keeps a persistent, structural (shape/op-based,
+  not object-identity) dispatch-key cache across calls (see `dispatch_key/3`
+  in the source), which is what makes `Nx.Defn.Graph.run/3`'s per-call
+  re-tracing and structurally-identical-but-distinct call sites (e.g. many
+  copies of the same layer in a model) cheap too — but a caller-held
+  `Nx.Defn.compile/3` closure is always cheaper still, since it skips
+  retracing entirely.
+
   ## CPU JIT compilation and SIGCHLD
 
   On the CPU backend, MLX JIT-compiles fused kernels the first time it sees
@@ -1656,7 +1688,7 @@ defmodule EMLX do
     # `lower/2` can densify its input list even when `output_expr` doesn't
     # reference every parameter position (see EMLX.Native.Expr.lower/2 doc).
     num_inputs = vars |> Nx.Defn.Composite.flatten_list() |> length()
-    build_eval_fn(output_expr, worker, effective_device, num_inputs)
+    build_eval_fn(output_expr, worker, effective_device, num_inputs, fun, vars)
   end
 
   # Wraps a compiled eval closure so each invocation routes through `queue`.
@@ -1720,7 +1752,7 @@ defmodule EMLX do
   #     every `while`, replayed by `Nx.Defn.Graph.run/3` with
   #     `compiler: EMLX`; each stage re-enters this compiler (flat stages
   #     compile flat, isolated split-point stages hit the base case above).
-  defp build_eval_fn(output_expr, worker, effective_device, num_inputs) do
+  defp build_eval_fn(output_expr, worker, effective_device, num_inputs, fun, vars) do
     cond do
       bare_while?(output_expr) ->
         build_while_base_eval_fn(output_expr, effective_device)
@@ -1729,7 +1761,14 @@ defmodule EMLX do
         base_key = dispatch_key(output_expr, num_inputs, effective_device)
 
         {resource, hooks, runtime_calls} =
-          get_or_compile_program(base_key, %{}, output_expr, num_inputs, worker, effective_device)
+          get_or_compile_program(
+            base_key,
+            %{},
+            fn -> output_expr end,
+            num_inputs,
+            worker,
+            effective_device
+          )
 
         build_native_eval_fn(
           base_key,
@@ -1738,7 +1777,9 @@ defmodule EMLX do
           runtime_calls,
           output_expr,
           num_inputs,
-          effective_device
+          effective_device,
+          fun,
+          vars
         )
 
       true ->
@@ -1847,14 +1888,20 @@ defmodule EMLX do
   end
 
   # Builds the per-call eval closure for the flat (no-while) native path.
-  # `output_expr`/`num_inputs` are kept (not just the eagerly-compiled plain
-  # `program_resource`) so a quantized call can lower+compile a *specialized*
-  # program on demand — see `get_or_compile_program/6`. `base_key`
-  # is the structural dispatch key (`dispatch_key/3`),
-  # threaded through so a quantized specialization is cached persistently
-  # too, not just the plain program.
-  # `output_expr` also serves as the type/shape template for reconstructing
-  # output tensors after the NIF returns raw resource refs. `plain_hooks`
+  # `output_expr` is only used *here*, up front, to derive `output_template`,
+  # `real_output_count`, `quantizable_positions`, and `output_param_positions`
+  # (each bounded by output/parameter count, not graph size) — the returned
+  # closure itself never captures `output_expr` directly. The one exception
+  # is the rare quantized-specialization branch below, which needs the full
+  # expression to lower+compile a specialized program; it re-derives
+  # `output_expr` on demand via `fun.(vars)` instead of keeping it resident
+  # in every call's closure environment — see `get_or_compile_program/6`.
+  # `base_key` is the structural dispatch key (`dispatch_key/3`), threaded
+  # through so a quantized specialization is cached persistently too, not
+  # just the plain program.
+  # `output_template` (derived from `output_expr` above) serves as the
+  # type/shape template for reconstructing output tensors after the NIF
+  # returns raw resource refs. `plain_hooks`
   # (from `EMLX.Native.Expr.lower/2`'s `hooks` field, see its moduledoc
   # "Hooks" section) ride along as extra outputs after the real ones; the
   # corresponding Elixir callbacks fire here, once, right after the single
@@ -1870,7 +1917,9 @@ defmodule EMLX do
          plain_runtime_calls,
          output_expr,
          num_inputs,
-         effective_device
+         effective_device,
+         fun,
+         vars
        ) do
     output_template = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
     real_output_count = [output_template] |> Nx.Defn.Composite.flatten_list() |> length()
@@ -1904,12 +1953,22 @@ defmodule EMLX do
       # (and cached under `{base_key, %{}}`) by our caller, so the common
       # case skips a redundant cache round-trip; a quantized signature is
       # looked up (or compiled once and cached) here — see
-      # get_or_compile_program/6.
+      # get_or_compile_program/6. `fn -> fun.(vars) end` is only forced on
+      # that cache's own miss (once per distinct `{base_key, quant_signature}`
+      # for the process's lifetime) — never eagerly, so a cache *hit* here
+      # costs nothing beyond the lookup itself.
       {program_resource, hooks, runtime_calls} =
         if quant_signature == %{} do
           {plain_resource, plain_hooks, plain_runtime_calls}
         else
-          get_or_compile_program(base_key, quant_signature, output_expr, num_inputs, worker, dev)
+          get_or_compile_program(
+            base_key,
+            quant_signature,
+            fn -> fun.(vars) end,
+            num_inputs,
+            worker,
+            dev
+          )
         end
 
       job_ref =
@@ -1971,7 +2030,22 @@ defmodule EMLX do
   # won — we discard our (still valid, just unused) compiled resource and
   # reuse theirs. Wasted work on that race, not a correctness hazard (no
   # shared mutable state is corrupted).
-  defp get_or_compile_program(base_key, quant_signature, output_expr, num_inputs, worker, dev) do
+  #
+  # `output_expr_thunk` (a 0-arity fun, not `output_expr` itself) is only
+  # forced on this cache's own miss (the `[]` branch below) — callers that
+  # already have `output_expr` in hand (the plain, non-quantized path) pay
+  # nothing extra for the indirection, but the quantized-specialization
+  # caller (`build_native_eval_fn/9`) that re-derives `output_expr` via
+  # `fun.(vars)` only actually retraces when this cache misses, not on
+  # every call.
+  defp get_or_compile_program(
+         base_key,
+         quant_signature,
+         output_expr_thunk,
+         num_inputs,
+         worker,
+         dev
+       ) do
     cache_key = {base_key, quant_signature}
     table = dispatch_cache_table()
 
@@ -1980,7 +2054,7 @@ defmodule EMLX do
         {resource, hooks, runtime_calls}
 
       [] ->
-        program = EMLX.Native.Expr.lower(output_expr, num_inputs, quant_signature)
+        program = EMLX.Native.Expr.lower(output_expr_thunk.(), num_inputs, quant_signature)
         resource = compile_native_program(worker, dev, program)
 
         if :ets.insert_new(table, {cache_key, resource, program.hooks, program.runtime_calls}) do
@@ -2108,6 +2182,25 @@ defmodule EMLX do
           # (which is exactly what `EMLX.Native.Expr.lower/2` actually lowers)
           # keeps this O(1) per node instead of O(depth) per node.
           {:__emlx__, t.shape, t.type, sanitize_key_term(emlx, positions)}
+
+        %Nx.Tensor{
+          data: %Nx.Defn.Expr{op: :block, args: [struct, in_args, _default_expr, _fun] = args}
+        } = t ->
+          # See `EMLX.Native.Expr.native_lowerable_block?/2`'s doc: recognized
+          # native blocks (e.g. `Nx.LinAlg.svd/1`'s `full_matrices?: true`)
+          # never consult `default_expr` when lowering, so `default_expr` is
+          # deliberately excluded from the signature too — walking/hashing it
+          # (potentially a ~100-node Jacobi-rotation fallback graph, per call)
+          # would be pure waste for a sub-scope that provably can't affect the
+          # output. Anything not recognized falls back to signing the full
+          # `args` (including `default_expr`, via the opaque-scope path in
+          # `sanitize_key_term/2` below) exactly as before — the conservative
+          # default.
+          if EMLX.Native.Expr.native_lowerable_block?(struct, in_args) do
+            {:block, t.shape, t.type, struct, sanitize_key_term(in_args, positions)}
+          else
+            {:block, t.shape, t.type, sanitize_key_term(args, positions)}
+          end
 
         %Nx.Tensor{data: %Nx.Defn.Expr{op: op, args: args}} = t ->
           {op, t.shape, t.type, sanitize_key_term(args, positions)}

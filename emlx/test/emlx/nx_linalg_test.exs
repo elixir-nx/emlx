@@ -92,6 +92,41 @@ defmodule EMLX.Nx.LinalgTest do
     end
   end
 
+  describe "native linalg: svd/1 (GPU eager fallback via defn_evaluator)" do
+    @describetag :metal
+
+    test "full_matrices?: true on a GPU-resident tensor doesn't crash under compiler: Nx.Defn.Evaluator" do
+      # `EMLX.Backend.block/4` has no native `:gpu` kernel for `full_matrices?:
+      # true` SVD, so it falls back to eagerly running the plain-Nx composite
+      # algorithm (`Nx.LinAlg.SVD.svd/2`) op-by-op. That composite creates a
+      # literal tensor internally without an explicit `:backend` (`qdwh/2`'s
+      # `while`-loop condition seed, `Nx.iota({}, type: :u8, ...) + 1`), which
+      # used to land on `Nx.default_backend()` instead of matching the real
+      # (GPU) operand's backend/device -- crashing with a `FunctionClauseError`
+      # in `Nx.BinaryBackend.put_slice/5` the first time the composite's
+      # `while` loop tried to merge state across the mismatched backends.
+      # `EMLX.Backend.block/4`'s `eager_fallback/3,4` helper pins the default
+      # backend to the operand's own backend/device for the duration of the
+      # fallback to prevent this.
+      a =
+        Nx.iota({6, 6}, type: :f32)
+        |> Nx.add(Nx.eye(6))
+        |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+      {u, s, vt} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: true) end,
+          compiler: Nx.Defn.Evaluator
+        ).(a)
+
+      assert u.shape == {6, 6}
+      assert s.shape == {6}
+      assert vt.shape == {6, 6}
+
+      recon = Nx.dot(Nx.multiply(u, Nx.reshape(s, {1, 6})), vt)
+      assert_all_close(recon, Nx.backend_transfer(a), rtol: 1.0e-3)
+    end
+  end
+
   describe "native linalg: cholesky/1" do
     test "L @ L^T reconstruction" do
       a =

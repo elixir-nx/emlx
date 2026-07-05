@@ -3433,6 +3433,64 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
+  describe "native block dispatch-key caching (skips default_expr for recognized blocks)" do
+    test "svd full_matrices?: true: distinct retraces of the same shape share one dispatch-key entry" do
+      shape = {17, 17}
+      a1 = Nx.iota(shape, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
+
+      a2 =
+        Nx.iota(shape, type: :f32) |> Nx.divide(7) |> Nx.add(1) |> Nx.backend_transfer(EMLX.Backend)
+
+      fun = fn t -> Nx.LinAlg.svd(t, full_matrices?: true) end
+
+      # `Nx.Defn.jit_apply/3` retraces `fun` from scratch on every call (fresh
+      # `Expr` ids each time), so `dispatch_key/3`'s id-based fast path always
+      # misses and the structural signature walk always runs -- this is the
+      # retrace-per-call pattern the PRD targets. Both calls must still land
+      # in the *same* dispatch-cache entry: `default_expr`'s content (data-
+      # independent, since tracing is symbolic) was never what discriminated
+      # these before this change either, so this also guards against a
+      # regression that would split them.
+      {u1, s1, vt1} = Nx.Defn.jit_apply(fun, [a1], compiler: EMLX)
+      {u2, s2, vt2} = Nx.Defn.jit_apply(fun, [a2], compiler: EMLX)
+
+      entries = dispatch_cache_entries_mentioning(shape)
+      assert length(entries) == 1
+
+      assert_close(Nx.dot(Nx.multiply(u1, Nx.reshape(s1, {1, 17})), vt1), a1)
+      assert_close(Nx.dot(Nx.multiply(u2, Nx.reshape(s2, {1, 17})), vt2), a2)
+    end
+
+    test "svd full_matrices?: false: default_expr still discriminates the dispatch key" do
+      # full_matrices?: false lowers via `expand_block_via_default`'s
+      # while-unroll (see "while-in-default_expr descent" above) -- it
+      # genuinely consults `default_expr`, so two traces whose `default_expr`
+      # differs (here, via `max_iter`, which changes the unrolled Jacobi
+      # iteration count) must land in *different* dispatch-cache entries.
+      # G3 regression guard: `native_lowerable_block?/2` must not (and does
+      # not) match `full_matrices?: false`, so this path is untouched by P1.
+      shape = {13, 13}
+      a = Nx.iota(shape, type: :f32) |> Nx.add(1) |> Nx.backend_transfer(EMLX.Backend)
+
+      fun_50 = fn t -> Nx.LinAlg.svd(t, full_matrices?: false, max_iter: 50) end
+      fun_100 = fn t -> Nx.LinAlg.svd(t, full_matrices?: false, max_iter: 100) end
+
+      {u1, s1, vt1} = Nx.Defn.jit_apply(fun_50, [a], compiler: EMLX)
+      entries_after_50 = dispatch_cache_entries_mentioning(shape)
+
+      {u2, s2, vt2} = Nx.Defn.jit_apply(fun_100, [a], compiler: EMLX)
+      entries_after_both = dispatch_cache_entries_mentioning(shape)
+
+      assert length(entries_after_both) > length(entries_after_50)
+
+      # Loose tolerance: the Jacobi rotation algorithm's reconstruction
+      # accuracy at these iteration counts isn't what this test is about --
+      # only that both traces still compute a valid SVD.
+      assert_close(Nx.dot(Nx.multiply(u1, Nx.reshape(s1, {1, 13})), vt1), a, 1.0e-2)
+      assert_close(Nx.dot(Nx.multiply(u2, Nx.reshape(s2, {1, 13})), vt2), a, 1.0e-2)
+    end
+  end
+
   # Softmax normalisation over the last axis (primitive SDPA reference helper).
   defp normalize_rows(t) do
     Nx.divide(t, Nx.sum(t, axes: [-1], keep_axes: true))
