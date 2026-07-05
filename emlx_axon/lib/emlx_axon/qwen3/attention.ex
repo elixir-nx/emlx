@@ -7,8 +7,11 @@ defmodule EMLXAxon.Qwen3.Attention do
   the cache without an extra transpose, and feeds directly into
   `EMLX.Fast.scaled_dot_product_attention` which expects `{B, N, T, D}`.
 
-  RoPE is computed by `EMLX.Fast.rope/6` (single Metal shader, no precomputed
-  cos/sin needed). The `offset` is the current cache fill length.
+  `forward/12` delegates to the native `EMLX.Native.Qwen3.kv_cache_attention`/
+  `attention_block` NIFs (`qwen3_plugin.cpp`), which transpose Q/K to
+  `{B, N, T, D}` and apply RoPE internally via `mlx::core::fast::rope`
+  (single Metal shader, no precomputed cos/sin needed) before the fused
+  cache-update + SDPA. The `offset` is the current cache fill length.
   """
 
   alias EMLXAxon.Qwen3.Layers

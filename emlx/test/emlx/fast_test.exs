@@ -123,6 +123,32 @@ defmodule EMLX.FastTest do
 
       assert_all_close(out2, expected, atol: 1.0e-4, rtol: 1.0e-4)
     end
+
+    # https://github.com/elixir-nx/emlx/issues/121 — mlx::core::fast::rope's
+    # head_seq_transpose stride-detection guard doesn't trigger for a
+    # freshly-allocated, contiguous {B,T,H,D} tensor, so its row_contiguous
+    # fallback used to rotate head h at angle `position + h` instead of
+    # `position`, for every h > 0. Every head, computed jointly, must equal
+    # that same head computed alone (same position, no cross-head leakage).
+    test "T=1 decode, H>1: every head matches its single-head computation" do
+      dims = 8
+      half = div(dims, 2)
+      freqs = Nx.iota({half}, type: :f32) |> Nx.add(0.1) |> Nx.divide(20) |> gpu()
+
+      a = Nx.iota({1, 1, 3, dims}, type: :f32) |> Nx.divide(20) |> gpu()
+      pos = Nx.tensor([[6]], type: :s32) |> gpu()
+
+      joint = Fast.rope_with_freqs(a, pos, dims, false, 1.0, freqs) |> Nx.backend_transfer()
+
+      for head <- 0..2 do
+        a_head = a[[.., .., head..head, ..]]
+
+        alone =
+          Fast.rope_with_freqs(a_head, pos, dims, false, 1.0, freqs) |> Nx.backend_transfer()
+
+        assert_all_close(joint[[.., .., head..head, ..]], alone, atol: 1.0e-4, rtol: 1.0e-4)
+      end
+    end
   end
 
   describe "EMLX.Fast.rope_with_positions/6" do
@@ -150,6 +176,32 @@ defmodule EMLX.FastTest do
         Nx.add(Nx.multiply(a, cos_full), Nx.multiply(rotated, sin_full)) |> Nx.backend_transfer()
 
       assert_all_close(out, expected, atol: 1.0e-4, rtol: 1.0e-4)
+    end
+
+    # https://github.com/elixir-nx/emlx/issues/121 — low-base (< 1.0e5) T=1
+    # decode routes through fast_rope_ids (mlx::core::fast::rope's
+    # array-offset overload), which had the same multi-head bug as
+    # fast_rope_with_freqs (see the regression test in the describe block
+    # above). Every head, computed jointly, must equal that same head
+    # computed alone.
+    test "low-base decode (T=1), H>1: every head matches its single-head computation" do
+      dims = 8
+      base = 10_000.0
+
+      a = Nx.iota({1, 1, 3, dims}, type: :f32) |> Nx.divide(50) |> gpu()
+      pos = Nx.tensor([[7]], type: :s32) |> gpu()
+
+      joint = Fast.rope_with_positions(a, pos, dims, false, base, 1.0) |> Nx.backend_transfer()
+
+      for head <- 0..2 do
+        a_head = a[[.., .., head..head, ..]]
+
+        alone =
+          Fast.rope_with_positions(a_head, pos, dims, false, base, 1.0)
+          |> Nx.backend_transfer()
+
+        assert_all_close(joint[[.., .., head..head, ..]], alone, atol: 1.0e-4, rtol: 1.0e-4)
+      end
     end
   end
 

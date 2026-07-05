@@ -461,7 +461,12 @@ defmodule EMLX.Fast do
   @doc """
   Fused rotary position embedding (`mlx::fast::rope`).
 
-  - `a`           — input `{B, ..., T, D}`; `...` dims are passed through.
+  - `a`           — input `{B, ..., T, D}`; `...` dims are passed through, but
+    **`T` must be the second-to-last axis** (e.g. `{B, H, T, D}`,
+    heads-transposed) — see `EMLX.fast_rope/6`'s `@doc` for why a heads-axis
+    placed *before* `T` (Bumblebee's `{B, T, H, D}`) silently miscomputes for
+    more than one head ([elixir-nx/emlx#121](https://github.com/elixir-nx/emlx/issues/121)).
+    Use `rope_with_positions/6` or `rope_with_freqs/6` for that layout instead.
   - `dims`        — number of feature dims to rotate (≤ last-axis size, must be even).
   - `traditional` — `false` for split-half (Qwen3); `true` for interleaved.
   - `base`        — angular frequency base (e.g. `10_000` or `1_000_000`).
