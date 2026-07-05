@@ -3,7 +3,6 @@ defmodule EMLX.Native.ExprTest do
   Tests for the EMLX native defn compiler:
     - EMLX.Native.Expr struct shape (refs as node IDs, atom opcodes, attrs)
     - lower/1 (parameter, constant, tensor/capture, add, identity)
-    - EMLX.Native.Expr.Interpreter (pure-Elixir reference evaluator)
     - compile_program / eval_program NIFs via to_wire/1 (C++ replay)
     - Compiler seam: Nx.Defn.compile(..., compiler: EMLX) via single-NIF replay
     - Unary + binary + compare/logical equivalence vs EMLX.Backend
@@ -19,10 +18,7 @@ defmodule EMLX.Native.ExprTest do
   defn add_one(x), do: Nx.add(x, 1)
   defn identity(x), do: x
 
-  defn mul_chain(x), do: x |> Nx.multiply(2.0) |> Nx.add(1.0) |> Nx.tanh()
-
   defn gt_f32(a, b), do: Nx.greater(a, b)
-  defn eq_f32(a, b), do: Nx.equal(a, b)
   defn cmp_mixed(a, b), do: Nx.greater(a, b)
   defn mixed_add(a, b), do: Nx.add(a, b)
 
@@ -58,10 +54,6 @@ defmodule EMLX.Native.ExprTest do
     dense = EMLX.Quantization.dequantize(qw)
     Nx.add(x, dense) |> Nx.multiply(2.0)
   end
-
-  defn reshape_23(x), do: Nx.reshape(x, {2, 3})
-  defn broadcast_23(x), do: Nx.broadcast(x, {2, 3})
-  defn concat_axis0(a, b), do: Nx.concatenate([a, b], axis: 0)
 
   defn hook_top_level(a, b) do
     hooked = hook(Nx.multiply(Nx.add(a, b), 2), :mid, fn t -> send(self(), {:mid, t}) end)
@@ -258,6 +250,31 @@ defmodule EMLX.Native.ExprTest do
       assert [{_result, :add, [_input_ref, ^capture_ref], []}] = prog.instructions
     end
 
+    test "closed-over tensor executes correctly (capture, not just lowering shape)" do
+      # Same manually-built capture Expr as the lowering-shape test above --
+      # `Nx.Defn.jit`/`check_equiv` can't exercise this naturally: Nx itself
+      # guards against a real `defn` closure embedding an EMLX.Backend tensor
+      # (see the comment above), so this can only be reached by hand-building
+      # the Expr tree. Runs it through the real to_wire/NIF path (not just
+      # inspecting `prog`) to prove the capture actually evaluates correctly.
+      weight_tensor = Nx.tensor(10.0, backend: EMLX.Backend)
+
+      weight_expr = %Nx.Tensor{
+        data: %Nx.Defn.Expr{id: make_ref(), op: :tensor, args: [weight_tensor], context: nil},
+        type: weight_tensor.type,
+        shape: weight_tensor.shape,
+        names: weight_tensor.names
+      }
+
+      param_a = Nx.Defn.Expr.parameter(:root, {:f, 32}, {}, 0)
+      prog = Expr.lower(Nx.add(param_a, weight_expr))
+
+      x = Nx.tensor(5.0, backend: EMLX.Backend)
+      [out] = run_nif(prog, [x])
+
+      assert_in_delta Nx.to_number(out), 15.0, 1.0e-6
+    end
+
     test "unknown op raises ArgumentError with 'does not yet lower op'" do
       expr = %Nx.Tensor{
         data: %Nx.Defn.Expr{id: make_ref(), op: :this_op_does_not_exist, args: [], context: nil},
@@ -302,50 +319,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  # ── Interpreter (reference evaluator) ────────────────────────────────────
-
-  describe "EMLX.Native.Expr.Interpreter" do
-    test "identity program returns input unchanged" do
-      expr = Nx.Defn.debug_expr_apply(&identity/1, [Nx.template({3}, :f32)])
-      prog = Expr.lower(expr)
-
-      x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
-      [out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
-
-      assert_all_close(out, x)
-    end
-
-    test "add two EMLX inputs" do
-      expr = Nx.Defn.debug_expr_apply(&add_two/2, [Nx.template({}, :f32), Nx.template({}, :f32)])
-      prog = Expr.lower(expr)
-
-      x = Nx.tensor(3.0, backend: EMLX.Backend)
-      y = Nx.tensor(4.0, backend: EMLX.Backend)
-      [out] = EMLX.Native.Expr.Interpreter.eval(prog, [x, y])
-
-      assert_in_delta Nx.to_number(out), 7.0, 1.0e-6
-    end
-
-    test "add parameter + captured tensor" do
-      weight_tensor = Nx.tensor(10.0, backend: EMLX.Backend)
-
-      weight_expr = %Nx.Tensor{
-        data: %Nx.Defn.Expr{id: make_ref(), op: :tensor, args: [weight_tensor], context: nil},
-        type: weight_tensor.type,
-        shape: weight_tensor.shape,
-        names: weight_tensor.names
-      }
-
-      param_a = Nx.Defn.Expr.parameter(:root, {:f, 32}, {}, 0)
-      prog = Expr.lower(Nx.add(param_a, weight_expr))
-
-      x = Nx.tensor(5.0, backend: EMLX.Backend)
-      [out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
-
-      assert_in_delta Nx.to_number(out), 15.0, 1.0e-6
-    end
-  end
-
   # ── compile_program / eval_program NIFs ──────────────────────────────────
 
   describe "compile_program / eval_program NIFs" do
@@ -387,26 +360,6 @@ defmodule EMLX.Native.ExprTest do
       out = EMLX.Backend.to_nx({device, out_ref}, a)
 
       assert_in_delta Nx.to_number(out), 7.0, 1.0e-6
-    end
-
-    test "Interpreter and C++ replay agree on add", %{worker: worker, device: device} do
-      expr = Nx.Defn.debug_expr_apply(&add_two/2, [Nx.template({}, :f32), Nx.template({}, :f32)])
-      prog = Expr.lower(expr)
-
-      a = Nx.tensor(2.5, backend: EMLX.Backend)
-      b = Nx.tensor(1.5, backend: EMLX.Backend)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [a, b])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_a}} = a.data
-      %EMLX.Backend{ref: {_, ref_b}} = b.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_a, ref_b])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, a)
-
-      assert_in_delta Nx.to_number(interp_out), Nx.to_number(cpp_out), 1.0e-6
     end
   end
 
@@ -753,51 +706,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  describe "interpreter ↔ C++ replay parity (unary/binary/compare)" do
-    setup do
-      device = EMLX.default_device()
-      {worker, _} = EMLX.resolve_worker(device)
-      %{worker: worker, device: device}
-    end
-
-    test "interpreter and C++ agree on mul+add+tanh chain", %{worker: worker, device: device} do
-      x = Nx.tensor([0.5, 1.0, -1.0], backend: EMLX.Backend)
-      expr = Nx.Defn.debug_expr_apply(&mul_chain/1, [Nx.template({3}, :f32)])
-      prog = EMLX.Native.Expr.lower(expr)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_x}} = x.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, x)
-
-      assert_all_close(interp_out, cpp_out, tol: 1.0e-5)
-    end
-
-    test "interpreter and C++ agree on compare+cast: equal(f32, f32) → u8",
-         %{worker: worker, device: device} do
-      a = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
-      b = Nx.tensor([1.0, 3.0, 3.0], backend: EMLX.Backend)
-      expr = Nx.Defn.debug_expr_apply(&eq_f32/2, [Nx.template({3}, :f32), Nx.template({3}, :f32)])
-      prog = EMLX.Native.Expr.lower(expr)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [a, b])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_a}} = a.data
-      %EMLX.Backend{ref: {_, ref_b}} = b.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_a, ref_b])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
-
-      assert_all_close(interp_out, cpp_out)
-    end
-  end
-
   describe "reshape" do
     test "1D → 2D, 2D → 1D" do
       x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], backend: EMLX.Backend)
@@ -1003,73 +911,6 @@ defmodule EMLX.Native.ExprTest do
     test "squeeze all singleton dims" do
       x = Nx.tensor([[[1.0]]], backend: EMLX.Backend)
       check_equiv(fn t -> Nx.squeeze(t) end, [x])
-    end
-  end
-
-  describe "interpreter ↔ C++ replay parity (shape/movement)" do
-    setup do
-      device = EMLX.default_device()
-      {worker, _} = EMLX.resolve_worker(device)
-      %{worker: worker, device: device}
-    end
-
-    test "interpreter and C++ agree on reshape {6} → {2, 3}", %{worker: worker, device: device} do
-      x = Nx.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], backend: EMLX.Backend)
-      expr = Nx.Defn.debug_expr_apply(&reshape_23/1, [Nx.template({6}, :f32)])
-      prog = EMLX.Native.Expr.lower(expr)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_x}} = x.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
-
-      assert_all_close(interp_out, cpp_out)
-    end
-
-    test "interpreter and C++ agree on broadcast {3} → {2, 3}", %{worker: worker, device: device} do
-      x = Nx.tensor([1.0, 2.0, 3.0], backend: EMLX.Backend)
-      expr = Nx.Defn.debug_expr_apply(&broadcast_23/1, [Nx.template({3}, :f32)])
-      prog = EMLX.Native.Expr.lower(expr)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_x}} = x.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
-
-      assert_all_close(interp_out, cpp_out)
-    end
-
-    test "interpreter and C++ agree on concatenate axis 0", %{worker: worker, device: device} do
-      a = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
-      b = Nx.tensor([3.0, 4.0, 5.0], backend: EMLX.Backend)
-
-      expr =
-        Nx.Defn.debug_expr_apply(&concat_axis0/2, [
-          Nx.template({2}, :f32),
-          Nx.template({3}, :f32)
-        ])
-
-      prog = EMLX.Native.Expr.lower(expr)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [a, b])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_a}} = a.data
-      %EMLX.Backend{ref: {_, ref_b}} = b.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_a, ref_b])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
-
-      assert_all_close(interp_out, cpp_out)
     end
   end
 
@@ -1392,59 +1233,6 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  defn sum_all(x), do: Nx.sum(x)
-  defn matmul_22(a, b), do: Nx.dot(a, b)
-
-  describe "interpreter ↔ C++ parity" do
-    setup do
-      device = EMLX.default_device()
-      {worker, _} = EMLX.resolve_worker(device)
-      %{worker: worker, device: device}
-    end
-
-    test "interpreter and C++ agree on sum {2,3}", %{worker: worker, device: device} do
-      x = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
-      expr = Nx.Defn.debug_expr_apply(&sum_all/1, [Nx.template({2, 3}, :f32)])
-      prog = EMLX.Native.Expr.lower(expr)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [x])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_x}} = x.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
-
-      assert_all_close(interp_out, cpp_out)
-    end
-
-    test "interpreter and C++ agree on matmul {2,3}×{3,2}", %{worker: worker, device: device} do
-      a = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], backend: EMLX.Backend)
-      b = Nx.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], backend: EMLX.Backend)
-
-      expr =
-        Nx.Defn.debug_expr_apply(&matmul_22/2, [
-          Nx.template({2, 3}, :f32),
-          Nx.template({3, 2}, :f32)
-        ])
-
-      prog = EMLX.Native.Expr.lower(expr)
-
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [a, b])
-
-      {n_inputs, caps, cvs, cts, ops, ors, ias, outs} = EMLX.Native.Expr.to_wire(prog)
-      prog_ref = compile_nif!(worker, n_inputs, caps, cvs, cts, ops, ors, ias, outs)
-
-      %EMLX.Backend{ref: {_, ref_a}} = a.data
-      %EMLX.Backend{ref: {_, ref_b}} = b.data
-      [out_ref] = eval_nif!(worker, prog_ref, [ref_a, ref_b])
-      cpp_out = EMLX.Backend.to_nx({device, out_ref}, interp_out)
-
-      assert_all_close(interp_out, cpp_out)
-    end
-  end
-
   defn sum_axis1_keep(x), do: Nx.sum(x, axes: [1], keep_axes: true)
   defn argmax_axis0(x), do: Nx.argmax(x, axis: 0)
   defn matmul_defn(a, b), do: Nx.dot(a, b)
@@ -1493,22 +1281,6 @@ defmodule EMLX.Native.ExprTest do
   defn indexed_add_defn(x, idx, updates), do: Nx.indexed_add(x, idx, updates)
 
   describe "select" do
-    test "interpreter parity — f32" do
-      pred =
-        Nx.tensor([1, 0, 1, 0], type: :u8, backend: EMLX.Backend)
-        |> Nx.reshape({4})
-
-      a = Nx.tensor([1.0, 2.0, 3.0, 4.0], backend: EMLX.Backend)
-      b = Nx.tensor([5.0, 6.0, 7.0, 8.0], backend: EMLX.Backend)
-
-      expr = Nx.Defn.debug_expr_apply(&select_defn/3, [pred, a, b])
-      prog = Expr.lower(expr)
-
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [pred, a, b])
-      nif = run_nif(prog, [pred, a, b])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend" do
       pred = Nx.tensor([1, 0, 1], type: :u8, backend: EMLX.Backend)
       a = Nx.tensor([10.0, 20.0, 30.0], backend: EMLX.Backend)
@@ -1530,19 +1302,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "clip" do
-    test "interpreter parity — f32" do
-      x = Nx.tensor([-1.0, 0.5, 2.0, 3.5], backend: EMLX.Backend)
-      lo = Nx.tensor(0.0, backend: EMLX.Backend)
-      hi = Nx.tensor(2.0, backend: EMLX.Backend)
-
-      expr = Nx.Defn.debug_expr_apply(&clip_defn/3, [x, lo, hi])
-      prog = Expr.lower(expr)
-
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, lo, hi])
-      nif = run_nif(prog, [x, lo, hi])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend — f32" do
       x = Nx.iota({5}, type: :f32, backend: EMLX.Backend) |> Nx.subtract(2.0)
       lo = Nx.tensor(-1.0, backend: EMLX.Backend)
@@ -1563,15 +1322,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "slice (static indices)" do
-    test "interpreter parity — static 2D slice" do
-      x = Nx.iota({4, 5}, type: :f32, backend: EMLX.Backend)
-      expr = Nx.Defn.debug_expr_apply(&slice_static_defn/1, [x])
-      prog = Expr.lower(expr)
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x])
-      nif = run_nif(prog, [x])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend — static 2D slice" do
       x = Nx.iota({4, 5}, type: :f32, backend: EMLX.Backend)
       native = Nx.Defn.jit(&slice_static_defn/1, compiler: EMLX).(x)
@@ -1618,17 +1368,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "put_slice (static indices)" do
-    test "interpreter parity — static 2D put_slice" do
-      x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
-      patch = Nx.broadcast(Nx.tensor(99.0, backend: EMLX.Backend), {2, 2})
-
-      expr = Nx.Defn.debug_expr_apply(&put_slice_static_defn/2, [x, patch])
-      prog = Expr.lower(expr)
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, patch])
-      nif = run_nif(prog, [x, patch])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend — static 2D put_slice" do
       x = Nx.iota({4, 4}, type: :f32, backend: EMLX.Backend)
       patch = Nx.broadcast(Nx.tensor(99.0, backend: EMLX.Backend), {2, 2})
@@ -1654,17 +1393,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "gather" do
-    test "interpreter parity — 2D gather on axis 0" do
-      x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
-      idx = Nx.tensor([[0], [2], [1]], type: :s32, backend: EMLX.Backend)
-
-      expr = Nx.Defn.debug_expr_apply(&gather_defn/2, [x, idx])
-      prog = Expr.lower(expr)
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx])
-      nif = run_nif(prog, [x, idx])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend — 2D gather on axis 0" do
       x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
       idx = Nx.tensor([[0], [2], [1]], type: :s32, backend: EMLX.Backend)
@@ -1686,17 +1414,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "take" do
-    test "interpreter parity" do
-      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
-      idx = Nx.tensor([2, 0, 3, 1], type: :s32, backend: EMLX.Backend)
-
-      expr = Nx.Defn.debug_expr_apply(&take_defn/2, [x, idx])
-      prog = Expr.lower(expr)
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx])
-      nif = run_nif(prog, [x, idx])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend" do
       x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
       idx = Nx.tensor([2, 0, 3, 1], type: :s32, backend: EMLX.Backend)
@@ -1707,17 +1424,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "take_along_axis" do
-    test "interpreter parity" do
-      x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
-      idx = Nx.tensor([[2, 0, 1, 2]], type: :s32, backend: EMLX.Backend)
-
-      expr = Nx.Defn.debug_expr_apply(&take_along_axis_defn/2, [x, idx])
-      prog = Expr.lower(expr)
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx])
-      nif = run_nif(prog, [x, idx])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend" do
       x = Nx.iota({3, 4}, type: :f32, backend: EMLX.Backend)
       idx = Nx.tensor([[2, 0, 1, 2]], type: :s32, backend: EMLX.Backend)
@@ -1728,18 +1434,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "indexed_put" do
-    test "interpreter parity" do
-      x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
-      idx = Nx.tensor([[0], [2]], type: :s32, backend: EMLX.Backend)
-      updates = Nx.tensor([[99.0, 99.0, 99.0], [88.0, 88.0, 88.0]], backend: EMLX.Backend)
-
-      expr = Nx.Defn.debug_expr_apply(&indexed_put_defn/3, [x, idx, updates])
-      prog = Expr.lower(expr)
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx, updates])
-      nif = run_nif(prog, [x, idx, updates])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend" do
       x = Nx.iota({4, 3}, type: :f32, backend: EMLX.Backend)
       idx = Nx.tensor([[0], [2]], type: :s32, backend: EMLX.Backend)
@@ -1751,20 +1445,6 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "indexed_add" do
-    test "interpreter parity" do
-      x = Nx.broadcast(Nx.tensor(0.0, backend: EMLX.Backend), {4, 3})
-      idx = Nx.tensor([[0], [0], [2]], type: :s32, backend: EMLX.Backend)
-
-      updates =
-        Nx.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [5.0, 5.0, 5.0]], backend: EMLX.Backend)
-
-      expr = Nx.Defn.debug_expr_apply(&indexed_add_defn/3, [x, idx, updates])
-      prog = Expr.lower(expr)
-      interp = EMLX.Native.Expr.Interpreter.eval(prog, [x, idx, updates])
-      nif = run_nif(prog, [x, idx, updates])
-      assert_close(hd(interp), hd(nif))
-    end
-
     test "equivalence vs EMLX.Backend" do
       x = Nx.broadcast(Nx.tensor(0.0, backend: EMLX.Backend), {4, 3})
       idx = Nx.tensor([[0], [0], [2]], type: :s32, backend: EMLX.Backend)
@@ -2101,20 +1781,11 @@ defmodule EMLX.Native.ExprTest do
       assert shape == [3, 4]
     end
 
-    test "iota flat: interpreter matches Nx.iota" do
-      alias EMLX.Native.Expr.Interpreter
-
-      prog = Expr.lower(Nx.Defn.debug_expr_apply(&iota_flat_defn/0, []))
-      [out] = Interpreter.eval(prog, [])
-      expected = Nx.iota({3, 4}, backend: EMLX.Backend)
-      assert_close(out, expected)
-    end
-
-    test "iota flat: C++ replay matches interpreter" do
+    test "iota flat: C++ replay (to_wire) matches Nx.iota" do
       prog = Expr.lower(Nx.Defn.debug_expr_apply(&iota_flat_defn/0, []))
       [nif_out] = run_nif(prog, [])
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [])
-      assert_close(nif_out, interp_out)
+      expected = Nx.iota({3, 4}, backend: EMLX.Backend)
+      assert_close(nif_out, expected)
     end
 
     test "iota flat: E2E jit vs Nx.Defn.Evaluator" do
@@ -2155,20 +1826,11 @@ defmodule EMLX.Native.ExprTest do
       assert n == 3
     end
 
-    test "eye 3x3: interpreter matches Nx.eye" do
-      alias EMLX.Native.Expr.Interpreter
-
-      prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
-      [out] = Interpreter.eval(prog, [])
-      expected = Nx.eye({3, 3}, backend: EMLX.Backend)
-      assert_close(out, expected)
-    end
-
-    test "eye 3x3: C++ replay matches interpreter" do
+    test "eye 3x3: C++ replay (to_wire) matches Nx.eye" do
       prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
       [nif_out] = run_nif(prog, [])
-      [interp_out] = EMLX.Native.Expr.Interpreter.eval(prog, [])
-      assert_close(nif_out, interp_out)
+      expected = Nx.eye({3, 3}, backend: EMLX.Backend)
+      assert_close(nif_out, expected)
     end
 
     test "eye 3x3: E2E jit vs Nx.Defn.Evaluator" do
