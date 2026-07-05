@@ -380,6 +380,52 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
 // stream — validated to work for both :cpu and :gpu default devices.
 static const mlx::core::Device k_linalg_cpu(mlx::core::Device::DeviceType::cpu, 0);
 
+// ── SPIKE: EMLXWhileSpike ─────────────────────────────────────────────────
+//
+// TEMPORARY — de-risking spike for native `:while` lowering (see
+// EMLX.Native.Expr's `:while` TODO). Proves that a `mlx::core::Primitive`
+// pinned to the CPU stream can safely call `mlx::core::eval()` *from inside*
+// its own `eval_cpu`, while that primitive's own evaluation is itself
+// reached via an outer `mlx::core::eval(outputs)` call in `eval_program`
+// (i.e. a nested/reentrant eval on the same worker OS thread) — the same
+// question EMLXRuntimeCall's design deliberately avoids (it never calls
+// mlx::core::eval itself; it only blocks on a condvar). If this spike
+// deadlocks, crashes, or produces wrong results, native `:while` needs a
+// different execution strategy than "loop + eval() each iteration inside
+// eval_cpu". Not reachable from any real Elixir lowering path — wired
+// directly via a hand-built `EMLX.Native.Instruction{op: :while_spike}` in
+// a throwaway test. Remove once the real EMLXWhile primitive lands.
+class EMLXWhileSpike : public mlx::core::Primitive {
+public:
+  explicit EMLXWhileSpike(mlx::core::Stream stream) : mlx::core::Primitive(stream) {}
+
+  void eval_cpu(const std::vector<mlx::core::array> &inputs,
+               std::vector<mlx::core::array> &outputs) override {
+    eval(inputs, outputs);
+  }
+  void eval_gpu(const std::vector<mlx::core::array> &inputs,
+               std::vector<mlx::core::array> &outputs) override {
+    eval(inputs, outputs);
+  }
+
+  bool is_equivalent(const mlx::core::Primitive &) const override { return false; }
+  const char *name() const override { return "EMLXWhileSpike"; }
+
+private:
+  void eval(const std::vector<mlx::core::array> &inputs,
+           std::vector<mlx::core::array> &outputs) {
+    mlx::core::array current = inputs[0];
+    for (int i = 0; i < 5; i++) {
+      mlx::core::array next =
+          mlx::core::add(current, mlx::core::array(1, current.dtype()));
+      // The nested/reentrant eval() call under test.
+      mlx::core::eval(next);
+      current = next;
+    }
+    outputs[0].copy_shared_buffer(current);
+  }
+};
+
 static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
     {"astype",
@@ -1330,6 +1376,15 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        return mlx::core::contiguous(
            mlx::core::linalg::solve_triangular(ops[0], ops[1], upper, k_linalg_cpu),
            false, k_linalg_cpu);
+     }},
+
+    // ── SPIKE: while_spike (see EMLXWhileSpike above) ────────────────────
+    {"while_spike",
+     [](const auto &ops, const auto &) {
+       auto primitive = std::make_shared<EMLXWhileSpike>(
+           mlx::core::default_stream(k_linalg_cpu));
+       return mlx::core::array::make_arrays({ops[0].shape()}, {ops[0].dtype()},
+                                            primitive, ops)[0];
      }},
 
     // ── EMLX.Fast fused kernels (mlx::core::fast) ──────────────────────────

@@ -355,6 +355,40 @@ defmodule EMLX.Native.ExprTest do
 
       assert_in_delta Nx.to_number(out), 7.0, 1.0e-6
     end
+
+    # SPIKE (temporary): de-risks native `:while` lowering by proving that a
+    # `mlx::core::Primitive` (`EMLXWhileSpike`, emlx_compiler.cpp) can safely
+    # call `mlx::core::eval()` *inside* its own `eval_cpu`, itself reached via
+    # `eval_program`'s outer `mlx::core::eval(outputs)` — i.e. a
+    # nested/reentrant eval on the same worker OS thread. Hand-built
+    # instruction (no Elixir lowering path emits `:while_spike` — see
+    # EMLXWhileSpike's own doc comment). Bounded by a generous-but-finite
+    # test timeout: a deadlock here should fail loudly, not hang the suite.
+    @tag timeout: 15_000
+    test "SPIKE: nested eval() inside a Primitive's eval_cpu does not deadlock", %{
+      worker: worker,
+      device: device
+    } do
+      wire = %EMLX.Native.Program{
+        num_inputs: 1,
+        captures: [],
+        constants: [],
+        instructions: [
+          %EMLX.Native.Instruction{op: :while_spike, operands: [{:input, 0}], attrs: []}
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      prog_ref = compile_nif!(worker, wire)
+
+      x = Nx.tensor(10, type: :s32, backend: EMLX.Backend)
+      %EMLX.Backend{ref: {_, ref_x}} = x.data
+
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
+      out = EMLX.Backend.to_nx({device, out_ref}, x)
+
+      assert Nx.to_number(out) == 15
+    end
   end
 
   # ── compiler seam (end-to-end) ────────────────────────────────────────────
