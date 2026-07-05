@@ -9,7 +9,9 @@ defmodule EMLX.Nx.LinalgTest do
   # Ops that use defn fallbacks and may differ from LAPACK doctests:
   # - matrix_power: pure defn
   # - least_squares: no MLX native
-  # - triangular_solve: small float differences from solve_triangular vs LAPACK reference
+  # - triangular_solve: small float differences vs LAPACK reference, plus a
+  #   handful of doctests using `Nx.vectorize/2`-batched inputs (unsupported —
+  #   separate pre-existing gap, not related to left_side/transform_a)
   # - cholesky: small float differences
   # - lu: MLX raises on singular matrices (doctest uses [[1,2,3],[4,5,6],[7,8,9]])
   # - qr: sign convention differences (-0.0 vs 0.0) and float precision
@@ -87,6 +89,41 @@ defmodule EMLX.Nx.LinalgTest do
       u_reduced = u[[0..-1//1, 0..1//1]]
       reconstructed = u_reduced |> Nx.multiply(s) |> Nx.dot(vt)
       assert_all_close(reconstructed, a, rtol: 1.0e-4)
+    end
+  end
+
+  describe "native linalg: svd/1 (GPU eager fallback via defn_evaluator)" do
+    @describetag :metal
+
+    test "full_matrices?: true on a GPU-resident tensor doesn't crash under compiler: Nx.Defn.Evaluator" do
+      # `EMLX.Backend.block/4` has no native `:gpu` kernel for `full_matrices?:
+      # true` SVD, so it falls back to eagerly running the plain-Nx composite
+      # algorithm (`Nx.LinAlg.SVD.svd/2`) op-by-op. That composite creates a
+      # literal tensor internally without an explicit `:backend` (`qdwh/2`'s
+      # `while`-loop condition seed, `Nx.iota({}, type: :u8, ...) + 1`), which
+      # used to land on `Nx.default_backend()` instead of matching the real
+      # (GPU) operand's backend/device -- crashing with a `FunctionClauseError`
+      # in `Nx.BinaryBackend.put_slice/5` the first time the composite's
+      # `while` loop tried to merge state across the mismatched backends.
+      # `EMLX.Backend.block/4`'s `eager_fallback/3,4` helper pins the default
+      # backend to the operand's own backend/device for the duration of the
+      # fallback to prevent this.
+      a =
+        Nx.iota({6, 6}, type: :f32)
+        |> Nx.add(Nx.eye(6))
+        |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+      {u, s, vt} =
+        Nx.Defn.jit(fn t -> Nx.LinAlg.svd(t, full_matrices?: true) end,
+          compiler: Nx.Defn.Evaluator
+        ).(a)
+
+      assert u.shape == {6, 6}
+      assert s.shape == {6}
+      assert vt.shape == {6, 6}
+
+      recon = Nx.dot(Nx.multiply(u, Nx.reshape(s, {1, 6})), vt)
+      assert_all_close(recon, Nx.backend_transfer(a), rtol: 1.0e-3)
     end
   end
 

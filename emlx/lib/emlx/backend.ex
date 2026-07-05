@@ -4,15 +4,15 @@ defmodule EMLX.Backend do
   alias Nx.Tensor, as: T
   alias EMLX.Backend, as: Backend
 
-  require Logger
+  require EMLX.Debug
+  import EMLX.Debug, only: [assert_no_nan_inf!: 2]
 
-  # Compile-time debug flags. Both default to false (zero runtime cost when off).
+  # Compile-time debug flag. Defaults to false (zero runtime cost when off).
   # Enable only in development via config/dev.exs:
   #   config :emlx, enable_bounds_check: true
-  #   config :emlx, detect_non_finites: true
-  # After flipping a flag run: mix compile --force
+  # After flipping run: mix compile --force
+  # (:detect_non_finites lives in EMLX.Debug, shared with EMLX.Fast.)
   @enable_bounds_check Application.compile_env(:emlx, :enable_bounds_check, false)
-  @detect_non_finites Application.compile_env(:emlx, :detect_non_finites, false)
 
   # Each macro expands to the assertion body when its flag is true, or to nil
   # when false — leaving no trace in the BEAM opcodes (no call instruction,
@@ -72,25 +72,6 @@ defmodule EMLX.Backend do
           raise ArgumentError,
                 "index out of bounds on axis #{unquote(axis)}: all values must be in [0, #{limit}). " <>
                   "Tensor shape: #{inspect(unquote(tensor).shape)}"
-        end
-      end
-    else
-      quote do: nil
-    end
-  end
-
-  # Checks a raw MLX ref for NaN or Inf. Forces two eval syncs — development only.
-  defmacrop assert_no_nan_inf!(tensor_ref, op) do
-    if @detect_non_finites do
-      quote do
-        has_nan = unquote(tensor_ref) |> EMLX.is_nan() |> EMLX.any([], false)
-        has_inf = unquote(tensor_ref) |> EMLX.is_infinity() |> EMLX.any([], false)
-        EMLX.eval(has_nan)
-        EMLX.eval(has_inf)
-
-        if EMLX.item(has_nan) == 1 or EMLX.item(has_inf) == 1 do
-          raise ArgumentError,
-                "#{unquote(op)} produced NaN or Inf. Disable :detect_non_finites for production."
         end
       end
     else
@@ -381,8 +362,10 @@ defmodule EMLX.Backend do
 
   @impl true
   def to_binary(tensor, limit) do
-    EMLX.to_blob(from_nx(tensor), limit)
-    |> maybe_modify_binary(to_nx_type(to_mlx_type(tensor.type)), tensor.type)
+    EMLX.Telemetry.span_to_binary(tensor, fn ->
+      EMLX.to_blob(from_nx(tensor), limit)
+      |> maybe_modify_binary(to_nx_type(to_mlx_type(tensor.type)), tensor.type)
+    end)
   end
 
   @impl true
@@ -450,10 +433,16 @@ defmodule EMLX.Backend do
     end
   end
 
-  defp maybe_modify_binary(binary, {:u, size}, {:u, 8}) when size in [2, 4] do
-    for <<bits::integer-native-size(size) <- binary>>, into: <<>> do
-      <<bits::integer-native-size(8)>>
-    end
+  defp maybe_modify_binary(binary, {:u, 2}, {:u, 8}) do
+    for <<bits::integer-native-size(2) <- binary>>,
+      into: <<>>,
+      do: <<bits::integer-native-size(8)>>
+  end
+
+  defp maybe_modify_binary(binary, {:u, 4}, {:u, 8}) do
+    for <<bits::integer-native-size(4) <- binary>>,
+      into: <<>>,
+      do: <<bits::integer-native-size(8)>>
   end
 
   defp maybe_modify_binary(binary, {:u, 8}, {:u, size}) when size in [2, 4] do
@@ -701,26 +690,7 @@ defmodule EMLX.Backend do
   defp needs_type_conversion?({:u, 8}, :bool), do: true
   defp needs_type_conversion?(_, _), do: false
 
-  defp to_mlx_type({:u, 2}), do: :uint8
-  defp to_mlx_type({:u, 4}), do: :uint8
-  defp to_mlx_type({:u, 8}), do: :uint8
-  defp to_mlx_type({:u, 16}), do: :uint16
-  defp to_mlx_type({:u, 32}), do: :uint32
-  defp to_mlx_type({:u, 64}), do: :uint64
-  defp to_mlx_type({:s, 2}), do: :int8
-  defp to_mlx_type({:s, 4}), do: :int8
-  defp to_mlx_type({:s, 8}), do: :int8
-  defp to_mlx_type({:s, 16}), do: :int16
-  defp to_mlx_type({:s, 32}), do: :int32
-  defp to_mlx_type({:s, 64}), do: :int64
-  defp to_mlx_type({:f, 8}), do: :float16
-  defp to_mlx_type({:f, 16}), do: :float16
-  defp to_mlx_type({:f, 32}), do: :float32
-  defp to_mlx_type({:f, 64}), do: :float32
-  defp to_mlx_type({:bf, 16}), do: :bfloat16
-  defp to_mlx_type({:c, 64}), do: :complex64
-  defp to_mlx_type({:c, 128}), do: :complex64
-  defp to_mlx_type(:bool), do: :bool
+  defp to_mlx_type(type), do: EMLX.Native.to_mlx_type(type)
 
   defp to_nx_type(:uint8), do: {:u, 8}
   defp to_nx_type(:uint16), do: {:u, 16}
@@ -865,7 +835,6 @@ defmodule EMLX.Backend do
       # Get the actual shape after summation
       actual_shape = EMLX.shape(result)
       # FIXME: MLX returns whatever the original type is, but Nx expects u8 -> u32
-      # scalar_type = EMLX.scalar_type(result)
 
       # Create a new output tensor with the correct shape
       %{out | shape: actual_shape}
@@ -916,7 +885,7 @@ defmodule EMLX.Backend do
       # Apply reversal for tie_break after NaN check
       t_mx =
         if opts[:tie_break] == :high do
-          reverse_mlx(t_mx, tensor.shape, [axis] || Nx.axes(tensor))
+          reverse_mlx(t_mx, tensor.shape, if(axis, do: [axis], else: Nx.axes(tensor)))
         else
           t_mx
         end
@@ -1119,19 +1088,23 @@ defmodule EMLX.Backend do
       |> Enum.sort()
       |> Enum.map(&elem(&1, 1))
 
-    input_mx
-    |> EMLX.conv_general(
-      kernel_mx,
-      strides,
-      padding_low,
-      padding_high,
-      kernel_dilation,
-      input_dilation,
-      feature_group_count
-    )
-    |> EMLX.transpose(permute_channels_first)
-    |> EMLX.transpose(output_permutation)
-    |> to_nx(out)
+    result_ref =
+      input_mx
+      |> EMLX.conv_general(
+        kernel_mx,
+        strides,
+        padding_low,
+        padding_high,
+        kernel_dilation,
+        input_dilation,
+        feature_group_count
+      )
+      |> EMLX.transpose(permute_channels_first)
+      |> EMLX.transpose(output_permutation)
+
+    assert_no_nan_inf!(result_ref, :conv)
+
+    to_nx(result_ref, out)
   end
 
   defp dot_spec_to_einsum_spec(
@@ -1250,8 +1223,13 @@ defmodule EMLX.Backend do
   defp quantized_dot(out, activation, qw_tensor, right_axes) do
     %Backend{ref: weight_ref, quantization_config: cfg} = qw_tensor.data
 
-    %EMLX.Quantization.Config{scales: scales_nx, biases: biases_nx, group_size: gs, bits: bits} =
-      cfg
+    %EMLX.Quantization.Config{
+      scales: scales_nx,
+      biases: biases_nx,
+      group_size: gs,
+      bits: bits,
+      mode: mode
+    } = cfg
 
     weight_rank = tuple_size(qw_tensor.shape)
     last_dim = weight_rank - 1
@@ -1265,15 +1243,20 @@ defmodule EMLX.Backend do
         explicit -> explicit
       end
 
+    # biases_nx is nil for microscaled modes (mxfp4/mxfp8/nvfp4) — mx::fp_quantize
+    # doesn't emit them.
+    biases_ref = biases_nx && from_nx(biases_nx)
+
     result =
       EMLX.quantized_matmul(
         from_nx(activation),
         weight_ref,
         from_nx(scales_nx),
-        from_nx(biases_nx),
+        biases_ref,
         transpose,
         gs,
-        bits
+        bits,
+        mode
       )
 
     to_nx(result, out)
@@ -1310,8 +1293,10 @@ defmodule EMLX.Backend do
           )
 
         EMLX.einsum(
-          to_typed_ref(left_mx, left_type, computation_out_type),
-          to_typed_ref(right_mx, right_type, computation_out_type),
+          [
+            to_typed_ref(left_mx, left_type, computation_out_type),
+            to_typed_ref(right_mx, right_type, computation_out_type)
+          ],
           einsum_spec
         )
         |> to_typed_ref(computation_out_type, out_type)
@@ -2054,13 +2039,23 @@ defmodule EMLX.Backend do
     b_mx = to_typed_ref(from_nx(b), b.type, {:f, 32}) |> EMLX.to_device(:cpu)
 
     upper = !opts[:lower]
+    a_axes_swap = swap_last_two_axes(Nx.rank(a))
 
     # Apply transform_a: transposing flips the upper/lower triangularity.
-    # For real types, :conjugate is equivalent to :transpose.
+    # :conjugate means "conjugate the entries" (a no-op for the real dtypes
+    # EMLX supports here — complex is rejected above), NOT a transpose. It is
+    # only equivalent to :transpose under LAPACK's conjugate-*transpose*
+    # convention, which is not what Nx.LinAlg.triangular_solve documents (see
+    # Nx.BinaryBackend.Matrix.ts/8: :conjugate pre-conjugates and is treated
+    # as :none).
+    #
+    # NB: axes must be a non-negative full permutation (e.g. [1, 0] for rank 2)
+    # here — a literal [-2, -1] normalizes to [0, 1] for rank 2, which is a
+    # silent no-op, not a swap.
     {a_mx, effective_upper} =
       case opts[:transform_a] do
-        :none -> {a_typed, upper}
-        t when t in [:transpose, :conjugate] -> {EMLX.transpose(a_typed, [-2, -1]), !upper}
+        :transpose -> {EMLX.transpose(a_typed, a_axes_swap), !upper}
+        _ -> {a_typed, upper}
       end
 
     out_mx =
@@ -2069,16 +2064,17 @@ defmodule EMLX.Backend do
         EMLX.linalg_solve_triangular(a_mx, b_mx, effective_upper)
       else
         # Solve XA = B → A^T x = b (works for both 1D and 2D b)
-        a_t = EMLX.transpose(a_mx, [-2, -1])
+        a_t = EMLX.transpose(a_mx, a_axes_swap)
 
         if Nx.rank(b) == 1 do
           # b is 1D: solve_triangular handles A^T x = b directly
           EMLX.linalg_solve_triangular(a_t, b_mx, !effective_upper)
         else
-          b_t = EMLX.transpose(b_mx, [-2, -1])
+          b_axes_swap = swap_last_two_axes(Nx.rank(b))
+          b_t = EMLX.transpose(b_mx, b_axes_swap)
 
           EMLX.linalg_solve_triangular(a_t, b_t, !effective_upper)
-          |> EMLX.transpose([-2, -1])
+          |> EMLX.transpose(b_axes_swap)
         end
       end
 
@@ -2086,6 +2082,13 @@ defmodule EMLX.Backend do
     |> EMLX.astype(to_mlx_type(out.type))
     |> EMLX.to_device(device)
     |> to_nx(out)
+  end
+
+  # Non-negative permutation swapping the last two axes, identity elsewhere.
+  # rank 2 -> [1, 0]; rank 3 -> [0, 2, 1]; etc.
+  defp swap_last_two_axes(rank) do
+    {front, [x, y]} = Enum.split(Enum.to_list(0..(rank - 1)), rank - 2)
+    front ++ [y, x]
   end
 
   cumulative_blocks = [
@@ -2180,7 +2183,7 @@ defmodule EMLX.Backend do
         to_nx(cholesky, out)
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
@@ -2204,14 +2207,14 @@ defmodule EMLX.Backend do
         {to_nx(q, out_q), to_nx(r, out_r)}
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
   @impl true
   def block(%Nx.Block.LinAlg.QR{mode: :complete} = struct, _output, args, fun) do
     # MLX only supports reduced QR; fall back to defn for :complete mode
-    apply(fun, [struct | args])
+    eager_fallback(struct, args, fun)
   end
 
   @impl true
@@ -2225,7 +2228,7 @@ defmodule EMLX.Backend do
         {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
@@ -2245,7 +2248,7 @@ defmodule EMLX.Backend do
         {to_nx(u, out_u), to_nx(s, out_s), to_nx(vt, out_v)}
 
       :gpu ->
-        fun.(struct, tensor)
+        eager_fallback(device, struct, [tensor], fun)
     end
   end
 
@@ -2265,7 +2268,32 @@ defmodule EMLX.Backend do
 
   @impl true
   def block(struct, _output, args, fun) do
-    apply(fun, [struct | args])
+    eager_fallback(struct, args, fun)
+  end
+
+  # Runs a block's plain-Nx composite `fun` (the traced `default_expr`
+  # implementation) with `Nx.default_backend/1` pinned to `tensor`'s own
+  # backend/device for the duration of the call.
+  #
+  # Without this, a literal tensor `fun` creates internally without an
+  # explicit `:backend` (e.g. `Nx.LinAlg.SVD.svd/2`'s `qdwh/2` helper does
+  # `Nx.iota({}, type: :u8, ...) + 1` to seed its `while` loop's condition
+  # state) is allocated on `Nx.default_backend()` — `Nx.BinaryBackend` unless
+  # configured otherwise — regardless of which backend/device the real
+  # operand (`tensor`) lives on. Mixing that literal with `tensor` inside the
+  # composite's own control flow (e.g. the `while` loop's per-iteration
+  # state) then crashes some `Nx.BinaryBackend` ops (e.g. `put_slice/5`,
+  # which assumes all its operands are already `Nx.BinaryBackend`) with a
+  # `FunctionClauseError` instead of raising a clean cross-backend error.
+  # Pinning the default backend to `tensor`'s keeps every literal `fun`
+  # creates on the same backend/device, avoiding the mismatch entirely.
+  defp eager_fallback(device, struct, args, fun) when is_atom(device) do
+    Nx.with_default_backend({Backend, device: device}, fn -> apply(fun, [struct | args]) end)
+  end
+
+  defp eager_fallback(struct, [tensor | _] = args, fun) do
+    {device, _ref} = from_nx(tensor)
+    eager_fallback(device, struct, args, fun)
   end
 
   for {op, arity} <- [

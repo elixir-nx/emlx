@@ -1,5 +1,7 @@
+#include "emlx_compiler.hpp"
 #include "emlx_nif_shared.hpp"
 #include "emlx_fast/qwen3.hpp"
+#include "emlx_plugin_registry.hpp"
 
 #include <iostream>
 #include <map>
@@ -9,15 +11,6 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
-
-std::map<const std::string, const mlx::core::Dtype> dtypes = {
-    {"bool", mlx::core::bool_},         {"uint8", mlx::core::uint8},
-    {"uint16", mlx::core::uint16},      {"uint32", mlx::core::uint32},
-    {"uint64", mlx::core::uint64},      {"int8", mlx::core::int8},
-    {"int16", mlx::core::int16},        {"int32", mlx::core::int32},
-    {"int64", mlx::core::int64},        {"float16", mlx::core::float16},
-    {"float32", mlx::core::float32},    {"bfloat16", mlx::core::bfloat16},
-    {"complex64", mlx::core::complex64}};
 
 std::map<const std::string, const uint8_t> dtype_sizes = {
     {"bool", mlx::core::bool_.size()},
@@ -33,23 +26,6 @@ std::map<const std::string, const uint8_t> dtype_sizes = {
     {"float32", mlx::core::float32.size()},
     {"bfloat16", mlx::core::bfloat16.size()},
     {"complex64", mlx::core::complex64.size()}};
-
-inline mlx::core::Dtype string2dtype(const std::string &atom) {
-  auto it = dtypes.find(atom);
-  if (it != dtypes.end()) {
-    return it->second;
-  }
-  throw std::runtime_error("Unknown dtype: " + atom);
-}
-
-inline const std::string *dtype2string(const mlx::core::Dtype dtype) {
-  for (const auto &pair : dtypes) {
-    if (pair.second == dtype) {
-      return &pair.first;
-    }
-  }
-  return nullptr;
-}
 
 
 ERL_NIF_TERM
@@ -74,29 +50,6 @@ create_tensor_resource(ErlNifEnv *env, mlx::core::array tensor) {
 
   return ret;
 }
-
-ERL_NIF_TERM create_function_resource(ErlNifEnv *env, emlx::function function) {
-  ERL_NIF_TERM ret;
-  std::atomic<int> *refcount;
-  auto function_ptr = (emlx::function *)enif_alloc_resource(
-      resource_object<emlx::function>::type,
-      sizeof(std::function<std::vector<array>(const std::vector<array> &)>) +
-          sizeof(std::atomic<int>) + sizeof(std::atomic_flag));
-
-  if (function_ptr == NULL) {
-    return enif_make_badarg(env);
-  }
-
-  new (function_ptr) emlx::function(function);
-  refcount = new (function_ptr + 1) std::atomic<int>(1);
-  new (refcount + 1) std::atomic_flag();
-
-  ret = enif_make_resource(env, function_ptr);
-  enif_release_resource(function_ptr);
-
-  return ret;
-}
-
 
 NIF(deallocate) {
   TensorP t(env, argv[0]);
@@ -135,14 +88,6 @@ NIF(ones) {
   DEVICE_PARAM(2, device);
 
   TENSOR(mlx::core::ones(to_shape(shape), type, device));
-}
-
-NIF(zeros) {
-  SHAPE_PARAM(0, shape);
-  TYPE_PARAM(1, type);
-  DEVICE_PARAM(2, device);
-
-  TENSOR(mlx::core::zeros(to_shape(shape), type, device));
 }
 
 NIF(reshape) {
@@ -332,18 +277,19 @@ NIF(tensordot) {
 }
 
 NIF(einsum) {
-  TENSOR_PARAM(0, a);
-  TENSOR_PARAM(1, b);
+  // Variadic operand count (2+), e.g. for a 3-operand contraction like
+  // "ij,jk,kl->il" — see stack/concatenate above for the same
+  // list-of-tensor-resources decode pattern.
+  LIST_PARAM(0, std::vector<mlx::core::array>, arrays);
 
   std::string spec_string;
-  if (!nx::nif::get(env, argv[2], spec_string)) {
+  if (!nx::nif::get(env, argv[1], spec_string)) {
     return nx::nif::error(env, "Unable to get spec_string param.");
   }
 
-  DEVICE_PARAM(3, device);
+  DEVICE_PARAM(2, device);
 
-  TENSOR(mlx::core::einsum(spec_string, std::vector<mlx::core::array>({*a, *b}),
-                           device));
+  TENSOR(mlx::core::einsum(spec_string, arrays, device));
 }
 
 NIF(tri_inv) {
@@ -500,6 +446,21 @@ NIF(argsort) {
 NIF(eval) {
   TENSOR_PARAM(0, t);
   mlx::core::eval(*t);
+  mlx::core::synchronize();
+  return nx::nif::ok(env);
+}
+
+// Evaluates several tensors in one round trip instead of one `eval` NIF
+// call per ref. `eval_program` itself returns lazy refs (see its comment);
+// this batches their materialization. Currently unused from Elixir (kept
+// as a general-purpose multi-ref eval primitive) — the earlier in-graph
+// `:host_callback` round-trip opcode that motivated it was removed in
+// favor of graph-splitting on bare `Nx.runtime_call` (see `EMLX.__compile__/3`
+// and `EMLX.Defn.Tree`'s `:__EMLX__` metadata handling in `expr.ex`).
+NIF(eval_many) {
+  LIST_PARAM(0, std::vector<mlx::core::array>, inputs);
+  mlx::core::eval(inputs);
+  mlx::core::synchronize();
   return nx::nif::ok(env);
 }
 
@@ -1037,14 +998,21 @@ static int open_resources(ErlNifEnv *env) {
     return -1;
   }
 
-  if (!open_resource<emlx::function>(env, mod, "CompiledFunction")) {
-    return -1;
-  }
-
   // emlx::Worker — backs EMLX.CommandQueue and the application default
   // worker. Default destructor (~Worker) signals stop, drains pending
   // jobs, and joins the OS thread.
   if (!open_resource<emlx::Worker>(env, mod, "CommandQueue")) {
+    return -1;
+  }
+
+  // emlx::native::Expr — opaque compiled program resource for the defn compiler.
+  if (!open_resource<emlx::native::Expr>(env, mod, "NativeProgram")) {
+    return -1;
+  }
+
+  // emlx::native::PendingRuntimeCall — opaque handle for one in-flight
+  // Nx.runtime_call/4 round trip (see emlx_runtime_call_bridge.hpp).
+  if (!open_resource<emlx::native::PendingRuntimeCall>(env, mod, "PendingRuntimeCall")) {
     return -1;
   }
 
@@ -1381,52 +1349,76 @@ NIF(as_strided) {
 // quantized_matmul - Multiplies x with a quantized weight matrix w
 // This is the key operation for efficient 4-bit inference
 // MLX API: quantized_matmul(x, w, scales, biases, transpose, group_size, bits, stream)
+// mode: "affine" (default, real biases) or a microscaled variant
+// ("mxfp4"/"mxfp8"/"nvfp4" — no biases; mx::fp_quantize returns only
+// (wq, scales)). biases is `nil` from Elixir for microscaled modes.
 NIF(quantized_matmul) {
   TENSOR_PARAM(0, x);       // Input tensor [batch, seq, hidden]
   TENSOR_PARAM(1, w);       // Quantized weights [out/8, in] (uint32 packed)
-  TENSOR_PARAM(2, scales);  // Scales [out/group_size, in] (bfloat16)
-  TENSOR_PARAM(3, biases);  // Biases [out/group_size, in] (bfloat16)
+  TENSOR_PARAM(2, scales);  // Scales [out/group_size, in] (bfloat16, or u8 for microscaled)
+  OPTIONAL_TENSOR_PARAM(3, biases); // Biases (bfloat16); nil for microscaled modes
   PARAM(4, bool, transpose);
   PARAM(5, int, group_size);
   PARAM(6, int, bits);
-  DEVICE_PARAM(7, device);
+  std::string mode;
+  if (!nx::nif::get(env, argv[7], mode)) {
+    return nx::nif::error(env, "Unable to get mode param.");
+  }
+  DEVICE_PARAM(8, device);
+
+  std::optional<mlx::core::array> biases_opt =
+      biases ? std::make_optional(*biases) : std::nullopt;
 
   TENSOR(mlx::core::quantized_matmul(
-      *x, *w, *scales, *biases, transpose, group_size, bits, "affine", device));
+      *x, *w, *scales, biases_opt, transpose, group_size, bits, mode, device));
 }
 
 // dequantize - Converts quantized weights back to float
 // Useful for debugging and verification
-// MLX API: dequantize(w, scales, biases, group_size, bits, stream)
+// MLX API: dequantize(w, scales, biases, group_size, bits, mode, stream)
 NIF(dequantize) {
   TENSOR_PARAM(0, w);       // Quantized weights (uint32 packed)
-  TENSOR_PARAM(1, scales);  // Scales (bfloat16)
-  TENSOR_PARAM(2, biases);  // Biases (bfloat16)
+  TENSOR_PARAM(1, scales);  // Scales (bfloat16, or u8 for microscaled)
+  OPTIONAL_TENSOR_PARAM(2, biases); // Biases (bfloat16); nil for microscaled modes
   PARAM(3, int, group_size);
   PARAM(4, int, bits);
-  DEVICE_PARAM(5, device);
+  std::string mode;
+  if (!nx::nif::get(env, argv[5], mode)) {
+    return nx::nif::error(env, "Unable to get mode param.");
+  }
+  DEVICE_PARAM(6, device);
 
-  TENSOR(mlx::core::dequantize(*w, *scales, *biases, group_size, bits, "affine", std::nullopt, std::nullopt, device));
+  std::optional<mlx::core::array> biases_opt =
+      biases ? std::make_optional(*biases) : std::nullopt;
+
+  TENSOR(mlx::core::dequantize(*w, *scales, biases_opt, group_size, bits, mode, std::nullopt, std::nullopt, device));
 }
 
 // quantize - Quantizes a float tensor to packed format
-// Returns tuple of {weights, scales, biases}
-// MLX API: quantize(w, group_size, bits, stream) -> tuple<array, array, array>
+// Returns a 3-tuple {weights, scales, biases}; biases is the atom `nil` for
+// microscaled modes ("mxfp4"/"mxfp8"/"nvfp4"), which don't produce a biases
+// array (mx::quantize's `result` vector has 2 elements instead of 3 there).
+// MLX API: quantize(w, group_size, bits, mode, stream) -> vector<array>
 NIF(quantize) {
   TENSOR_PARAM(0, w);       // Float weights to quantize
   PARAM(1, int, group_size);
   PARAM(2, int, bits);
-  DEVICE_PARAM(3, device);
+  std::string mode;
+  if (!nx::nif::get(env, argv[3], mode)) {
+    return nx::nif::error(env, "Unable to get mode param.");
+  }
+  DEVICE_PARAM(4, device);
 
   try {
-    auto result = mlx::core::quantize(*w, group_size, bits, "affine", std::nullopt, device);
+    auto result = mlx::core::quantize(*w, group_size, bits, mode, std::nullopt, device);
 
-    ERL_NIF_TERM result_tuple[3];
-    result_tuple[0] = create_tensor_resource(env, result[0]);
-    result_tuple[1] = create_tensor_resource(env, result[1]);
-    result_tuple[2] = create_tensor_resource(env, result[2]);
+    ERL_NIF_TERM weights_term = create_tensor_resource(env, result[0]);
+    ERL_NIF_TERM scales_term = create_tensor_resource(env, result[1]);
+    ERL_NIF_TERM biases_term = result.size() > 2
+        ? create_tensor_resource(env, result[2])
+        : enif_make_atom(env, "nil");
 
-    return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
+    return nx::nif::ok(env, enif_make_tuple3(env, weights_term, scales_term, biases_term));
   }
   CATCH()
 }
@@ -1682,6 +1674,7 @@ NIF(window_scatter_min) {
 // limits, evaluated buffer pointers).
 
 ASYNC_NIF(eval)
+ASYNC_NIF(eval_many)
 ASYNC_NIF(to_blob)
 ASYNC_NIF(tensor_to_shm)
 ASYNC_NIF(item)
@@ -1813,8 +1806,19 @@ ASYNC_NIF(tensordot)
 ASYNC_NIF(window_scatter_max)
 ASYNC_NIF(window_scatter_min)
 
+// ── Native compiler NIFs (logic lives in emlx_compiler.cpp) ──────────────────
+//
+// compile_program is defined directly in emlx_compiler.cpp via
+// FINE_ASYNC_NIF(compile_program) (see emlx_compiler.hpp for the
+// compile_program/compile_program_async declarations); referenced fully
+// qualified in nif_funcs[] below, same as resolve_runtime_call.
+
+NIF(eval_program) { return emlx::native::eval_program(env, argc, argv); }
+ASYNC_NIF(eval_program)
+
 static ErlNifFunc nif_funcs[] = {
-    {"eval", 2, eval_async},
+    {"eval", 2, eval_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"eval_many", 2, eval_many_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"to_device", 3, to_device_async},
     {"to_blob", 2, to_blob_async},
     {"to_blob", 3, to_blob_async},
@@ -1944,7 +1948,7 @@ static ErlNifFunc nif_funcs[] = {
     {"linalg_solve", 4, linalg_solve_async},
     {"linalg_solve_triangular", 5, linalg_solve_triangular_async},
     {"conv_general", 10, conv_general_async},
-    {"einsum", 5, einsum_async},
+    {"einsum", 4, einsum_async},
     {"tensordot", 6, tensordot_async},
 
     {"window_scatter_max", 9, window_scatter_max_async},
@@ -1969,35 +1973,53 @@ static ErlNifFunc nif_funcs[] = {
     {"command_queue_new", 1, command_queue_new},
     {"command_queue_synchronize", 1, command_queue_synchronize},
     // Quantization operations (async — must run on a worker thread)
-    {"quantized_matmul", 9, quantized_matmul_async},
-    {"dequantize", 7, dequantize_async},
-    {"quantize", 5, quantize_async},
+    {"quantized_matmul", 10, quantized_matmul_async},
+    {"dequantize", 8, dequantize_async},
+    {"quantize", 6, quantize_async},
 
     // mlx::fast ops (worker arity includes queue ref as argv[0])
     {"fast_rms_norm", 5, fast_rms_norm_async},
     {"fast_rope", 8, fast_rope_async},
-    {"fast_sdpa", 6, fast_sdpa_async},
-    {"fast_sdpa_masked", 7, fast_sdpa_masked_async},
+    {"fast_sdpa", 7, fast_sdpa_async},
+    {"fast_sdpa_masked", 8, fast_sdpa_masked_async},
     {"fast_rope_ids", 8, fast_rope_ids_async},
     {"fast_rope_with_freqs", 8, fast_rope_with_freqs_async},
     {"fast_rope_positions", 8, fast_rope_positions_async},
-    {"fast_sdpa_causal_key_masked", 8, fast_sdpa_causal_key_masked_async},
-    {"fast_sdpa_causal", 6, fast_sdpa_causal_async},
+    {"fast_sdpa_causal_key_masked", 9, fast_sdpa_causal_key_masked_async},
+    {"fast_sdpa_causal", 7, fast_sdpa_causal_async},
     {"fast_layer_norm", 6, fast_layer_norm_async},
     {"fast_layer_norm_no_bias", 5, fast_layer_norm_no_bias_async},
     {"fast_swiglu", 4, fast_swiglu_async},
     {"kv_cache_attention", 9, kv_cache_attention_async},
     {"kv_cache_attention_masked", 10, kv_cache_attention_masked_async},
     {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
+
+    // ── Native compiler NIFs.
+    {"compile_program", 2, emlx::native::compile_program_async,
+     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"eval_program", 3, eval_program_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    // resolve_runtime_call is NOT worker-routed: it only decodes a reply and
+    // memcpy's it into pre-registered buffers/notifies a condvar — no MLX
+    // graph work, so it can run directly on the calling BEAM scheduler.
+    {"resolve_runtime_call", 3, emlx::native::resolve_runtime_call},
+
+    // ── Qwen3 model accelerators (emlx_fast/qwen3.cpp).
     {"qwen3_kv_cache_attention", 11, qwen3_kv_cache_attention_async},
     {"qwen3_mlp", 8, qwen3_mlp_async},
     {"qwen3_layer", 21, qwen3_layer_async},
+    {"qwen3_layer_quantized", 21, qwen3_layer_quantized_async},
     {"qwen3_forward_greedy_ids", 13, qwen3_forward_greedy_ids_async},
     {"qwen3_forward_greedy_ids_chunk", 14, qwen3_forward_greedy_ids_chunk_async},
+    {"qwen3_forward_greedy_ids_chunk_quantized", 14,
+     qwen3_forward_greedy_ids_chunk_quantized_async},
     {"qwen3_forward_greedy_ids_token_id", 13, qwen3_forward_greedy_ids_token_id_async},
     {"qwen3_forward_greedy_token_id", 13, qwen3_forward_greedy_token_id_async},
     {"qwen3_final_greedy", 6, qwen3_final_greedy_async},
     {"qwen3_attention_residual", 5, qwen3_attention_residual_async},
-    {"qwen3_attention_block", 17, qwen3_attention_block_async}};
+    {"qwen3_attention_block", 17, qwen3_attention_block_async},
+    // load_plugin `dlopen`s a named, standalone native plugin (see
+    // emlx_plugin_registry.hpp); not worker-routed since it does no MLX
+    // graph work.
+    {"load_plugin", 2, load_plugin}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

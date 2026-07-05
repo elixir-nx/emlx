@@ -66,7 +66,9 @@ defmodule EMLX.Nx.DoctestTest do
     population_count: 1,
     count_leading_zeros: 1,
     # f8_e4m3fn is not supported by MLX; skip all tensor/2 doctests
-    tensor: 2
+    tensor: 2,
+    # reflect deprecated for pad_outer
+    reflect: 2
   ]
 
   doctest Nx,

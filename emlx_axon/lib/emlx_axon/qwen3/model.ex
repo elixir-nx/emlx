@@ -4,22 +4,22 @@ defmodule EMLXAxon.Qwen3.Model do
 
   ## Defn / JIT strategy
 
-  Every hot-path computation that consists purely of tensor arithmetic is
-  wrapped in a `defnp` kernel (declared in `Layers` and `Attention`).
-  `defnp` uses `Nx.Defn.Compiler.__jit__` — the same mechanism as
-  `Nx.Defn.jit/1` — to compile the function once per unique input shape and
-  cache the result.  Subsequent calls skip Nx-side type/shape inference and
-  dispatch directly to the compiled kernel.
+  For the quantized (MLX-4bit) and dense native-greedy paths actually
+  exercised by `bench/validate_qwen3.exs`, **every** hot-path call is a plain
+  eager function call against concrete `EMLX.Backend` tensors —
+  `EMLX.Native.Qwen3.*` NIFs, `EMLX.Fast.*` fused kernels, `Nx.dot` (quantized
+  dispatch) — with no `Nx.Defn.Expr` tracing or `Nx.Defn.Compiler` involved
+  anywhere in the loop. `Layers.swiglu/2` (the sole remaining `defn` in
+  `Layers`/`Attention`) is dead code (`mlp/5` below calls
+  `EMLX.Fast.swiglu/2` directly, not `Layers.swiglu/2`), and
+  `Sampler.top_p_gpu/3` is only reached by the `:top_p_gpu` sampler, not
+  `:greedy`. This is why a `:compiler` option threaded into
+  `EMLXAxon.TextGeneration.serving/3` would be a no-op regardless of whether
+  it's read out of `opts`: there is no `Nx.Defn` call site downstream for it
+  to select a compiler for.
 
-  Functions that still run eagerly:
-  - The quantized `Nx.dot` projections — the `Nx.Defn.Evaluator` (EMLX's
-    default compiler) cannot mix jit-argument `Nx.Defn.Expr` nodes with
-    captured `EMLX.Backend` tensors in closures.  Wrapping individual ops
-    with `Nx.Defn.jit` would require a backend that implements
-    `Nx.Defn.Compiler` (e.g. EXLA). Dense native generation uses dedicated
-    EMLX Qwen3 primitives instead.
-  - `Nx.put_slice` KV-cache update (dynamic start index) and the valid-slice
-    read (dynamic end index).
+  `Nx.put_slice` KV-cache update (dynamic start index) and the valid-slice
+  read (dynamic end index) also always ran eagerly, independent of the above.
 
   GPU sync: `EMLX.eval` is called once per token at the sampler boundary so
   the full lazy MLX graph spans all 28 layers before any CPU sync.
@@ -82,7 +82,6 @@ defmodule EMLXAxon.Qwen3.Model do
   Returns a list of `{k_cache, v_cache}` pairs, one per transformer layer,
   where each cache is pre-allocated to `max_len` positions.
   """
-  @spec init_kv_cache(State.t(), pos_integer()) :: [{Nx.Tensor.t(), Nx.Tensor.t()}]
   def init_kv_cache(%State{config: cfg, layers: layers}, max_len) do
     num_kv_heads = cfg.num_key_value_heads
     head_dim = cfg.head_dim
@@ -111,7 +110,6 @@ defmodule EMLXAxon.Qwen3.Model do
   `%Nx.Tensor{}`. The native greedy Qwen3 NIFs accept this shape directly.
   Unsupported states fall back to `init_kv_cache/2`.
   """
-  @spec init_native_kv_cache(State.t(), pos_integer()) :: kv_cache()
   def init_native_kv_cache(%State{} = state, max_len) do
     if native_forward_greedy?(state) do
       %State{config: cfg, layers: layers} = state
@@ -139,8 +137,6 @@ defmodule EMLXAxon.Qwen3.Model do
   The cache is updated in-place via `Nx.put_slice`; `kv_cache_updated` is the
   same list with updated slices.
   """
-  @spec forward(Nx.Tensor.t(), [{Nx.Tensor.t(), Nx.Tensor.t()}], non_neg_integer(), State.t()) ::
-          {Nx.Tensor.t(), [{Nx.Tensor.t(), Nx.Tensor.t()}]}
   def forward(input_ids, kv_cache, current_len, %State{} = state) do
     {hidden, kv_cache_updated} = forward_hidden(input_ids, kv_cache, current_len, state)
 
@@ -159,8 +155,6 @@ defmodule EMLXAxon.Qwen3.Model do
   """
   @type kv_cache :: [{Nx.Tensor.t() | EMLX.tensor_ref(), Nx.Tensor.t() | EMLX.tensor_ref()}]
 
-  @spec forward_greedy(Nx.Tensor.t(), kv_cache(), non_neg_integer(), State.t()) ::
-          {Nx.Tensor.t(), kv_cache()}
   def forward_greedy(input_ids, kv_cache, current_len, %State{} = state) do
     if native_forward_greedy?(state) do
       forward_native_greedy(input_ids, kv_cache, current_len, state)
@@ -190,13 +184,6 @@ defmodule EMLXAxon.Qwen3.Model do
   a CPU `Nx.Tensor` plus backend transfer for every decode step. Other states
   fall back to the regular tensor based path.
   """
-  @spec forward_greedy_decode_token_id(
-          non_neg_integer(),
-          kv_cache(),
-          non_neg_integer(),
-          State.t()
-        ) ::
-          {non_neg_integer(), kv_cache()}
   def forward_greedy_decode_token_id(token_id, kv_cache, current_len, %State{} = state) do
     if native_forward_greedy?(state) do
       forward_native_greedy_decode_token_id(token_id, kv_cache, current_len, state)
@@ -213,17 +200,9 @@ defmodule EMLXAxon.Qwen3.Model do
   generated token tensors on the EMLX backend and returns the final KV cache,
   avoiding one Elixir/NIF boundary crossing per decoded token.
   """
-  @spec forward_greedy_chunk(
-          Nx.Tensor.t(),
-          kv_cache(),
-          non_neg_integer(),
-          pos_integer(),
-          State.t()
-        ) ::
-          {[Nx.Tensor.t()], kv_cache()} | :fallback
   def forward_greedy_chunk(input_ids, kv_cache, current_len, count, %State{} = state)
       when is_integer(count) and count > 0 do
-    if native_forward_greedy?(state) do
+    if native_forward_greedy_chunk?(state) do
       forward_native_greedy_chunk(input_ids, kv_cache, current_len, count, state)
     else
       :fallback
@@ -264,6 +243,16 @@ defmodule EMLXAxon.Qwen3.Model do
   defp native_forward_greedy?(%State{config: cfg, lm_head: lm_head}),
     do: cfg[:dense_layers?] == true and not EMLX.Quantization.quantized?(lm_head)
 
+  # Relaxed gate for `forward_greedy_chunk/5` only: `qwen3_layer_quantized`/
+  # `qwen3_forward_greedy_ids_chunk_quantized` handle dense, quantized, and
+  # mixed per-projection weights (including a quantized `lm_head`)
+  # uniformly, so every `State` qualifies for the native chunked decode path
+  # — unlike `native_forward_greedy?/1` above, which still gates the
+  # single-step native paths (`forward_greedy`/`_token_id`/`_decode_token_id`)
+  # that call the dense-only `qwen3_forward_greedy_ids*` NIFs and are
+  # untouched by this change.
+  defp native_forward_greedy_chunk?(%State{}), do: true
+
   defp forward_native_greedy(input_ids, kv_cache, current_len, %State{} = state) do
     %State{embed_tokens: embed_tokens, layers: layers, norm: norm, lm_head: lm_head, config: cfg} =
       state
@@ -272,7 +261,7 @@ defmodule EMLXAxon.Qwen3.Model do
     embed_ref = EMLX.Backend.from_nx(embed_tokens)
 
     {token_ref, kv_cache_refs} =
-      EMLX.qwen3_forward_greedy_ids(
+      EMLX.Native.Qwen3.forward_greedy_ids(
         input_ids_ref(input_ids, embed_ref),
         embed_ref,
         layers,
@@ -302,7 +291,7 @@ defmodule EMLXAxon.Qwen3.Model do
     embed_ref = EMLX.Backend.from_nx(embed_tokens)
 
     {token_id, kv_cache_refs} =
-      EMLX.qwen3_forward_greedy_ids_token_id(
+      EMLX.Native.Qwen3.forward_greedy_ids_token_id(
         input_ids_ref(input_ids, embed_ref),
         embed_ref,
         layers,
@@ -327,7 +316,7 @@ defmodule EMLXAxon.Qwen3.Model do
     embed_ref = EMLX.Backend.from_nx(embed_tokens)
 
     {next_token_id, kv_cache_refs} =
-      EMLX.qwen3_forward_greedy_token_id(
+      EMLX.Native.Qwen3.forward_greedy_token_id(
         token_id,
         embed_ref,
         layers,
@@ -352,20 +341,42 @@ defmodule EMLXAxon.Qwen3.Model do
     embed_ref = EMLX.Backend.from_nx(embed_tokens)
 
     {token_refs, kv_cache_refs} =
-      EMLX.qwen3_forward_greedy_ids_chunk(
-        input_ids_ref(input_ids, embed_ref),
-        embed_ref,
-        layers,
-        kv_cache,
-        EMLX.Backend.from_nx(norm),
-        EMLX.Backend.from_nx(lm_head),
-        current_len,
-        count,
-        scale,
-        head_dim,
-        theta,
-        eps
-      )
+      if native_forward_greedy?(state) do
+        # All-dense layers + dense lm_head: keep using the proven, dense-only
+        # fused chunk NIF — zero regression risk to the working fast path.
+        EMLX.Native.Qwen3.forward_greedy_ids_chunk(
+          input_ids_ref(input_ids, embed_ref),
+          embed_ref,
+          layers,
+          kv_cache,
+          EMLX.Backend.from_nx(norm),
+          EMLX.Backend.from_nx(lm_head),
+          current_len,
+          count,
+          scale,
+          head_dim,
+          theta,
+          eps
+        )
+      else
+        # Any quantized layer projection and/or quantized lm_head: the
+        # generalized chunk NIF fuses the whole chunk into 1 NIF call instead
+        # of falling back to per-token/per-op decoding.
+        EMLX.Native.Qwen3.forward_greedy_ids_chunk_quantized(
+          input_ids_ref(input_ids, embed_ref),
+          embed_ref,
+          layers,
+          kv_cache,
+          EMLX.Backend.from_nx(norm),
+          lm_head,
+          current_len,
+          count,
+          scale,
+          head_dim,
+          theta,
+          eps
+        )
+      end
 
     tokens =
       Enum.map(token_refs, fn token_ref ->
@@ -410,7 +421,7 @@ defmodule EMLXAxon.Qwen3.Model do
     else
       hidden
       |> EMLX.Backend.from_nx()
-      |> EMLX.qwen3_final_greedy(
+      |> EMLX.Native.Qwen3.final_greedy(
         EMLX.Backend.from_nx(norm),
         EMLX.Backend.from_nx(lm_head),
         cfg.rms_norm_eps
@@ -471,25 +482,29 @@ defmodule EMLXAxon.Qwen3.Model do
          [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj],
          &EMLX.Quantization.quantized?/1
        ) do
-      {attn_out, k_new, v_new} =
-        Attention.forward(
-          hidden,
-          norm1,
-          k_cache,
-          v_cache,
-          current_len,
-          q_proj,
-          k_proj,
-          v_proj,
-          o_proj,
-          q_norm,
-          k_norm,
-          cfg
-        )
-
-      hidden = mlp(attn_out, norm2, gate_proj, up_proj, down_proj, cfg.rms_norm_eps)
-
-      {hidden, k_new, v_new}
+      # `qwen3_layer_quantized` is a strict superset of `qwen3_layer`: it
+      # accepts any dense-or-quantized mix of the 7 projections, fusing the
+      # ~13 per-op NIF calls the old `Attention.forward` + `mlp/5` path made
+      # for a quantized layer down to 1. `Attention.forward`/quantized `mlp`
+      # stay defined below as an unreferenced rollback option.
+      layer_generalized(
+        hidden,
+        norm1,
+        q_norm,
+        k_norm,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        gate_proj,
+        up_proj,
+        down_proj,
+        norm2,
+        k_cache,
+        v_cache,
+        current_len,
+        cfg
+      )
     else
       layer(
         hidden,
@@ -535,7 +550,7 @@ defmodule EMLXAxon.Qwen3.Model do
     theta = cfg.rope_theta
 
     {hidden_ref, k_cache_ref, v_cache_ref} =
-      EMLX.qwen3_layer(
+      EMLX.Native.Qwen3.layer(
         EMLX.Backend.from_nx(hidden),
         EMLX.Backend.from_nx(norm1),
         EMLX.Backend.from_nx(q_proj),
@@ -564,6 +579,61 @@ defmodule EMLXAxon.Qwen3.Model do
     }
   end
 
+  # Generalized variant of `layer/16`: q/k/v/o/gate/up/down each independently
+  # accept a dense or quantized (`EMLX.quantize/2`) `Nx.Tensor`, via
+  # `EMLX.Native.Qwen3.layer_quantized/19`.
+  defp layer_generalized(
+         hidden,
+         norm1,
+         q_norm,
+         k_norm,
+         q_proj,
+         k_proj,
+         v_proj,
+         o_proj,
+         gate_proj,
+         up_proj,
+         down_proj,
+         norm2,
+         k_cache,
+         v_cache,
+         current_len,
+         cfg
+       ) do
+    head_dim = cfg.head_dim
+    scale = 1.0 / :math.sqrt(head_dim)
+    theta = cfg.rope_theta
+
+    {hidden_ref, k_cache_ref, v_cache_ref} =
+      EMLX.Native.Qwen3.layer_quantized(
+        EMLX.Backend.from_nx(hidden),
+        norm1,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        EMLX.Backend.from_nx(k_cache),
+        EMLX.Backend.from_nx(v_cache),
+        norm2,
+        gate_proj,
+        up_proj,
+        down_proj,
+        current_len,
+        scale,
+        head_dim,
+        theta,
+        cfg.rms_norm_eps
+      )
+
+    {
+      EMLX.Backend.to_nx(hidden_ref),
+      EMLX.Backend.to_nx(k_cache_ref),
+      EMLX.Backend.to_nx(v_cache_ref)
+    }
+  end
+
   defp dense_transformer_layer(
          hidden,
          k_cache,
@@ -574,7 +644,7 @@ defmodule EMLXAxon.Qwen3.Model do
          {head_dim, scale, theta, eps}
        ) do
     {hidden_ref, k_cache_ref, v_cache_ref} =
-      EMLX.qwen3_layer(
+      EMLX.Native.Qwen3.layer(
         EMLX.Backend.from_nx(hidden),
         EMLX.Backend.from_nx(norm1),
         EMLX.Backend.from_nx(q_proj),
@@ -613,7 +683,7 @@ defmodule EMLXAxon.Qwen3.Model do
     else
       hidden
       |> EMLX.Backend.from_nx()
-      |> EMLX.qwen3_mlp(
+      |> EMLX.Native.Qwen3.mlp(
         EMLX.Backend.from_nx(norm2),
         EMLX.Backend.from_nx(gate_proj),
         EMLX.Backend.from_nx(up_proj),

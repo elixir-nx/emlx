@@ -1,0 +1,1514 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Qwen3 EMLX / Bumblebee / Emily Benchmark
+
+```elixir
+Mix.install(
+  [
+    {:emlx, path: Path.expand("../../emlx", __DIR__)},
+    {:emlx_axon, path: Path.expand("..", __DIR__)},
+    # {:emlx, github: "elixir-nx/emlx", branch: "main", sparse: "emlx", override: true},
+    # {:emlx_axon, github: "elixir-nx/emlx", branch: "main", sparse: "emlx_axon", override: true},
+    
+    {:nx, github: "elixir-nx/nx", branch: "main", sparse: "nx", override: true},
+    {:axon, "~> 0.7"},
+    {:bumblebee, "~> 0.7"},
+    {:emily, "~> 0.7"},
+    {:kino, "~> 0.14"}
+  ],
+  config: [nx: [default_backend: {EMLX.Backend, device: :gpu}]]
+)
+```
+
+## Overview
+
+Dense (bf16) and MLX-4bit Qwen3-0.6B checkpoints; lanes per checkpoint:
+
+* **bb base** — Bumblebee, stock Axon graph
+* **bb+rewrite** — Bumblebee + `EMLXAxon.rewrite/1`
+* **native** — `EMLXAxon.TextGeneration`
+* **emily-eager** / **emily-native** — dense only; [Emily](https://github.com/ausimian/emily) backend/compiler, unmodified Bumblebee graph
+* **emily-quantized** — mlx4bit entry only; Emily int4-quantizes the *dense* checkpoint (not the lmstudio mlx4bit file on disk)
+
+Each lane runs in a fresh `:peer` node (~150 ms overhead) so MLX allocator state does not bleed across lanes.
+
+## Peer helper
+
+```elixir
+defmodule PeerBench.Registry do
+  @moduledoc false
+  use Agent
+
+  def start_link(_), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
+
+  def put(module, binary) do
+    ensure_started()
+    Agent.update(__MODULE__, &Map.put(&1, module, binary))
+  end
+
+  def get(module) do
+    ensure_started()
+    Agent.get(__MODULE__, &Map.fetch!(&1, module))
+  end
+
+  defp ensure_started do
+    if is_nil(Process.whereis(__MODULE__)), do: start_link([])
+  end
+end
+
+defmodule PeerBench do
+  @moduledoc false
+
+  defmacro defshippable(name, do: block) do
+    quote do
+      {:module, unquote(name), bin, _} =
+        defmodule unquote(name) do
+          unquote(block)
+        end
+
+      PeerBench.Registry.put(unquote(name), bin)
+    end
+  end
+
+  @apps [:nx, :emlx, :emlx_axon, :axon, :bumblebee, :emily]
+
+  def run(modules, mod, fun, args) do
+    peer_args = Enum.flat_map(:code.get_path(), fn p -> [~c"-pa", p] end)
+
+    {:ok, pid, _node} =
+      :peer.start_link(%{name: :peer.random_name(), args: peer_args, connection: :standard_io})
+
+    try do
+      for m <- modules do
+        bin = PeerBench.Registry.get(m)
+        {:module, ^m} = :peer.call(pid, :code, :load_binary, [m, ~c"nofile", bin], :infinity)
+      end
+
+      for app <- @apps, do: :peer.call(pid, Application, :ensure_all_started, [app], :infinity)
+
+      :peer.call(pid, :erlang, :apply, [mod, fun, args], :infinity)
+    after
+      :peer.stop(pid)
+    end
+  end
+end
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Benchmark helpers
+
+```elixir
+require PeerBench
+
+PeerBench.defshippable Bench do
+  def run_serving(serving, prompt, extract_fn) do
+    t_start = System.monotonic_time(:millisecond)
+    result = Nx.Serving.run(serving, prompt)
+    t_end = System.monotonic_time(:millisecond)
+    {text, n_tokens} = extract_fn.(result)
+    elapsed_ms = t_end - t_start
+    tok_s = if elapsed_ms > 0, do: Float.round(n_tokens / elapsed_ms * 1000.0, 1), else: 0.0
+    {elapsed_ms, n_tokens, tok_s, text}
+  end
+
+  def warmup(label, serving, prompt, extract_fn, runs) do
+    IO.puts("\n==> [#{label}] Warmup (#{runs} run(s), not timed) ...")
+
+    for i <- 1..runs do
+      {ms, n, _, text} = run_serving(serving, prompt, extract_fn)
+      preview = text |> String.slice(0, 60) |> String.replace("\n", " ")
+      IO.puts("    warmup #{i}: #{n} tokens / #{ms} ms  \"#{preview}...\"")
+    end
+  end
+
+  def bench(label, serving, prompt, extract_fn, runs) do
+    IO.puts("\n==> [#{label}] Benchmark (#{runs} run(s)) ...")
+
+    for i <- 1..runs do
+      {ms, n, tok_s, _} = run_serving(serving, prompt, extract_fn)
+      IO.puts("    run #{i}: #{n} tokens / #{ms} ms = #{tok_s} tok/s")
+      %{elapsed_ms: ms, n_tokens: n, tok_s: tok_s}
+    end
+  end
+
+  def stats(label, results) do
+    toks_list = Enum.map(results, & &1.tok_s)
+    sorted = Enum.sort(toks_list)
+    n = length(sorted)
+    median = Enum.at(sorted, div(n, 2))
+    mean = Float.round(Enum.sum(toks_list) / n, 1)
+    min_v = List.first(sorted)
+    max_v = List.last(sorted)
+    variance = Enum.reduce(toks_list, 0.0, fn x, acc -> acc + (x - mean) * (x - mean) end) / n
+    stddev = Float.round(:math.sqrt(variance), 1)
+    IO.puts("    #{label}: median=#{median}  mean=#{mean}±#{stddev}  min/max=#{min_v}/#{max_v} tok/s")
+    %{label: label, median: median, mean: mean, stddev: stddev, min: min_v, max: max_v}
+  end
+end
+
+PeerBench.defshippable Extract do
+  def bb(%{results: [%{text: text, token_summary: summary}]}) do
+    {text, summary.output}
+  end
+
+  def native(%{results: [%{generated_text: text, num_tokens: n}]}, _tokenizer) do
+    {text, n}
+  end
+
+  def native(%{results: [%{generated_text: text}]}, tokenizer) do
+    %{"input_ids" => ids} = Bumblebee.apply_tokenizer(tokenizer, text)
+    {text, elem(Nx.shape(ids), 1)}
+  end
+end
+
+PeerBench.defshippable ModelSource do
+  def resolve(path_raw) do
+    if File.exists?(Path.expand(path_raw)) do
+      {:local, Path.expand(path_raw)}
+    else
+      {:hf, path_raw}
+    end
+  end
+end
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Emily lanes
+
+Quantize rewrite vendored from Emily's `livebooks/qwen3_quantized.livemd`.
+
+```elixir
+require PeerBench
+
+PeerBench.defshippable EmilyQuantize do
+  alias Emily.Quantization.Layers
+  alias Emily.QuantizedWeight
+
+  def quantize(model, model_state, opts \\ []) do
+    {rewrite_graph(model), quantize_state(model, model_state, opts)}
+  end
+
+  defp rewrite_graph(model) do
+    Axon.rewrite_nodes(model, fn
+      %Axon.Node{op: :dense, meta: meta, name: name_fn} ->
+        fn [x], _output ->
+          quantized_dense_layer(x, meta[:units], use_bias: meta[:use_bias], name: name_fn)
+        end
+
+      _ ->
+        :skip
+    end)
+  end
+
+  defp quantized_dense_layer(x, units, opts) do
+    kernel_shape = fn input_shape ->
+      in_features = elem(input_shape, tuple_size(input_shape) - 1)
+      {in_features, units}
+    end
+
+    bias_shape = fn _input_shape -> {units} end
+
+    kernel = Axon.param("kernel", kernel_shape, initializer: :glorot_uniform)
+
+    {inputs, op} =
+      if opts[:use_bias] do
+        bias = Axon.param("bias", bias_shape, initializer: :zeros)
+        {[x, kernel, bias], &Layers.quantized_dense/4}
+      else
+        {[x, kernel], &Layers.quantized_dense/3}
+      end
+
+    Axon.layer(op, inputs,
+      name: opts[:name],
+      meta: %{units: units, use_bias: opts[:use_bias]},
+      op_name: :quantized_dense
+    )
+  end
+
+  defp quantize_state(model, state, opts) do
+    transpose = Keyword.fetch!(opts, :transpose)
+
+    dense_names =
+      model
+      |> Axon.properties()
+      |> Enum.filter(fn {_name, op} -> op == :dense end)
+      |> Enum.map(fn {name, _} -> name end)
+
+    Enum.reduce(dense_names, state, fn name, acc ->
+      update_in(acc, [Access.key!(:data), name, "kernel"], fn kernel ->
+        source = if transpose, do: Nx.transpose(kernel), else: kernel
+
+        QuantizedWeight.from_dense(source,
+          group_size: Keyword.fetch!(opts, :group_size),
+          bits: Keyword.fetch!(opts, :bits),
+          transpose: transpose
+        )
+      end)
+    end)
+  end
+end
+
+PeerBench.defshippable EmilyLane do
+  def run(kind, source, checkpoint_label, prompt, cfg) do
+    if cfg.skip_emily? do
+      nil
+    else
+      lane_label = "#{checkpoint_label} / emily-#{kind}"
+      Nx.default_backend(Emily.Backend)
+
+      try do
+        IO.puts("\n==> [#{lane_label}] Loading model on Emily.Backend ...")
+        {:ok, model_info} = Bumblebee.load_model(source, backend: Emily.Backend, type: :bf16)
+        {:ok, tokenizer} = Bumblebee.load_tokenizer(source)
+        {:ok, generation_config} = Bumblebee.load_generation_config(source)
+
+        generation_config =
+          Bumblebee.configure(generation_config,
+            max_new_tokens: cfg.max_new,
+            strategy: %{type: :greedy_search}
+          )
+
+        {defn_options, model_info} = build_defn_options(kind, model_info, cfg)
+
+        serving =
+          Bumblebee.Text.generation(model_info, tokenizer, generation_config, defn_options: defn_options)
+
+        Bench.warmup(lane_label, serving, prompt, &Extract.bb/1, cfg.warmup_runs)
+        Bench.bench(lane_label, serving, prompt, &Extract.bb/1, cfg.bench_runs)
+      rescue
+        exception ->
+          IO.puts("\n==> [#{lane_label}] FAILED: #{Exception.message(exception)}")
+          nil
+      end
+    end
+  end
+
+  defp build_defn_options(:eager, model_info, _cfg) do
+    {[compiler: Nx.Defn.Evaluator], model_info}
+  end
+
+  defp build_defn_options(:native, model_info, _cfg) do
+    {[compiler: Emily.Compiler, native: true, native_fallback: :raise], model_info}
+  end
+
+  defp build_defn_options(:quantized, model_info, cfg) do
+    IO.puts(
+      "    quantizing every Axon.dense node " <>
+        "(bits=#{cfg.emily_quant_bits}, group_size=#{cfg.emily_quant_group_size}) ..."
+    )
+
+    {qmodel, qparams} =
+      EmilyQuantize.quantize(model_info.model, model_info.params,
+        bits: cfg.emily_quant_bits,
+        group_size: cfg.emily_quant_group_size,
+        transpose: true
+      )
+
+    {[compiler: Emily.Compiler, native: true, native_fallback: :raise],
+     %{model_info | model: qmodel, params: qparams}}
+  end
+end
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Checkpoint runner
+
+```elixir
+require PeerBench
+
+PeerBench.defshippable Runner do
+  @shipped_modules [Bench, Extract, ModelSource, EmilyQuantize, EmilyLane, Runner]
+
+  def run_checkpoint(%{kind: kind, label: label, path_raw: path_raw} = checkpoint, cfg) do
+    IO.puts("""
+
+    ################################################################################
+    === #{label} — #{inspect(ModelSource.resolve(path_raw))} ===
+    ################################################################################
+    """)
+
+    stats =
+      for lane <- applicable_lanes(kind, cfg), into: %{} do
+        IO.puts("\n==> Spawning isolated peer for lane #{inspect(lane)} ...")
+        {lane, PeerBench.run(@shipped_modules, Runner, :run_lane, [lane, checkpoint, cfg])}
+      end
+
+    %{
+      label: label,
+      base: stats[:bb_base],
+      rewrite: stats[:bb_rewrite],
+      native: stats[:native],
+      emily_eager: stats[:emily_eager],
+      emily_native: stats[:emily_native],
+      emily_quantized: stats[:emily_quantized]
+    }
+  end
+
+  defp applicable_lanes(kind, cfg) do
+    [
+      bb_base: not cfg.skip_bb_base?,
+      bb_rewrite: not cfg.skip_bb_rewrite?,
+      native: true,
+      emily_eager: kind == :dense and not cfg.skip_emily?,
+      emily_native: kind == :dense and not cfg.skip_emily?,
+      emily_quantized: kind == :mlx4bit and not cfg.skip_emily?
+    ]
+    |> Enum.filter(fn {_lane, enabled?} -> enabled? end)
+    |> Enum.map(fn {lane, _} -> lane end)
+  end
+
+  def run_lane(lane, %{kind: kind, label: label, path_raw: path_raw}, cfg) do
+    Nx.default_backend({EMLX.Backend, device: :gpu})
+    source = ModelSource.resolve(path_raw)
+
+    {model_info, tokenizer, generation_config} =
+      if lane in [:bb_base, :bb_rewrite] do
+        {:ok, model_info} = Bumblebee.load_model(source, backend: {EMLX.Backend, device: :gpu}, type: :bf16)
+        model_info = load_params(model_info, kind, path_raw)
+        {:ok, tokenizer} = Bumblebee.load_tokenizer(source)
+        {:ok, generation_config} = Bumblebee.load_generation_config(source)
+
+        generation_config =
+          Bumblebee.configure(generation_config,
+            max_new_tokens: cfg.max_new,
+            strategy: %{type: :greedy_search}
+          )
+
+        {model_info, tokenizer, generation_config}
+      else
+        tokenizer =
+          if lane == :native do
+            {:ok, tokenizer} = Bumblebee.load_tokenizer(source)
+            tokenizer
+          end
+
+        {nil, tokenizer, nil}
+      end
+
+    dispatch_lane(lane, kind, path_raw, label, source, model_info, tokenizer, generation_config, cfg)
+  end
+
+  defp dispatch_lane(:bb_base, _kind, _path_raw, label, _source, model_info, tokenizer, generation_config, cfg) do
+    IO.puts("==> Building Bumblebee.Text.generation serving (base — no rewrite) ...")
+
+    serving =
+      Bumblebee.Text.generation(model_info, tokenizer, generation_config,
+        compile: [batch_size: 1, sequence_length: cfg.seq_len],
+        defn_options: [compiler: EMLX]
+      )
+
+    lane_label = "#{label} / bb base"
+    Bench.warmup(lane_label, serving, cfg.prompt, &Extract.bb/1, cfg.warmup_runs)
+    results = Bench.bench(lane_label, serving, cfg.prompt, &Extract.bb/1, cfg.bench_runs)
+    Bench.stats("bb base           (Bumblebee, no rewrite)        ", results)
+  end
+
+  defp dispatch_lane(:bb_rewrite, _kind, _path_raw, label, _source, model_info, tokenizer, generation_config, cfg) do
+    IO.puts("==> Applying EMLXAxon.rewrite/1 (all rewrites — best performing path) ...")
+    model_rewritten = EMLXAxon.rewrite(model_info.model)
+
+    serving =
+      Bumblebee.Text.generation(%{model_info | model: model_rewritten}, tokenizer, generation_config,
+        compile: [batch_size: 1, sequence_length: cfg.seq_len],
+        defn_options: [compiler: EMLX]
+      )
+
+    lane_label = "#{label} / bb+rewrite"
+    Bench.warmup(lane_label, serving, cfg.prompt, &Extract.bb/1, cfg.warmup_runs)
+    results = Bench.bench(lane_label, serving, cfg.prompt, &Extract.bb/1, cfg.bench_runs)
+    Bench.stats("bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  ", results)
+  end
+
+  defp dispatch_lane(:native, kind, path_raw, label, _source, _model_info, tokenizer, _generation_config, cfg) do
+    serving = build_native_serving(kind, path_raw, tokenizer, cfg)
+    extract = fn result -> Extract.native(result, tokenizer) end
+
+    lane_label = "#{label} / native"
+    Bench.warmup(lane_label, serving, cfg.prompt, extract, cfg.warmup_runs)
+    results = Bench.bench(lane_label, serving, cfg.prompt, extract, cfg.bench_runs)
+    Bench.stats("native            (EMLXAxon.TextGeneration)       ", results)
+  end
+
+  defp dispatch_lane(:emily_eager, _kind, _path_raw, label, source, _model_info, _tokenizer, _generation_config, cfg) do
+    EmilyLane.run(:eager, source, label, cfg.prompt, cfg)
+    |> wrap_stats("emily-eager       (Evaluator + Emily.Backend)      ")
+  end
+
+  defp dispatch_lane(:emily_native, _kind, _path_raw, label, source, _model_info, _tokenizer, _generation_config, cfg) do
+    EmilyLane.run(:native, source, label, cfg.prompt, cfg)
+    |> wrap_stats("emily-native      (Emily.Compiler, native: true)   ")
+  end
+
+  defp dispatch_lane(:emily_quantized, _kind, _path_raw, label, _source, _model_info, _tokenizer, _generation_config, cfg) do
+    dense_source = ModelSource.resolve(cfg.dense_path_raw)
+
+    EmilyLane.run(:quantized, dense_source, label, cfg.prompt, cfg)
+    |> wrap_stats("emily-quantized   (Emily int4, native: true)      ")
+  end
+
+  defp wrap_stats(nil, _label), do: nil
+  defp wrap_stats(results, label), do: Bench.stats(label, results)
+
+  defp load_params(model_info, :dense, _path_raw), do: model_info
+
+  defp load_params(model_info, :mlx4bit, path_raw) do
+    IO.puts("==> Loading MLX-4bit params (dequantize → Bumblebee layout → re-quantize) ...")
+    t0 = System.monotonic_time(:millisecond)
+    params = EMLXAxon.MLX4BitParams.load(Path.expand(path_raw))
+    params = EMLXAxon.QuantizeParams.quantize(params)
+    t1 = System.monotonic_time(:millisecond)
+    IO.puts("    params loaded in #{t1 - t0} ms")
+    %{model_info | params: params}
+  end
+
+  defp build_native_serving(kind, path_raw, tokenizer, cfg) do
+    IO.puts("\n==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...")
+    t0 = System.monotonic_time(:millisecond)
+
+    serving =
+      case kind do
+        :mlx4bit ->
+          EMLXAxon.TextGeneration.from_mlx4bit(
+            Path.expand(path_raw),
+            tokenizer,
+            defn_options: [compiler: Nx.Defn.Evaluator],
+            max_new_tokens: cfg.max_new,
+            sampler: :greedy,
+            profile_timing: cfg.native_profile_timing?
+          )
+
+        :dense ->
+          {:ok, state} = EMLXAxon.Qwen3.DenseLoader.from_safetensors_dir(Path.expand(path_raw), type: :bf16)
+
+          EMLXAxon.TextGeneration.serving(
+            tokenizer,
+            state,
+            defn_options: [compiler: Nx.Defn.Evaluator],
+            max_new_tokens: cfg.max_new,
+            sampler: :greedy,
+            profile_timing: cfg.native_profile_timing?
+          )
+      end
+
+    IO.puts("    loaded in #{System.monotonic_time(:millisecond) - t0} ms")
+    serving
+  end
+end
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Summary rendering
+
+```elixir
+defmodule Summary do
+  def ratio(nil, _), do: nil
+  def ratio(_, nil), do: nil
+  def ratio(row, col) when col.median > 0, do: Float.round(row.median / col.median, 2)
+  def ratio(_, _), do: nil
+
+  def to_markdown({:ok, result}) do
+    lanes = lanes(result)
+
+    matrix =
+      if length(lanes) < 2 do
+        "_fewer than two lanes ran — nothing to compare._"
+      else
+        matrix_markdown(lanes)
+      end
+
+    bullets =
+      Enum.map_join(lanes, "\n", fn {name, stats} ->
+        "- **#{name}**: median=#{stats.median}  mean=#{stats.mean}±#{stats.stddev}  min/max=#{stats.min}/#{stats.max} tok/s"
+      end)
+
+    "### #{result.label}\n\n#{matrix}\n\n#{bullets}"
+  end
+
+  def to_markdown({:error, label, formatted}) do
+    fence = String.duplicate("`", 3)
+    "### #{label} — FAILED\n\n#{fence}\n#{formatted}\n#{fence}"
+  end
+
+  def stats_rows(results) do
+    for {:ok, result} <- results,
+        {name, stats} <- lanes(result) do
+      %{
+        checkpoint: result.label,
+        lane: name,
+        median_tok_s: stats.median,
+        mean_tok_s: stats.mean,
+        stddev: stats.stddev,
+        min_tok_s: stats.min,
+        max_tok_s: stats.max
+      }
+    end
+  end
+
+  defp lanes(result) do
+    [
+      {"bb base", result.base},
+      {"bb+rewrite", result.rewrite},
+      {"native", result.native},
+      {"emily-eager", result.emily_eager},
+      {"emily-native", result.emily_native},
+      {"emily-quantized", result.emily_quantized}
+    ]
+    |> Enum.reject(fn {_name, stats} -> is_nil(stats) end)
+  end
+
+  defp matrix_markdown(lanes) do
+    header = Enum.map_join(lanes, "", fn {name, _} -> " #{name} |" end)
+    sep = Enum.map_join(lanes, "", fn _ -> " --- |" end)
+
+    rows =
+      for {row_name, row_stats} <- lanes do
+        cells =
+          Enum.map_join(lanes, "", fn {col_name, col_stats} ->
+            " #{format_cell(row_name, col_name, row_stats, col_stats)} |"
+          end)
+
+        "| **#{row_name}** |#{cells}"
+      end
+
+    Enum.join(["| row ∖ col (row / col) |#{header}", "| --- |#{sep}" | rows], "\n")
+  end
+
+  defp format_cell(row_name, col_name, _row_stats, _col_stats) when row_name == col_name, do: "–"
+
+  defp format_cell(_row_name, _col_name, row_stats, col_stats) do
+    case ratio(row_stats, col_stats) do
+      nil -> "n/a"
+      value -> "#{value}×"
+    end
+  end
+end
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Configuration
+
+```elixir
+dense_path_input =
+  Kino.Input.text("Dense model path",
+    default: System.get_env("EMLX_QWEN3_DENSE_MODEL_PATH") || "~/models/Qwen3-0.6B"
+  )
+
+mlx4bit_path_input =
+  Kino.Input.text("MLX-4bit model path",
+    default: System.get_env("EMLX_QWEN3_4BIT_MODEL_PATH") || "~/models/Qwen3-0.6B-MLX-4bit"
+  )
+
+skip_dense_input = Kino.Input.checkbox("Skip dense checkpoint", default: false)
+skip_4bit_input = Kino.Input.checkbox("Skip MLX-4bit checkpoint", default: false)
+skip_emily_input = Kino.Input.checkbox("Skip Emily lanes", default: false)
+skip_bb_base_input = Kino.Input.checkbox("Skip bb base lane", default: false)
+skip_bb_rewrite_input = Kino.Input.checkbox("Skip bb+rewrite lane", default: false)
+native_profile_timing_input = Kino.Input.checkbox("Native per-token profile timing", default: true)
+
+max_new_input = Kino.Input.number("Max new tokens", default: 60)
+bench_runs_input = Kino.Input.number("Bench runs", default: 5)
+warmup_runs_input = Kino.Input.number("Warmup runs", default: 2)
+seq_len_input = Kino.Input.number("Sequence length", default: 1024)
+emily_quant_bits_input = Kino.Input.number("Emily quant bits", default: 4)
+emily_quant_group_size_input = Kino.Input.number("Emily quant group size", default: 64)
+
+Kino.Layout.grid(
+  [
+    dense_path_input,
+    mlx4bit_path_input,
+    skip_dense_input,
+    skip_4bit_input,
+    skip_emily_input,
+    skip_bb_base_input,
+    skip_bb_rewrite_input,
+    native_profile_timing_input,
+    max_new_input,
+    bench_runs_input,
+    warmup_runs_input,
+    seq_len_input,
+    emily_quant_bits_input,
+    emily_quant_group_size_input
+  ],
+  columns: 2
+)
+```
+
+```elixir
+dense_path_raw = Kino.Input.read(dense_path_input)
+
+cfg = %{
+  max_new: Kino.Input.read(max_new_input),
+  bench_runs: Kino.Input.read(bench_runs_input),
+  warmup_runs: Kino.Input.read(warmup_runs_input),
+  seq_len: Kino.Input.read(seq_len_input),
+  native_profile_timing?: Kino.Input.read(native_profile_timing_input),
+  skip_bb_rewrite?: Kino.Input.read(skip_bb_rewrite_input),
+  skip_bb_base?: Kino.Input.read(skip_bb_base_input),
+  skip_emily?: Kino.Input.read(skip_emily_input),
+  emily_quant_bits: Kino.Input.read(emily_quant_bits_input),
+  emily_quant_group_size: Kino.Input.read(emily_quant_group_size_input),
+  dense_path_raw: dense_path_raw,
+  prompt:
+    "<|im_start|>user\nList twenty programming languages with a one-line description each.<|im_end|>\n<|im_start|>assistant\n"
+}
+
+checkpoints = [
+  %{
+    kind: :dense,
+    label: "Qwen3-0.6B (dense bf16)",
+    skip?: Kino.Input.read(skip_dense_input),
+    path_raw: dense_path_raw
+  },
+  %{
+    kind: :mlx4bit,
+    label: "Qwen3-0.6B-MLX-4bit",
+    skip?: Kino.Input.read(skip_4bit_input),
+    path_raw: Kino.Input.read(mlx4bit_path_input)
+  }
+]
+
+IO.puts("""
+max_new:  #{cfg.max_new}  bench_runs: #{cfg.bench_runs}  warmup_runs: #{cfg.warmup_runs}
+seq_len:  #{cfg.seq_len}
+""")
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+max_new:  60  bench_runs: 5  warmup_runs: 2
+seq_len:  1024
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Run benchmarks
+
+```elixir
+results =
+  checkpoints
+  |> Enum.reject(& &1.skip?)
+  |> Enum.shuffle()
+  |> Enum.map(fn checkpoint ->
+    try do
+      {:ok, Runner.run_checkpoint(checkpoint, cfg)}
+    rescue
+      exception -> {:error, checkpoint.label, Exception.format(:error, exception, __STACKTRACE__)}
+    end
+  end)
+
+:ok
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+################################################################################
+=== Qwen3-0.6B-MLX-4bit — {:local, "/Users/valente/models/Qwen3-0.6B-MLX-4bit"} ===
+################################################################################
+
+
+==> Spawning isolated peer for lane :bb_base ...
+
+09:15:23.657 [debug] the following PyTorch parameters were unused:
+
+  * model.embed_tokens.biases
+  * model.embed_tokens.scales
+  * model.layers.0.mlp.down_proj.biases
+  * model.layers.0.mlp.down_proj.scales
+  * model.layers.0.mlp.gate_proj.biases
+  * model.layers.0.mlp.gate_proj.scales
+  * model.layers.0.mlp.up_proj.biases
+  * model.layers.0.mlp.up_proj.scales
+  * model.layers.0.self_attn.k_proj.biases
+  * model.layers.0.self_attn.k_proj.scales
+  * model.layers.0.self_attn.o_proj.biases
+  * model.layers.0.self_attn.o_proj.scales
+  * model.layers.0.self_attn.q_proj.biases
+  * model.layers.0.self_attn.q_proj.scales
+  * model.layers.0.self_attn.v_proj.biases
+  * model.layers.0.self_attn.v_proj.scales
+  * model.layers.1.mlp.down_proj.biases
+  * model.layers.1.mlp.down_proj.scales
+  * model.layers.1.mlp.gate_proj.biases
+  * model.layers.1.mlp.gate_proj.scales
+  * model.layers.1.mlp.up_proj.biases
+  * model.layers.1.mlp.up_proj.scales
+  * model.layers.1.self_attn.k_proj.biases
+  * model.layers.1.self_attn.k_proj.scales
+  * model.layers.1.self_attn.o_proj.biases
+  * model.layers.1.self_attn.o_proj.scales
+  * model.layers.1.self_attn.q_proj.biases
+  * model.layers.1.self_attn.q_proj.scales
+  * model.layers.1.self_attn.v_proj.biases
+  * model.layers.1.self_attn.v_proj.scales
+  * model.layers.10.mlp.down_proj.biases
+  * model.layers.10.mlp.down_proj.scales
+  * model.layers.10.mlp.gate_proj.biases
+  * model.layers.10.mlp.gate_proj.scales
+  * model.layers.10.mlp.up_proj.biases
+  * model.layers.10.mlp.up_proj.scales
+  * model.layers.10.self_attn.k_proj.biases
+  * model.layers.10.self_attn.k_proj.scales
+  * model.layers.10.self_attn.o_proj.biases
+  * model.layers.10.self_attn.o_proj.scales
+  * model.layers.10.self_attn.q_proj.biases
+  * model.layers.10.self_attn.q_proj.scales
+  * model.layers.10.self_attn.v_proj.biases
+  * model.layers.10.self_attn.v_proj.scales
+  * model.layers.11.mlp.down_proj.biases
+  * model.layers.11.mlp.down_proj.scales
+  * model.layers.11.mlp.gate_proj.biases
+  * model.layers.11.mlp.gate_proj.scales
+  * model.layers.11.mlp.up_proj.biases
+  * model.layers.11.mlp.up_proj.scales
+  * model.layers.11.self_attn.k_proj.biases
+  * model.layers.11.self_attn.k_proj.scales
+  * model.layers.11.self_attn.o_proj.biases
+  * model.layers.11.self_attn.o_proj.scales
+  * model.layers.11.self_attn.q_proj.biases
+  * model.layers.11.self_attn.q_proj.scales
+  * model.layers.11.self_attn.v_proj.biases
+  * model.layers.11.self_attn.v_proj.scales
+  * model.layers.12.mlp.down_proj.biases
+  * model.layers.12.mlp.down_proj.scales
+  * model.layers.12.mlp.gate_proj.biases
+  * model.layers.12.mlp.gate_proj.scales
+  * model.layers.12.mlp.up_proj.biases
+  * model.layers.12.mlp.up_proj.scales
+  * model.layers.12.self_attn.k_proj.biases
+  * model.layers.12.self_attn.k_proj.scales
+  * model.layers.12.self_attn.o_proj.biases
+  * model.layers.12.self_attn.o_proj.scales
+  * model.layers.12.self_attn.q_proj.biases
+  * model.layers.12.self_attn.q_proj.scales
+  * model.layers.12.self_attn.v_proj.biases
+  * model.layers.12.self_attn.v_proj.scales
+  * model.layers.13.mlp.down_proj.biases
+  * model.layers.13.mlp.down_proj.scales
+  * model.layers.13.mlp.gate_proj.biases
+  * model.layers.13.mlp.gate_proj.scales
+  * model.layers.13.mlp.up_proj.biases
+  * model.layers.13.mlp.up_proj.scales
+  * model.layers.13.self_attn.k_proj.biases
+  * model.layers.13.self_attn.k_proj.scales
+  * model.layers.13.self_attn.o_proj.biases
+  * model.layers.13.self_attn.o_proj.scales
+  * model.layers.13.self_attn.q_proj.biases
+  * model.layers.13.self_attn.q_proj.scales
+  * model.layers.13.self_attn.v_proj.biases
+  * model.layers.13.self_attn.v_proj.scales
+  * model.layers.14.mlp.down_proj.biases
+  * model.layers.14.mlp.down_proj.scales
+  * model.layers.14.mlp.gate_proj.biases
+  * model.layers.14.mlp.gate_proj.scales
+  * model.layers.14.mlp.up_proj.biases
+  * model.layers.14.mlp.up_proj.scales
+  * model.layers.14.self_attn.k_proj.biases
+  * model.layers.14.self_attn.k_proj.scales
+  * model.layers.14.self_attn.o_proj.biases
+  * model.layers.14.self_attn.o_proj.scales
+  * model.layers.14.self_attn.q_proj.biases
+  * model.layers.14.self_attn.q_proj.scales
+  * model.layers.14.self_attn.v_proj.biases
+  * model.layers.14.self_attn.v_proj.scales
+  * model.layers.15.mlp.down_proj.biases
+  * model.layers.15.mlp.down_proj.scales
+  * model.layers.15.mlp.gate_proj.biases
+  * model.layers.15.mlp.gate_proj.scales
+  * model.layers.15.mlp.up_proj.biases
+  * model.layers.15.mlp.up_proj.scales
+  * model.layers.15.self_attn.k_proj.biases
+  * model.layers.15.self_attn.k_proj.scales
+  * model.layers.15.self_attn.o_proj.biases
+  * model.layers.15.self_attn.o_proj.scales
+  * model.layers.15.self_attn.q_proj.biases
+  * model.layers.15.self_attn.q_proj.scales
+  * model.layers.15.self_attn.v_proj.biases
+  * model.layers.15.self_attn.v_proj.scales
+  * model.layers.16.mlp.down_proj.biases
+  * model.layers.16.mlp.down_proj.scales
+  * model.layers.16.mlp.gate_proj.biases
+  * model.layers.16.mlp.gate_proj.scales
+  * model.layers.16.mlp.up_proj.biases
+  * model.layers.16.mlp.up_proj.scales
+  * model.layers.16.self_attn.k_proj.biases
+  * model.layers.16.self_attn.k_proj.scales
+  * model.layers.16.self_attn.o_proj.biases
+  * model.layers.16.self_attn.o_proj.scales
+  * model.layers.16.self_attn.q_proj.biases
+  * model.layers.16.self_attn.q_proj.scales
+  * model.layers.16.self_attn.v_proj.biases
+  * model.layers.16.self_attn.v_proj.scales
+  * model.layers.17.mlp.down_proj.biases
+  * model.layers.17.mlp.down_proj.scales
+  * model.layers.17.mlp.gate_proj.biases
+  * model.layers.17.mlp.gate_proj.scales
+  * model.layers.17.mlp.up_proj.biases
+  * model.layers.17.mlp.up_proj.scales
+  * model.layers.17.self_attn.k_proj.biases
+  * model.layers.17.self_attn.k_proj.scales
+  * model.layers.17.self_attn.o_proj.biases
+  * model.layers.17.self_attn.o_proj.scales
+  * model.layers.17.self_attn.q_proj.biases
+  * model.layers.17.self_attn.q_proj.scales
+  * model.layers.17.self_attn.v_proj.biases
+  * model.layers.17.self_attn.v_proj.scales
+  * model.layers.18.mlp.down_proj.biases
+  * model.layers.18.mlp.down_proj.scales
+  * model.layers.18.mlp.gate_proj.biases
+  * model.layers.18.mlp.gate_proj.scales
+  * model.layers.18.mlp.up_proj.biases
+  * model.layers.18.mlp.up_proj.scales
+  * model.layers.18.self_attn.k_proj.biases
+  * model.layers.18.self_attn.k_proj.scales
+  * model.layers.18.self_attn.o_proj.biases
+  * model.layers.18.self_attn.o_proj.scales
+  * model.layers.18.self_attn.q_proj.biases
+  * model.layers.18.self_attn.q_proj.scales
+  * model.layers.18.self_attn.v_proj.biases
+  * model.layers.18.self_attn.v_proj.scales
+  * model.layers.19.mlp.down_proj.biases
+  * model.layers.19.mlp.down_proj.scales
+  * model.layers.19.mlp.gate_proj.biases
+  * model.layers.19.mlp.gate_proj.scales
+  * model.layers.19.mlp.up_proj.biases
+  * model.layers.19.mlp.up_proj.scales
+  * model.layers.19.self_attn.k_proj.biases
+  * model.layers.19.self_attn.k_proj.scales
+  * model.layers.19.self_attn.o_proj.biases
+  * model.layers.19.self_attn.o_proj.scales
+  * model.layers.19.self_attn.q_proj.biases
+  * model.layers.19.self_attn.q_proj.scales
+  * model.layers.19.self_attn.v_proj.biases
+  * model.layers.19.self_attn.v_proj.scales
+  * model.layers.2.mlp.down_proj.biases
+  * model.layers.2.mlp.down_proj.scales
+  * model.layers.2.mlp.gate_proj.biases
+  * model.layers.2.mlp.gate_proj.scales
+  * model.layers.2.mlp.up_proj.biases
+  * model.layers.2.mlp.up_proj.scales
+  * model.layers.2.self_attn.k_proj.biases
+  * model.layers.2.self_attn.k_proj.scales
+  * model.layers.2.self_attn.o_proj.biases
+  * model.layers.2.self_attn.o_proj.scales
+  * model.layers.2.self_attn.q_proj.biases
+  * model.layers.2.self_attn.q_proj.scales
+  * model.layers.2.self_attn.v_proj.biases
+  * model.layers.2.self_attn.v_proj.scales
+  * model.layers.20.mlp.down_proj.biases
+  * model.layers.20.mlp.down_proj.scales
+  * model.layers.20.mlp.gate_proj.biases
+  * model.layers.20.mlp.gate_proj.scales
+  * model.layers.20.mlp.up_proj.biases
+  * model.layers.20.mlp.up_proj.scales
+  * model.layers.20.self_attn.k_proj.biases
+  * model.layers.20.sel (truncated)
+==> Loading MLX-4bit params (dequantize → Bumblebee layout → re-quantize) ...
+
+09:15:23.661 [debug] the following parameters were ignored, because of non-matching shape:
+
+  * decoder.blocks.19.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.17.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.0.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.7.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.11.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.17.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.21.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.6.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.16.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.16.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.8.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.16.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.3.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.20.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.13.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.2.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.26.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.8.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.16.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.7.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.12.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.14.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.18.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.20.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.19.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.2.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.23.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.18.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * language_modeling_head.output.kernel (expected {151936, 1024}, got: {151936, 128})
+  * decoder.blocks.27.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.0.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.23.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.11.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.9.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.4.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.7.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.21.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.2.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.15.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.6.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.22.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.22.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.ffn.intermediate.kernel (expect (truncated)
+    params loaded in 97 ms
+==> Building Bumblebee.Text.generation serving (base — no rewrite) ...
+
+==> [Qwen3-0.6B-MLX-4bit / bb base] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 1261 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 954 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / bb base] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 1034 ms = 58.0 tok/s
+    run 2: 60 tokens / 1028 ms = 58.4 tok/s
+    run 3: 60 tokens / 958 ms = 62.6 tok/s
+    run 4: 60 tokens / 942 ms = 63.7 tok/s
+    run 5: 60 tokens / 969 ms = 61.9 tok/s
+    bb base           (Bumblebee, no rewrite)        : median=61.9  mean=60.9±2.3  min/max=58.0/63.7 tok/s
+
+==> Spawning isolated peer for lane :bb_rewrite ...
+
+09:15:35.284 [debug] the following PyTorch parameters were unused:
+
+  * model.embed_tokens.biases
+  * model.embed_tokens.scales
+  * model.layers.0.mlp.down_proj.biases
+  * model.layers.0.mlp.down_proj.scales
+  * model.layers.0.mlp.gate_proj.biases
+  * model.layers.0.mlp.gate_proj.scales
+  * model.layers.0.mlp.up_proj.biases
+  * model.layers.0.mlp.up_proj.scales
+  * model.layers.0.self_attn.k_proj.biases
+  * model.layers.0.self_attn.k_proj.scales
+  * model.layers.0.self_attn.o_proj.biases
+  * model.layers.0.self_attn.o_proj.scales
+  * model.layers.0.self_attn.q_proj.biases
+  * model.layers.0.self_attn.q_proj.scales
+  * model.layers.0.self_attn.v_proj.biases
+  * model.layers.0.self_attn.v_proj.scales
+  * model.layers.1.mlp.down_proj.biases
+  * model.layers.1.mlp.down_proj.scales
+  * model.layers.1.mlp.gate_proj.biases
+  * model.layers.1.mlp.gate_proj.scales
+  * model.layers.1.mlp.up_proj.biases
+  * model.layers.1.mlp.up_proj.scales
+  * model.layers.1.self_attn.k_proj.biases
+  * model.layers.1.self_attn.k_proj.scales
+  * model.layers.1.self_attn.o_proj.biases
+  * model.layers.1.self_attn.o_proj.scales
+  * model.layers.1.self_attn.q_proj.biases
+  * model.layers.1.self_attn.q_proj.scales
+  * model.layers.1.self_attn.v_proj.biases
+  * model.layers.1.self_attn.v_proj.scales
+  * model.layers.10.mlp.down_proj.biases
+  * model.layers.10.mlp.down_proj.scales
+  * model.layers.10.mlp.gate_proj.biases
+  * model.layers.10.mlp.gate_proj.scales
+  * model.layers.10.mlp.up_proj.biases
+  * model.layers.10.mlp.up_proj.scales
+  * model.layers.10.self_attn.k_proj.biases
+  * model.layers.10.self_attn.k_proj.scales
+  * model.layers.10.self_attn.o_proj.biases
+  * model.layers.10.self_attn.o_proj.scales
+  * model.layers.10.self_attn.q_proj.biases
+  * model.layers.10.self_attn.q_proj.scales
+  * model.layers.10.self_attn.v_proj.biases
+  * model.layers.10.self_attn.v_proj.scales
+  * model.layers.11.mlp.down_proj.biases
+  * model.layers.11.mlp.down_proj.scales
+  * model.layers.11.mlp.gate_proj.biases
+  * model.layers.11.mlp.gate_proj.scales
+  * model.layers.11.mlp.up_proj.biases
+  * model.layers.11.mlp.up_proj.scales
+  * model.layers.11.self_attn.k_proj.biases
+  * model.layers.11.self_attn.k_proj.scales
+  * model.layers.11.self_attn.o_proj.biases
+  * model.layers.11.self_attn.o_proj.scales
+  * model.layers.11.self_attn.q_proj.biases
+  * model.layers.11.self_attn.q_proj.scales
+  * model.layers.11.self_attn.v_proj.biases
+  * model.layers.11.self_attn.v_proj.scales
+  * model.layers.12.mlp.down_proj.biases
+  * model.layers.12.mlp.down_proj.scales
+  * model.layers.12.mlp.gate_proj.biases
+  * model.layers.12.mlp.gate_proj.scales
+  * model.layers.12.mlp.up_proj.biases
+  * model.layers.12.mlp.up_proj.scales
+  * model.layers.12.self_attn.k_proj.biases
+  * model.layers.12.self_attn.k_proj.scales
+  * model.layers.12.self_attn.o_proj.biases
+  * model.layers.12.self_attn.o_proj.scales
+  * model.layers.12.self_attn.q_proj.biases
+  * model.layers.12.self_attn.q_proj.scales
+  * model.layers.12.self_attn.v_proj.biases
+  * model.layers.12.self_attn.v_proj.scales
+  * model.layers.13.mlp.down_proj.biases
+  * model.layers.13.mlp.down_proj.scales
+  * model.layers.13.mlp.gate_proj.biases
+  * model.layers.13.mlp.gate_proj.scales
+  * model.layers.13.mlp.up_proj.biases
+  * model.layers.13.mlp.up_proj.scales
+  * model.layers.13.self_attn.k_proj.biases
+  * model.layers.13.self_attn.k_proj.scales
+  * model.layers.13.self_attn.o_proj.biases
+  * model.layers.13.self_attn.o_proj.scales
+  * model.layers.13.self_attn.q_proj.biases
+  * model.layers.13.self_attn.q_proj.scales
+  * model.layers.13.self_attn.v_proj.biases
+  * model.layers.13.self_attn.v_proj.scales
+  * model.layers.14.mlp.down_proj.biases
+  * model.layers.14.mlp.down_proj.scales
+  * model.layers.14.mlp.gate_proj.biases
+  * model.layers.14.mlp.gate_proj.scales
+  * model.layers.14.mlp.up_proj.biases
+  * model.layers.14.mlp.up_proj.scales
+  * model.layers.14.self_attn.k_proj.biases
+  * model.layers.14.self_attn.k_proj.scales
+  * model.layers.14.self_attn.o_proj.biases
+  * model.layers.14.self_attn.o_proj.scales
+  * model.layers.14.self_attn.q_proj.biases
+  * model.layers.14.self_attn.q_proj.scales
+  * model.layers.14.self_attn.v_proj.biases
+  * model.layers.14.self_attn.v_proj.scales
+  * model.layers.15.mlp.down_proj.biases
+  * model.layers.15.mlp.down_proj.scales
+  * model.layers.15.mlp.gate_proj.biases
+  * model.layers.15.mlp.gate_proj.scales
+  * model.layers.15.mlp.up_proj.biases
+  * model.layers.15.mlp.up_proj.scales
+  * model.layers.15.self_attn.k_proj.biases
+  * model.layers.15.self_attn.k_proj.scales
+  * model.layers.15.self_attn.o_proj.biases
+  * model.layers.15.self_attn.o_proj.scales
+  * model.layers.15.self_attn.q_proj.biases
+  * model.layers.15.self_attn.q_proj.scales
+  * model.layers.15.self_attn.v_proj.biases
+  * model.layers.15.self_attn.v_proj.scales
+  * model.layers.16.mlp.down_proj.biases
+  * model.layers.16.mlp.down_proj.scales
+  * model.layers.16.mlp.gate_proj.biases
+  * model.layers.16.mlp.gate_proj.scales
+  * model.layers.16.mlp.up_proj.biases
+  * model.layers.16.mlp.up_proj.scales
+  * model.layers.16.self_attn.k_proj.biases
+  * model.layers.16.self_attn.k_proj.scales
+  * model.layers.16.self_attn.o_proj.biases
+  * model.layers.16.self_attn.o_proj.scales
+  * model.layers.16.self_attn.q_proj.biases
+  * model.layers.16.self_attn.q_proj.scales
+  * model.layers.16.self_attn.v_proj.biases
+  * model.layers.16.self_attn.v_proj.scales
+  * model.layers.17.mlp.down_proj.biases
+  * model.layers.17.mlp.down_proj.scales
+  * model.layers.17.mlp.gate_proj.biases
+  * model.layers.17.mlp.gate_proj.scales
+  * model.layers.17.mlp.up_proj.biases
+  * model.layers.17.mlp.up_proj.scales
+  * model.layers.17.self_attn.k_proj.biases
+  * model.layers.17.self_attn.k_proj.scales
+  * model.layers.17.self_attn.o_proj.biases
+  * model.layers.17.self_attn.o_proj.scales
+  * model.layers.17.self_attn.q_proj.biases
+  * model.layers.17.self_attn.q_proj.scales
+  * model.layers.17.self_attn.v_proj.biases
+  * model.layers.17.self_attn.v_proj.scales
+  * model.layers.18.mlp.down_proj.biases
+  * model.layers.18.mlp.down_proj.scales
+  * model.layers.18.mlp.gate_proj.biases
+  * model.layers.18.mlp.gate_proj.scales
+  * model.layers.18.mlp.up_proj.biases
+  * model.layers.18.mlp.up_proj.scales
+  * model.layers.18.self_attn.k_proj.biases
+  * model.layers.18.self_attn.k_proj.scales
+  * model.layers.18.self_attn.o_proj.biases
+  * model.layers.18.self_attn.o_proj.scales
+  * model.layers.18.self_attn.q_proj.biases
+  * model.layers.18.self_attn.q_proj.scales
+  * model.layers.18.self_attn.v_proj.biases
+  * model.layers.18.self_attn.v_proj.scales
+  * model.layers.19.mlp.down_proj.biases
+  * model.layers.19.mlp.down_proj.scales
+  * model.layers.19.mlp.gate_proj.biases
+  * model.layers.19.mlp.gate_proj.scales
+  * model.layers.19.mlp.up_proj.biases
+  * model.layers.19.mlp.up_proj.scales
+  * model.layers.19.self_attn.k_proj.biases
+  * model.layers.19.self_attn.k_proj.scales
+  * model.layers.19.self_attn.o_proj.biases
+  * model.layers.19.self_attn.o_proj.scales
+  * model.layers.19.self_attn.q_proj.biases
+  * model.layers.19.self_attn.q_proj.scales
+  * model.layers.19.self_attn.v_proj.biases
+  * model.layers.19.self_attn.v_proj.scales
+  * model.layers.2.mlp.down_proj.biases
+  * model.layers.2.mlp.down_proj.scales
+  * model.layers.2.mlp.gate_proj.biases
+  * model.layers.2.mlp.gate_proj.scales
+  * model.layers.2.mlp.up_proj.biases
+  * model.layers.2.mlp.up_proj.scales
+  * model.layers.2.self_attn.k_proj.biases
+  * model.layers.2.self_attn.k_proj.scales
+  * model.layers.2.self_attn.o_proj.biases
+  * model.layers.2.self_attn.o_proj.scales
+  * model.layers.2.self_attn.q_proj.biases
+  * model.layers.2.self_attn.q_proj.scales
+  * model.layers.2.self_attn.v_proj.biases
+  * model.layers.2.self_attn.v_proj.scales
+  * model.layers.20.mlp.down_proj.biases
+  * model.layers.20.mlp.down_proj.scales
+  * model.layers.20.mlp.gate_proj.biases
+  * model.layers.20.mlp.gate_proj.scales
+  * model.layers.20.mlp.up_proj.biases
+  * model.layers.20.mlp.up_proj.scales
+  * model.layers.20.self_attn.k_proj.biases
+  * model.layers.20.sel (truncated)
+==> Loading MLX-4bit params (dequantize → Bumblebee layout → re-quantize) ...
+
+09:15:35.289 [debug] the following parameters were ignored, because of non-matching shape:
+
+  * decoder.blocks.19.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.17.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.12.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.0.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.7.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.11.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.5.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.11.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.17.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.21.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.6.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.16.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.16.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.8.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.16.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.17.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.3.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.20.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.15.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.13.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.2.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.26.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.8.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.21.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.16.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.7.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.12.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.14.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.14.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.26.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.18.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.13.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.20.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.24.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.8.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.19.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.9.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.10.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.2.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.18.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.26.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.23.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.ffn.gate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.18.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * language_modeling_head.output.kernel (expected {151936, 1024}, got: {151936, 128})
+  * decoder.blocks.27.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.3.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.0.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.23.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.11.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.9.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.4.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.4.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.25.self_attention.value.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.ffn.output.kernel (expected {3072, 1024}, got: {384, 1024})
+  * decoder.blocks.7.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.13.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.21.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.2.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.22.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.15.self_attention.query.kernel (expected {1024, 2048}, got: {128, 2048})
+  * decoder.blocks.6.ffn.intermediate.kernel (expected {1024, 3072}, got: {128, 3072})
+  * decoder.blocks.14.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.22.self_attention.key.kernel (expected {1024, 1024}, got: {128, 1024})
+  * decoder.blocks.6.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.22.self_attention.output.kernel (expected {2048, 1024}, got: {256, 1024})
+  * decoder.blocks.1.ffn.intermediate.kernel (expect (truncated)
+    params loaded in 103 ms
+==> Applying EMLXAxon.rewrite/1 (all rewrites — best performing path) ...
+
+==> [Qwen3-0.6B-MLX-4bit / bb+rewrite] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 897 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 708 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / bb+rewrite] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 762 ms = 78.7 tok/s
+    run 2: 60 tokens / 766 ms = 78.3 tok/s
+    run 3: 60 tokens / 683 ms = 87.8 tok/s
+    run 4: 60 tokens / 718 ms = 83.6 tok/s
+    run 5: 60 tokens / 754 ms = 79.6 tok/s
+    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=79.6  mean=81.6±3.6  min/max=78.3/87.8 tok/s
+
+==> Spawning isolated peer for lane :native ...
+
+==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...
+    loaded in 120 ms
+
+==> [Qwen3-0.6B-MLX-4bit / native] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 399 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 483 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / native] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 465 ms = 129.0 tok/s
+    run 2: 60 tokens / 432 ms = 138.9 tok/s
+    run 3: 60 tokens / 385 ms = 155.8 tok/s
+    run 4: 60 tokens / 452 ms = 132.7 tok/s
+    run 5: 60 tokens / 378 ms = 158.7 tok/s
+    native            (EMLXAxon.TextGeneration)       : median=138.9  mean=143.0±12.1  min/max=129.0/158.7 tok/s
+
+==> Spawning isolated peer for lane :emily_quantized ...
+
+==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Loading model on Emily.Backend ...
+    quantizing every Axon.dense node (bits=4, group_size=64) ...
+
+==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 1824 ms  "<think> Okay, the user is asking for twenty programming lang..."
+    warmup 2: 60 tokens / 1758 ms  "<think> Okay, the user is asking for twenty programming lang..."
+
+==> [Qwen3-0.6B-MLX-4bit / emily-quantized] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 1707 ms = 35.1 tok/s
+    run 2: 60 tokens / 1742 ms = 34.4 tok/s
+    run 3: 60 tokens / 1727 ms = 34.7 tok/s
+    run 4: 60 tokens / 1702 ms = 35.3 tok/s
+    run 5: 60 tokens / 1775 ms = 33.8 tok/s
+    emily-quantized   (Emily int4, native: true)      : median=34.7  mean=34.7±0.5  min/max=33.8/35.3 tok/s
+
+################################################################################
+=== Qwen3-0.6B (dense bf16) — {:local, "/Users/valente/models/Qwen3-0.6B"} ===
+################################################################################
+
+
+==> Spawning isolated peer for lane :bb_base ...
+==> Building Bumblebee.Text.generation serving (base — no rewrite) ...
+
+==> [Qwen3-0.6B (dense bf16) / bb base] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 1162 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 990 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / bb base] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 1001 ms = 59.9 tok/s
+    run 2: 60 tokens / 1018 ms = 58.9 tok/s
+    run 3: 60 tokens / 1025 ms = 58.5 tok/s
+    run 4: 60 tokens / 986 ms = 60.9 tok/s
+    run 5: 60 tokens / 989 ms = 60.7 tok/s
+    bb base           (Bumblebee, no rewrite)        : median=59.9  mean=59.8±1.0  min/max=58.5/60.9 tok/s
+
+==> Spawning isolated peer for lane :bb_rewrite ...
+==> Applying EMLXAxon.rewrite/1 (all rewrites — best performing path) ...
+
+==> [Qwen3-0.6B (dense bf16) / bb+rewrite] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 848 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 739 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / bb+rewrite] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 770 ms = 77.9 tok/s
+    run 2: 60 tokens / 730 ms = 82.2 tok/s
+    run 3: 60 tokens / 764 ms = 78.5 tok/s
+    run 4: 60 tokens / 728 ms = 82.4 tok/s
+    run 5: 60 tokens / 730 ms = 82.2 tok/s
+    bb+rewrite        (Bumblebee + EMLXAxon.rewrite)  : median=82.2  mean=80.6±2.0  min/max=77.9/82.4 tok/s
+
+==> Spawning isolated peer for lane :native ...
+
+==> Loading EMLXAxon.TextGeneration (native 28-layer bypass) ...
+    loaded in 207 ms
+
+==> [Qwen3-0.6B (dense bf16) / native] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 790 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 708 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / native] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 707 ms = 84.9 tok/s
+    run 2: 60 tokens / 716 ms = 83.8 tok/s
+    run 3: 60 tokens / 702 ms = 85.5 tok/s
+    run 4: 60 tokens / 701 ms = 85.6 tok/s
+    run 5: 60 tokens / 709 ms = 84.6 tok/s
+    native            (EMLXAxon.TextGeneration)       : median=84.9  mean=84.9±0.7  min/max=83.8/85.6 tok/s
+
+==> Spawning isolated peer for lane :emily_eager ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-eager] Loading model on Emily.Backend ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-eager] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 6632 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 6448 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / emily-eager] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 6391 ms = 9.4 tok/s
+    run 2: 60 tokens / 6139 ms = 9.8 tok/s
+    run 3: 60 tokens / 6240 ms = 9.6 tok/s
+    run 4: 60 tokens / 6828 ms = 8.8 tok/s
+    run 5: 60 tokens / 6318 ms = 9.5 tok/s
+    emily-eager       (Evaluator + Emily.Backend)      : median=9.5  mean=9.4±0.3  min/max=8.8/9.8 tok/s
+
+==> Spawning isolated peer for lane :emily_native ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-native] Loading model on Emily.Backend ...
+
+==> [Qwen3-0.6B (dense bf16) / emily-native] Warmup (2 run(s), not timed) ...
+    warmup 1: 60 tokens / 793 ms  "<think> Okay, the user wants a list of twenty programming la..."
+    warmup 2: 60 tokens / 888 ms  "<think> Okay, the user wants a list of twenty programming la..."
+
+==> [Qwen3-0.6B (dense bf16) / emily-native] Benchmark (5 run(s)) ...
+    run 1: 60 tokens / 776 ms = 77.3 tok/s
+    run 2: 60 tokens / 838 ms = 71.6 tok/s
+    run 3: 60 tokens / 722 ms = 83.1 tok/s
+    run 4: 60 tokens / 851 ms = 70.5 tok/s
+    run 5: 60 tokens / 923 ms = 65.0 tok/s
+    emily-native      (Emily.Compiler, native: true)   : median=71.6  mean=73.5±6.2  min/max=65.0/83.1 tok/s
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Results
+
+> Matrix cells: row median tok/s ÷ col median tok/s (> 1 ⇒ row faster).
+
+```elixir
+results
+|> Enum.map(&Summary.to_markdown/1)
+|> Enum.join("\n\n---\n\n")
+|> Kino.Markdown.new()
+```
+
+```elixir
+results
+|> Summary.stats_rows()
+|> Kino.DataTable.new(name: "Per-lane tok/s stats")
+```
+
+<!-- livebook:{"output":true} -->
+
+```text
+[%{stddev: 2.3, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb base", median_tok_s: 61.9, mean_tok_s: 60.9, min_tok_s: 58.0, max_tok_s: 63.7}, %{stddev: 3.6, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "bb+rewrite", median_tok_s: 79.6, mean_tok_s: 81.6, min_tok_s: 78.3, max_tok_s: 87.8}, %{stddev: 12.1, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "native", median_tok_s: 138.9, mean_tok_s: 143.0, min_tok_s: 129.0, max_tok_s: 158.7}, %{stddev: 0.5, checkpoint: "Qwen3-0.6B-MLX-4bit", lane: "emily-quantized", median_tok_s: 34.7, mean_tok_s: 34.7, min_tok_s: 33.8, max_tok_s: 35.3}, %{stddev: 1.0, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb base", median_tok_s: 59.9, mean_tok_s: 59.8, min_tok_s: 58.5, max_tok_s: 60.9}, %{stddev: 2.0, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "bb+rewrite", median_tok_s: 82.2, mean_tok_s: 80.6, min_tok_s: 77.9, max_tok_s: 82.4}, %{stddev: 0.7, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "native", median_tok_s: 84.9, mean_tok_s: 84.9, min_tok_s: 83.8, max_tok_s: 85.6}, %{stddev: 0.3, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-eager", median_tok_s: 9.5, mean_tok_s: 9.4, min_tok_s: 8.8, max_tok_s: 9.8}, %{stddev: 6.2, checkpoint: "Qwen3-0.6B (dense bf16)", lane: "emily-native", median_tok_s: 71.6, mean_tok_s: 73.5, min_tok_s: 65.0, max_tok_s: 83.1}]
+```

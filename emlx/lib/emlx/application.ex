@@ -8,6 +8,11 @@ defmodule EMLX.Application do
   `EMLX.to_blob/1` for any process that has not bound its own queue via
   `EMLX.CommandQueue.with_queue/2`.
 
+  Also allocates one *runtime_call worker* per device — see
+  `runtime_call_worker/1`'s doc for why a `Nx.runtime_call/4` callback's own
+  eager EMLX calls must never route back to the worker that is, right now,
+  blocked waiting for that very callback to return.
+
   See `clean-room-import/01-worker-thread-dispatch.md` for the rationale
   behind `:persistent_term` instead of a `GenServer` + `Registry`.
 
@@ -28,6 +33,13 @@ defmodule EMLX.Application do
   this module silently skips the GPU worker. Subsequent
   `EMLX.eval/1` calls on a GPU tensor will raise at use time with the
   underlying `:persistent_term` `ArgumentError`.
+
+  ## CPU JIT compilation and SIGCHLD
+
+  Hitting `** (EMLX.NIFError) ... pclose() failed.` on the CPU backend? See
+  the "CPU JIT compilation and SIGCHLD" section of the `EMLX` moduledoc —
+  it's a BEAM/MLX interaction this application deliberately does not paper
+  over for you.
   """
 
   use Application
@@ -37,6 +49,8 @@ defmodule EMLX.Application do
     EMLX.Profiling.init()
     ensure_default_worker!(:cpu, _gpu_optional? = false)
     ensure_default_worker!(:gpu, _gpu_optional? = true)
+    ensure_worker!(:runtime_call_worker, :cpu, _gpu_optional? = false)
+    ensure_worker!(:runtime_call_worker, :gpu, _gpu_optional? = true)
     Supervisor.start_link([], strategy: :one_for_one, name: __MODULE__)
   end
 
@@ -51,13 +65,46 @@ defmodule EMLX.Application do
   (`{EMLX, :default_worker, device}`) — overwriting a `:persistent_term`
   value triggers a node-wide GC.
   """
-  @spec default_worker(:cpu | :gpu) :: reference()
   def default_worker(device) when device in [:cpu, :gpu] do
-    :persistent_term.get(persistent_term_key(device))
+    :persistent_term.get(persistent_term_key(:default_worker, device))
+  end
+
+  @doc """
+  Returns the `EMLX.CommandQueue` NIF resource dedicated to running
+  `Nx.runtime_call/4` callbacks for the given device.
+
+  `EMLX.handle_runtime_call/5` binds *this* worker (via
+  `EMLX.CommandQueue.with_queue/2`'s same `Process.put(:emlx_command_queue,
+  _)` mechanism) for the duration of every real callback invocation, so any
+  eager EMLX call the callback itself makes (e.g.
+  `EMLX.Quantization.dequantize_callback/2` calling `EMLX.dequantize/1`)
+  gets worker-routed *here* instead of to the default (or bound) worker that
+  is, right now, blocked inside `EMLXRuntimeCall::eval_cpu`/`eval_gpu`
+  waiting for that very callback to finish. Reusing that same, still-busy
+  worker would either deadlock (its one dedicated OS thread cannot service
+  a new job while blocked — see `emlx_worker.hpp`) or, if the blocked wait
+  instead pumps that worker's own queue inline, crash (MLX's GPU `eval()`
+  is not reentrant on one OS thread — nesting a second `mlx::core::eval`
+  call while the first is still on the C++ stack corrupts Metal
+  command-buffer/completion-handler state). A second, otherwise-idle
+  worker sidesteps both failure modes: it is a distinct OS thread with its
+  own `mlx::core::Stream`, so its jobs never contend with (or nest inside)
+  the blocked worker's.
+
+  Raises `ArgumentError` if no worker has been allocated for the device
+  (e.g. asking for `:gpu` on a system without Metal) — same contract as
+  `default_worker/1`.
+  """
+  def runtime_call_worker(device) when device in [:cpu, :gpu] do
+    :persistent_term.get(persistent_term_key(:runtime_call_worker, device))
   end
 
   defp ensure_default_worker!(device, gpu_optional?) do
-    key = persistent_term_key(device)
+    ensure_worker!(:default_worker, device, gpu_optional?)
+  end
+
+  defp ensure_worker!(kind, device, gpu_optional?) do
+    key = persistent_term_key(kind, device)
 
     case :persistent_term.get(key, :unset) do
       :unset ->
@@ -70,7 +117,7 @@ defmodule EMLX.Application do
 
           {:error, reason} ->
             raise EMLX.NIFError,
-                  "EMLX.Application could not allocate default #{device} worker: " <>
+                  "EMLX.Application could not allocate #{kind} #{device} worker: " <>
                     List.to_string(reason)
         end
 
@@ -79,5 +126,5 @@ defmodule EMLX.Application do
     end
   end
 
-  defp persistent_term_key(device), do: {EMLX, :default_worker, device}
+  defp persistent_term_key(kind, device), do: {EMLX, kind, device}
 end

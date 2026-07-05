@@ -123,7 +123,7 @@ defmodule EMLXAxon.Qwen3.Attention do
     # The slice and SDPA are fused in the same lazy graph, so they land in one
     # Metal command buffer submission.
     {attn_ref, k_cache_ref, v_cache_ref} =
-      EMLX.qwen3_kv_cache_attention(
+      EMLX.Native.Qwen3.kv_cache_attention(
         EMLX.Backend.from_nx(q),
         EMLX.Backend.from_nx(k),
         EMLX.Backend.from_nx(v),
@@ -161,7 +161,7 @@ defmodule EMLXAxon.Qwen3.Attention do
     theta = cfg.rope_theta
 
     {out_ref, k_cache_ref, v_cache_ref} =
-      EMLX.qwen3_attention_block(
+      EMLX.Native.Qwen3.attention_block(
         EMLX.Backend.from_nx(hidden),
         EMLX.Backend.from_nx(norm),
         EMLX.Backend.from_nx(q_proj),
@@ -193,7 +193,7 @@ defmodule EMLXAxon.Qwen3.Attention do
     else
       residual_hidden
       |> EMLX.Backend.from_nx()
-      |> EMLX.qwen3_attention_residual(attn_ref, EMLX.Backend.from_nx(o_proj))
+      |> EMLX.Native.Qwen3.attention_residual(attn_ref, EMLX.Backend.from_nx(o_proj))
       |> EMLX.Backend.to_nx()
     end
   end

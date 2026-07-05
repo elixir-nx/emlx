@@ -76,8 +76,6 @@ defmodule EMLXAxon.Qwen3.Generate do
                         (median ≈ steady-state)
   - `:total_ms`       — wall time for the whole call, with microsecond resolution
   """
-  @spec generate(Nx.Tensor.t(), Model.State.t(), keyword()) ::
-          {[non_neg_integer()], map()}
   def generate(input_ids, %Model.State{} = state, opts \\ []) do
     ensure_single_batch!(input_ids)
 

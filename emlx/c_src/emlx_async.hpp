@@ -60,11 +60,11 @@
 
 #pragma once
 
+#include "emlx_runtime_call_bridge.hpp"
 #include "emlx_worker.hpp"
 #include "erl_nif.h"
 #include "nx_nif_utils.hpp"
 
-#include <cstring>
 #include <exception>
 #include <vector>
 
@@ -144,6 +144,27 @@ ERL_NIF_TERM async_dispatch(ErlNifEnv *env, int argc,
                   op_argv = std::move(op_argv)]() mutable {
       ERL_NIF_TERM payload;
       try {
+        // Make this job's caller pid available to emlx::native's
+        // EMLXRuntimeCall primitive for the duration of the call — see
+        // emlx_runtime_call_bridge.hpp. Jobs *can* nest on a worker's one
+        // dedicated OS thread: a blocked runtime_call pumps this same
+        // worker's queue while waiting (Worker::pump_until,
+        // emlx_worker.hpp), so a job posted by that call's own real
+        // callback (e.g. EMLX.Quantization reentering EMLX on this same
+        // worker) may run to completion *before* this outer job does.
+        // Restore the *previous* pid on exit (not unconditionally
+        // nullptr) so unwinding back out of a nested job doesn't clobber
+        // the outer job's still-in-flight caller pid.
+        struct CallerPidGuard {
+          ErlNifPid pid;
+          ErlNifPid *previous;
+          explicit CallerPidGuard(ErlNifPid p) : pid(p) {
+            previous = emlx::g_current_caller_pid;
+            emlx::g_current_caller_pid = &pid;
+          }
+          ~CallerPidGuard() { emlx::g_current_caller_pid = previous; }
+        } caller_pid_guard(caller_pid);
+
         payload = SyncOp(msg_env, static_cast<int>(op_argv.size()),
                          op_argv.data());
       } catch (...) {

@@ -41,7 +41,6 @@ defmodule EMLXAxon.Qwen3.Loader do
 
   Returns `{:ok, %State{}}` or `{:error, reason}`.
   """
-  @spec load(Path.t()) :: {:ok, State.t()} | {:error, term()}
   def load(path) do
     path = Path.expand(path)
 

@@ -14,7 +14,15 @@ import Config
 # indexed_add, and indexed_put before the NIF call.
 # config :emlx, enable_bounds_check: true
 
-# Raises ArgumentError if dot (matmul / einsum) produces NaN or Inf.
-# When EMLX.Fast is implemented (task 05), rms_norm, layer_norm, and
-# scaled_dot_product_attention will also be checked.
+# Raises ArgumentError if dot (matmul / einsum), conv, or EMLX.Fast's
+# rms_norm/layer_norm/scaled_dot_product_attention kernels produce NaN or Inf.
 # config :emlx, detect_non_finites: true
+
+# Raises ArgumentError on internal lowering/to_native invariant violations in
+# EMLX.Native.Expr (ref id collisions, forward/self-referencing instructions,
+# double-bound result refs) that would otherwise silently miscompile instead
+# of failing loudly. Unlike the two flags above, this one is cheap (no extra
+# eval syncs) — it's off by default only because these bugs should never
+# happen in a working compiler and the checks add wasted work on the hot
+# compile-cache-miss path.
+# config :emlx, compiler_debug: true

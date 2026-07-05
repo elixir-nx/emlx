@@ -22,6 +22,7 @@
 #include "mlx/stream.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -31,6 +32,16 @@
 #include <thread>
 
 namespace emlx {
+
+class Worker;
+
+// Points at the `Worker` whose dedicated OS thread is currently running,
+// for the entire lifetime of that thread (set once in `thread_main`, not
+// per-job — unlike `emlx::g_current_caller_pid`, which changes per job).
+// Lets code running deep inside a job (e.g. `invoke_runtime_call` in
+// emlx_runtime_call_bridge.hpp) find its own worker to pump its queue
+// while blocked, without threading a `Worker*` through every call site.
+inline thread_local Worker *g_current_worker = nullptr;
 
 class Worker {
 public:
@@ -105,6 +116,53 @@ public:
   mlx::core::Device device() const { return device_; }
   mlx::core::Stream stream() const { return stream_; }
 
+  // Called *from inside* a currently-executing job, on this worker's own
+  // OS thread — e.g. `emlx::native::invoke_runtime_call`
+  // (emlx_runtime_call_bridge.hpp), blocked inside `EMLXRuntimeCall::
+  // eval_cpu`/`eval_gpu` waiting for the Elixir side's reply. Rather than
+  // parking this thread on a bare wait (which would starve the rest of
+  // this worker's queue — including any job the pending reply's own
+  // real callback needs, e.g. `EMLX.Quantization`'s callbacks reentering
+  // EMLX on this very worker/device to run the actual op), keep draining
+  // and running this worker's own queue until `done()` returns true.
+  // Safe to do because we're still on the one OS thread that owns this
+  // worker's MLX stream thread-local state (see the class comment above
+  // and emlx_async.hpp's header comment) — no cross-thread MLX dispatch
+  // occurs, we're just running the *next* queued job a little earlier
+  // than `thread_main`'s own loop would have. Jobs run this way nest:
+  // if one of them itself blocks on another runtime_call, it recurses
+  // into another `pump_until` a level deeper, which is why
+  // `CallerPidGuard` (emlx_async.hpp) restores the *previous* caller pid
+  // on exit rather than unconditionally clearing it.
+  //
+  // `done` may be polled many times and must be cheap and never block.
+  void pump_until(const std::function<bool()> &done) {
+    while (!done()) {
+      Job job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        // Bounded wait: re-checks `done()` even if no job ever arrives
+        // (e.g. the reply is delivered without going through this
+        // worker's queue at all).
+        cv_.wait_for(lock, std::chrono::milliseconds(5), [this] {
+          return !queue_.empty() || stop_.load(std::memory_order_acquire);
+        });
+        if (queue_.empty()) {
+          continue;
+        }
+        job = std::move(queue_.front());
+        queue_.pop_front();
+      }
+
+      // Same contract as thread_main's loop below: a job must never let
+      // an exception escape.
+      try {
+        job();
+      } catch (...) {
+      }
+    }
+  }
+
 private:
   void thread_main(std::promise<mlx::core::Stream> stream_promise) {
     // Allocate the stream on THIS thread (MLX 0.31.2 thread-locality
@@ -122,6 +180,8 @@ private:
       stream_promise.set_exception(std::current_exception());
       return;
     }
+
+    g_current_worker = this;
 
     while (true) {
       Job job;
@@ -149,6 +209,8 @@ private:
         // here would orphan the calling process's receive.
       }
     }
+
+    g_current_worker = nullptr;
 
     // Release any per-thread MLX resources we hold (the StreamThread
     // for stream_ in the global scheduler will be torn down when the

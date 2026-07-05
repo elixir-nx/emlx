@@ -10,6 +10,14 @@ PRIV_DIR = $(MIX_APP_PATH)/priv
 BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)/objs
 EMLX_SO = $(PRIV_DIR)/libemlx.so
 EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
+# Headers are copied alongside the lib (unlike the lib copy, these are not
+# needed by EMLX itself at runtime) so out-of-tree native plugins loaded via
+# `EMLX.NIF.load_plugin/2` (e.g. emlx_axon's qwen3 compute plugin) can build
+# against the exact same libmlx this EMLX was compiled against, without
+# duplicating EMLX's libmlx version/cache-dir resolution logic — see
+# emlx_axon's Makefile/mix.exs, which locate these via
+# `Application.app_dir(:emlx, "priv/mlx/...")`.
+EMLX_INCLUDE_DIR = $(PRIV_DIR)/mlx/include
 
 # Only used if MLX_BUILD is true
 MLX_SRC_ARCHIVE = $(EMLX_CACHE_DIR)/mlx/$(MLX_VERSION)$(MLX_VARIANT).tar.gz
@@ -20,8 +28,8 @@ MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
 
 $(info LIBMLX_ENABLE_DEBUG=$(LIBMLX_ENABLE_DEBUG))
 # Build flags
-CFLAGS = -fPIC -I$(call esc,$(ERTS_INCLUDE_DIR)) -I$(call esc,$(MLX_INCLUDE_DIR)) -Wall \
-         -std=c++20
+CFLAGS = -fPIC -I$(call esc,$(ERTS_INCLUDE_DIR)) -I$(call esc,$(MLX_INCLUDE_DIR)) \
+         -I$(call esc,$(FINE_INCLUDE_DIR)) -Wall -std=c++20
 ifeq ($(LIBMLX_ENABLE_DEBUG),true)
 		CFLAGS += -g
 		CMAKE_BUILD_TYPE = Debug
@@ -47,8 +55,8 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_fast/qwen3.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_fast/qwen3_plugin_abi.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 
 # Main targets
@@ -100,6 +108,9 @@ $(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(OBJECTS)
 	@ echo "Copying MLX library to $(EMLX_LIB_DIR)"
 	@ mkdir -p "$(EMLX_LIB_DIR)"
 	@ cp -a "$(MLX_LIB_DIR)"/* "$(EMLX_LIB_DIR)"
+	@ echo "Copying MLX headers to $(EMLX_INCLUDE_DIR)"
+	@ mkdir -p "$(EMLX_INCLUDE_DIR)"
+	@ cp -a "$(MLX_INCLUDE_DIR)"/* "$(EMLX_INCLUDE_DIR)"
 	$(CXX) $(OBJECTS) -o "$(EMLX_SO)" $(LDFLAGS)
 
 clean:

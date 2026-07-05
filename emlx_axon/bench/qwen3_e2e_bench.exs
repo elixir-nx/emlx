@@ -36,16 +36,21 @@ max_new = 100
 IO.puts("==> Warming up (20 tokens greedy) ...")
 {_, _} = Generate.generate(input_ids, state, max_new_tokens: 20, sampler: :greedy)
 
+
 IO.puts("==> Benchmarking #{max_new} tokens per sampler ...\n")
 
 bench_sampler = fn sampler, label ->
   {tokens, %{timing: t}} =
-    Generate.generate(input_ids, state, max_new_tokens: max_new, sampler: sampler)
+    Generate.generate(input_ids, state,
+      max_new_tokens: max_new,
+      sampler: sampler,
+      profile_timing: true
+    )
 
   sorted_ms  = Enum.sort(t.per_token_ms)
   n          = length(sorted_ms)
-  median_ms  = Enum.at(sorted_ms, div(n, 2))
-  p95_ms     = Enum.at(sorted_ms, floor(n * 0.95))
+  median_ms  = if n > 0, do: Enum.at(sorted_ms, div(n, 2)), else: 0.0
+  p95_ms     = if n > 0, do: Enum.at(sorted_ms, floor(n * 0.95)), else: 0.0
   e2e_tok_s  = if t.total_ms > 0, do: Float.round(length(tokens) / t.total_ms * 1000, 1), else: 0.0
   kernel_tok_s = if median_ms > 0, do: Float.round(1000.0 / median_ms, 1), else: 0.0
 

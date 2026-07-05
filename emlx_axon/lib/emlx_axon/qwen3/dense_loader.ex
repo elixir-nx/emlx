@@ -17,7 +17,6 @@ defmodule EMLXAxon.Qwen3.DenseLoader do
   @doc """
   Converts a Bumblebee Qwen3 `model_info` map into a native dense state.
   """
-  @spec from_model_info(map()) :: {:ok, State.t()} | {:error, term()}
   def from_model_info(%{params: %{data: params}, spec: %Bumblebee.Text.Qwen3{} = spec}) do
     config = config_from_spec(spec)
 
@@ -71,7 +70,6 @@ defmodule EMLXAxon.Qwen3.DenseLoader do
   weights are transposed once at load time from safetensors `{out, in}` layout
   into the native dense `{in, out}` layout.
   """
-  @spec from_safetensors_dir(Path.t(), keyword()) :: {:ok, State.t()} | {:error, term()}
   def from_safetensors_dir(path, opts \\ []) do
     path = Path.expand(path)
 
@@ -88,8 +86,6 @@ defmodule EMLXAxon.Qwen3.DenseLoader do
   This is useful when a repository cache stores files by content addressed names
   rather than as a model directory.
   """
-  @spec from_safetensors_files(Path.t(), [Path.t()], keyword()) ::
-          {:ok, State.t()} | {:error, term()}
   def from_safetensors_files(config_path, safetensors_paths, opts \\ []) do
     device = Keyword.get(opts, :device, :gpu)
     type = Keyword.get(opts, :type)
