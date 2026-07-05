@@ -588,7 +588,16 @@ defmodule EMLX do
 
   Single Metal shader. Applies RoPE with a scalar position `offset`.
 
-  - `a`           — input `{B, ..., T, D}`
+  - `a`           — input `{B, ..., T, D}`; **`T` must be the second-to-last
+    axis** — e.g. `{B, T, D}` or, with a heads axis, `{B, H, T, D}`
+    (heads-transposed). If `H` (or any other middle axis) is placed *before*
+    `T` instead — e.g. `{B, T, H, D}` — `mlx::core::fast::rope` silently
+    rotates row `h` at angle `position + h` instead of `position` for every
+    `h > 0` (only row 0 is correct); see
+    [elixir-nx/emlx#121](https://github.com/elixir-nx/emlx/issues/121).
+    For Bumblebee's heads-not-yet-transposed `{B, T, H, D}` convention, use
+    `EMLX.fast_rope_ids/6` or `EMLX.fast_rope_positions/6` instead, which
+    guard against this.
   - `dims`        — number of feature dims to rotate (≤ last-axis size, must be even)
   - `traditional` — `false` for split-half (Qwen3); `true` for interleaved
   - `base`        — angular frequency base (e.g. 10_000 or 1_000_000)

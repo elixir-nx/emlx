@@ -9,6 +9,87 @@
 // plus a one-line `FINE_ASYNC_NIF(NAME)` — the registered NIF name, arity,
 // and the ASYNC_NIF/nif_funcs[] wiring in emlx_nif.cpp are all unchanged.
 
+// ── Multi-head-safe RoPE helpers ────────────────────────────────────────────
+//
+// mlx::core::fast::rope only recognizes Bumblebee's {B, T, H, D}
+// (heads-not-yet-transposed) convention via a stride-detection special case
+// meant to catch a *transposed view* of {B, H, T, D}. A plain, freshly
+// allocated {B, T, H, D} tensor is row-contiguous, so that guard never fires
+// and the kernel falls into its row_contiguous branch, which treats axis -2
+// (H) as the sequence axis — rotating head `h` at angle `position + h`
+// instead of `position` for every h > 0.
+// See https://github.com/elixir-nx/emlx/issues/121.
+//
+// H==1 has no such ambiguity (there's only one "row" per position), so the
+// fused Metal path stays correct and fast there. For H>1 we compose the same
+// split-half rotation from primitive ops instead, broadcasting cos/sin across
+// every head — this mirrors mlx::fast::rope's non-traditional formula
+// bit-for-bit:
+//   out[..half] = a[..half]*cos(angles) - a[half..dims]*sin(angles)
+//   out[half..] = a[half..dims]*cos(angles) + a[..half]*sin(angles)
+// (equivalently: rotate_half = concat(-a[half..dims], a[..half]); out =
+// a[..dims]*cos_full + rotate_half*sin_full — the form used below).
+//
+// `a` is {B, T, H, D}; `angles` is {B, T, half} (already position*inv_freq*scale).
+static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
+                                                const mlx::core::array &angles,
+                                                int dims,
+                                                mlx::core::Device device) {
+  int B = a.shape(0);
+  int T = a.shape(1);
+  int H = a.shape(2);
+  int D = a.shape(3);
+  int half = dims / 2;
+
+  auto cos_bt1h = astype(reshape(cos(angles, device), {B, T, 1, half}, device), a.dtype(), device);
+  auto sin_bt1h = astype(reshape(sin(angles, device), {B, T, 1, half}, device), a.dtype(), device);
+
+  auto cos_full = concatenate(std::vector<array>{cos_bt1h, cos_bt1h}, 3, device);
+  auto sin_full = concatenate(std::vector<array>{sin_bt1h, sin_bt1h}, 3, device);
+
+  auto x1 = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, half}), device);
+  auto x2 = slice(a, to_shape({0, 0, 0, half}), to_shape({B, T, H, dims}), device);
+  auto rotated = concatenate(std::vector<array>{negative(x2, device), x1}, 3, device);
+
+  auto a_head = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, dims}), device);
+  auto rope_head = add(multiply(a_head, cos_full, device), multiply(rotated, sin_full, device), device);
+
+  if (dims == D) {
+    return rope_head;
+  }
+  auto tail = slice(a, to_shape({0, 0, 0, dims}), to_shape({B, T, H, D}), device);
+  return concatenate(std::vector<array>{rope_head, tail}, 3, device);
+}
+
+// inv_freq[i] = 1 / base^(2i/dims), i in [0, dims/2).
+static mlx::core::array rope_inv_freq_from_base(int dims, double base) {
+  int half = dims / 2;
+  std::vector<float> inv_freq_host(half);
+  float base_f = static_cast<float>(base);
+  for (int i = 0; i < half; ++i) {
+    float expo = (2.0f * static_cast<float>(i)) / static_cast<float>(dims);
+    inv_freq_host[i] = 1.0f / std::pow(base_f, expo);
+  }
+  return array(inv_freq_host.begin(), {half}, float32);
+}
+
+// Reconstructs per-token angles = (offset[b] + t) * inv_freq * scale for the
+// assumed-sequential-positions contract of fast_rope_ids/fast_rope_with_freqs
+// (offset is {B}, one starting position per batch example; T is a's shape(1)).
+static mlx::core::array rope_sequential_angles(const mlx::core::array &offset,
+                                               const mlx::core::array &inv_freq,
+                                               int B, int T, int half,
+                                               double scale,
+                                               mlx::core::Device device) {
+  auto offset_b1 = reshape(astype(offset, float32, device), {B, 1}, device);
+  auto steps_1t = reshape(astype(arange(T, int32, device), float32, device), {1, T}, device);
+  auto pos_bt = add(offset_b1, steps_1t, device);
+  auto pos_bt1 = reshape(pos_bt, {B, T, 1}, device);
+  auto inv_11h = reshape(inv_freq, {1, 1, half}, device);
+  auto scale_arr = array(static_cast<float>(scale), float32);
+  return multiply(multiply(pos_bt1, inv_11h, device), scale_arr, device);
+}
+
 // fast_rms_norm — fused RMS normalisation
 // MLX: mlx::fast::rms_norm(x, weight, eps, stream) → array, same shape as x
 // weight is optional<array> in the C++ API; a plain TensorArg implicitly
@@ -86,10 +167,31 @@ FINE_ASYNC_NIF(fast_layer_norm_no_bias)
 // Calls the array-offset overload of mlx::fast::rope.
 // offset must be shape {B} — one starting position per batch example.
 // Assumes positions are sequential within each example: [offset[b], offset[b]+1, ..., offset[b]+T-1].
+//
+// H>1 (Bumblebee {B,T,H,D} convention — see the multi-head-safe RoPE helpers
+// comment above) falls back to the hand cos/sin/rotate composition; H==1
+// keeps the fused Metal path.
 mlx::core::array fast_rope_ids_impl(ErlNifEnv *env, TensorArg a, int dims,
                                     bool traditional, double base,
                                     double scale, TensorArg offset,
                                     mlx::core::Device device) {
+  if (a->ndim() == 4 && a->shape(2) > 1) {
+    if (traditional) {
+      throw std::invalid_argument(
+          "fast_rope_ids: traditional=true not supported for multi-head "
+          "(H>1) input");
+    }
+
+    int B = a->shape(0);
+    int T = a->shape(1);
+    int half = dims / 2;
+
+    auto inv_freq = rope_inv_freq_from_base(dims, base);
+    auto angles = rope_sequential_angles(*offset, inv_freq, B, T, half, scale, device);
+
+    return rope_rotate_from_angles(*a, angles, dims, device);
+  }
+
   return fast::rope(*a, dims, traditional, (float)base, (float)scale, *offset,
                     std::nullopt, device);
 }
@@ -99,11 +201,34 @@ FINE_ASYNC_NIF(fast_rope_ids)
 // Calls the freqs overload of mlx::fast::rope (base=nullopt, freqs supplied).
 // offset must be shape {B} — one starting position per batch example.
 // freqs must be shape {dims/2} — precomputed inverse frequencies.
+//
+// H>1 falls back to the hand cos/sin/rotate composition (see the
+// multi-head-safe RoPE helpers comment above); H==1 keeps the fused Metal
+// path. mlx::fast::rope's freqs overload uses inv_freq = reciprocal(freqs)
+// internally, so we replicate that reciprocal here to stay bit-for-bit with
+// the fused path.
 mlx::core::array fast_rope_with_freqs_impl(ErlNifEnv *env, TensorArg a,
                                            int dims, bool traditional,
                                            double scale, TensorArg offset,
                                            TensorArg freqs,
                                            mlx::core::Device device) {
+  if (a->ndim() == 4 && a->shape(2) > 1) {
+    if (traditional) {
+      throw std::invalid_argument(
+          "fast_rope_with_freqs: traditional=true not supported for "
+          "multi-head (H>1) input");
+    }
+
+    int B = a->shape(0);
+    int T = a->shape(1);
+    int half = dims / 2;
+
+    auto inv_freq = reciprocal(astype(*freqs, float32, device), device);
+    auto angles = rope_sequential_angles(*offset, inv_freq, B, T, half, scale, device);
+
+    return rope_rotate_from_angles(*a, angles, dims, device);
+  }
+
   return fast::rope(*a, dims, traditional, std::nullopt, (float)scale,
                     *offset, *freqs, device);
 }
@@ -140,7 +265,6 @@ mlx::core::array fast_rope_positions_impl(ErlNifEnv *env, TensorArg a,
 
   int B = a->shape(0);
   int T = a->shape(1);
-  int H = a->shape(2);
   int D = a->shape(3);
 
   if (position_ids->shape(0) != B || position_ids->shape(1) != T) {
@@ -158,14 +282,7 @@ mlx::core::array fast_rope_positions_impl(ErlNifEnv *env, TensorArg a,
 
   int half = dims / 2;
 
-  std::vector<float> inv_freq_host(half);
-  float base_f = static_cast<float>(base);
-  for (int i = 0; i < half; ++i) {
-    float expo = (2.0f * static_cast<float>(i)) / static_cast<float>(dims);
-    inv_freq_host[i] = 1.0f / std::pow(base_f, expo);
-  }
-
-  auto inv_freq = array(inv_freq_host.begin(), {half}, float32);
+  auto inv_freq = rope_inv_freq_from_base(dims, base);
 
   auto pos_f = astype(*position_ids, float32, device);
   auto pos_bt1 = reshape(pos_f, {B, T, 1}, device);
@@ -173,25 +290,7 @@ mlx::core::array fast_rope_positions_impl(ErlNifEnv *env, TensorArg a,
   auto scale_arr = array(static_cast<float>(scale), float32);
   auto angles = multiply(multiply(pos_bt1, inv_11h, device), scale_arr, device);
 
-  auto cos_bt1h = astype(reshape(cos(angles, device), {B, T, 1, half}, device), a->dtype(), device);
-  auto sin_bt1h = astype(reshape(sin(angles, device), {B, T, 1, half}, device), a->dtype(), device);
-
-  auto cos_full = concatenate(std::vector<array>{cos_bt1h, cos_bt1h}, 3, device);
-  auto sin_full = concatenate(std::vector<array>{sin_bt1h, sin_bt1h}, 3, device);
-
-  auto x1 = slice(*a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, half}), device);
-  auto x2 = slice(*a, to_shape({0, 0, 0, half}), to_shape({B, T, H, dims}), device);
-  auto rotated = concatenate(std::vector<array>{negative(x2, device), x1}, 3, device);
-
-  auto a_head = slice(*a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, dims}), device);
-  auto rope_head = add(multiply(a_head, cos_full, device), multiply(rotated, sin_full, device), device);
-
-  if (dims == D) {
-    return rope_head;
-  } else {
-    auto tail = slice(*a, to_shape({0, 0, 0, dims}), to_shape({B, T, H, D}), device);
-    return concatenate(std::vector<array>{rope_head, tail}, 3, device);
-  }
+  return rope_rotate_from_angles(*a, angles, dims, device);
 }
 FINE_ASYNC_NIF(fast_rope_positions)
 

@@ -2657,6 +2657,56 @@ defmodule EMLX.Native.ExprTest do
       assert_all_close(native, eager, tol: 1.0e-3)
     end
 
+    # https://github.com/elixir-nx/emlx/issues/121 — mlx::core::fast::rope's
+    # head_seq_transpose stride-detection guard doesn't trigger for a
+    # freshly-allocated, contiguous {B,T,H,D} tensor, so its row_contiguous
+    # fallback used to rotate head h at angle `position + h` instead of
+    # `position`, for every h > 0. "fused replay matches eager" above only
+    # proves native and eager *agree*, which they trivially did even while
+    # both called the same buggy primitive underneath — these tests instead
+    # check each head against an independent single-head computation (every
+    # head, computed alone, must use only its own position).
+    test "rope_with_positions (decode T=1, H>1): every head matches its single-head computation" do
+      dims = 64
+      base = 10_000.0
+      fun = fn a, pos -> EMLX.Fast.rope_with_positions(a, pos, dims, false, base, 1.0) end
+
+      a = Nx.iota({1, 1, 3, dims}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[6]], type: :s32) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos)
+
+      for head <- 0..2 do
+        a_head = a[[.., .., head..head, ..]]
+        alone = EMLX.Fast.rope_with_positions(a_head, pos, dims, false, base, 1.0)
+
+        assert_all_close(native[[.., .., head..head, ..]], alone, tol: 1.0e-3)
+        assert_all_close(eager[[.., .., head..head, ..]], alone, tol: 1.0e-3)
+      end
+    end
+
+    test "rope_with_freqs (decode T=1, H>1): every head matches its single-head computation" do
+      dims = 64
+      half = div(dims, 2)
+      fun = fn a, pos, freqs -> EMLX.Fast.rope_with_freqs(a, pos, dims, false, 1.0, freqs) end
+
+      a = Nx.iota({1, 1, 3, dims}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      pos = Nx.tensor([[6]], type: :s32) |> gpu_t()
+      freqs = Nx.iota({half}, type: :f32) |> Nx.add(1) |> Nx.divide(1000) |> gpu_t()
+
+      native = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(a, pos, freqs)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(a, pos, freqs)
+
+      for head <- 0..2 do
+        a_head = a[[.., .., head..head, ..]]
+        alone = EMLX.Fast.rope_with_freqs(a_head, pos, dims, false, 1.0, freqs)
+
+        assert_all_close(native[[.., .., head..head, ..]], alone, tol: 1.0e-3)
+        assert_all_close(eager[[.., .., head..head, ..]], alone, tol: 1.0e-3)
+      end
+    end
+
     test "decode-shaped block: fused path improves over primitive replay" do
       # A small attention+norm decode step: RMSNorm → causal SDPA → RMSNorm.
       scale = 0.125
@@ -3495,11 +3545,15 @@ defmodule EMLX.Native.ExprTest do
 
   # Pure-Nx primitive reference for prefill RoPE against a precomputed `freqs`
   # tensor (mirrors emlx_compiler.cpp's fast_rope_with_freqs_positions lambda:
-  # inv_freq = reciprocal(freqs), half-rotate cos/sin blend). Needed for H>1
-  # cases because the eager EMLX.Fast.rope_with_freqs reference calls
-  # mlx::core::fast::rope directly, which miscomputes non-head-0 rotations for
-  # multi-head input — see mlx-fast-rope-multihead-bugreport.md. `a` is
-  # {B, T, H, D}; `pos` is {B, T}; `freqs` is {dims/2}.
+  # inv_freq = reciprocal(freqs), half-rotate cos/sin blend). Kept as an
+  # independent oracle for H>1 prefill: the T>1 lowering path never calls
+  # mlx::core::fast::rope directly (it always uses the hand cos/sin/rotate
+  # composition, broadcast across heads), but a hand-written primitive here
+  # still guards against regressions in that composition without relying on
+  # the code under test to check itself. (T=1 decode used to have a related,
+  # now-fixed, multi-head bug — see elixir-nx/emlx#121 and the "multi-head
+  # correctness" tests below.) `a` is {B, T, H, D}; `pos` is {B, T}; `freqs`
+  # is {dims/2}.
   defp rope_freqs_prim(a, pos, freqs, dims, scale) do
     {b, t, _h, d} = Nx.shape(a)
     half = div(dims, 2)
