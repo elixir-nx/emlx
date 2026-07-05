@@ -86,7 +86,6 @@ defmodule EMLX.Quantization do
   * `:type` — Nx storage type: `{:s, 2}`, `{:s, 4}` (default), or `{:s, 8}`.
   * `:group_size` — quantization group size (default 64).
   """
-  @spec quantized_tensor(term(), term(), term(), tuple(), keyword()) :: Nx.Tensor.t()
   def quantized_tensor(weight_ref, scales_ref, biases_ref, original_shape, opts \\ []) do
     type = Keyword.get(opts, :type, {:s, 4})
     {_, bits} = type
@@ -191,7 +190,6 @@ defmodule EMLX.Quantization do
   @doc """
   Returns `true` if the tensor has quantization metadata on its backend.
   """
-  @spec quantized?(term()) :: boolean()
   def quantized?(%Nx.Tensor{data: %EMLX.Backend{quantization_config: cfg}}) when not is_nil(cfg),
     do: true
 

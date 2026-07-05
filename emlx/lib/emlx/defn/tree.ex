@@ -62,8 +62,6 @@ defmodule EMLX.Defn.Tree do
     * `:block` — `args = [struct, in_args, default_expr, callback]`;
       `default_expr` is the block's inner scope.
   """
-  @spec post_order(Nx.Container.t(), (Nx.Tensor.t() -> {:ok, [Nx.Tensor.t()]} | :default)) ::
-          [Nx.Tensor.t()]
   def post_order(output, scope_dependencies \\ fn _node -> :default end) do
     roots = Composite.flatten_list([output])
     {_visited, rev} = Enum.reduce(roots, {MapSet.new(), []}, &visit(&1, &2, scope_dependencies))

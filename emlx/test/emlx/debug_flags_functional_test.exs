@@ -80,7 +80,7 @@ defmodule EMLX.DebugFlagsFunctionalTest do
     end
   end
 
-  test "EMLX.Native.Expr.to_wire raises on a ref id collision across categories (:compiler_debug)" do
+  test "EMLX.Native.Expr.to_native raises on a ref id collision across categories (:compiler_debug)" do
     ref = make_ref()
 
     prog = %Expr{
@@ -92,11 +92,11 @@ defmodule EMLX.DebugFlagsFunctionalTest do
     }
 
     assert_raise ArgumentError, ~r/ref id collision across inputs\/captures\/constants/, fn ->
-      Expr.to_wire(prog)
+      Expr.to_native(prog)
     end
   end
 
-  test "EMLX.Native.Expr.to_wire raises when an instruction's result ref is already bound (:compiler_debug)" do
+  test "EMLX.Native.Expr.to_native raises when an instruction's result ref is already bound (:compiler_debug)" do
     ref = make_ref()
 
     prog = %Expr{
@@ -108,7 +108,7 @@ defmodule EMLX.DebugFlagsFunctionalTest do
     }
 
     assert_raise ArgumentError, ~r/that ref is already bound/, fn ->
-      Expr.to_wire(prog)
+      Expr.to_native(prog)
     end
   end
 end

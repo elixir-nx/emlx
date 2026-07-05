@@ -8,7 +8,6 @@ defmodule EMLX.Native do
   C++ NIFs. Sub-byte integer types (`{:u, 2}`, `{:u, 4}`, `{:s, 2}`, `{:s, 4}`)
   are widened to the smallest MLX integer type that can hold them.
   """
-  @spec to_mlx_type(Nx.Type.t()) :: atom()
   def to_mlx_type({:u, 2}), do: :uint8
   def to_mlx_type({:u, 4}), do: :uint8
   def to_mlx_type({:u, 8}), do: :uint8

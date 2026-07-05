@@ -1608,7 +1608,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 // Ops that produce more than one result array (linalg factorizations).  Their
 // outputs are appended to the flat `results` accumulator in the returned order;
 // the Elixir lowerer assigns consecutive result indices to the matching output
-// refs (see to_wire/1's list-result handling).  Pinned to the CPU device.
+// refs (see to_native/1's list-result handling).  Pinned to the CPU device.
 using MultiOpFn = std::function<
     std::vector<mlx::core::array>(const std::vector<mlx::core::array> &ops,
                                   const std::vector<Attr> &attrs)>;
@@ -1761,8 +1761,8 @@ Expr::~Expr() {
 
 // ── NIF implementations ───────────────────────────────────────────────────────
 
-// compile_program — decodes the wire Program (see EMLX.Native.Wire.Program /
-// EMLX.Native.Expr.to_wire/1, decoded directly by fine::Decoder<Program> in
+// compile_program — decodes the wire Program (see EMLX.Native.Program /
+// EMLX.Native.Expr.to_native/1, decoded directly by fine::Decoder<Program> in
 // emlx_compiler.hpp), builds a capturing interpreter lambda backed by the op
 // registry, wraps it with mlx::core::compile(), and stores the result as an
 // opaque Expr BEAM resource.

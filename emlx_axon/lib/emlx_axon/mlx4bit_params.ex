@@ -38,7 +38,6 @@ defmodule EMLXAxon.MLX4BitParams do
   Returns `%Axon.ModelState{}` with BF16 tensors in Bumblebee key layout.
   All linear kernels are transposed from MLX `{out, in}` to Bumblebee `{in, out}`.
   """
-  @spec load(Path.t()) :: Axon.ModelState.t()
   def load(mlx_path) do
     mlx_path = Path.expand(mlx_path)
     config = read_config(mlx_path)

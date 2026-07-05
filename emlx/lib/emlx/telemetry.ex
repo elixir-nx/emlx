@@ -48,13 +48,11 @@ defmodule EMLX.Telemetry do
   """
 
   @doc false
-  @spec span_eval((-> result)) :: result when result: term()
   def span_eval(fun) do
     :telemetry.span([:emlx, :eval], %{}, fn -> {fun.(), %{}} end)
   end
 
   @doc false
-  @spec span_to_binary(Nx.Tensor.t(), (-> binary())) :: binary()
   def span_to_binary(%Nx.Tensor{shape: shape, type: type}, fun) do
     start_metadata = %{shape: shape, dtype: type}
 
@@ -76,11 +74,6 @@ defmodule EMLX.Telemetry do
       [:active_memory, :cache_memory, :peak_memory]
 
   """
-  @spec memory_stats() :: %{
-          active_memory: non_neg_integer(),
-          peak_memory: non_neg_integer(),
-          cache_memory: non_neg_integer()
-        }
   def memory_stats do
     stats = EMLX.memory_info()
     :telemetry.execute([:emlx, :memory, :stats], stats, %{})

@@ -65,7 +65,6 @@ defmodule EMLX.Application do
   (`{EMLX, :default_worker, device}`) — overwriting a `:persistent_term`
   value triggers a node-wide GC.
   """
-  @spec default_worker(:cpu | :gpu) :: reference()
   def default_worker(device) when device in [:cpu, :gpu] do
     :persistent_term.get(persistent_term_key(:default_worker, device))
   end
@@ -96,7 +95,6 @@ defmodule EMLX.Application do
   (e.g. asking for `:gpu` on a system without Metal) — same contract as
   `default_worker/1`.
   """
-  @spec runtime_call_worker(:cpu | :gpu) :: reference()
   def runtime_call_worker(device) when device in [:cpu, :gpu] do
     :persistent_term.get(persistent_term_key(:runtime_call_worker, device))
   end

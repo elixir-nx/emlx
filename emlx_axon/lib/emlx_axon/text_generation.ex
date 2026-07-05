@@ -56,13 +56,6 @@ defmodule EMLXAxon.TextGeneration do
   `EMLXAxon.Qwen3.Model.State` and want to avoid serving preprocessing
   overhead. The return shape matches `serving/3` for the same `:output_format`.
   """
-  @spec run(
-          Bumblebee.Tokenizer.t(),
-          Model.State.t(),
-          binary() | %{text: binary()},
-          keyword()
-        ) ::
-          map()
   def run(tokenizer, %Model.State{} = state, input, opts \\ []) do
     max_new = max_new_tokens!(opts, 100)
     configured_max_len = Keyword.get(opts, :max_len, 2048)
@@ -211,13 +204,6 @@ defmodule EMLXAxon.TextGeneration do
     the response. Samplers that cannot use deferred host sync fall back to
     emitting each token.
   """
-  @spec stream(
-          Bumblebee.Tokenizer.t(),
-          Model.State.t(),
-          binary() | map(),
-          (binary() -> term()),
-          keyword()
-        ) :: %{token_summary: map()}
   def stream(tokenizer, %Model.State{} = state, input, emit_fun, opts \\ [])
       when is_function(emit_fun, 1) do
     max_new = max_new_tokens!(opts, 100)
@@ -323,7 +309,6 @@ defmodule EMLXAxon.TextGeneration do
                         `:bumblebee` returns `%{text: text, token_summary: summary}`
                         compatible with `Bumblebee.Text.generation/4` (default `:native`)
   """
-  @spec serving(Bumblebee.Tokenizer.t(), Model.State.t(), keyword()) :: Nx.Serving.t()
   def serving(tokenizer, state, opts \\ []) do
     max_new = max_new_tokens!(opts, 100)
     configured_max_len = Keyword.get(opts, :max_len, 2048)
@@ -400,7 +385,6 @@ defmodule EMLXAxon.TextGeneration do
   The tokenizer is expected to come from the same directory (same `tokenizer.json`).
   Loading both from the same directory avoids chat-template / BOS-token divergence.
   """
-  @spec from_mlx4bit(Path.t(), Bumblebee.Tokenizer.t(), keyword()) :: Nx.Serving.t()
   def from_mlx4bit(checkpoint_path, tokenizer, opts \\ []) do
     {:ok, state} = Loader.load(checkpoint_path)
     serving(tokenizer, state, opts)

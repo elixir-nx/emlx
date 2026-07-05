@@ -18,7 +18,7 @@ import Config
 # rms_norm/layer_norm/scaled_dot_product_attention kernels produce NaN or Inf.
 # config :emlx, detect_non_finites: true
 
-# Raises ArgumentError on internal lowering/to_wire invariant violations in
+# Raises ArgumentError on internal lowering/to_native invariant violations in
 # EMLX.Native.Expr (ref id collisions, forward/self-referencing instructions,
 # double-bound result refs) that would otherwise silently miscompile instead
 # of failing loudly. Unlike the two flags above, this one is cheap (no extra

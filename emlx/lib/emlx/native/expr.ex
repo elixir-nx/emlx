@@ -52,11 +52,6 @@ defmodule EMLX.Native.Expr do
   # ── lowering ──────────────────────────────────────────────────────────────
 
   @doc false
-  @spec lower(
-          Nx.Container.t(),
-          non_neg_integer() | nil,
-          %{non_neg_integer() => EMLX.Quantization.Config.t()}
-        ) :: t()
   def lower(output, num_inputs \\ nil, quant_signature \\ %{}) do
     ordered = EMLX.Defn.Tree.post_order(output, &scope_dependencies/1)
 
@@ -1694,7 +1689,6 @@ defmodule EMLX.Native.Expr do
   end
 
   @doc false
-  @spec native_lowerable_block?(struct(), [Nx.Tensor.t()]) :: boolean()
   def native_lowerable_block?(%Nx.Block.LogicalNot{}, _in_args), do: true
   def native_lowerable_block?(%Nx.Block.Take{}, _in_args), do: true
   def native_lowerable_block?(%Nx.Block.TakeAlongAxis{}, _in_args), do: true
@@ -2270,7 +2264,6 @@ defmodule EMLX.Native.Expr do
   end
 
   @doc false
-  @spec quantizable_param_positions(Nx.Container.t()) :: MapSet.t(non_neg_integer())
   def quantizable_param_positions(output) do
     output
     |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
@@ -2292,14 +2285,12 @@ defmodule EMLX.Native.Expr do
   defp maybe_put_param_position(acc, _node), do: acc
 
   @doc false
-  @spec f64_bits(number()) :: integer()
   def f64_bits(v) when is_number(v) do
     <<bits::signed-64>> = <<v * 1.0::float-64>>
     bits
   end
 
   @doc false
-  @spec bits_to_f64(integer()) :: float()
   def bits_to_f64(bits) when is_integer(bits) do
     <<v::float-64>> = <<bits::signed-64>>
     v
@@ -2388,11 +2379,10 @@ defmodule EMLX.Native.Expr do
   # ── wire serialisation ────────────────────────────────────────────────────
 
   @doc false
-  @spec to_wire(t()) :: EMLX.Native.Wire.Program.t()
-  def to_wire(%__MODULE__{} = prog) do
+  def to_native(%__MODULE__{} = prog) do
     # Build ref → wire-ref map for all non-instruction nodes. A wire ref is a
     # tagged tuple ({:input, i} / {:capture, i} / {:const, i} / {:result, i})
-    # instead of a bit-packed int — see EMLX.Native.Wire.Instruction.ref/0.
+    # instead of a bit-packed int — see EMLX.Native.Instruction.ref/0.
     input_map =
       prog.inputs
       |> Enum.with_index()
@@ -2415,7 +2405,7 @@ defmodule EMLX.Native.Expr do
 
       if map_size(ref_to_wire) != expected_size do
         raise ArgumentError,
-              "EMLX.Native.Expr.to_wire: ref id collision across inputs/captures/constants -- " <>
+              "EMLX.Native.Expr.to_native: ref id collision across inputs/captures/constants -- " <>
                 "#{map_size(input_map)} input(s), #{map_size(capture_map)} capture(s), " <>
                 "#{map_size(constant_map)} constant(s) should merge to #{expected_size} distinct " <>
                 "refs, but only #{map_size(ref_to_wire)} survived Map.merge/2. This means two " <>
@@ -2435,7 +2425,7 @@ defmodule EMLX.Native.Expr do
         maybe_debug_check do
           for {:result, idx} <- wire_operands, idx >= flat do
             raise ArgumentError,
-                  "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
+                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
                     "references result index #{idx} of the flat results accumulator, but only " <>
                     "#{flat} result(s) have been produced so far -- this is a forward/self " <>
                     "reference bug in program lowering, not a valid program. Full instruction " <>
@@ -2446,7 +2436,7 @@ defmodule EMLX.Native.Expr do
         maybe_debug_check do
           for one <- List.wrap(id), Map.has_key?(rmap, one) do
             raise ArgumentError,
-                  "EMLX.Native.Expr.to_wire: instruction #{inspect(op)} produces result ref " <>
+                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} produces result ref " <>
                     "#{inspect(one)}, but that ref is already bound (to " <>
                     "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
                     "silently overwriting its earlier binding for every prior instruction that " <>
@@ -2465,7 +2455,7 @@ defmodule EMLX.Native.Expr do
               {Map.put(rmap, one, {:result, flat}), flat + 1}
           end
 
-        instr = %EMLX.Native.Wire.Instruction{op: op, operands: wire_operands, attrs: attrs}
+        instr = %EMLX.Native.Instruction{op: op, operands: wire_operands, attrs: attrs}
         {[instr | instrs], rmap2, flat2}
       end)
 
@@ -2480,7 +2470,7 @@ defmodule EMLX.Native.Expr do
     wire_constants =
       Enum.map(prog.constants, fn {_, v, t} -> {v * 1.0, EMLX.Native.to_mlx_type(t)} end)
 
-    %EMLX.Native.Wire.Program{
+    %EMLX.Native.Program{
       num_inputs: length(prog.inputs),
       captures: capture_nif_refs,
       constants: wire_constants,

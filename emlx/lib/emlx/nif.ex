@@ -110,8 +110,8 @@ defmodule EMLX.NIF do
   # ── Native.Expr compiler NIFs ─────────────────────────────────────────────
   # compile_program — builds an opaque ProgramResource from the Native.Expr IR
   # and a set of captured arrays. Worker-routed (argv[0] = worker).
-  # `program` is an `EMLX.Native.Wire.Program.t()` (see
-  # EMLX.Native.Expr.to_wire/1), decoded directly by `fine` on the C++ side
+  # `program` is an `EMLX.Native.Program.t()` (see
+  # EMLX.Native.Expr.to_native/1), decoded directly by `fine` on the C++ side
   # (emlx_compiler.hpp's `Program`/`Instruction` structs) instead of manually
   # parsed positional args.
   # Arity = 1 (worker) + 1 = 2 registered.

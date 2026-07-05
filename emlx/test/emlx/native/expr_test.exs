@@ -3,7 +3,7 @@ defmodule EMLX.Native.ExprTest do
   Tests for the EMLX native defn compiler:
     - EMLX.Native.Expr struct shape (refs as node IDs, atom opcodes, attrs)
     - lower/1 (parameter, constant, tensor/capture, add, identity)
-    - compile_program / eval_program NIFs via to_wire/1 (C++ replay)
+    - compile_program / eval_program NIFs via to_native/1 (C++ replay)
     - Compiler seam: Nx.Defn.compile(..., compiler: EMLX) via single-NIF replay
     - Unary + binary + compare/logical equivalence vs EMLX.Backend
   """
@@ -254,7 +254,7 @@ defmodule EMLX.Native.ExprTest do
       # `Nx.Defn.jit`/`check_equiv` can't exercise this naturally: Nx itself
       # guards against a real `defn` closure embedding an EMLX.Backend tensor
       # (see the comment above), so this can only be reached by hand-building
-      # the Expr tree. Runs it through the real to_wire/NIF path (not just
+      # the Expr tree. Runs it through the real to_native/NIF path (not just
       # inspecting `prog`) to prove the capture actually evaluates correctly.
       weight_tensor = Nx.tensor(10.0, backend: EMLX.Backend)
 
@@ -286,26 +286,26 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  # ── to_wire/1 ────────────────────────────────────────────────────────────
+  # ── to_native/1 ──────────────────────────────────────────────────────────
 
-  describe "to_wire/1" do
+  describe "to_native/1" do
     test "identity program: n_inputs=1, no instructions, output encodes input ref" do
       expr = Nx.Defn.debug_expr_apply(&identity/1, [Nx.template({3}, :f32)])
       prog = Expr.lower(expr)
-      wire = Expr.to_wire(prog)
+      program = Expr.to_native(prog)
 
-      assert %EMLX.Native.Wire.Program{} = wire
-      assert wire.num_inputs == 1
-      assert wire.captures == []
-      assert wire.constants == []
-      assert wire.instructions == []
-      assert wire.outputs == [{:input, 0}]
+      assert %EMLX.Native.Program{} = program
+      assert program.num_inputs == 1
+      assert program.captures == []
+      assert program.constants == []
+      assert program.instructions == []
+      assert program.outputs == [{:input, 0}]
     end
 
     test "add program: op_name is :add, operands encode the two inputs" do
       expr = Nx.Defn.debug_expr_apply(&add_two/2, [Nx.template({}, :f32), Nx.template({}, :f32)])
       prog = Expr.lower(expr)
-      %EMLX.Native.Wire.Program{instructions: [instr], outputs: [output]} = Expr.to_wire(prog)
+      %EMLX.Native.Program{instructions: [instr], outputs: [output]} = Expr.to_native(prog)
 
       assert instr.op == :add
       assert instr.operands == [{:input, 0}, {:input, 1}]
@@ -322,10 +322,10 @@ defmodule EMLX.Native.ExprTest do
       %{worker: worker, device: device}
     end
 
-    test "identity program via to_wire: output equals input", %{worker: worker, device: device} do
+    test "identity program via to_native: output equals input", %{worker: worker, device: device} do
       expr = Nx.Defn.debug_expr_apply(&identity/1, [Nx.template({3}, :f32)])
       prog = Expr.lower(expr)
-      wire = Expr.to_wire(prog)
+      wire = Expr.to_native(prog)
 
       prog_ref = compile_nif!(worker, wire)
 
@@ -338,10 +338,10 @@ defmodule EMLX.Native.ExprTest do
       assert_all_close(out, x)
     end
 
-    test "add program via to_wire: correct result", %{worker: worker, device: device} do
+    test "add program via to_native: correct result", %{worker: worker, device: device} do
       expr = Nx.Defn.debug_expr_apply(&add_two/2, [Nx.template({}, :f32), Nx.template({}, :f32)])
       prog = Expr.lower(expr)
-      wire = Expr.to_wire(prog)
+      wire = Expr.to_native(prog)
 
       prog_ref = compile_nif!(worker, wire)
 
@@ -1473,7 +1473,7 @@ defmodule EMLX.Native.ExprTest do
 
   # ── private helpers ───────────────────────────────────────────────────────
 
-  defp compile_nif!(worker, %EMLX.Native.Wire.Program{} = wire) do
+  defp compile_nif!(worker, %EMLX.Native.Program{} = wire) do
     EMLX.NIF.compile_program(worker, wire)
     |> unwrap!()
     |> await_worker!()
@@ -1775,7 +1775,7 @@ defmodule EMLX.Native.ExprTest do
       assert shape == [3, 4]
     end
 
-    test "iota flat: C++ replay (to_wire) matches Nx.iota" do
+    test "iota flat: C++ replay (to_native) matches Nx.iota" do
       prog = Expr.lower(Nx.Defn.debug_expr_apply(&iota_flat_defn/0, []))
       [nif_out] = run_nif(prog, [])
       expected = Nx.iota({3, 4}, backend: EMLX.Backend)
@@ -1820,7 +1820,7 @@ defmodule EMLX.Native.ExprTest do
       assert n == 3
     end
 
-    test "eye 3x3: C++ replay (to_wire) matches Nx.eye" do
+    test "eye 3x3: C++ replay (to_native) matches Nx.eye" do
       prog = Expr.lower(Nx.Defn.debug_expr_apply(&eye_3x3_defn/0, []))
       [nif_out] = run_nif(prog, [])
       expected = Nx.eye({3, 3}, backend: EMLX.Backend)
@@ -3544,7 +3544,7 @@ defmodule EMLX.Native.ExprTest do
   defp run_nif(%Expr{} = prog, inputs) do
     device = EMLX.default_device()
     {worker, _} = EMLX.resolve_worker(device)
-    wire = Expr.to_wire(prog)
+    wire = Expr.to_native(prog)
 
     input_refs =
       Enum.map(inputs, fn %Nx.Tensor{data: %EMLX.Backend{ref: {_, r}}} -> r end)

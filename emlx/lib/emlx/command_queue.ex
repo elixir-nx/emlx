@@ -63,7 +63,6 @@ defmodule EMLX.CommandQueue do
   `{:error, reason}` if the NIF cannot allocate the stream (e.g. `:gpu` on a
   system without Metal).
   """
-  @spec new(:cpu | :gpu) :: {:ok, t()} | {:error, list()}
   def new(device) do
     case EMLX.NIF.command_queue_new(device) do
       {:ok, ref} -> {:ok, %__MODULE__{ref: ref, device: device}}
@@ -78,7 +77,6 @@ defmodule EMLX.CommandQueue do
   Useful in one-liner contexts (e.g. `__partitions_options__/1`) where the
   caller has no reasonable recovery path if the device is unavailable.
   """
-  @spec new!(:cpu | :gpu) :: t()
   def new!(device) do
     case new(device) do
       {:ok, q} -> q
@@ -93,7 +91,6 @@ defmodule EMLX.CommandQueue do
   Internally posts a barrier job that calls `mlx::core::synchronize(stream)`
   on the worker thread, then blocks in `receive` until the reply arrives.
   """
-  @spec synchronize(t()) :: :ok
   def synchronize(%__MODULE__{ref: ref}) do
     case EMLX.NIF.command_queue_synchronize(ref) do
       {:ok, job_ref} ->
@@ -115,7 +112,6 @@ defmodule EMLX.CommandQueue do
   `after` block. Nested calls are safe — each level saves and restores
   independently.
   """
-  @spec with_queue(t(), (-> result)) :: result when result: term()
   def with_queue(%__MODULE__{ref: ref, device: device}, fun) when is_function(fun, 0) do
     previous = Process.get(:emlx_command_queue)
     Process.put(:emlx_command_queue, {ref, device})

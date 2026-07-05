@@ -1395,7 +1395,6 @@ defmodule EMLX.Fast do
       {2, 4}
 
   """
-  @spec einsum(String.t(), [Nx.Tensor.t()]) :: Nx.Tensor.t()
   def einsum(subscripts, operands) when is_binary(subscripts) and is_list(operands) do
     refs = Enum.map(operands, &einsum_operand_ref!/1)
 

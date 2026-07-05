@@ -82,7 +82,6 @@ defmodule EMLXAxon.Qwen3.Model do
   Returns a list of `{k_cache, v_cache}` pairs, one per transformer layer,
   where each cache is pre-allocated to `max_len` positions.
   """
-  @spec init_kv_cache(State.t(), pos_integer()) :: [{Nx.Tensor.t(), Nx.Tensor.t()}]
   def init_kv_cache(%State{config: cfg, layers: layers}, max_len) do
     num_kv_heads = cfg.num_key_value_heads
     head_dim = cfg.head_dim
@@ -111,7 +110,6 @@ defmodule EMLXAxon.Qwen3.Model do
   `%Nx.Tensor{}`. The native greedy Qwen3 NIFs accept this shape directly.
   Unsupported states fall back to `init_kv_cache/2`.
   """
-  @spec init_native_kv_cache(State.t(), pos_integer()) :: kv_cache()
   def init_native_kv_cache(%State{} = state, max_len) do
     if native_forward_greedy?(state) do
       %State{config: cfg, layers: layers} = state
@@ -139,8 +137,6 @@ defmodule EMLXAxon.Qwen3.Model do
   The cache is updated in-place via `Nx.put_slice`; `kv_cache_updated` is the
   same list with updated slices.
   """
-  @spec forward(Nx.Tensor.t(), [{Nx.Tensor.t(), Nx.Tensor.t()}], non_neg_integer(), State.t()) ::
-          {Nx.Tensor.t(), [{Nx.Tensor.t(), Nx.Tensor.t()}]}
   def forward(input_ids, kv_cache, current_len, %State{} = state) do
     {hidden, kv_cache_updated} = forward_hidden(input_ids, kv_cache, current_len, state)
 
@@ -159,8 +155,6 @@ defmodule EMLXAxon.Qwen3.Model do
   """
   @type kv_cache :: [{Nx.Tensor.t() | EMLX.tensor_ref(), Nx.Tensor.t() | EMLX.tensor_ref()}]
 
-  @spec forward_greedy(Nx.Tensor.t(), kv_cache(), non_neg_integer(), State.t()) ::
-          {Nx.Tensor.t(), kv_cache()}
   def forward_greedy(input_ids, kv_cache, current_len, %State{} = state) do
     if native_forward_greedy?(state) do
       forward_native_greedy(input_ids, kv_cache, current_len, state)
@@ -190,13 +184,6 @@ defmodule EMLXAxon.Qwen3.Model do
   a CPU `Nx.Tensor` plus backend transfer for every decode step. Other states
   fall back to the regular tensor based path.
   """
-  @spec forward_greedy_decode_token_id(
-          non_neg_integer(),
-          kv_cache(),
-          non_neg_integer(),
-          State.t()
-        ) ::
-          {non_neg_integer(), kv_cache()}
   def forward_greedy_decode_token_id(token_id, kv_cache, current_len, %State{} = state) do
     if native_forward_greedy?(state) do
       forward_native_greedy_decode_token_id(token_id, kv_cache, current_len, state)
@@ -213,14 +200,6 @@ defmodule EMLXAxon.Qwen3.Model do
   generated token tensors on the EMLX backend and returns the final KV cache,
   avoiding one Elixir/NIF boundary crossing per decoded token.
   """
-  @spec forward_greedy_chunk(
-          Nx.Tensor.t(),
-          kv_cache(),
-          non_neg_integer(),
-          pos_integer(),
-          State.t()
-        ) ::
-          {[Nx.Tensor.t()], kv_cache()} | :fallback
   def forward_greedy_chunk(input_ids, kv_cache, current_len, count, %State{} = state)
       when is_integer(count) and count > 0 do
     if native_forward_greedy_chunk?(state) do

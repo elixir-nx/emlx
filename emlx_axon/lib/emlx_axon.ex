@@ -121,7 +121,6 @@ defmodule EMLXAxon do
       model = EMLXAxon.rewrite(model, only: [:rms_norm, :layer_norm])
 
   """
-  @spec rewrite(Axon.t(), keyword()) :: Axon.t()
   def rewrite(%Axon{} = model, opts \\ []) do
     {:ok, opts} = Keyword.validate(opts, only: @default_rewrites)
     cache = :ets.new(:emlx_axon_rewrite_cache, [:set, :public])
@@ -198,7 +197,6 @@ defmodule EMLXAxon do
     warnings are benign — the quantized tensors are still used correctly via the EMLX
     backend's quantized_matmul dispatch.
   """
-  @spec load_quantized({:local, Path.t()}, keyword()) :: {:ok, map()} | {:error, term()}
   def load_quantized(source, opts \\ [])
 
   def load_quantized({:local, path}, opts) do
@@ -239,8 +237,6 @@ defmodule EMLXAxon do
   Replaces `op_name: :rms_norm` nodes with `shift: 0.0` with an Axon layer
   that calls `EMLX.Fast.rms_norm/3` — a single fused Metal shader.
   """
-  @spec rms_norm_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def rms_norm_rewriter do
     fn
       %Axon.Node{op_name: :rms_norm, opts: node_opts, name: name_fn} ->
@@ -290,8 +286,6 @@ defmodule EMLXAxon do
   Metal shader. Skips nodes where `channel_index` is not `-1` (last axis),
   as the kernel only normalises over the last axis.
   """
-  @spec layer_norm_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def layer_norm_rewriter do
     fn
       %Axon.Node{op_name: :layer_norm, opts: node_opts, name: name_fn} ->
@@ -347,8 +341,6 @@ defmodule EMLXAxon do
 
   **Assumes sequential positions** — see `EMLXAxon` moduledoc for the limitation.
   """
-  @spec rotary_embedding_rewriter(reference() | nil) ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def rotary_embedding_rewriter(cache \\ nil) do
     fn %Axon.Node{op: op, opts: node_opts, name: name_fn} ->
       if function_info(op) == @bumblebee_rope_mfa do
@@ -406,8 +398,6 @@ defmodule EMLXAxon do
   **Not appropriate for training graphs** — only enable this rewriter when the
   model will be used for inference only.
   """
-  @spec dropout_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def dropout_rewriter do
     fn
       %Axon.Node{op_name: :dropout, name: name_fn} ->
@@ -432,8 +422,6 @@ defmodule EMLXAxon do
   consumes) becomes unreachable. Inference-only: attention weight tensors are
   never used for token generation.
   """
-  @spec attn_weights_rewriter() ::
-          (Axon.Node.t() -> :skip | ([Axon.t(), ...], Axon.t() -> Axon.t()))
   def attn_weights_rewriter do
     fn
       %Axon.Node{op_name: :bb_attn_weights} ->
@@ -468,8 +456,6 @@ defmodule EMLXAxon do
   **Do not enable for training graphs** — training models typically run without a
   KV cache and rely on the `else` branch.
   """
-  @spec if_present_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def if_present_rewriter do
     fn
       # 3-parent :if_present: [optional(condition), optional(on_true), optional(on_false)]
@@ -514,8 +500,6 @@ defmodule EMLXAxon do
   Only applies when the key or value parent is a Bumblebee `repeat_interleave` node.
   Models without GQA (or where repeat_interleave is already absent) are unaffected.
   """
-  @spec gqa_cache_fix_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def gqa_cache_fix_rewriter do
     fn
       %Axon.Node{op: op, parent: [_key_id, _value_id | _]} ->
@@ -551,8 +535,6 @@ defmodule EMLXAxon do
   Generic `:multiply` nodes (no `:container` parent, or container without a
   `:silu` child) are reconstructed identically.
   """
-  @spec swiglu_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def swiglu_rewriter do
     fn
       # Bumblebee's SwiGLU: multiply(container(up_proj, silu(gate))).
@@ -636,8 +618,6 @@ defmodule EMLXAxon do
   **Inference-only**: attention dropout is elided (a no-op at inference time). Nodes
   with `dropout_rate > 0` are skipped to preserve training-time stochastic behaviour.
   """
-  @spec sdpa_rewriter() ::
-          (Axon.Node.t() -> ([Axon.t()], Axon.t() -> Axon.t()) | :skip)
   def sdpa_rewriter do
     fn %Axon.Node{op: op, opts: node_opts} ->
       dropout_rate = Keyword.get(node_opts, :dropout_rate, 0.0)
@@ -826,7 +806,6 @@ defmodule EMLXAxon do
   Note: Nx's `defnp` may compile to a closure rather than a named function,
   so this helper intentionally does not filter by `:erlang.fun_info(:type)`.
   """
-  @spec function_info(term()) :: {module(), atom(), non_neg_integer()} | nil
   def function_info(fun) when is_function(fun) do
     {:module, m} = Function.info(fun, :module)
     {:name, n} = Function.info(fun, :name)
@@ -889,7 +868,6 @@ defmodule EMLXAxon.QuantizeParams do
     * `:group_size` — quantization group size, must evenly divide in_features (default 64).
     * `:skip_vocab_threshold` — skip tensors whose first dim exceeds this (default 100_000).
   """
-  @spec quantize(map(), keyword()) :: map()
   def quantize(params, opts \\ []) do
     bits = Keyword.get(opts, :bits, 4)
     group_size = Keyword.get(opts, :group_size, 64)

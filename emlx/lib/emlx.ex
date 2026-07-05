@@ -194,7 +194,7 @@ defmodule EMLX do
     kernels produce NaN or Inf. Forces extra `EMLX.eval` syncs and breaks
     MLX lazy-graph fusion; never enable in production.
   * `:compiler_debug` — raises on internal `EMLX.Native.Expr` lowering /
-    `to_wire` invariant violations that would otherwise silently miscompile.
+    `to_native` invariant violations that would otherwise silently miscompile.
     Cheap (no extra eval syncs); off by default.
 
   WARNING: `:enable_bounds_check` and `:detect_non_finites` break MLX
@@ -1160,15 +1160,6 @@ defmodule EMLX do
   store and reuse device resident cache buffers without converting them back to
   `Nx.Tensor` between decode steps.
   """
-  @spec causal_kv_attention(
-          tensor_ref(),
-          tensor_ref(),
-          tensor_ref(),
-          tensor_ref(),
-          tensor_ref(),
-          non_neg_integer(),
-          keyword()
-        ) :: {tensor_ref(), tensor_ref(), tensor_ref()}
   def causal_kv_attention(query, new_key, new_value, key_cache, value_cache, offset, opts)
       when is_integer(offset) and offset >= 0 and is_list(opts) do
     scale = Keyword.fetch!(opts, :scale)
@@ -1210,7 +1201,6 @@ defmodule EMLX do
     (`mx::fp_quantize` returns only `(wq, scales)`); the returned tensor's
     `EMLX.Quantization.Config.biases` is `nil`.
   """
-  @spec quantize(Nx.Tensor.t(), keyword()) :: Nx.Tensor.t()
   def quantize(%Nx.Tensor{} = tensor, opts) when is_list(opts) do
     type = Keyword.get(opts, :type, {:s, 4})
     {_, bits} = type
@@ -1266,7 +1256,6 @@ defmodule EMLX do
   dense float tensor by calling `mx::dequantize`. Supports every mode
   `EMLX.quantize/2` accepts (`"affine"` and the microscaled variants).
   """
-  @spec dequantize(Nx.Tensor.t()) :: Nx.Tensor.t()
   def dequantize(
         %Nx.Tensor{
           data: %EMLX.Backend{ref: weight_ref, quantization_config: cfg}
@@ -1292,7 +1281,6 @@ defmodule EMLX do
   `qw` must be a quantized tensor produced by `EMLX.quantize/2`. Raises
   `ArgumentError` if both arguments are quantized.
   """
-  @spec quantized_matmul(Nx.Tensor.t(), Nx.Tensor.t()) :: Nx.Tensor.t()
   def quantized_matmul(%Nx.Tensor{} = activation, %Nx.Tensor{} = qw) do
     cfg = qw.data.quantization_config
 
@@ -1828,10 +1816,10 @@ defmodule EMLX do
   # Compiles an `EMLX.Native.Expr` program to a NIF resource on `worker`.
   # Captured host tensors are copied onto `device` first: a `defn`-embedded
   # constant tensor (e.g. an RNG algorithm constant) is traced with the default
-  # backend, so it must be moved to EMLX before `to_wire` can extract its ref.
+  # backend, so it must be moved to EMLX before `to_native` can extract its ref.
   defp compile_native_program(worker, device, %EMLX.Native.Expr{} = program) do
     program = ensure_emlx_captures(program, device)
-    wire_program = EMLX.Native.Expr.to_wire(program)
+    wire_program = EMLX.Native.Expr.to_native(program)
 
     EMLX.NIF.compile_program(worker, wire_program)
     |> unwrap!()
@@ -1839,7 +1827,7 @@ defmodule EMLX do
   end
 
   # Ensures every captured tensor is EMLX-backed on `device` (copies any that
-  # were traced with another backend), so `to_wire` can read a NIF ref per
+  # were traced with another backend), so `to_native` can read a NIF ref per
   # capture.
   defp ensure_emlx_captures(%EMLX.Native.Expr{captures: captures} = program, device) do
     captures =
@@ -2306,7 +2294,7 @@ defmodule EMLX do
   defp sanitize_key_term(other, _positions), do: other
 
   # Reconstructs each hook's value from its slice of `hook_refs` (in
-  # `hooks` order, matching `EMLX.Native.Expr.to_wire/1`'s flattening) and
+  # `hooks` order, matching `EMLX.Native.Expr.to_native/1`'s flattening) and
   # invokes its callback for the side effect. Return value is discarded,
   # matching `Nx.Defn.Evaluator`'s hook semantics.
   defp fire_hooks([], [], _dev), do: :ok
@@ -2543,7 +2531,6 @@ defmodule EMLX do
       EMLX.clear_cache()
       #=> :ok
   """
-  @spec clear_cache() :: :ok
   def clear_cache, do: EMLX.NIF.clear_cache() |> unwrap!()
 
   @doc """
@@ -2554,7 +2541,6 @@ defmodule EMLX do
       EMLX.reset_peak_memory()
       #=> :ok
   """
-  @spec reset_peak_memory() :: :ok
   def reset_peak_memory, do: EMLX.NIF.reset_peak_memory() |> unwrap!()
 
   @doc """

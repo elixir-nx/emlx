@@ -15,9 +15,9 @@ namespace native {
 
 // ── Program wire types ────────────────────────────────────────────────────
 //
-// Elixir counterparts: EMLX.Native.Wire.Instruction / EMLX.Native.Wire.Program
-// (lib/emlx/native/wire.ex), produced by EMLX.Native.Expr.to_wire/1. Decoded
-// by the fine::Decoder specializations below instead of the old to_wire/1
+// Elixir counterparts: EMLX.Native.Instruction / EMLX.Native.Program
+// (lib/emlx/native/{instruction,program}.ex), produced by EMLX.Native.Expr.to_native/1. Decoded
+// by the fine::Decoder specializations below instead of the old to_native/1
 // format's positional NIF args + bit-packed-int refs.
 
 // A reference to an already-produced value ({:input, i} / {:capture, i} /
@@ -151,7 +151,7 @@ template <> struct Decoder<emlx::native::Instruction> {
         !enif_get_map_value(env, term, fine::encode(env, attrs_atom),
                             &attrs_term)) {
       throw std::invalid_argument(
-          "decode failed, expected an EMLX.Native.Wire.Instruction struct, "
+          "decode failed, expected an EMLX.Native.Instruction struct, "
           "got: " +
           format_term(env, term));
     }
@@ -175,7 +175,7 @@ template <> struct Decoder<emlx::native::Program> {
       ERL_NIF_TERM value;
       if (!enif_get_map_value(env, term, fine::encode(env, key), &value)) {
         throw std::invalid_argument(
-            "decode failed, expected an EMLX.Native.Wire.Program struct with "
+            "decode failed, expected an EMLX.Native.Program struct with "
             "field " +
             key.to_string() + ", got: " + format_term(env, term));
       }
