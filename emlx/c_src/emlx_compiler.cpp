@@ -1939,6 +1939,12 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
         return constants.at(static_cast<size_t>(ref.index));
       case RefKind::Result:
         return results.at(static_cast<size_t>(ref.index));
+      case RefKind::Carry:
+        // Only valid inside a `:while` instruction's SubProgram, resolved by
+        // EMLXWhile's own (sub-program) interpreter loop — never at the top
+        // level of a Program's own instruction list.
+        throw std::runtime_error(
+            "emlx::native: {:carry, _} ref found outside a :while sub-program");
       }
       throw std::runtime_error("emlx::native: invalid ref kind");
     };

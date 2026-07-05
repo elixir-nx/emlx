@@ -389,6 +389,65 @@ defmodule EMLX.Native.ExprTest do
 
       assert Nx.to_number(out) == 15
     end
+
+    # Wire-format extension for native `:while` lowering (checkpoint b — see
+    # EMLX.Native.Expr's `:while` TODO): `RefKind::Carry` and the
+    # `EMLX.Native.Instruction.subprograms` field (decoded into
+    # `emlx_compiler.hpp`'s `SubProgram` struct) let a `:while` instruction
+    # carry two nested, self-contained instruction lists (`cond`/`body`)
+    # instead of splicing them into the parent program.
+    #
+    # `:while` itself isn't registered in the op registry yet (that's
+    # checkpoint c — the actual `EMLXWhile` primitive), so this only proves
+    # the wire format round-trips through the NIF boundary intact: a Program
+    # whose sole instruction is `op: :while` with two SubPrograms (using
+    # `{:carry, _}` refs, matching real future `:while` shape) decodes
+    # cleanly and reaches the "unknown op" registry check — as opposed to
+    # failing earlier with a decode/argument error, which would indicate a
+    # bug in the `Ref`/`Instruction`/`SubProgram` decoders.
+    test "wire format: :while instruction with nested cond/body sub-programs round-trips",
+         %{worker: worker} do
+      cond_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :less,
+            operands: [{:carry, 0}, {:const, 0}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      body_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :add,
+            operands: [{:carry, 0}, {:const, 1}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      wire = %EMLX.Native.Program{
+        num_inputs: 1,
+        captures: [],
+        constants: [{5.0, :int32}, {1.0, :int32}],
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :while,
+            operands: [{:input, 0}],
+            attrs: [],
+            subprograms: [cond_subprogram, body_subprogram]
+          }
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      assert_raise EMLX.NIFError, ~r/unknown op "while"/, fn ->
+        compile_nif!(worker, wire)
+      end
+    end
   end
 
   # ── compiler seam (end-to-end) ────────────────────────────────────────────
