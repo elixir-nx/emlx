@@ -91,7 +91,11 @@ struct Program {
   std::vector<mlx::core::array> captures;
   std::vector<std::tuple<double, mlx::core::Dtype>> constants;
   std::vector<Instruction> instructions;
+  // Full ref list: real outputs followed by any keepalive tail (see
+  // EMLX.Native.Expr.t/0's `keepalive_refs` doc on the Elixir side) —
+  // `num_real_outputs` (below) marks the boundary.
   std::vector<Ref> outputs;
+  int num_real_outputs;
 };
 
 // Compiled representation of an EMLX.Native.Expr program.
@@ -109,6 +113,12 @@ struct Expr {
   // EMLXRuntimeCall::eval_cpu/eval_gpu fires while this NIF call's caller
   // pid (emlx::g_current_caller_pid) is still in scope.
   bool has_runtime_call = false;
+  // How many of compiled_fn's returned arrays are real outputs (to be
+  // converted to resource terms and returned to Elixir) — the rest is a
+  // keepalive tail forced via mlx::core::eval alongside them (when
+  // has_runtime_call) purely for its side effects, then dropped. See
+  // emlx::native::Program::num_real_outputs.
+  int num_real_outputs = 0;
   emlx::function compiled_fn;
 
   ~Expr();
@@ -225,6 +235,7 @@ template <> struct Decoder<emlx::native::Program> {
     static const fine::Atom constants_atom("constants");
     static const fine::Atom instructions_atom("instructions");
     static const fine::Atom outputs_atom("outputs");
+    static const fine::Atom num_real_outputs_atom("num_real_outputs");
 
     auto get_field = [&](const fine::Atom &key) -> ERL_NIF_TERM {
       ERL_NIF_TERM value;
@@ -248,6 +259,8 @@ template <> struct Decoder<emlx::native::Program> {
         env, get_field(instructions_atom));
     program.outputs =
         fine::decode<std::vector<emlx::native::Ref>>(env, get_field(outputs_atom));
+    program.num_real_outputs =
+        fine::decode<int>(env, get_field(num_real_outputs_atom));
     return program;
   }
 };

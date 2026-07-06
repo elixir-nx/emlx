@@ -547,7 +547,8 @@ defmodule EMLX.Native.ExprTest do
             subprograms: [cond_subprogram, body_subprogram]
           }
         ],
-        outputs: [{:result, 0}]
+        outputs: [{:result, 0}],
+        num_real_outputs: 1
       }
 
       prog_ref = compile_nif!(worker, wire)
@@ -606,7 +607,8 @@ defmodule EMLX.Native.ExprTest do
             subprograms: [cond_subprogram, body_subprogram]
           }
         ],
-        outputs: [{:result, 0}, {:result, 1}]
+        outputs: [{:result, 0}, {:result, 1}],
+        num_real_outputs: 2
       }
 
       prog_ref = compile_nif!(worker, wire)
@@ -3849,6 +3851,34 @@ defmodule EMLX.Native.ExprTest do
       assert qw_out.data.quantization_config
       assert_all_close(EMLX.dequantize(qw_out), EMLX.dequantize(qw))
       assert_all_close(native, eager)
+    end
+
+    test "a freshly requantized value returned directly (not a bare parameter passthrough)" do
+      # Unlike the test above, `qw` here is *not* returned untouched -- it's
+      # dequantized and requantized first, so the output leaf is a
+      # `:runtime_call` result, not a bare `:parameter` node.
+      # `output_param_positions` (emlx.ex) only recognizes the latter, so
+      # this exercises the plain `EMLX.Backend.to_nx/2` path for a quantized
+      # output instead of the pass-through substitution.
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+
+      requantize_and_return = fn qw ->
+        dense = EMLX.Quantization.dequantize(qw)
+        EMLX.Quantization.quantize(Nx.add(dense, 10), [])
+      end
+
+      qw_out = Nx.Defn.jit(requantize_and_return, compiler: EMLX).(qw)
+      expected_dense = Nx.add(EMLX.dequantize(qw), 10)
+
+      assert Nx.shape(qw_out) == Nx.shape(qw)
+      assert qw_out.data.quantization_config
+      # tol accounts for genuine 4-bit requantization error (dequantize ->
+      # add 10 -> quantize again loses precision), unlike the bare
+      # passthrough test above where the underlying bits are untouched.
+      assert_all_close(EMLX.dequantize(qw_out), expected_dense, tol: 1.0e-3)
     end
 
     test "a quantized weight threaded through a while carry and dotted inside the body works" do

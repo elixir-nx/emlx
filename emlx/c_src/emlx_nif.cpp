@@ -325,13 +325,23 @@ NIF(linalg_qr) {
   CATCH()
 }
 
+// MLX's `svd`/`eigh` primitives are CPU-only — they throw on a GPU stream
+// (mirroring `emlx_compiler.cpp`'s `k_linalg_cpu`, which pins the same ops
+// for the compiled path). Both NIFs below ignore the caller's `device` and
+// pin to CPU instead: unified memory means the array's data doesn't need to
+// move, only the stream that executes on it, so this is free and lets
+// `EMLX.Backend.block/4` call these directly for `:gpu` tensors too instead
+// of falling back to `Nx.LinAlg`'s much slower eager `default_expr`.
+static const mlx::core::Device kLinalgCpuDevice(mlx::core::Device::DeviceType::cpu, 0);
+
 NIF(linalg_svd) {
   TENSOR_PARAM(0, tensor);
   PARAM(1, bool, compute_uv);
   DEVICE_PARAM(2, device);
+  (void)device;
 
   try {
-    auto result = mlx::core::linalg::svd(*tensor, compute_uv, device);
+    auto result = mlx::core::linalg::svd(*tensor, compute_uv, kLinalgCpuDevice);
     return nx::nif::ok(env, nx::nif::make_list(env, result));
   }
   CATCH()
@@ -349,9 +359,10 @@ NIF(linalg_eigh) {
   TENSOR_PARAM(0, tensor);
   ATOM_PARAM(1, uplo);
   DEVICE_PARAM(2, device);
+  (void)device;
 
   try {
-    auto [eigenvalues, eigenvectors] = mlx::core::linalg::eigh(*tensor, uplo, device);
+    auto [eigenvalues, eigenvectors] = mlx::core::linalg::eigh(*tensor, uplo, kLinalgCpuDevice);
     return nx::nif::ok(env, enif_make_tuple2(
       env,
       create_tensor_resource(env, eigenvalues),

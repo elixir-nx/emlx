@@ -51,9 +51,11 @@ defmodule EMLX.Native.Expr do
           # dependency still fire in declaration order, without relying on
           # unspecified scheduling order between independent primitives.
           # `keepalive_refs` holds the *final* tip of that chain (0 or 1
-          # refs) -- appended to `outputs` on the wire (see `to_native/1`)
-          # and popped/discarded by the caller once `eval_program` returns
-          # (the real firing already happened inline, during evaluation).
+          # refs) -- appended to `outputs` on the wire (see `to_native/1`,
+          # which also records the real/keepalive boundary in
+          # `EMLX.Native.Program.num_real_outputs`) and dropped natively by
+          # `eval_program` before it returns (the real firing already
+          # happened inline, during evaluation) -- Elixir never sees it.
           keepalive_refs: [node_ref()],
           runtime_calls: [runtime_call()]
         }
@@ -63,6 +65,7 @@ defmodule EMLX.Native.Expr do
   @doc false
   def lower(output, num_inputs \\ nil, quant_signature \\ %{}) do
     ordered = EMLX.Defn.Tree.post_order(output, &scope_dependencies/1)
+    top_scope_ids = top_scope_ids(output, ordered)
 
     # inputs is a map of pos → ref during lowering; densified to a list at the end.
     state = %{
@@ -72,7 +75,7 @@ defmodule EMLX.Native.Expr do
       instructions: [],
       node_to_ref: %{},
       runtime_calls: [],
-      top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new(),
+      top_scope_ids: top_scope_ids,
       quant_signature: quant_signature,
       while_nesting_depth: 0,
       stable_positions: %{},
@@ -91,7 +94,31 @@ defmodule EMLX.Native.Expr do
       end
 
     flat_outputs = Composite.flatten_list([output])
-    output_refs = Enum.map(flat_outputs, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    # A `__EMLX_QUANT__`-tagged leaf (see `EMLX.Quantization.quantize/2`)
+    # is one *logical* output but has no single physical ref of its own
+    # (see the `:metadata` `expand_node/2` clause above) — emit its 2-3
+    # underlying decomposition refs directly instead of looking the leaf's
+    # own id up in `node_to_ref`. Every other leaf still contributes
+    # exactly one ref, as before.
+    output_refs =
+      Enum.flat_map(flat_outputs, fn
+        %T{
+          data: %Nx.Defn.Expr{
+            op: :metadata,
+            args: [_inner, %{__EMLX_QUANT__: %{weight: weight, scales: scales, biases: biases}}]
+          }
+        } ->
+          refs = [
+            Map.fetch!(state.node_to_ref, weight.data.id),
+            Map.fetch!(state.node_to_ref, scales.data.id)
+          ]
+
+          if biases, do: refs ++ [Map.fetch!(state.node_to_ref, biases.data.id)], else: refs
+
+        leaf ->
+          [Map.fetch!(state.node_to_ref, leaf.data.id)]
+      end)
 
     %__MODULE__{
       inputs: inputs_list,
@@ -104,6 +131,33 @@ defmodule EMLX.Native.Expr do
     }
   end
 
+  # `Nx.Defn.Tree.scope_ids/1` only walks a node's *generic* args — it has
+  # no notion of `__EMLX_QUANT__`'s custom `scope_dependencies/1` redirection
+  # (see `EMLX.Quantization.quantize/2`), so a quantize-traced node's
+  # decomposition `:runtime_call` (reachable only through that metadata
+  # payload) is invisible to it and never marked top-scope, even when the
+  # metadata node itself is. Backfill it here so the `:runtime_call`
+  # `expand_node/2` clause's "not inside a cond" check doesn't misfire on a
+  # decomposition call that is, in fact, top-scope.
+  defp top_scope_ids(output, ordered) do
+    base = output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new()
+
+    Enum.reduce(ordered, base, fn
+      %T{
+        data: %Nx.Defn.Expr{
+          id: id,
+          op: :metadata,
+          args: [_inner, %{__EMLX_QUANT__: %{weight: %T{data: %Nx.Defn.Expr{args: [root, _]}}}}]
+        }
+      },
+      acc ->
+        if MapSet.member?(acc, id), do: MapSet.put(acc, root.data.id), else: acc
+
+      _, acc ->
+        acc
+    end)
+  end
+
   # ── node expansion ────────────────────────────────────────────────────────
 
   @doc false
@@ -111,6 +165,20 @@ defmodule EMLX.Native.Expr do
         data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX__: %{operands: operands}}]}
       }) do
     {:ok, operands}
+  end
+
+  # `EMLX.Quantization.quantize/2`'s traced representation (see its
+  # `quantize_traced/2`) — redirects traversal to the decomposition leaves
+  # (weight/scales/biases, each a real dense `Nx.runtime_call` result) so
+  # `inner` (a plain-tensor fallback for non-EMLX compilers only) is never
+  # visited/lowered by this compiler at all.
+  def scope_dependencies(%T{
+        data: %Nx.Defn.Expr{
+          op: :metadata,
+          args: [_inner, %{__EMLX_QUANT__: %{weight: weight, scales: scales, biases: biases}}]
+        }
+      }) do
+    {:ok, if(biases, do: [weight, scales, biases], else: [weight, scales])}
   end
 
   def scope_dependencies(_node), do: :default
@@ -184,6 +252,22 @@ defmodule EMLX.Native.Expr do
       | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
+  end
+
+  # `EMLX.Quantization.quantize/2`'s traced representation — see
+  # `scope_dependencies/1`'s matching clause above. This node has no single
+  # physical ref of its own: `lower/2`'s output-ref builder reads
+  # `__EMLX_QUANT__` straight off an output leaf and emits its 2-3
+  # underlying refs directly, bypassing `node_to_ref` entirely for this id.
+  # Feeding this value into anything *other* than a direct output (e.g.
+  # `Nx.dot`) isn't supported yet — that consumer's own `Map.fetch!` on
+  # `node_to_ref` raises a `KeyError` instead of silently reading a
+  # meaningless ref.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX_QUANT__: _quant}]}},
+         state
+       ) do
+    state
   end
 
   defp expand_node(
@@ -1710,6 +1794,27 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_id)}
   end
 
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :while, args: [initial, arg, condition, body]}},
+         state
+       ) do
+    case detect_static_while_trip_count(initial, arg, condition, body) do
+      {:ok, count} ->
+        expand_while_unroll(id, initial, arg, body, count, state)
+
+      :error ->
+        if native_while_eligible?(condition, body) do
+          expand_while_native(id, initial, arg, condition, body, state)
+        else
+          raise ArgumentError, "does not yet lower op :while"
+        end
+    end
+  end
+
+  defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
+    raise ArgumentError, "does not yet lower op #{inspect(op)}"
+  end
+
   # Emits one `:runtime_call` instruction from already-resolved operand refs
   # (as opposed to the `:runtime_call` op's own `expand_node` clause, which
   # additionally has to resolve those refs from a real `Nx.Defn.Expr` --
@@ -1828,27 +1933,6 @@ defmodule EMLX.Native.Expr do
       end)
 
     %{state | hook_chain_ref: chain_out_ref, hooked_value_refs: hooked_value_refs}
-  end
-
-  defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :while, args: [initial, arg, condition, body]}},
-         state
-       ) do
-    case detect_static_while_trip_count(initial, arg, condition, body) do
-      {:ok, count} ->
-        expand_while_unroll(id, initial, arg, body, count, state)
-
-      :error ->
-        if native_while_eligible?(condition, body) do
-          expand_while_native(id, initial, arg, condition, body, state)
-        else
-          raise ArgumentError, "does not yet lower op :while"
-        end
-    end
-  end
-
-  defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
-    raise ArgumentError, "does not yet lower op #{inspect(op)}"
   end
 
   @doc false
@@ -2725,6 +2809,16 @@ defmodule EMLX.Native.Expr do
     digits
   end
 
+  # Only ever finds *bound top-level parameter* positions (propagated
+  # through invariant `while` carries) — a quantized value produced
+  # in-graph by `EMLX.Quantization.quantize/2` (a `:metadata`/
+  # `__EMLX_QUANT__` node, see its moduledoc's "Limitation" section) has no
+  # such position and is never recognized as a `:dot` operand here, even
+  # when fed straight into one. Extending quantized `:dot` dispatch to
+  # cover that case would mean recognizing `__EMLX_QUANT__` nodes here too,
+  # and reworking `expand_quantized_dot/8` to consume scales/biases as
+  # graph-flowing operands (via their own `node_to_ref` entries) instead of
+  # `emit_capture/2`-ing real, call-time-known tensors — out of scope today.
   @doc false
   def quantizable_param_positions(output) do
     {positions, _stable} = quantizable_positions_in_scope(output, %{})
@@ -2936,6 +3030,7 @@ defmodule EMLX.Native.Expr do
       to_native_instructions(prog.instructions, ref_to_wire, capture_map, constant_map)
 
     wire_outputs = Enum.map(prog.outputs ++ prog.keepalive_refs, &Map.fetch!(ref_to_wire, &1))
+    num_real_outputs = length(prog.outputs)
 
     capture_nif_refs =
       Enum.map(prog.captures, fn {_ref, %Nx.Tensor{data: %EMLX.Backend{ref: {_, nif_ref}}}} ->
@@ -2950,7 +3045,8 @@ defmodule EMLX.Native.Expr do
       captures: capture_nif_refs,
       constants: wire_constants,
       instructions: Enum.reverse(instructions),
-      outputs: wire_outputs
+      outputs: wire_outputs,
+      num_real_outputs: num_real_outputs
     }
   end
 

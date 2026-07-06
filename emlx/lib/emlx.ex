@@ -1730,7 +1730,6 @@ defmodule EMLX do
       )
 
     output_template = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
-    real_output_count = Nx.Defn.Composite.reduce(output_template, 0, fn _node, acc -> acc + 1 end)
 
     # See `quant_signature/2`'s doc for why this must be restricted to
     # positions actually consumed by a `:dot` — otherwise a quantized
@@ -1750,6 +1749,32 @@ defmodule EMLX do
       |> Enum.map(fn
         %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos
         _ -> nil
+      end)
+
+    # Mutually exclusive with output_param_positions above: a leaf freshly
+    # produced by `EMLX.Quantization.quantize/2` (see its moduledoc and
+    # `EMLX.Native.Expr.scope_dependencies/1`'s `__EMLX_QUANT__` clause) —
+    # `EMLX.Native.Expr.lower/2` emits 2-3 physical refs (weight, scales,
+    # optional biases) for such a leaf instead of 1, so out_refs isn't
+    # simply zippable 1:1 against output_template leaves. nil for every
+    # other leaf.
+    quantized_leaf_specs =
+      [output_expr]
+      |> Nx.Defn.Composite.flatten_list()
+      |> Enum.map(fn
+        %Nx.Tensor{
+          data: %Nx.Defn.Expr{
+            op: :metadata,
+            args: [
+              _inner,
+              %{__EMLX_QUANT__: %{group_size: group_size, bits: bits, mode: mode, biases: biases}}
+            ]
+          }
+        } ->
+          %{group_size: group_size, bits: bits, mode: mode, has_biases: biases != nil}
+
+        _ ->
+          nil
       end)
 
     fn [params] ->
@@ -1783,9 +1808,10 @@ defmodule EMLX do
         EMLX.NIF.eval_program(worker, program_resource, input_refs(tensors))
         |> unwrap!()
 
-      all_refs = await_worker(job_ref, runtime_calls, tensors, dev)
-
-      {out_refs, _keepalive_refs} = Enum.split(all_refs, real_output_count)
+      # `eval_program` already trims any keepalive tail on the native side
+      # (see `EMLX.Native.Program.num_real_outputs`'s doc) — every ref
+      # returned here is a real output, one per `output_template` leaf.
+      out_refs = await_worker(job_ref, runtime_calls, tensors, dev)
 
       # Reconstruct output tensors: traverse the output expression template
       # (provides type/shape/names) and attach each returned resource ref as
@@ -1793,35 +1819,90 @@ defmodule EMLX do
       # pass-through leaf (see output_param_positions above) — its Nx-visible
       # shape/type is a logical fiction (see quant_signature/2) that does not
       # match the physical (packed) array the NIF actually returns for an
-      # untouched pass-through, so EMLX.Backend.to_nx/2 would raise a shape
-      # mismatch. Substitute back the original bound tensor (quantization_config
-      # and all) instead for those leaves. Checked against the tensor's own
-      # `quantization_config` directly rather than `quant_signature` — the
-      # latter is deliberately narrowed to positions a `:dot` node actually
-      # consumes (see `quantizable_param_positions/1`'s doc), but a
-      # loop-invariant quantized carry passed straight through untouched
-      # (this leaf) need not be consumed by any `:dot` in this stage at all.
-      {output_container, {[], []}} =
+      # untouched pass-through, so EMLX.Backend.to_nx/2's *physical* shape
+      # check would raise spuriously. Substitute back the original bound
+      # tensor (quantization_config and all) instead for those leaves — but
+      # still assert its logical shape/type (its own `.shape`/`.type`, which
+      # mirror the logical dense shape same as `leaf`'s) match `leaf`'s, so a
+      # `pos`/`tensors` mismatch doesn't silently smuggle a wrong tensor into
+      # the output. Checked against the tensor's own `quantization_config`
+      # directly rather than `quant_signature` — the latter is deliberately
+      # narrowed to positions a `:dot` node actually consumes (see
+      # `quantizable_param_positions/1`'s doc), but a loop-invariant
+      # quantized carry passed straight through untouched (this leaf) need
+      # not be consumed by any `:dot` in this stage at all.
+      {output_container, {[], [], []}} =
         Nx.Defn.Composite.traverse(
           output_template,
-          {out_refs, output_param_positions},
-          fn leaf, {[ref | refs_rest], [pos | pos_rest]} ->
-            emlx_tensor =
-              case pos && Enum.at(tensors, pos) do
-                %Nx.Tensor{data: %EMLX.Backend{quantization_config: %EMLX.Quantization.Config{}}} =
-                    t ->
-                  t
+          {out_refs, output_param_positions, quantized_leaf_specs},
+          fn leaf, {refs, [pos | pos_rest], [quant_spec | quant_rest]} ->
+            {emlx_tensor, refs_rest} =
+              case {pos && Enum.at(tensors, pos), quant_spec} do
+                {%Nx.Tensor{
+                   data: %EMLX.Backend{quantization_config: %EMLX.Quantization.Config{}}
+                 } = t, _} ->
+                  if t.shape != leaf.shape or t.type != leaf.type do
+                    raise ArgumentError, """
+                    quantized pass-through output mismatch at parameter position #{pos}: \
+                    expected shape/type #{inspect(leaf.shape)}/#{inspect(leaf.type)}, \
+                    got #{inspect(t.shape)}/#{inspect(t.type)}\
+                    """
+                  end
 
-                _ ->
-                  EMLX.Backend.to_nx({dev, ref}, leaf)
+                  [_ref | rest] = refs
+                  {t, rest}
+
+                {_, %{has_biases: true} = spec} ->
+                  [weight_ref, scales_ref, biases_ref | rest] = refs
+                  {reconstruct_quantized_output(dev, weight_ref, scales_ref, biases_ref, spec, leaf), rest}
+
+                {_, %{has_biases: false} = spec} ->
+                  [weight_ref, scales_ref | rest] = refs
+                  {reconstruct_quantized_output(dev, weight_ref, scales_ref, nil, spec, leaf), rest}
+
+                {_, nil} ->
+                  [ref | rest] = refs
+                  {EMLX.Backend.to_nx({dev, ref}, leaf), rest}
               end
 
-            {emlx_tensor, {refs_rest, pos_rest}}
+            {emlx_tensor, {refs_rest, pos_rest, quant_rest}}
           end
         )
 
       [output_container]
     end
+  end
+
+  # Reassembles the 2-3 physical refs `EMLX.Native.Expr.lower/2` emitted for
+  # a `__EMLX_QUANT__` output leaf (see `EMLX.Quantization.quantize/2`) back
+  # into a proper annotated quantized tensor — mirrors the construction in
+  # `EMLX.quantize/2` and `EMLX.Quantization.quantized_tensor/5`, but (unlike
+  # the latter) handles a `nil` biases_ref (microscaled modes) and an
+  # arbitrary `mode`.
+  defp reconstruct_quantized_output(dev, weight_ref, scales_ref, biases_ref, spec, %Nx.Tensor{} = leaf) do
+    scales = EMLX.Backend.to_nx({dev, scales_ref})
+    biases = biases_ref && EMLX.Backend.to_nx({dev, biases_ref})
+
+    config = %EMLX.Quantization.Config{
+      scales: scales,
+      biases: biases,
+      group_size: spec.group_size,
+      bits: spec.bits,
+      mode: spec.mode
+    }
+
+    weight_device_ref = {dev, weight_ref}
+    weight_shape = EMLX.shape(weight_device_ref)
+
+    %Nx.Tensor{
+      leaf
+      | data: %EMLX.Backend{
+          ref: weight_device_ref,
+          shape: weight_shape,
+          type: {:u, 32},
+          quantization_config: config
+        }
+    }
   end
 
   # Wraps a compiled eval closure so each invocation routes through `queue`.
@@ -1861,32 +1942,6 @@ defmodule EMLX do
       end)
     end)
   end
-
-  # True when the parent scope contains a `while` split point. `post_order/2`
-  # treats it as an opaque leaf, so this only sees parent-scope split
-  # points — a nested one inside a sub-scope surfaces when that sub-scope is
-  # compiled.
-  defp contains_split_point?(output_expr) do
-    output_expr
-    |> EMLX.Defn.Tree.post_order(&EMLX.Native.Expr.scope_dependencies/1)
-    |> Enum.any?(&split_point?/1)
-  end
-
-  # A `while` is only a split point when it can't be natively lowered to a
-  # single `EMLXWhile` primitive (see `EMLX.Native.Expr.native_while_eligible?/2`
-  # and its `:while` moduledoc section) -- currently always false, since
-  # `:runtime_call`/`:token` hooks and nesting are all native-eligible; see
-  # this module's `build_eval_fn/5` moduledoc comment above for why this is
-  # kept as a defensive check rather than deleted. An eligible `while` is
-  # left in place: `EMLX.Native.Expr.lower/1` (via `expand_node`) lowers it
-  # straight into a flat native program below, no split needed.
-  defp split_point?(%Nx.Tensor{
-         data: %Nx.Defn.Expr{op: :while, args: [_initial, _arg, condition, body]}
-       }) do
-    not EMLX.Native.Expr.native_while_eligible?(condition, body)
-  end
-
-  defp split_point?(%Nx.Tensor{}), do: false
 
   # Compiles an `EMLX.Native.Expr` program to a NIF resource on `worker`.
   # Captured host tensors are copied onto `device` first: a `defn`-embedded
@@ -2235,167 +2290,7 @@ defmodule EMLX do
 
   defp sanitize_key_term(other, _positions), do: other
 
-  # Builds the eval closure for a `while` split point surrounded by other
-  # computation. The expression is split on every `while` node and replayed
-  # by `Nx.Defn.Graph`: `compiler: EMLX` makes every stage re-enter this
-  # compiler, so straight-line stages compile flat (any `:runtime_call` in
-  # them lowers in-graph — see `build_eval_fn/4`) and the isolated `while`
-  # stage hits `build_while_base_eval_fn/2`. `device:` keeps stage
-  # compilation on the same device; the command queue (if any) is
-  # propagated through the process binding set by the outer wrapper.
-  defp build_split_chain_eval_fn(output_expr, effective_device) do
-    stages = Nx.Defn.Graph.split(output_expr, &if(split_point?(&1), do: :both, else: :none))
 
-    fn [params] ->
-      {_worker, dev} = resolve_worker(effective_device)
-      inputs = Enum.map(params, &materialise_tensor(&1, dev))
-      result = Nx.Defn.Graph.run(stages, inputs, compiler: __MODULE__, device: effective_device)
-      [result]
-    end
-  end
-
-  # Builds the eval closure for the base case: a bare tail `while` whose initial
-  # carry is exactly the stage inputs (every output leaf is the `while` node or
-  # an `:elem` of it). The condition and body are compiled by re-entering this
-  # compiler via `Nx.Defn.jit/2`, so a nested `while` in the body recurses
-  # through the same splitting machinery. The loop itself is driven host-side.
-  defp build_while_base_eval_fn(output_expr, effective_device) do
-    while_node = find_while_node(output_expr)
-    [initial, _arg, cond_expr, body_expr] = while_node.data.args
-
-    jit_opts = [compiler: __MODULE__, device: effective_device]
-    cond_fn = Nx.Defn.jit(fn _ -> cond_expr end, jit_opts)
-    body_fn = Nx.Defn.jit(fn _ -> body_expr end, jit_opts)
-
-    # The stage inputs arrive in stage-argument order, which need not match the
-    # carry (sub-scope parameter) order: each flattened `initial` leaf is the
-    # parameter whose position picks the stage input feeding that carry slot.
-    # Reorder inputs into carry order so the condition/body parameters bind to
-    # the right tensors.
-    initial_positions =
-      [initial]
-      |> Nx.Defn.Composite.flatten_list()
-      |> Enum.map(fn %Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos end)
-
-    while_id = while_node.data.id
-    output_flat = Nx.Defn.Composite.flatten_list([output_expr])
-    carry_indices = Enum.map(output_flat, &while_output_index(&1, while_id))
-    output_template = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
-
-    fn [params] ->
-      {_worker, dev} = resolve_worker(effective_device)
-      inputs = Enum.map(params, &materialise_tensor(&1, dev))
-      carry = Enum.map(initial_positions, &Enum.at(inputs, &1))
-      final_carry = run_while_loop(carry, cond_fn, body_fn)
-
-      output_tensors = Enum.map(carry_indices, &Enum.at(final_carry, &1))
-
-      {output_container, []} =
-        Nx.Defn.Composite.traverse(output_template, output_tensors, fn _leaf, [t | rest] ->
-          {t, rest}
-        end)
-
-      [output_container]
-    end
-  end
-
-  # Host-driven while loop. `carry` is the flat list of carry tensors; it is
-  # passed to the compiled condition/body as a single tuple argument (mirroring
-  # how `Nx.Defn.Graph.run` invokes a stage), which jit re-flattens to match the
-  # carry parameters of the sub-scope. The body result is flattened back to a
-  # flat list so a nested-container carry stays aligned with the leaf indices.
-  defp run_while_loop(carry, cond_fn, body_fn) do
-    if Nx.to_number(cond_fn.(List.to_tuple(carry))) == 0 do
-      carry
-    else
-      new_carry = Nx.Defn.Composite.flatten_list([body_fn.(List.to_tuple(carry))])
-      run_while_loop(new_carry, cond_fn, body_fn)
-    end
-  end
-
-  defp find_while_node(output_expr) do
-    output_expr
-    |> EMLX.Defn.Tree.post_order(&EMLX.Native.Expr.scope_dependencies/1)
-    |> Enum.find(&(&1.data.op == :while))
-  end
-
-  # True for the base case: the output projects exactly one `while` (each leaf
-  # is the `while` node or an `:elem` of it) and that `while`'s initial carry is
-  # made entirely of parameters — i.e. all pre-loop work has already been split
-  # into an earlier stage, so the carry is the stage input as-is.
-  defp bare_while?(output_expr) do
-    leaves = Nx.Defn.Composite.flatten_list([output_expr])
-
-    while_ids =
-      leaves
-      |> Enum.flat_map(fn
-        %Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}} ->
-          [id]
-
-        %Nx.Tensor{
-          data: %Nx.Defn.Expr{
-            op: :elem,
-            args: [%Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}}, _]
-          }
-        } ->
-          [id]
-
-        _ ->
-          []
-      end)
-      |> Enum.uniq()
-
-    case while_ids do
-      [wid] ->
-        all_project =
-          Enum.all?(leaves, fn
-            %Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: ^wid}} ->
-              true
-
-            %Nx.Tensor{
-              data: %Nx.Defn.Expr{op: :elem, args: [%Nx.Tensor{data: %Nx.Defn.Expr{id: ^wid}}, _]}
-            } ->
-              true
-
-            _ ->
-              false
-          end)
-
-        all_project and while_initial_all_params?(find_while_node(output_expr))
-
-      _ ->
-        false
-    end
-  end
-
-  defp while_initial_all_params?(%Nx.Tensor{data: %Nx.Defn.Expr{args: [initial | _]}}) do
-    [initial]
-    |> Nx.Defn.Composite.flatten_list()
-    |> Enum.all?(&match?(%Nx.Tensor{data: %Nx.Defn.Expr{op: :parameter}}, &1))
-  end
-
-  # Maps a flat output leaf to the carry index it projects from `while_id`.
-  defp while_output_index(%Nx.Tensor{data: %Nx.Defn.Expr{op: :while, id: id}}, while_id)
-       when id == while_id,
-       do: 0
-
-  defp while_output_index(
-         %Nx.Tensor{
-           data: %Nx.Defn.Expr{op: :elem, args: [%Nx.Tensor{data: %Nx.Defn.Expr{id: id}}, i]}
-         },
-         while_id
-       )
-       when id == while_id,
-       do: i
-
-  # Materialises a defn input lazy ref to a concrete EMLX-backed tensor on `dev`
-  # (for use as a `Nx.Defn.Graph.run` / jitted-stage argument).
-  defp materialise_tensor(lazy, dev) do
-    case lazy.() do
-      %Nx.Tensor{data: %EMLX.Backend{}} = tensor -> tensor
-      %Nx.Tensor{} = tensor -> Nx.backend_copy(tensor, {EMLX.Backend, device: dev})
-    end
-  end
 
   @impl Nx.Defn.Compiler
   def __partitions_options__(opts) do

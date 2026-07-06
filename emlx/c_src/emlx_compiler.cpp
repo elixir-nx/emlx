@@ -2154,6 +2154,7 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   ptr->num_inputs = num_inputs_val;
   ptr->compile_id = unique_id;
   ptr->has_runtime_call = has_runtime_call;
+  ptr->num_real_outputs = program.num_real_outputs;
   {
     std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
     ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
@@ -2214,7 +2215,11 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
       mlx::core::synchronize();
     }
 
-    size_t n = outputs.size();
+    // Only the real outputs are converted to resources and returned to
+    // Elixir — any keepalive tail (see emlx::native::Program::num_real_outputs)
+    // was included above solely to force mlx::core::eval to run it for its
+    // side effects; the caller has no use for the resulting array itself.
+    size_t n = static_cast<size_t>(prog->num_real_outputs);
     std::vector<ERL_NIF_TERM> terms;
     terms.reserve(n);
     for (size_t i = 0; i < n; i++) {
