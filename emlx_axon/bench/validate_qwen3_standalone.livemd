@@ -704,6 +704,7 @@ results =
 results
 |> Enum.map(&Summary.to_markdown/1)
 |> Enum.join("\n\n---\n\n")
+|> dbg()
 |> Kino.Markdown.new()
 ```
 

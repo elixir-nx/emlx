@@ -1854,11 +1854,21 @@ defmodule EMLX do
 
                 {_, %{has_biases: true} = spec} ->
                   [weight_ref, scales_ref, biases_ref | rest] = refs
-                  {reconstruct_quantized_output(dev, weight_ref, scales_ref, biases_ref, spec, leaf), rest}
+
+                  {reconstruct_quantized_output(
+                     dev,
+                     weight_ref,
+                     scales_ref,
+                     biases_ref,
+                     spec,
+                     leaf
+                   ), rest}
 
                 {_, %{has_biases: false} = spec} ->
                   [weight_ref, scales_ref | rest] = refs
-                  {reconstruct_quantized_output(dev, weight_ref, scales_ref, nil, spec, leaf), rest}
+
+                  {reconstruct_quantized_output(dev, weight_ref, scales_ref, nil, spec, leaf),
+                   rest}
 
                 {_, nil} ->
                   [ref | rest] = refs
@@ -1879,7 +1889,14 @@ defmodule EMLX do
   # `EMLX.quantize/2` and `EMLX.Quantization.quantized_tensor/5`, but (unlike
   # the latter) handles a `nil` biases_ref (microscaled modes) and an
   # arbitrary `mode`.
-  defp reconstruct_quantized_output(dev, weight_ref, scales_ref, biases_ref, spec, %Nx.Tensor{} = leaf) do
+  defp reconstruct_quantized_output(
+         dev,
+         weight_ref,
+         scales_ref,
+         biases_ref,
+         spec,
+         %Nx.Tensor{} = leaf
+       ) do
     scales = EMLX.Backend.to_nx({dev, scales_ref})
     biases = biases_ref && EMLX.Backend.to_nx({dev, biases_ref})
 
@@ -2289,8 +2306,6 @@ defmodule EMLX do
   end
 
   defp sanitize_key_term(other, _positions), do: other
-
-
 
   @impl Nx.Defn.Compiler
   def __partitions_options__(opts) do

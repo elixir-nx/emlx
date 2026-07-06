@@ -3648,7 +3648,8 @@ defmodule EMLX.Native.ExprTest do
       refute_receive {:step2, _}
       # Each iteration must fire step1 immediately before step2 (never
       # interleaved out of order across iterations).
-      assert Enum.chunk_every(native_events, 2) |> Enum.all?(&match?([{:step1, _}, {:step2, _}], &1))
+      assert Enum.chunk_every(native_events, 2)
+             |> Enum.all?(&match?([{:step1, _}, {:step2, _}], &1))
 
       eager = Nx.Defn.jit(&two_hooks_in_while_body/1, compiler: Nx.Defn.Evaluator).(a)
 
@@ -3882,7 +3883,9 @@ defmodule EMLX.Native.ExprTest do
     end
 
     test "a quantized weight threaded through a while carry and dotted inside the body works" do
-      weight = Nx.iota({64, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+      weight =
+        Nx.iota({64, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
       qw = EMLX.quantize(weight, [])
       x = Nx.iota({4, 64}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
       n = Nx.tensor(3, backend: EMLX.Backend)
