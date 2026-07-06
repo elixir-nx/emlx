@@ -2218,38 +2218,31 @@ defmodule EMLX.Backend do
   end
 
   @impl true
-  def block(%Nx.Block.LinAlg.Eigh{} = struct, {out_eigenvals, out_eigenvecs}, [tensor], fun) do
-    {device, _ref} = t_mx = from_nx(tensor)
-
-    case device do
-      :cpu ->
-        t = to_typed_ref(t_mx, tensor.type, {:f, 32})
-        {eigenvalues, eigenvectors} = EMLX.linalg_eigh(t, :L)
-        {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
-
-      :gpu ->
-        eager_fallback(device, struct, [tensor], fun)
-    end
+  def block(%Nx.Block.LinAlg.Eigh{}, {out_eigenvals, out_eigenvecs}, [tensor], _fun) do
+    # `EMLX.linalg_eigh`'s NIF always pins the actual computation to the CPU
+    # stream (MLX's `eigh` has no Metal kernel) regardless of `tensor`'s own
+    # device, so there's no need to special-case `:gpu` here anymore — doing
+    # so used to fall back to `Nx.LinAlg`'s much slower eager `default_expr`.
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    {eigenvalues, eigenvectors} = EMLX.linalg_eigh(t, :L)
+    {to_nx(eigenvalues, out_eigenvals), to_nx(eigenvectors, out_eigenvecs)}
   end
 
   @impl true
   def block(
-        %Nx.Block.LinAlg.SVD{full_matrices?: true} = struct,
+        %Nx.Block.LinAlg.SVD{full_matrices?: true},
         {out_u, out_s, out_v},
         [tensor],
-        fun
+        _fun
       ) do
-    {device, _ref} = t_mx = from_nx(tensor)
-
-    case device do
-      :cpu ->
-        t = to_typed_ref(t_mx, tensor.type, {:f, 32})
-        [u, s, vt] = EMLX.linalg_svd(t, true)
-        {to_nx(u, out_u), to_nx(s, out_s), to_nx(vt, out_v)}
-
-      :gpu ->
-        eager_fallback(device, struct, [tensor], fun)
-    end
+    # `EMLX.linalg_svd`'s NIF always pins the actual computation to the CPU
+    # stream (MLX's `svd` has no Metal kernel) regardless of `tensor`'s own
+    # device, so there's no need to special-case `:gpu` here anymore — doing
+    # so used to fall back to `Nx.LinAlg`'s much slower eager, ~100-iteration
+    # Jacobi-rotation `default_expr`.
+    t = to_typed_ref(from_nx(tensor), tensor.type, {:f, 32})
+    [u, s, vt] = EMLX.linalg_svd(t, true)
+    {to_nx(u, out_u), to_nx(s, out_s), to_nx(vt, out_v)}
   end
 
   @impl true

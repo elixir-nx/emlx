@@ -21,17 +21,11 @@ defmodule EMLX.Native.Expr do
     :constants,
     :instructions,
     :outputs,
-    hooks: [],
+    keepalive_refs: [],
     runtime_calls: []
   ]
 
   @type node_ref :: reference()
-  @type hook :: %{
-          name: atom(),
-          callback: (Nx.Container.t() -> term()),
-          template: Nx.Container.t(),
-          refs: [node_ref()]
-        }
   @type runtime_call :: %{
           index: non_neg_integer(),
           callback: (Nx.Container.t(), keyword() -> Nx.Container.t()),
@@ -45,7 +39,24 @@ defmodule EMLX.Native.Expr do
           constants: [{node_ref(), number(), Nx.Type.t()}],
           instructions: [{node_ref(), atom(), [node_ref()], [integer()]}],
           outputs: [node_ref()],
-          hooks: [hook()],
+          # Hooks (`:token`/`:attach_token`) lower to inline `:runtime_call`s
+          # (see the `:token` clause of `expand_node/2`) chained through a
+          # single running "keepalive" ref per program: each hook's runtime
+          # call both fires the real Elixir side effect *and* threads a
+          # scalar forward, so (a) MLX's lazy evaluator is forced to actually
+          # run a hook whose value would otherwise be unreferenced by the
+          # real output (matching a hook's own token/attach_token becoming
+          # reachable, without needing that specific hook's value to be),
+          # and (b) hooks that aren't already ordered by a genuine data
+          # dependency still fire in declaration order, without relying on
+          # unspecified scheduling order between independent primitives.
+          # `keepalive_refs` holds the *final* tip of that chain (0 or 1
+          # refs) -- appended to `outputs` on the wire (see `to_native/1`,
+          # which also records the real/keepalive boundary in
+          # `EMLX.Native.Program.num_real_outputs`) and dropped natively by
+          # `eval_program` before it returns (the real firing already
+          # happened inline, during evaluation) -- Elixir never sees it.
+          keepalive_refs: [node_ref()],
           runtime_calls: [runtime_call()]
         }
 
@@ -54,6 +65,7 @@ defmodule EMLX.Native.Expr do
   @doc false
   def lower(output, num_inputs \\ nil, quant_signature \\ %{}) do
     ordered = EMLX.Defn.Tree.post_order(output, &scope_dependencies/1)
+    top_scope_ids = top_scope_ids(output, ordered)
 
     # inputs is a map of pos → ref during lowering; densified to a list at the end.
     state = %{
@@ -62,10 +74,13 @@ defmodule EMLX.Native.Expr do
       constants: [],
       instructions: [],
       node_to_ref: %{},
-      hooks: [],
       runtime_calls: [],
-      top_scope_ids: output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new(),
-      quant_signature: quant_signature
+      top_scope_ids: top_scope_ids,
+      quant_signature: quant_signature,
+      while_nesting_depth: 0,
+      stable_positions: %{},
+      hook_chain_ref: nil,
+      hooked_value_refs: %{}
     }
 
     state = Enum.reduce(ordered, state, &expand_node/2)
@@ -79,7 +94,31 @@ defmodule EMLX.Native.Expr do
       end
 
     flat_outputs = Composite.flatten_list([output])
-    output_refs = Enum.map(flat_outputs, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    # A `__EMLX_QUANT__`-tagged leaf (see `EMLX.Quantization.quantize/2`)
+    # is one *logical* output but has no single physical ref of its own
+    # (see the `:metadata` `expand_node/2` clause above) — emit its 2-3
+    # underlying decomposition refs directly instead of looking the leaf's
+    # own id up in `node_to_ref`. Every other leaf still contributes
+    # exactly one ref, as before.
+    output_refs =
+      Enum.flat_map(flat_outputs, fn
+        %T{
+          data: %Nx.Defn.Expr{
+            op: :metadata,
+            args: [_inner, %{__EMLX_QUANT__: %{weight: weight, scales: scales, biases: biases}}]
+          }
+        } ->
+          refs = [
+            Map.fetch!(state.node_to_ref, weight.data.id),
+            Map.fetch!(state.node_to_ref, scales.data.id)
+          ]
+
+          if biases, do: refs ++ [Map.fetch!(state.node_to_ref, biases.data.id)], else: refs
+
+        leaf ->
+          [Map.fetch!(state.node_to_ref, leaf.data.id)]
+      end)
 
     %__MODULE__{
       inputs: inputs_list,
@@ -87,9 +126,36 @@ defmodule EMLX.Native.Expr do
       constants: Enum.reverse(state.constants),
       instructions: Enum.reverse(state.instructions),
       outputs: output_refs,
-      hooks: Enum.reverse(state.hooks),
+      keepalive_refs: List.wrap(state.hook_chain_ref),
       runtime_calls: Enum.reverse(state.runtime_calls)
     }
+  end
+
+  # `Nx.Defn.Tree.scope_ids/1` only walks a node's *generic* args — it has
+  # no notion of `__EMLX_QUANT__`'s custom `scope_dependencies/1` redirection
+  # (see `EMLX.Quantization.quantize/2`), so a quantize-traced node's
+  # decomposition `:runtime_call` (reachable only through that metadata
+  # payload) is invisible to it and never marked top-scope, even when the
+  # metadata node itself is. Backfill it here so the `:runtime_call`
+  # `expand_node/2` clause's "not inside a cond" check doesn't misfire on a
+  # decomposition call that is, in fact, top-scope.
+  defp top_scope_ids(output, ordered) do
+    base = output |> Nx.Defn.Tree.scope_ids() |> Map.keys() |> MapSet.new()
+
+    Enum.reduce(ordered, base, fn
+      %T{
+        data: %Nx.Defn.Expr{
+          id: id,
+          op: :metadata,
+          args: [_inner, %{__EMLX_QUANT__: %{weight: %T{data: %Nx.Defn.Expr{args: [root, _]}}}}]
+        }
+      },
+      acc ->
+        if MapSet.member?(acc, id), do: MapSet.put(acc, root.data.id), else: acc
+
+      _, acc ->
+        acc
+    end)
   end
 
   # ── node expansion ────────────────────────────────────────────────────────
@@ -101,6 +167,20 @@ defmodule EMLX.Native.Expr do
     {:ok, operands}
   end
 
+  # `EMLX.Quantization.quantize/2`'s traced representation (see its
+  # `quantize_traced/2`) — redirects traversal to the decomposition leaves
+  # (weight/scales/biases, each a real dense `Nx.runtime_call` result) so
+  # `inner` (a plain-tensor fallback for non-EMLX compilers only) is never
+  # visited/lowered by this compiler at all.
+  def scope_dependencies(%T{
+        data: %Nx.Defn.Expr{
+          op: :metadata,
+          args: [_inner, %{__EMLX_QUANT__: %{weight: weight, scales: scales, biases: biases}}]
+        }
+      }) do
+    {:ok, if(biases, do: [weight, scales, biases], else: [weight, scales])}
+  end
+
   def scope_dependencies(_node), do: :default
 
   defp expand_node(%T{data: %Nx.Defn.Expr{id: id, op: :parameter, args: [pos]}}, state) do
@@ -109,7 +189,12 @@ defmodule EMLX.Native.Expr do
     %{
       state
       | inputs: Map.put(state.inputs, pos, ref),
-        node_to_ref: Map.put(state.node_to_ref, id, ref)
+        node_to_ref: Map.put(state.node_to_ref, id, ref),
+        # Real top-level position, in this program's own :parameter numbering
+        # (matches `tensors` in EMLX.handle_runtime_call/6) -- see
+        # `expand_while_native/6`'s stable-carry propagation for how this
+        # reaches a `:runtime_call` operand nested inside a `:while` body.
+        stable_positions: Map.put(state.stable_positions, id, pos)
     }
   end
 
@@ -167,6 +252,22 @@ defmodule EMLX.Native.Expr do
       | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
         node_to_ref: Map.put(state.node_to_ref, id, ref)
     }
+  end
+
+  # `EMLX.Quantization.quantize/2`'s traced representation — see
+  # `scope_dependencies/1`'s matching clause above. This node has no single
+  # physical ref of its own: `lower/2`'s output-ref builder reads
+  # `__EMLX_QUANT__` straight off an output leaf and emits its 2-3
+  # underlying refs directly, bypassing `node_to_ref` entirely for this id.
+  # Feeding this value into anything *other* than a direct output (e.g.
+  # `Nx.dot`) isn't supported yet — that consumer's own `Map.fetch!` on
+  # `node_to_ref` raises a `KeyError` instead of silently reading a
+  # meaningless ref.
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{op: :metadata, args: [_inner, %{__EMLX_QUANT__: _quant}]}},
+         state
+       ) do
+    state
   end
 
   defp expand_node(
@@ -595,13 +696,13 @@ defmodule EMLX.Native.Expr do
          },
          state
        ) do
-    if quantized_param_config(left, state.quant_signature) do
+    if quantized_param_config(left, state.quant_signature, state.stable_positions) do
       raise ArgumentError,
             "does not yet lower op :dot with a quantized left operand. " <>
               "Dequantize it first with EMLX.dequantize/1."
     end
 
-    case quantized_param_config(right, state.quant_signature) do
+    case quantized_param_config(right, state.quant_signature, state.stable_positions) do
       nil ->
         expand_plain_dot(id, out_type, left, c_left, right, c_right, b_left, b_right, state)
 
@@ -1570,6 +1671,23 @@ defmodule EMLX.Native.Expr do
 
   defp expand_node(%T{data: %Nx.Defn.Expr{op: :fun}}, state), do: state
 
+  # A hook lowers to an inline `:runtime_call` (see `emit_hook_runtime_call/3`)
+  # instead of the old "extra program output fired once after the whole
+  # compiled program returns" scheme: that older scheme couldn't represent
+  # "once per iteration" inside a native `:while`, which is exactly why
+  # `native_eligible_node?/1` used to reject `:token` outright. Firing inline
+  # gets per-iteration semantics for free (same mechanism validated for
+  # `:runtime_call` generally -- see `EMLXRuntimeCall`'s moduledoc in
+  # emlx_compiler.cpp), and each hook's runtime call also threads a
+  # `hook_chain_ref` scalar through `state`: this is what still makes a hook
+  # fire even when *this specific token's* hook value has no other consumer
+  # (matching Evaluator's "the token, not the individual hook expr, is what
+  # attach_token makes reachable" semantics -- see `Nx.Defn.Kernel.hook/3`'s
+  # doc), and forces a deterministic firing order between hooks that aren't
+  # already ordered by a genuine data dependency (MLX's own execution order
+  # for independent primitives is not a documented guarantee). See
+  # `EMLX.Native.Expr.t/0`'s `keepalive_refs` doc for where the final tip of
+  # this chain ends up.
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}},
          state
@@ -1583,27 +1701,33 @@ defmodule EMLX.Native.Expr do
               "branch's hook). Move the hook outside the cond."
     end
 
-    Enum.reduce(hooks, state, fn
+    # `token.hooks` stores the most-recently-declared hook at the head (see
+    # Nx.Defn.Token's moduledoc) -- reverse to chain them in true declaration
+    # order.
+    Enum.reduce(Enum.reverse(hooks), state, fn
       %{callback: nil}, state ->
         state
 
-      %{callback: callback, expr: expr, name: name}, state ->
-        refs =
-          [expr]
-          |> Composite.flatten_list()
-          |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
-
-        template = Composite.traverse(expr, &Nx.to_template/1)
-        hook = %{name: name, callback: callback, template: template, refs: refs}
-        %{state | hooks: [hook | state.hooks]}
+      %{callback: callback, expr: expr}, state ->
+        emit_hook_runtime_call(expr, callback, state)
     end)
   end
 
+  # Resolves to the hooked (post-side-effect) value when `expr` is one of
+  # *this* token's own hooked expressions -- see `emit_hook_runtime_call/3`'s
+  # `hooked_value_refs` doc -- falling back to the plain ref otherwise (a
+  # name-only hook with no callback, or `attach_token` wrapping something
+  # that isn't itself hooked).
   defp expand_node(
          %T{data: %Nx.Defn.Expr{id: id, op: :attach_token, args: [_token, expr]}},
          state
        ) do
-    ref = Map.fetch!(state.node_to_ref, expr.data.id)
+    ref =
+      case Map.fetch(state.hooked_value_refs, expr.data.id) do
+        {:ok, hooked_ref} -> hooked_ref
+        :error -> Map.fetch!(state.node_to_ref, expr.data.id)
+      end
+
     %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
   end
 
@@ -1630,11 +1754,17 @@ defmodule EMLX.Native.Expr do
 
     operand_refs = Enum.map(operand_leaves, &Map.fetch!(state.node_to_ref, &1.data.id))
 
+    # A bare `%T{op: :parameter}` leaf is only a genuine top-level position
+    # when it IS a top-level parameter; inside a `:while` sub-program, `arg`'s
+    # parameters have their own local 0..N-1 numbering, unrelated to this
+    # program's real input list. `stable_positions` (populated by the
+    # top-level :parameter clause and propagated through invariant `while`
+    # carries by `expand_while_native/6`) resolves the correct position in
+    # both cases, and is `nil` when no such stable identity exists (e.g. the
+    # operand is computed, or a while carry that actually changes per
+    # iteration) -- see EMLX.handle_runtime_call/6's `positions` doc.
     arg_param_positions =
-      Enum.map(operand_leaves, fn
-        %T{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}} -> pos
-        _ -> nil
-      end)
+      Enum.map(operand_leaves, &Map.get(state.stable_positions, &1.data.id))
 
     output_templates =
       case out_template do
@@ -1642,6 +1772,69 @@ defmodule EMLX.Native.Expr do
         container -> Composite.flatten_list([container])
       end
 
+    args_template = Composite.traverse(tensor_expr, &Nx.to_template/1)
+
+    {result_refs, state} =
+      emit_runtime_call_refs(
+        operand_refs,
+        arg_param_positions,
+        args_template,
+        callback,
+        opts,
+        output_templates,
+        state
+      )
+
+    result_id =
+      case out_template do
+        %Nx.Tensor{} -> hd(result_refs)
+        _ -> result_refs
+      end
+
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_id)}
+  end
+
+  defp expand_node(
+         %T{data: %Nx.Defn.Expr{id: id, op: :while, args: [initial, arg, condition, body]}},
+         state
+       ) do
+    case detect_static_while_trip_count(initial, arg, condition, body) do
+      {:ok, count} ->
+        expand_while_unroll(id, initial, arg, body, count, state)
+
+      :error ->
+        if native_while_eligible?(condition, body) do
+          expand_while_native(id, initial, arg, condition, body, state)
+        else
+          raise ArgumentError, "does not yet lower op :while"
+        end
+    end
+  end
+
+  defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
+    raise ArgumentError, "does not yet lower op #{inspect(op)}"
+  end
+
+  # Emits one `:runtime_call` instruction from already-resolved operand refs
+  # (as opposed to the `:runtime_call` op's own `expand_node` clause, which
+  # additionally has to resolve those refs from a real `Nx.Defn.Expr` --
+  # `emit_hook_runtime_call/3` builds its operands from a hook's `expr`
+  # instead). Shared so both call sites stay byte-for-byte identical in how
+  # they build the wire `attrs`/`runtime_call` map. Always returns a *list*
+  # of result refs (even for a single output) -- safe for the instruction's
+  # own result identifier (`register_result_refs/3` treats a 1-element list
+  # the same as a bare ref), but callers that need `node_to_ref` to hold a
+  # bare ref for a bare-tensor output must unwrap it themselves (see the
+  # `:runtime_call` clause above).
+  defp emit_runtime_call_refs(
+         operand_refs,
+         arg_param_positions,
+         args_template,
+         callback,
+         opts,
+         output_templates,
+         state
+       ) do
     callback_index = length(state.runtime_calls)
 
     attrs =
@@ -1655,37 +1848,91 @@ defmodule EMLX.Native.Expr do
     runtime_call = %{
       index: callback_index,
       callback: callback,
-      args_template: Composite.traverse(tensor_expr, &Nx.to_template/1),
+      args_template: args_template,
       arg_param_positions: arg_param_positions,
       opts: opts
     }
 
-    result_ref =
-      case out_template do
-        %Nx.Tensor{} -> make_ref()
-        _ -> Enum.map(output_templates, fn _ -> make_ref() end)
-      end
+    result_refs = Enum.map(output_templates, fn _ -> make_ref() end)
 
-    %{
+    state = %{
       state
-      | instructions: [{result_ref, :runtime_call, operand_refs, attrs} | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, result_ref),
+      | instructions: [{result_refs, :runtime_call, operand_refs, attrs} | state.instructions],
         runtime_calls: [runtime_call | state.runtime_calls]
     }
+
+    {result_refs, state}
   end
 
-  defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :while, args: [initial, arg, condition, body]}},
-         state
-       ) do
-    case detect_static_while_trip_count(initial, arg, condition, body) do
-      {:ok, count} -> expand_while_unroll(id, initial, arg, body, count, state)
-      :error -> raise ArgumentError, "does not yet lower op :while"
+  # Emits a scalar (shape `{}`) constant, mirroring the `:constant` op's own
+  # shape-`{}` case (see that `expand_node/2` clause) -- used to seed the
+  # hook keepalive chain (see `emit_hook_runtime_call/3`) when there's no
+  # earlier hook in the current scope to chain from.
+  defp emit_scalar_constant(number, type, state) do
+    ref = make_ref()
+    {ref, %{state | constants: [{ref, number, type} | state.constants]}}
+  end
+
+  @hook_chain_type {:u, 32}
+
+  # Converts one hook (`%{expr: ..., callback: ...}` from a `:token` node's
+  # hook list) into an inline `:runtime_call`. The callback's *real* job
+  # (calling the user's function for its side effect) is wrapped in a
+  # closure that also passes the value through unchanged and advances the
+  # keepalive chain -- see `EMLX.Native.Expr.t/0`'s `keepalive_refs` doc for
+  # why the chain exists at all.
+  #
+  # `state.hooked_value_refs` (id of the *hooked* leaf -> its post-side-effect
+  # ref) is separate from `state.node_to_ref` -- deliberately: `expr`'s own
+  # `node_to_ref` entry (already computed by ordinary `expand_node`
+  # processing before this `:token` node is reached) must be left untouched,
+  # since some *other*, non-hooked use of the same underlying value elsewhere
+  # in the graph must not be delayed behind this hook's side effect. Only
+  # `:attach_token`'s own clause consults `hooked_value_refs`, which is
+  # exactly the one place Nx's semantics say the hooked identity should be
+  # visible.
+  defp emit_hook_runtime_call(hook_expr, callback, state) do
+    leaves = Composite.flatten_list([hook_expr])
+    leaf_refs = Enum.map(leaves, &Map.fetch!(state.node_to_ref, &1.data.id))
+    leaf_positions = Enum.map(leaves, &Map.get(state.stable_positions, &1.data.id))
+    hook_template = Composite.traverse(hook_expr, &Nx.to_template/1)
+    chain_template = Nx.template({}, @hook_chain_type)
+
+    {chain_in_ref, state} =
+      case state.hook_chain_ref do
+        nil -> emit_scalar_constant(0, @hook_chain_type, state)
+        ref -> {ref, state}
+      end
+
+    args_template = {hook_template, chain_template}
+    output_templates = Composite.flatten_list([args_template])
+
+    wrapped_callback = fn {value, chain_in}, _opts ->
+      callback.(value)
+      {value, Nx.add(chain_in, 1)}
     end
-  end
 
-  defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
-    raise ArgumentError, "does not yet lower op #{inspect(op)}"
+    {result_refs, state} =
+      emit_runtime_call_refs(
+        leaf_refs ++ [chain_in_ref],
+        leaf_positions ++ [nil],
+        args_template,
+        wrapped_callback,
+        [],
+        output_templates,
+        state
+      )
+
+    {value_refs, [chain_out_ref]} = Enum.split(result_refs, length(result_refs) - 1)
+
+    hooked_value_refs =
+      leaves
+      |> Enum.zip(value_refs)
+      |> Enum.reduce(state.hooked_value_refs, fn {leaf, ref}, acc ->
+        Map.put(acc, leaf.data.id, ref)
+      end)
+
+    %{state | hook_chain_ref: chain_out_ref, hooked_value_refs: hooked_value_refs}
   end
 
   @doc false
@@ -1704,13 +1951,23 @@ defmodule EMLX.Native.Expr do
 
   # ── dot helpers ────────────────────────────────────────────────────────────
 
-  defp quantized_param_config(
-         %T{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}},
-         quant_signature
-       ),
-       do: Map.get(quant_signature, pos)
-
-  defp quantized_param_config(_node, _quant_signature), do: nil
+  # Resolves via `stable_positions` (id -> true top-level parameter position,
+  # see `EMLX.Native.Expr.t/0`'s stable-carry propagation doc) rather than
+  # matching `op: :parameter, args: [pos]` and reading `pos` directly: a
+  # `:dot` operand living inside a `:while` body/condition is a `:parameter`
+  # node too, but scoped to that while's own local carry numbering, not the
+  # top-level program's -- reading its `pos` directly would look up the wrong
+  # (or a coincidentally-colliding) `quant_signature` key. `stable_positions`
+  # already carries a top-level parameter's own position (see `expand_node/2`'s
+  # `op: :parameter` clause) plus, for a while carry, whatever position the
+  # carry is transitively "stable" (loop-invariant) at (see
+  # `propagate_stable_carry_positions/4`), so this one lookup handles both.
+  defp quantized_param_config(%T{data: %Nx.Defn.Expr{id: id}}, quant_signature, stable_positions) do
+    case Map.fetch(stable_positions, id) do
+      {:ok, pos} -> Map.get(quant_signature, pos)
+      :error -> nil
+    end
+  end
 
   defp expand_plain_dot(id, out_type, left, c_left, right, c_right, b_left, b_right, state) do
     left_ref0 = Map.fetch!(state.node_to_ref, left.data.id)
@@ -2001,7 +2258,295 @@ defmodule EMLX.Native.Expr do
          captures: inner_state.captures,
          constants: inner_state.constants,
          inputs: inner_state.inputs,
-         hooks: inner_state.hooks
+         runtime_calls: inner_state.runtime_calls,
+         hook_chain_ref: inner_state.hook_chain_ref,
+         hooked_value_refs: inner_state.hooked_value_refs
+     }}
+  end
+
+  # ── while (native lowering for dynamic-trip-count loops) ───────────────────
+  #
+  # See emlx_compiler.cpp's EMLXWhile primitive and emlx_compiler.hpp's
+  # SubProgram/RefKind::Carry. Instead of unrolling (impossible: the trip
+  # count is data-dependent) or splitting the graph and driving the loop
+  # from Elixir (the old `emlx.ex` `build_while_base_eval_fn`/`run_while_loop`
+  # path, still used as a fallback -- see `native_while_eligible?/2`), this
+  # lowers straight to a single `:while` instruction carrying two
+  # self-contained cond/body sub-programs, so the whole loop runs natively
+  # inside one `eval_program` NIF call.
+
+  # A `:while` loop is native-lowerable unconditionally now: `:runtime_call`
+  # and `:token`/hooks (which lower to an inline `:runtime_call`, see
+  # `emit_hook_runtime_call/3`) are both native-eligible inside a while's
+  # condition/body -- see `native_eligible_node?/1`. `native_while_eligible?/2`
+  # is kept as an explicit, named check (rather than inlining `true`) so
+  # `EMLX.ex`'s `split_point?/1` has a single shared source of truth to call,
+  # in case a future node type needs to reintroduce a real restriction here.
+  # Nested `:while` *is* supported: EMLXWhile's cond/body
+  # sub-programs are interpreted by the same generic `interpret_instructions`
+  # helper used for the top-level program, so a nested `:while` instruction
+  # just recurses into another `EMLXWhile` primitive from inside the outer
+  # one's `eval()` -- validated safe (2- and 3-level nesting, both default
+  # CPU and GPU devices) against the checkpoint (a) spike's reentrant-`eval()`
+  # finding, which generalizes because C++ call-stack depth here scales with
+  # *lexical* nesting depth (fixed at compile time), not iteration count.
+  # `expand_while_native/6` below still guards against pathologically deep
+  # (e.g. generated) nesting with `@max_while_nesting_depth`, purely to turn
+  # a native stack overflow into a clean Elixir error -- not because
+  # correctness is in doubt at any realistic depth. Shared between here and
+  # `EMLX.ex`'s `split_point?/1` so the eligibility criteria can't drift
+  # between the two call sites (each does its own cheap traversal; only the
+  # *logic* is required to stay in sync).
+  @doc false
+  def native_while_eligible?(condition, body) do
+    Enum.all?([condition, body], &while_scope_native_eligible?/1)
+  end
+
+  defp while_scope_native_eligible?(container) do
+    container
+    |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
+    |> Enum.all?(&native_eligible_node?/1)
+  end
+
+  # Every node is native-eligible: `:runtime_call` is backed by a genuine
+  # `mx::core::Primitive` (`EMLXRuntimeCall`, emlx_compiler.cpp) that re-fires
+  # on every replay of the compiled tape, including replays driven by
+  # `EMLXWhile`'s own per-iteration `mlx::core::eval()` calls (validated safe:
+  # both are CPU-pinned primitives triggering nested `eval()` from inside a
+  # primitive's own `eval()`, the same pattern already validated for
+  # while-inside-while nesting -- see `EMLXWhile`'s moduledoc comment in
+  # emlx_compiler.cpp). See `propagate_stable_carry_positions/4` for how a
+  # `:runtime_call` operand recovers its true top-level position when it's a
+  # `while`-carried value instead of a direct top-level parameter. `:token`
+  # (hooks) lowers to an inline `:runtime_call` too (see
+  # `emit_hook_runtime_call/3`), same per-iteration semantics -- the only
+  # remaining restriction is structural, not eligibility-based: a hook whose
+  # value isn't already the condition's own boolean result can't sit inside
+  # a `:while` *condition* (fixed at exactly one output -- see
+  # `expand_while_native/6`'s keepalive-widening raise).
+  defp native_eligible_node?(%T{}), do: true
+
+  # Defensive cap on lexical `:while`-inside-`:while` nesting depth: each
+  # extra level adds a handful of native C++ call-stack frames (outer
+  # `EMLXWhile::eval` -> `interpret_instructions` -> inner `EMLXWhile::eval`,
+  # reentered via `mlx::core::eval()`), so unbounded nesting from generated
+  # code could in principle exhaust the stack. 64 levels is far beyond any
+  # hand-written loop nest while leaving ample stack headroom.
+  @max_while_nesting_depth 64
+
+  defp expand_while_native(id, initial, arg, condition, body, state) do
+    depth = state.while_nesting_depth
+
+    if depth >= @max_while_nesting_depth do
+      raise ArgumentError,
+            "while loops nested #{@max_while_nesting_depth} levels deep exceed EMLX's " <>
+              "native lowering depth limit (a defensive guard against unbounded native " <>
+              "C++ call-stack recursion -- not a real Nx.Defn.while restriction)"
+    end
+
+    initial_list = while_leaf_list(initial)
+    arg_list = while_leaf_list(arg)
+    body_list = while_leaf_list(body)
+
+    init_refs = Enum.map(initial_list, &Map.fetch!(state.node_to_ref, &1.data.id))
+    carry_refs = Enum.map(arg_list, fn _ -> make_ref() end)
+
+    param_ref_by_pos =
+      arg_list
+      |> Enum.zip(carry_refs)
+      |> Map.new(fn {param, ref} -> {hd(param.data.args), ref} end)
+
+    stable_positions =
+      propagate_stable_carry_positions(arg_list, body_list, initial_list, state.stable_positions)
+
+    # A hook inside cond/body needs its own scope-local keepalive chain (see
+    # `EMLX.Native.Expr.t/0`'s `keepalive_refs` doc) -- `Nx.Defn.while`'s
+    # closure rules mean cond/body can't reference anything outside their own
+    # carry/captures/constants (enforced structurally: a sub-program's own
+    # `{:result, i}` numbering is local, see `to_native_subprogram/3`), so an
+    # *ambient* chain from outside this `:while` can't simply be read inside
+    # -- it has to come in as one more (fixed-width, invariant-shape) carry
+    # slot instead, exactly like any other loop-invariant value threaded
+    # through untouched. Only paid for when a hook is actually present.
+    needs_keepalive? = while_scope_contains_hook?(condition) or while_scope_contains_hook?(body)
+
+    {keepalive_seed, init_refs, sub_carry_refs, state} =
+      if needs_keepalive? do
+        {seed_ref, state} =
+          case state.hook_chain_ref do
+            nil -> emit_scalar_constant(0, @hook_chain_type, state)
+            ref -> {ref, state}
+          end
+
+        keepalive_carry_ref = make_ref()
+        {keepalive_carry_ref, init_refs ++ [seed_ref], carry_refs ++ [keepalive_carry_ref], state}
+      else
+        {nil, init_refs, carry_refs, state}
+      end
+
+    nested_state = %{
+      state
+      | while_nesting_depth: depth + 1,
+        stable_positions: stable_positions,
+        hook_chain_ref: keepalive_seed,
+        hooked_value_refs: %{}
+    }
+
+    {cond_sub, state} =
+      lower_while_subprogram([condition], sub_carry_refs, param_ref_by_pos, nested_state)
+
+    if cond_sub.hook_chain_ref != keepalive_seed do
+      raise ArgumentError,
+            "cannot lower a hook inside a :while condition unless its value is exactly the " <>
+              "condition's own boolean result -- EMLXWhile's condition sub-program is fixed " <>
+              "at exactly one output (see EMLXWhile::evaluate_predicate in " <>
+              "emlx_compiler.cpp), so there is no way to force evaluation of a hook whose " <>
+              "value the returned boolean doesn't already depend on. Move the hook into the " <>
+              "while's body instead."
+    end
+
+    {body_sub, state} =
+      lower_while_subprogram(body_list, sub_carry_refs, param_ref_by_pos, %{
+        state
+        | while_nesting_depth: depth + 1,
+          stable_positions: stable_positions,
+          hook_chain_ref: keepalive_seed,
+          hooked_value_refs: %{}
+      })
+
+    state = %{state | while_nesting_depth: depth}
+
+    body_sub =
+      if needs_keepalive? do
+        %{body_sub | outputs: body_sub.outputs ++ [body_sub.hook_chain_ref]}
+      else
+        body_sub
+      end
+
+    result_refs = Enum.map(init_refs, fn _ -> make_ref() end)
+
+    {real_result_refs, outer_chain_ref} =
+      if needs_keepalive? do
+        {real_refs, [chain_ref]} = Enum.split(result_refs, length(result_refs) - 1)
+        {real_refs, chain_ref}
+      else
+        {result_refs, nil}
+      end
+
+    result_id = if match?([_], real_result_refs), do: hd(real_result_refs), else: real_result_refs
+
+    instr = {result_refs, :while, init_refs, [], [cond_sub, body_sub]}
+
+    %{
+      state
+      | instructions: [instr | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, result_id),
+        hook_chain_ref: outer_chain_ref
+    }
+  end
+
+  # Cheap pre-scan (separate from `native_eligible_node?`'s own traversal,
+  # since we need this decided *before* lowering starts, to size the carry --
+  # see `expand_while_native/6`) for whether a `:while` scope needs the extra
+  # keepalive carry slot at all. A name-only hook (nil callback) never emits
+  # a runtime_call (see `emit_hook_runtime_call/3`'s caller), so it doesn't
+  # count.
+  defp while_scope_contains_hook?(container) do
+    container
+    |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
+    |> Enum.any?(fn
+      %T{data: %Nx.Defn.Expr{op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}} ->
+        Enum.any?(hooks, &(&1.callback != nil))
+
+      _ ->
+        false
+    end)
+  end
+
+  defp while_leaf_list(container) when is_tuple(container), do: Tuple.to_list(container)
+  defp while_leaf_list(leaf), do: [leaf]
+
+  # A carry slot is "stable" (its runtime value is identical on every
+  # iteration, including the first) exactly when the loop body returns it
+  # completely unmodified -- i.e. `body`'s i-th output IS `arg`'s i-th
+  # parameter (same node id, not just an equal value). For such a slot, a
+  # `:runtime_call` deep inside the loop (see the `:runtime_call` clause of
+  # `expand_node/2`) can safely resolve its operand back to `initial`'s own
+  # stable position (if any), instead of the carry's local, while-scoped
+  # parameter numbering -- required for `EMLX.handle_runtime_call/6`'s
+  # quantized-tensor fast path to recover the right argument when a quantized
+  # weight is threaded through a `while` unchanged (e.g. `dequantize/1` called
+  # once per iteration on a carried `qw`). Chains transitively through nested
+  # whiles for free: `initial_i` may itself be a stable position propagated
+  # from an enclosing while's own carry. Slots that are genuinely recomputed
+  # per iteration get no entry, so `Map.get/2` on `stable_positions` for them
+  # is `nil` -- correctly forcing the safe (if lossy-for-sub-byte-types)
+  # binary-decode fallback instead of reusing a stale Elixir tensor.
+  defp propagate_stable_carry_positions(arg_list, body_list, initial_list, stable_positions) do
+    [arg_list, body_list, initial_list]
+    |> Enum.zip()
+    |> Enum.reduce(stable_positions, fn {arg_i, body_i, initial_i}, acc ->
+      if body_i.data.id == arg_i.data.id do
+        case Map.fetch(stable_positions, initial_i.data.id) do
+          {:ok, pos} -> Map.put(acc, arg_i.data.id, pos)
+          :error -> acc
+        end
+      else
+        acc
+      end
+    end)
+  end
+
+  # Lowers a `:while` sub-scope (the condition wrapped in a 1-element list,
+  # or the body leaf list) into an isolated internal sub-program: unlike
+  # `lower_tuple_body/3` (used for *unrolling*, which splices the inner
+  # instructions into the outer `state.instructions` stream once per
+  # iteration), the inner instructions here stay local to the returned
+  # sub-program map -- they're converted to a wire `EMLX.Native.SubProgram`
+  # later, in `to_native_subprogram/3`. Only captures/constants/inputs/hooks
+  # merge back into the outer state, since those are shared global tables
+  # (see EMLX.Native.SubProgram's moduledoc note on shared captures/consts).
+  # `carry_refs` (this while's fresh per-slot refs, positionally matching
+  # `arg`/`initial`) is stashed on the returned map so `to_native_subprogram/3`
+  # knows which internal refs become `{:carry, i}` on the wire.
+  defp lower_while_subprogram(exprs, carry_refs, param_ref_by_pos, state) do
+    exprs_tuple = List.to_tuple(exprs)
+    state = merge_scope_ids(state, exprs_tuple)
+    inner_ordered = EMLX.Defn.Tree.post_order(exprs_tuple, &scope_dependencies/1)
+
+    param_id_to_ref =
+      inner_ordered
+      |> Enum.filter(&(&1.data.op == :parameter))
+      |> Map.new(fn p -> {p.data.id, Map.fetch!(param_ref_by_pos, hd(p.data.args))} end)
+
+    param_id_set = MapSet.new(Map.keys(param_id_to_ref))
+    local_base = Map.merge(state.node_to_ref, param_id_to_ref)
+
+    inner_state =
+      Enum.reduce(
+        inner_ordered,
+        %{state | node_to_ref: local_base, instructions: []},
+        fn node, st ->
+          if MapSet.member?(param_id_set, node.data.id), do: st, else: expand_node(node, st)
+        end
+      )
+
+    output_refs = Enum.map(exprs, &Map.fetch!(inner_state.node_to_ref, &1.data.id))
+
+    sub_program = %{
+      carry_refs: carry_refs,
+      instructions: Enum.reverse(inner_state.instructions),
+      outputs: output_refs,
+      hook_chain_ref: inner_state.hook_chain_ref
+    }
+
+    {sub_program,
+     %{
+       state
+       | captures: inner_state.captures,
+         constants: inner_state.constants,
+         inputs: inner_state.inputs,
+         runtime_calls: inner_state.runtime_calls
      }}
   end
 
@@ -2097,7 +2642,9 @@ defmodule EMLX.Native.Expr do
          captures: inner_state.captures,
          constants: inner_state.constants,
          inputs: inner_state.inputs,
-         hooks: inner_state.hooks
+         runtime_calls: inner_state.runtime_calls,
+         hook_chain_ref: inner_state.hook_chain_ref,
+         hooked_value_refs: inner_state.hooked_value_refs
      }}
   end
 
@@ -2262,26 +2809,90 @@ defmodule EMLX.Native.Expr do
     digits
   end
 
+  # Only ever finds *bound top-level parameter* positions (propagated
+  # through invariant `while` carries) — a quantized value produced
+  # in-graph by `EMLX.Quantization.quantize/2` (a `:metadata`/
+  # `__EMLX_QUANT__` node, see its moduledoc's "Limitation" section) has no
+  # such position and is never recognized as a `:dot` operand here, even
+  # when fed straight into one. Extending quantized `:dot` dispatch to
+  # cover that case would mean recognizing `__EMLX_QUANT__` nodes here too,
+  # and reworking `expand_quantized_dot/8` to consume scales/biases as
+  # graph-flowing operands (via their own `node_to_ref` entries) instead of
+  # `emit_capture/2`-ing real, call-time-known tensors — out of scope today.
   @doc false
   def quantizable_param_positions(output) do
-    output
+    {positions, _stable} = quantizable_positions_in_scope(output, %{})
+    positions
+  end
+
+  # Walks a single lexical scope (the top-level program, or a `:while`
+  # condition/body) collecting the top-level parameter positions consumed as
+  # a `:dot` operand anywhere in `container` -- descending into nested
+  # `:while` sub-scopes (which `EMLX.Defn.Tree.post_order/2` otherwise treats
+  # as opaque, see its moduledoc) so a quantized weight threaded unchanged
+  # through a `while` carry is still recognized as quantizable. Without this,
+  # e.g. Bumblebee's `Nx.Defn.while`-based generation loop (which carries
+  # `params` -- including quantized projection weights -- unchanged through
+  # the whole decode loop, see `Bumblebee.Text.Generation`) would never
+  # register any position here, `quant_signature/2` (emlx.ex) would come back
+  # empty, and every `:dot` against those weights would lower as a plain
+  # (non-quantized) `:dot` against the tensor's physical *packed* shape --
+  # producing a `[tensordot] a and b must have the same shape on the
+  # contracted axes` NIF error instead of a `:quantized_matmul`.
+  #
+  # Mirrors `propagate_stable_carry_positions/4` (used by the real lowering
+  # path) but as a standalone static pre-pass: this runs *before*
+  # `EMLX.Native.Expr.lower/3`'s own stateful traversal, directly on
+  # `output_expr`, with no `state` to reuse.
+  #
+  # Returns `{positions, stable_positions}`; `stable_positions` maps each
+  # node id in `container`'s own scope back to its top-level parameter
+  # position (only for slots ultimately backed by a genuine top-level
+  # parameter, directly or via an outer while's own stable carry) -- returned
+  # so processing a `:while`'s condition and body (both closing over the same
+  # carries) can share one computation, and so a nested `:while` can chain
+  # through its outer scope's stable positions.
+  defp quantizable_positions_in_scope(container, stable_positions) do
+    container
     |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
-    |> Enum.reduce(MapSet.new(), fn
+    |> Enum.reduce({MapSet.new(), stable_positions}, fn
+      %T{data: %Nx.Defn.Expr{id: id, op: :parameter, args: [pos]}}, {positions, stable} ->
+        {positions, Map.put(stable, id, pos)}
+
       %T{data: %Nx.Defn.Expr{op: :dot, args: [left, _c_left, _b_left, right, _c_right, _b_right]}},
-      acc ->
-        acc
-        |> maybe_put_param_position(left)
-        |> maybe_put_param_position(right)
+      {positions, stable} ->
+        positions =
+          positions
+          |> maybe_put_stable_position(left, stable)
+          |> maybe_put_stable_position(right, stable)
+
+        {positions, stable}
+
+      %T{data: %Nx.Defn.Expr{op: :while, args: [initial, arg, condition, body]}},
+      {positions, stable} ->
+        initial_list = while_leaf_list(initial)
+        arg_list = while_leaf_list(arg)
+        body_list = while_leaf_list(body)
+
+        inner_stable =
+          propagate_stable_carry_positions(arg_list, body_list, initial_list, stable)
+
+        {cond_positions, _} = quantizable_positions_in_scope(condition, inner_stable)
+        {body_positions, _} = quantizable_positions_in_scope(body, inner_stable)
+
+        {positions |> MapSet.union(cond_positions) |> MapSet.union(body_positions), stable}
 
       _, acc ->
         acc
     end)
   end
 
-  defp maybe_put_param_position(acc, %T{data: %Nx.Defn.Expr{op: :parameter, args: [pos]}}),
-    do: MapSet.put(acc, pos)
-
-  defp maybe_put_param_position(acc, _node), do: acc
+  defp maybe_put_stable_position(positions, %T{data: %Nx.Defn.Expr{id: id}}, stable) do
+    case Map.fetch(stable, id) do
+      {:ok, pos} -> MapSet.put(positions, pos)
+      :error -> positions
+    end
+  end
 
   @doc false
   def f64_bits(v) when is_number(v) do
@@ -2416,50 +3027,10 @@ defmodule EMLX.Native.Expr do
     end
 
     {instructions, ref_to_wire, _flat} =
-      prog.instructions
-      |> Enum.reduce({[], ref_to_wire, 0}, fn {id, op, operand_refs, attrs},
-                                              {instrs, rmap, flat} ->
-        wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
+      to_native_instructions(prog.instructions, ref_to_wire, capture_map, constant_map)
 
-        maybe_debug_check do
-          for {:result, idx} <- wire_operands, idx >= flat do
-            raise ArgumentError,
-                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
-                    "references result index #{idx} of the flat results accumulator, but only " <>
-                    "#{flat} result(s) have been produced so far -- this is a forward/self " <>
-                    "reference bug in program lowering, not a valid program. Full instruction " <>
-                    "list: #{inspect(prog.instructions)}"
-          end
-        end
-
-        maybe_debug_check do
-          for one <- List.wrap(id), Map.has_key?(rmap, one) do
-            raise ArgumentError,
-                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} produces result ref " <>
-                    "#{inspect(one)}, but that ref is already bound (to " <>
-                    "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
-                    "silently overwriting its earlier binding for every prior instruction that " <>
-                    "already referenced it. Full instruction list: #{inspect(prog.instructions)}"
-          end
-        end
-
-        {rmap2, flat2} =
-          case id do
-            ids when is_list(ids) ->
-              Enum.reduce(ids, {rmap, flat}, fn one, {m, f} ->
-                {Map.put(m, one, {:result, f}), f + 1}
-              end)
-
-            one ->
-              {Map.put(rmap, one, {:result, flat}), flat + 1}
-          end
-
-        instr = %EMLX.Native.Instruction{op: op, operands: wire_operands, attrs: attrs}
-        {[instr | instrs], rmap2, flat2}
-      end)
-
-    hook_refs = Enum.flat_map(prog.hooks, & &1.refs)
-    wire_outputs = Enum.map(prog.outputs ++ hook_refs, &Map.fetch!(ref_to_wire, &1))
+    wire_outputs = Enum.map(prog.outputs ++ prog.keepalive_refs, &Map.fetch!(ref_to_wire, &1))
+    num_real_outputs = length(prog.outputs)
 
     capture_nif_refs =
       Enum.map(prog.captures, fn {_ref, %Nx.Tensor{data: %EMLX.Backend{ref: {_, nif_ref}}}} ->
@@ -2474,7 +3045,126 @@ defmodule EMLX.Native.Expr do
       captures: capture_nif_refs,
       constants: wire_constants,
       instructions: Enum.reverse(instructions),
-      outputs: wire_outputs
+      outputs: wire_outputs,
+      num_real_outputs: num_real_outputs
     }
+  end
+
+  # Converts one flat internal instruction list (a Program's top-level
+  # `instructions`, or -- recursively -- a `:while` sub-program's own local
+  # `instructions`, see to_native_subprogram/3) into wire
+  # `EMLX.Native.Instruction`s, threading a `ref_to_wire` map + flat
+  # `{:result, i}` counter that starts wherever `seed_ref_to_wire` leaves off
+  # (0 for a fresh sub-program interpretation, matching emlx_compiler.hpp's
+  # SubProgram semantics). `capture_map`/`constant_map` are always the
+  # *outer* Program's tables, threaded down unchanged: a `:while`
+  # sub-program's `{:capture, i}`/`{:const, i}` refs resolve against the same
+  # shared tables as the parent program, never a duplicated per-sub-program
+  # copy (see EMLX.Native.SubProgram).
+  defp to_native_instructions(instructions, seed_ref_to_wire, capture_map, constant_map) do
+    Enum.reduce(instructions, {[], seed_ref_to_wire, 0}, fn
+      {id, :while, operand_refs, attrs, [cond_sub, body_sub]}, {instrs, rmap, flat} ->
+        wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
+        wire_cond = to_native_subprogram(cond_sub, capture_map, constant_map)
+        wire_body = to_native_subprogram(body_sub, capture_map, constant_map)
+
+        maybe_debug_check do
+          for one <- List.wrap(id), Map.has_key?(rmap, one) do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_native: instruction :while produces result ref " <>
+                    "#{inspect(one)}, but that ref is already bound (to " <>
+                    "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
+                    "silently overwriting its earlier binding for every prior instruction that " <>
+                    "already referenced it."
+          end
+        end
+
+        {rmap2, flat2} = register_result_refs(id, rmap, flat)
+
+        instr = %EMLX.Native.Instruction{
+          op: :while,
+          operands: wire_operands,
+          attrs: attrs,
+          subprograms: [wire_cond, wire_body]
+        }
+
+        {[instr | instrs], rmap2, flat2}
+
+      {id, op, operand_refs, attrs}, {instrs, rmap, flat} ->
+        wire_operands = Enum.map(operand_refs, &Map.fetch!(rmap, &1))
+
+        maybe_debug_check do
+          for {:result, idx} <- wire_operands, idx >= flat do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} (id=#{inspect(id)}) " <>
+                    "references result index #{idx} of the flat results accumulator, but only " <>
+                    "#{flat} result(s) have been produced so far -- this is a forward/self " <>
+                    "reference bug in program lowering, not a valid program. Full instruction " <>
+                    "list: #{inspect(instructions)}"
+          end
+        end
+
+        maybe_debug_check do
+          for one <- List.wrap(id), Map.has_key?(rmap, one) do
+            raise ArgumentError,
+                  "EMLX.Native.Expr.to_native: instruction #{inspect(op)} produces result ref " <>
+                    "#{inspect(one)}, but that ref is already bound (to " <>
+                    "#{inspect(Map.fetch!(rmap, one))}) -- the same node id was lowered twice, " <>
+                    "silently overwriting its earlier binding for every prior instruction that " <>
+                    "already referenced it."
+          end
+        end
+
+        {rmap2, flat2} = register_result_refs(id, rmap, flat)
+
+        instr = %EMLX.Native.Instruction{op: op, operands: wire_operands, attrs: attrs}
+        {[instr | instrs], rmap2, flat2}
+    end)
+  end
+
+  # Registers `id` (a single ref, or a list of refs for a multi-output
+  # instruction) into `rmap` as the next `{:result, i}` slot(s), advancing
+  # the flat counter by one per ref. Shared between the top-level Program
+  # walk and the `:while` sub-program walk in to_native_instructions/4.
+  defp register_result_refs(id, rmap, flat) do
+    case id do
+      ids when is_list(ids) ->
+        Enum.reduce(ids, {rmap, flat}, fn one, {m, f} ->
+          {Map.put(m, one, {:result, f}), f + 1}
+        end)
+
+      one ->
+        {Map.put(rmap, one, {:result, flat}), flat + 1}
+    end
+  end
+
+  # Converts a `:while` instruction's internal cond/body sub-scope (built by
+  # lower_while_subprogram/3) into a wire `EMLX.Native.SubProgram`. Its own
+  # `{:result, i}` numbering starts fresh at 0 (local to this sub-program,
+  # matching emlx_compiler.hpp's SubProgram semantics) -- the seed map only
+  # ever contains `{:carry, i}` (the sub-scope's own carry parameters) plus
+  # the outer program's shared `{:capture, i}`/`{:const, i}` entries, never
+  # the outer `{:input, i}`/`{:result, i}` entries: `Nx.Defn.while`'s closure
+  # rules guarantee cond/body never reference anything else from the parent
+  # scope, so this also structurally enforces that rule rather than merely
+  # trusting it.
+  defp to_native_subprogram(
+         %{carry_refs: carry_refs, instructions: instructions, outputs: outputs},
+         capture_map,
+         constant_map
+       ) do
+    carry_map =
+      carry_refs
+      |> Enum.with_index()
+      |> Map.new(fn {ref, i} -> {ref, {:carry, i}} end)
+
+    seed_ref_to_wire = Map.merge(capture_map, Map.merge(constant_map, carry_map))
+
+    {wire_instructions, local_ref_to_wire, _flat} =
+      to_native_instructions(instructions, seed_ref_to_wire, capture_map, constant_map)
+
+    wire_outputs = Enum.map(outputs, &Map.fetch!(local_ref_to_wire, &1))
+
+    %EMLX.Native.SubProgram{instructions: Enum.reverse(wire_instructions), outputs: wire_outputs}
   end
 end

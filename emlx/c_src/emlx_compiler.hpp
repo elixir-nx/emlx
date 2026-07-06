@@ -21,10 +21,14 @@ namespace native {
 // format's positional NIF args + bit-packed-int refs.
 
 // A reference to an already-produced value ({:input, i} / {:capture, i} /
-// {:const, i} / {:result, i} on the Elixir side), resolved against the
-// runtime inputs / closed-over captures / closed-over constants / the flat
-// per-eval results accumulator, respectively.
-enum class RefKind { Input, Capture, Const, Result };
+// {:const, i} / {:result, i} / {:carry, i} on the Elixir side), resolved
+// against the runtime inputs / closed-over captures / closed-over constants /
+// the flat per-eval results accumulator / a `:while` sub-program's current
+// loop-carry slot, respectively. `Carry` only ever appears inside a
+// `SubProgram` (a `:while` instruction's `cond`/`body`) — never in the
+// top-level program's own instruction list, and vice versa for `Input`
+// (see EMLXWhile's doc comment in emlx_compiler.cpp).
+enum class RefKind { Input, Capture, Const, Result, Carry };
 
 struct Ref {
   RefKind kind;
@@ -55,10 +59,31 @@ private:
   std::variant<int64_t, fine::Atom> value_;
 };
 
+struct Instruction;
+
+// A `:while` instruction's condition or body, lowered as its own
+// self-contained flat instruction list (not inlined into the parent
+// program) — see EMLX.Native.Expr's `:while` moduledoc section and
+// EMLXWhile (emlx_compiler.cpp). `instructions`' own `Ref::Result` entries
+// are local to this sub-program (a fresh flat accumulator per interpretation
+// — see `interpret_instructions`), distinct from the parent program's own
+// `{:result, i}` numbering. `Ref::Carry` entries resolve against whatever
+// loop-carry vector the interpreting primitive passes in for that
+// iteration. `Ref::Capture`/`Ref::Const` resolve against the *same* shared
+// captures/constants tables as the parent program (global, not
+// re-instantiated per sub-program). `Ref::Input` never appears here.
+struct SubProgram {
+  std::vector<Instruction> instructions;
+  std::vector<Ref> outputs;
+};
+
 struct Instruction {
   fine::Atom op;
   std::vector<Ref> operands;
   std::vector<Attr> attrs;
+  // Only non-empty for `op == "while"`: exactly two entries, `[cond, body]`.
+  // Empty (the common case) for every other op.
+  std::vector<SubProgram> subprograms;
 };
 
 struct Program {
@@ -66,7 +91,11 @@ struct Program {
   std::vector<mlx::core::array> captures;
   std::vector<std::tuple<double, mlx::core::Dtype>> constants;
   std::vector<Instruction> instructions;
+  // Full ref list: real outputs followed by any keepalive tail (see
+  // EMLX.Native.Expr.t/0's `keepalive_refs` doc on the Elixir side) —
+  // `num_real_outputs` (below) marks the boundary.
   std::vector<Ref> outputs;
+  int num_real_outputs;
 };
 
 // Compiled representation of an EMLX.Native.Expr program.
@@ -84,6 +113,12 @@ struct Expr {
   // EMLXRuntimeCall::eval_cpu/eval_gpu fires while this NIF call's caller
   // pid (emlx::g_current_caller_pid) is still in scope.
   bool has_runtime_call = false;
+  // How many of compiled_fn's returned arrays are real outputs (to be
+  // converted to resource terms and returned to Elixir) — the rest is a
+  // keepalive tail forced via mlx::core::eval alongside them (when
+  // has_runtime_call) purely for its side effects, then dropped. See
+  // emlx::native::Program::num_real_outputs.
+  int num_real_outputs = 0;
   emlx::function compiled_fn;
 
   ~Expr();
@@ -117,6 +152,8 @@ template <> struct Decoder<emlx::native::Ref> {
       return {emlx::native::RefKind::Const, index};
     if (kind_atom == "result")
       return {emlx::native::RefKind::Result, index};
+    if (kind_atom == "carry")
+      return {emlx::native::RefKind::Carry, index};
     throw std::invalid_argument("decode failed, unknown ref kind: " +
                                 kind_atom.to_string());
   }
@@ -134,6 +171,30 @@ template <> struct Decoder<emlx::native::Attr> {
   }
 };
 
+// Declared ahead of Decoder<Instruction> (which needs it) since
+// emlx::native::SubProgram embeds emlx::native::Instruction — mutually
+// recursive, so the two decoders are mutually recursive too.
+template <> struct Decoder<emlx::native::SubProgram> {
+  static emlx::native::SubProgram decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+    static const fine::Atom instructions_atom("instructions");
+    static const fine::Atom outputs_atom("outputs");
+
+    ERL_NIF_TERM instructions_term, outputs_term;
+    if (!enif_get_map_value(env, term, fine::encode(env, instructions_atom),
+                            &instructions_term) ||
+        !enif_get_map_value(env, term, fine::encode(env, outputs_atom),
+                            &outputs_term)) {
+      throw std::invalid_argument(
+          "decode failed, expected an EMLX.Native.SubProgram struct, got: " +
+          format_term(env, term));
+    }
+
+    return emlx::native::SubProgram{
+        fine::decode<std::vector<emlx::native::Instruction>>(env, instructions_term),
+        fine::decode<std::vector<emlx::native::Ref>>(env, outputs_term)};
+  }
+};
+
 // Custom (rather than the generic T::module/T::fields struct-decode
 // mechanism) so field lookup failures produce a clear, specific error
 // message without needing constexpr member-pointer/Atom-pointer tables.
@@ -143,13 +204,16 @@ template <> struct Decoder<emlx::native::Instruction> {
     static const fine::Atom op_atom("op");
     static const fine::Atom operands_atom("operands");
     static const fine::Atom attrs_atom("attrs");
+    static const fine::Atom subprograms_atom("subprograms");
 
-    ERL_NIF_TERM op_term, operands_term, attrs_term;
+    ERL_NIF_TERM op_term, operands_term, attrs_term, subprograms_term;
     if (!enif_get_map_value(env, term, fine::encode(env, op_atom), &op_term) ||
         !enif_get_map_value(env, term, fine::encode(env, operands_atom),
                             &operands_term) ||
         !enif_get_map_value(env, term, fine::encode(env, attrs_atom),
-                            &attrs_term)) {
+                            &attrs_term) ||
+        !enif_get_map_value(env, term, fine::encode(env, subprograms_atom),
+                            &subprograms_term)) {
       throw std::invalid_argument(
           "decode failed, expected an EMLX.Native.Instruction struct, "
           "got: " +
@@ -159,7 +223,8 @@ template <> struct Decoder<emlx::native::Instruction> {
     return emlx::native::Instruction{
         fine::decode<fine::Atom>(env, op_term),
         fine::decode<std::vector<emlx::native::Ref>>(env, operands_term),
-        fine::decode<std::vector<emlx::native::Attr>>(env, attrs_term)};
+        fine::decode<std::vector<emlx::native::Attr>>(env, attrs_term),
+        fine::decode<std::vector<emlx::native::SubProgram>>(env, subprograms_term)};
   }
 };
 
@@ -170,6 +235,7 @@ template <> struct Decoder<emlx::native::Program> {
     static const fine::Atom constants_atom("constants");
     static const fine::Atom instructions_atom("instructions");
     static const fine::Atom outputs_atom("outputs");
+    static const fine::Atom num_real_outputs_atom("num_real_outputs");
 
     auto get_field = [&](const fine::Atom &key) -> ERL_NIF_TERM {
       ERL_NIF_TERM value;
@@ -193,6 +259,8 @@ template <> struct Decoder<emlx::native::Program> {
         env, get_field(instructions_atom));
     program.outputs =
         fine::decode<std::vector<emlx::native::Ref>>(env, get_field(outputs_atom));
+    program.num_real_outputs =
+        fine::decode<int>(env, get_field(num_real_outputs_atom));
     return program;
   }
 };

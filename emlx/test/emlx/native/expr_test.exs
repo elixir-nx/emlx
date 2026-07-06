@@ -1,3 +1,29 @@
+defmodule EMLX.Native.ExprTest.NestedWhileAst do
+  @moduledoc false
+  # Builds a `depth`-levels-deep `while`-inside-`while` `defn` body (AST),
+  # used by `EMLX.Native.ExprTest` to generate `deeply_nested_while_*` defns
+  # -- exercising nesting depths well beyond what's practical to hand-write,
+  # to pin both "deep nesting still works" and "the defensive depth cap in
+  # `EMLX.Native.Expr`'s `expand_while_native/6` actually fires". Must live
+  # in its own module: a `defp` helper can't be called from `ExprTest`'s own
+  # top-level `for`/`Code.eval_quoted` (its own functions aren't callable
+  # until the module finishes compiling).
+  def build(0, leaf), do: leaf
+
+  def build(depth, leaf) do
+    inner = build(depth - 1, quote(do: acc))
+
+    quote do
+      {acc, _} =
+        while {acc = unquote(leaf), i = 0}, Nx.less(i, 1) do
+          {unquote(inner), Nx.add(i, 1)}
+        end
+
+      acc
+    end
+  end
+end
+
 defmodule EMLX.Native.ExprTest do
   @moduledoc """
   Tests for the EMLX native defn compiler:
@@ -32,6 +58,27 @@ defmodule EMLX.Native.ExprTest do
 
   defn dequant_only(qw), do: EMLX.Quantization.dequantize(qw)
 
+  # A quantized weight threaded unchanged through a `while` carry (the same
+  # shape as e.g. Bumblebee's `Nx.Defn.while`-based generation loop, which
+  # carries model params -- including quantized projection weights --
+  # unchanged through the whole decode loop) and consumed by a `:dot`
+  # *inside* the body on every iteration. Regression for
+  # `quantizable_param_positions/1`/`quantized_param_config/3` needing to
+  # resolve a while-body-local `:parameter` node back to its true top-level
+  # position via `stable_positions` (see those functions' docs) -- without
+  # it, this dot's weight operand is never recognized as quantized, and
+  # lowers as a plain (non-quantized) `:dot` against the tensor's physical
+  # *packed* shape, raising an MLX `[tensordot] a and b must have the same
+  # shape on the contracted axes` NIF error instead of computing correctly.
+  defn quantized_dot_in_while_body(x, qw, n) do
+    {result, _, _} =
+      while {acc = x, w = qw, i = n}, Nx.greater(i, 0) do
+        {Nx.add(acc, Nx.dot(acc, w)), w, i - 1}
+      end
+
+    result
+  end
+
   defn two_runtime_calls(x, qw1, qw2) do
     Nx.add(EMLX.Quantization.dequantize(qw1), EMLX.Quantization.dequantize(qw2)) |> Nx.add(x)
   end
@@ -40,6 +87,26 @@ defmodule EMLX.Native.ExprTest do
     {result, _, _, _} =
       while {acc = x0, i = 0, n, qw}, Nx.less(i, n) do
         {Nx.add(acc, EMLX.Quantization.dequantize(qw)), i + 1, n, qw}
+      end
+
+    result
+  end
+
+  # A runtime_call whose operand is threaded, unmodified, through two levels
+  # of while carry (outer carry -> inner carry -> dequantize) -- exercises
+  # `EMLX.Native.Expr.propagate_stable_carry_positions/4` chaining a stable
+  # position transitively across both levels back to `qw`'s true top-level
+  # parameter, rather than either while's own local (and mutually
+  # inconsistent) carry index.
+  defn runtime_call_inside_nested_while(x0, n_outer, n_inner, qw) do
+    {result, _, _, _, _} =
+      while {acc = x0, io = 0, n_outer, n_inner, qw}, Nx.less(io, n_outer) do
+        {inner_acc, _, _, _} =
+          while {a = acc, ii = 0, n_inner, qw}, Nx.less(ii, n_inner) do
+            {Nx.add(a, EMLX.Quantization.dequantize(qw)), ii + 1, n_inner, qw}
+          end
+
+        {inner_acc, io + 1, n_outer, n_inner, qw}
       end
 
     result
@@ -90,6 +157,85 @@ defmodule EMLX.Native.ExprTest do
       end
 
     result
+  end
+
+  # The hooked value never feeds the carry/output, so it's dead code at
+  # trace time (same DCE as `hook_unused_value/2` at top level, see that
+  # test) -- it should never even become part of the while body's traced
+  # scope, let alone fire.
+  defn hook_unused_in_while_body(a) do
+    {result, _} =
+      while {acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
+        _ = hook(Nx.multiply(acc, i), :dbg, fn t -> send(self(), {:dbg, t}) end)
+        {Nx.add(acc, i), i - 1}
+      end
+
+    result
+  end
+
+  # A hook inside an inner `while`'s body, itself nested inside an outer
+  # `while` -- exercises the keepalive chain threading through two levels
+  # of `EMLXWhile` nesting (each level gets its own scope-local chain, see
+  # `expand_while_native/6`'s moduledoc).
+  defn hook_in_nested_while(a) do
+    {result, _} =
+      while {outer_acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
+        {inner_acc, _} =
+          while {acc = outer_acc, j = Nx.tensor(2)}, Nx.less(0, j) do
+            hooked = hook(Nx.add(acc, 1), :inner, fn t -> send(self(), {:inner, t}) end)
+            {hooked, j - 1}
+          end
+
+        {inner_acc, i - 1}
+      end
+
+    result
+  end
+
+  # Two hooks per iteration, the second depending on the first's value --
+  # regression for the `hook_chain_ref` ordering mechanism (see this
+  # module's `expand_node/2` clause for `op: :token`): both must fire, in
+  # order, on every iteration, matching Evaluator.
+  defn two_hooks_in_while_body(a) do
+    {result, _} =
+      while {acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
+        step1 = hook(Nx.add(acc, i), :step1, fn t -> send(self(), {:step1, t}) end)
+        step2 = hook(Nx.multiply(step1, 2), :step2, fn t -> send(self(), {:step2, t}) end)
+        {step2, i - 1}
+      end
+
+    result
+  end
+
+  # Generates `deeply_nested_while_20`/`deeply_nested_while_over_cap` defns
+  # from `EMLX.Native.ExprTest.NestedWhileAst.build/2` (see its moduledoc).
+  for {name, depth} <- [deeply_nested_while_20: 20, deeply_nested_while_over_cap: 70] do
+    body = EMLX.Native.ExprTest.NestedWhileAst.build(depth, quote(do: x))
+
+    Code.eval_quoted(
+      quote do
+        defn unquote(name)(x), do: unquote(body)
+      end,
+      [],
+      __ENV__
+    )
+  end
+
+  # A `while` whose body contains another `while` — natively lowerable: the
+  # inner `while` lowers to its own `EMLXWhile` primitive, nested inside the
+  # outer body's sub-program (see `EMLX.Native.Expr.native_while_eligible?/2`).
+  defn nested_while_top_level(x) do
+    {out, _i} =
+      while {out = x, i = 0}, Nx.less(i, 2) do
+        {inner, _j} =
+          while {inner = out, j = 0}, Nx.less(j, 2) do
+            {Nx.add(inner, 1.0), j + 1}
+          end
+
+        {inner, i + 1}
+      end
+
+    out
   end
 
   # Exercises the Nx.Defn.Graph.split-chain path (hook before AND after a
@@ -354,6 +500,130 @@ defmodule EMLX.Native.ExprTest do
       out = EMLX.Backend.to_nx({device, out_ref}, a)
 
       assert_in_delta Nx.to_number(out), 7.0, 1.0e-6
+    end
+
+    # Native `:while` lowering (checkpoint c — see EMLX.Native.Expr's
+    # `:while` TODO / EMLXWhile in emlx_compiler.cpp): a hand-built wire
+    # `:while` instruction (no Elixir lowering path emits this yet — that's
+    # checkpoint d) with `RefKind::Carry` refs inside its cond/body
+    # `EMLX.Native.SubProgram`s. Exercises the whole native interpreter loop
+    # end to end: `EMLXWhile::eval` calls `interpret_instructions`
+    # recursively for cond (`carry < 5`) and body (`carry + 1`) each
+    # iteration, forcing the carry via `mlx::core::eval` every time, until
+    # cond goes false.
+    test "wire format: :while instruction with nested cond/body sub-programs runs natively",
+         %{worker: worker, device: device} do
+      cond_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :less,
+            operands: [{:carry, 0}, {:const, 0}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      body_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :add,
+            operands: [{:carry, 0}, {:const, 1}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      wire = %EMLX.Native.Program{
+        num_inputs: 1,
+        captures: [],
+        constants: [{5.0, :int32}, {1.0, :int32}],
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :while,
+            operands: [{:input, 0}],
+            attrs: [],
+            subprograms: [cond_subprogram, body_subprogram]
+          }
+        ],
+        outputs: [{:result, 0}],
+        num_real_outputs: 1
+      }
+
+      prog_ref = compile_nif!(worker, wire)
+
+      x = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      %EMLX.Backend{ref: {_, ref_x}} = x.data
+
+      [out_ref] = eval_nif!(worker, prog_ref, [ref_x])
+      out = EMLX.Backend.to_nx({device, out_ref}, x)
+
+      assert Nx.to_number(out) == 5
+    end
+
+    # Same native `:while` interpreter, but with two independent carry
+    # slots — proves multi-slot carry indexing (`{:carry, 0}`/`{:carry, 1}`)
+    # and multi-output EMLXWhile arity (one output array per input carry
+    # slot) both work, matching how a real `Nx.Defn.while` over a tuple
+    # accumulator would flatten to several carry leaves.
+    test "wire format: :while with two independent carry slots", %{worker: worker, device: device} do
+      cond_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :less,
+            operands: [{:carry, 0}, {:const, 0}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}]
+      }
+
+      body_subprogram = %EMLX.Native.SubProgram{
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :add,
+            operands: [{:carry, 0}, {:const, 1}],
+            attrs: []
+          },
+          %EMLX.Native.Instruction{
+            op: :multiply,
+            operands: [{:carry, 1}, {:const, 2}],
+            attrs: []
+          }
+        ],
+        outputs: [{:result, 0}, {:result, 1}]
+      }
+
+      wire = %EMLX.Native.Program{
+        num_inputs: 2,
+        captures: [],
+        constants: [{5.0, :int32}, {1.0, :int32}, {2.0, :int32}],
+        instructions: [
+          %EMLX.Native.Instruction{
+            op: :while,
+            operands: [{:input, 0}, {:input, 1}],
+            attrs: [],
+            subprograms: [cond_subprogram, body_subprogram]
+          }
+        ],
+        outputs: [{:result, 0}, {:result, 1}],
+        num_real_outputs: 2
+      }
+
+      prog_ref = compile_nif!(worker, wire)
+
+      counter = Nx.tensor(0, type: :s32, backend: EMLX.Backend)
+      acc = Nx.tensor(1, type: :s32, backend: EMLX.Backend)
+      %EMLX.Backend{ref: {_, ref_counter}} = counter.data
+      %EMLX.Backend{ref: {_, ref_acc}} = acc.data
+
+      [out_counter_ref, out_acc_ref] = eval_nif!(worker, prog_ref, [ref_counter, ref_acc])
+      out_counter = EMLX.Backend.to_nx({device, out_counter_ref}, counter)
+      out_acc = EMLX.Backend.to_nx({device, out_acc_ref}, acc)
+
+      assert Nx.to_number(out_counter) == 5
+      assert Nx.to_number(out_acc) == 32
     end
   end
 
@@ -2032,6 +2302,214 @@ defmodule EMLX.Native.ExprTest do
       assert Nx.to_number(ni) == Nx.to_number(ei)
       assert Nx.to_number(ni) == 4
     end
+
+    # Pins that a plain dynamic `while` actually takes the native lowering
+    # path (a single `:while` wire instruction, no raise) rather than merely
+    # "happening to still produce a correct result via the old host-driven
+    # fallback" -- the two are indistinguishable from a native-vs-eager
+    # equivalence assertion alone, so this checks the lowered wire program
+    # directly. See EMLX.Native.Expr's `:while` moduledoc section /
+    # `native_while_eligible?/2`.
+    test "while: dynamic trip count lowers to a single native :while instruction" do
+      expr = Nx.Defn.debug_expr_apply(&count_to_10/1, [Nx.template({}, :s32)])
+      wire = expr |> Expr.lower() |> Expr.to_native()
+
+      assert [%EMLX.Native.Instruction{op: :while, subprograms: [cond_sub, body_sub]}] =
+               wire.instructions
+
+      assert %EMLX.Native.SubProgram{outputs: [{:result, _}]} = cond_sub
+      assert %EMLX.Native.SubProgram{outputs: [{:result, _}]} = body_sub
+    end
+
+    test "native_while_eligible?/2: plain condition/body (no runtime_call, hook, or nesting)" do
+      expr = Nx.Defn.debug_expr_apply(&count_to_10/1, [Nx.template({}, :s32)])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      assert Expr.native_while_eligible?(condition, body)
+    end
+
+    test "native_while_eligible?/2: true when the body contains a runtime_call" do
+      # A `:runtime_call` is backed by a genuine `mx::core::Primitive`
+      # (EMLXRuntimeCall) that re-fires on every replay of the compiled tape,
+      # including replays driven by EMLXWhile's own per-iteration eval() --
+      # unlike `:token`/hooks, which have no native per-iteration
+      # representation. See `Expr.native_eligible_node?/1`'s doc.
+      weight = Nx.iota({2, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      qw = EMLX.quantize(weight, [])
+      x0 = Nx.broadcast(Nx.tensor(0.0, type: :f32, backend: EMLX.Backend), {2, 64})
+      n = Nx.tensor(3, type: :s32, backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&runtime_call_inside_while/3, [x0, n, qw])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      assert Expr.native_while_eligible?(condition, body)
+    end
+
+    # Pins that a `:runtime_call` referencing a while-carried quantized weight
+    # lowers to a single native `:while` instruction (no graph-split chain),
+    # and that the runtime_call fires correctly from inside it end-to-end --
+    # see `EMLX.Native.Expr.propagate_stable_carry_positions/4` for how the
+    # quantized-tensor fast path recovers the right argument despite the
+    # operand only being reachable via the while's own local carry numbering.
+    test "while: a runtime_call on a while-carried quantized weight lowers natively" do
+      weight = Nx.iota({2, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      qw = EMLX.quantize(weight, [])
+      x0 = Nx.broadcast(Nx.tensor(0.0, type: :f32, backend: EMLX.Backend), {2, 64})
+      n = Nx.tensor(3, type: :s32, backend: EMLX.Backend)
+
+      expr = Nx.Defn.debug_expr_apply(&runtime_call_inside_while/3, [x0, n, qw])
+      wire = expr |> Expr.lower() |> Expr.to_native()
+
+      assert [%EMLX.Native.Instruction{op: :while}] = wire.instructions
+
+      native = Nx.Defn.jit(&runtime_call_inside_while/3, compiler: EMLX).(x0, n, qw)
+      eager = Nx.Defn.jit(&runtime_call_inside_while/3, compiler: Nx.Defn.Evaluator).(x0, n, qw)
+
+      assert_all_close(native, eager)
+    end
+
+    # Same as above, but the quantized weight is threaded through TWO nested
+    # while carries (each with its own independent local numbering) before
+    # reaching the runtime_call -- pins that
+    # `propagate_stable_carry_positions/4` chains the stable position
+    # transitively across both levels back to `qw`'s true top-level parameter.
+    test "while: a runtime_call on a quantized weight carried through nested whiles lowers natively" do
+      weight = Nx.iota({2, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
+      qw = EMLX.quantize(weight, [])
+      x0 = Nx.broadcast(Nx.tensor(0.0, type: :f32, backend: EMLX.Backend), {2, 64})
+      n_outer = Nx.tensor(2, type: :s32, backend: EMLX.Backend)
+      n_inner = Nx.tensor(3, type: :s32, backend: EMLX.Backend)
+
+      expr =
+        Nx.Defn.debug_expr_apply(&runtime_call_inside_nested_while/4, [x0, n_outer, n_inner, qw])
+
+      wire = expr |> Expr.lower() |> Expr.to_native()
+      assert [%EMLX.Native.Instruction{op: :while}] = wire.instructions
+
+      native =
+        Nx.Defn.jit(&runtime_call_inside_nested_while/4, compiler: EMLX).(
+          x0,
+          n_outer,
+          n_inner,
+          qw
+        )
+
+      eager =
+        Nx.Defn.jit(&runtime_call_inside_nested_while/4, compiler: Nx.Defn.Evaluator).(
+          x0,
+          n_outer,
+          n_inner,
+          qw
+        )
+
+      assert_all_close(native, eager)
+    end
+
+    test "native_while_eligible?/2: true when the body contains a hook" do
+      expr = Nx.Defn.debug_expr_apply(&hook_in_while_body/1, [Nx.template({}, :s32)])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      assert Expr.native_while_eligible?(condition, body)
+    end
+
+    test "native_while_eligible?/2: true when the body contains a nested while" do
+      expr = Nx.Defn.debug_expr_apply(&nested_while_top_level/1, [Nx.template({3}, :f32)])
+
+      while_node =
+        expr
+        |> EMLX.Defn.Tree.post_order(&Expr.scope_dependencies/1)
+        |> Enum.find(&(&1.data.op == :while))
+
+      [_initial, _arg, condition, body] = while_node.data.args
+      assert Expr.native_while_eligible?(condition, body)
+    end
+
+    # Pins that a nested `while` lowers to a genuinely nested wire `:while`
+    # instruction (a `:while` `Instruction` inside another `:while`'s body
+    # `SubProgram`), not merely "correct end-to-end result via some fallback"
+    # — see `EMLX.Native.Expr`'s `:while` moduledoc section for why this is
+    # safe (validated 2- and 3-level nesting against the checkpoint (a) spike).
+    test "while: nested dynamic while lowers to a nested native :while instruction" do
+      expr = Nx.Defn.debug_expr_apply(&nested_while_top_level/1, [Nx.template({3}, :f32)])
+      wire = expr |> Expr.lower() |> Expr.to_native()
+
+      assert [%EMLX.Native.Instruction{op: :while, subprograms: [_outer_cond, outer_body]}] =
+               wire.instructions
+
+      assert %EMLX.Native.SubProgram{instructions: outer_body_instructions} = outer_body
+
+      assert Enum.any?(
+               outer_body_instructions,
+               &match?(%EMLX.Native.Instruction{op: :while, subprograms: [_, _]}, &1)
+             )
+    end
+
+    test "while: nested dynamic while matches eager evaluation" do
+      x = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&nested_while_top_level/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&nested_while_top_level/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native, eager)
+    end
+
+    # Two independent top-level native `:while`s (not nested inside each
+    # other) each get their own `EMLXWhile` primitive instance sharing the
+    # same read-only captures/constants tables (see `EMLXWhile`'s moduledoc
+    # in emlx_compiler.cpp) -- pins that there's no cross-instance mutable
+    # state that could leak between sibling loops.
+    defn sibling_whiles(x) do
+      {a, _} = while {a = x, i = 0}, Nx.less(i, 3), do: {a + 1.0, i + 1}
+      {b, _} = while {b = x, j = 0}, Nx.less(j, 5), do: {b * 2.0, j + 1}
+      {a, b}
+    end
+
+    test "while: two sibling top-level whiles don't share mutable state" do
+      x = Nx.tensor([1.0, 2.0], type: :f32, backend: EMLX.Backend)
+
+      {native_a, native_b} = Nx.Defn.jit(&sibling_whiles/1, compiler: EMLX).(x)
+      {eager_a, eager_b} = Nx.Defn.jit(&sibling_whiles/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native_a, eager_a)
+      assert_close(native_b, eager_b)
+    end
+
+    # Defensive depth cap (`@max_while_nesting_depth` in `EMLX.Native.Expr`):
+    # protects against unbounded native C++ call-stack recursion from
+    # pathologically deep (e.g. generated) `while`-inside-`while` nesting --
+    # not a realistic hand-written shape, so it's exercised via the
+    # `deeply_nested_while_20`/`deeply_nested_while_over_cap` defns generated
+    # near the top of this module (see `NestedWhileAst.build/2`).
+    test "while: deeply nested (20-level) while still lowers and evaluates correctly" do
+      x = Nx.tensor([0.0, 1.0], type: :f32, backend: EMLX.Backend)
+      native = Nx.Defn.jit(&deeply_nested_while_20/1, compiler: EMLX).(x)
+      eager = Nx.Defn.jit(&deeply_nested_while_20/1, compiler: Nx.Defn.Evaluator).(x)
+
+      assert_close(native, eager)
+    end
+
+    test "while: nesting beyond the depth cap raises a clear error" do
+      x = Nx.tensor([0.0, 1.0], type: :f32, backend: EMLX.Backend)
+
+      assert_raise ArgumentError, ~r/nested.*64 levels deep/, fn ->
+        Nx.Defn.jit(&deeply_nested_while_over_cap/1, compiler: EMLX).(x)
+      end
+    end
   end
 
   describe "splitter regressions" do
@@ -3024,13 +3502,15 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  describe "hooks (token/attach_token, extra-output design)" do
+  describe "hooks (token/attach_token, inline runtime_call design)" do
     # `Nx.Defn.Kernel.hook/2,3` is fire-and-forget, not control flow (see
-    # `EMLX.Native.Expr`'s moduledoc "Hooks" section): `attach_token`'s value
-    # is its wrapped expr unchanged, so the hook is lowered in the *same*
-    # single NIF-call program as everything else -- the hooked value(s) ride
-    # along as extra outputs, and the callback fires host-side right after
-    # `eval_program` returns. No `Nx.Defn.Graph.split` host round-trip needed.
+    # `EMLX.Native.Expr`'s moduledoc "Hooks" section): each hook lowers to an
+    # inline `:runtime_call` (see `emit_hook_runtime_call/3`) that fires the
+    # callback host-side as a side effect of the NIF evaluating the tape --
+    # no separate post-eval pass and no `Nx.Defn.Graph.split` host round-trip
+    # needed, so hooks inside `while` bodies fire once per native iteration
+    # too (see the "hook_chain_ref" keepalive mechanism in
+    # `expand_while_native/6`).
     test "top-level hook fires once with the correct value; result unaffected" do
       a = Nx.tensor(1, backend: EMLX.Backend)
       b = Nx.tensor(2, backend: EMLX.Backend)
@@ -3109,6 +3589,83 @@ defmodule EMLX.Native.ExprTest do
       refute_receive {:iter, _}
 
       assert native_values == eager_values
+    end
+
+    test "a hook inside a while body whose value is unused never fires (DCE, matches Evaluator)" do
+      a = Nx.tensor(3, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&hook_unused_in_while_body/1, compiler: EMLX).(a)
+      assert Nx.to_number(native) == 6
+      refute_receive {:dbg, _}
+
+      eager = Nx.Defn.jit(&hook_unused_in_while_body/1, compiler: Nx.Defn.Evaluator).(a)
+      assert Nx.to_number(eager) == 6
+      refute_receive {:dbg, _}
+    end
+
+    test "a hook inside a nested while's body fires once per inner iteration, matching Evaluator" do
+      a = Nx.tensor(2, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&hook_in_nested_while/1, compiler: EMLX).(a)
+      # 2 outer iterations x 2 inner iterations = 4 fires total.
+      native_values =
+        for _ <- 1..4 do
+          assert_receive {:inner, v}
+          Nx.to_number(v)
+        end
+
+      refute_receive {:inner, _}
+
+      eager = Nx.Defn.jit(&hook_in_nested_while/1, compiler: Nx.Defn.Evaluator).(a)
+
+      eager_values =
+        for _ <- 1..4 do
+          assert_receive {:inner, v}
+          Nx.to_number(v)
+        end
+
+      refute_receive {:inner, _}
+
+      assert Nx.to_number(native) == Nx.to_number(eager)
+      assert native_values == eager_values
+    end
+
+    test "two hooks per while iteration fire in order, matching Evaluator" do
+      a = Nx.tensor(3, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&two_hooks_in_while_body/1, compiler: EMLX).(a)
+
+      # 3 iterations x 2 hooks (step1, step2) each = 6 events total.
+      native_events =
+        for _ <- 1..6 do
+          receive do
+            {:step1, v} -> {:step1, Nx.to_number(v)}
+            {:step2, v} -> {:step2, Nx.to_number(v)}
+          end
+        end
+
+      refute_receive {:step1, _}
+      refute_receive {:step2, _}
+      # Each iteration must fire step1 immediately before step2 (never
+      # interleaved out of order across iterations).
+      assert Enum.chunk_every(native_events, 2)
+             |> Enum.all?(&match?([{:step1, _}, {:step2, _}], &1))
+
+      eager = Nx.Defn.jit(&two_hooks_in_while_body/1, compiler: Nx.Defn.Evaluator).(a)
+
+      eager_events =
+        for _ <- 1..6 do
+          receive do
+            {:step1, v} -> {:step1, Nx.to_number(v)}
+            {:step2, v} -> {:step2, Nx.to_number(v)}
+          end
+        end
+
+      refute_receive {:step1, _}
+      refute_receive {:step2, _}
+
+      assert Nx.to_number(native) == Nx.to_number(eager)
+      assert native_events == eager_events
     end
 
     # Regression: hooks straddling a non-bare `while` (surrounding work on
@@ -3297,6 +3854,48 @@ defmodule EMLX.Native.ExprTest do
       assert_all_close(native, eager)
     end
 
+    test "a freshly requantized value returned directly (not a bare parameter passthrough)" do
+      # Unlike the test above, `qw` here is *not* returned untouched -- it's
+      # dequantized and requantized first, so the output leaf is a
+      # `:runtime_call` result, not a bare `:parameter` node.
+      # `output_param_positions` (emlx.ex) only recognizes the latter, so
+      # this exercises the plain `EMLX.Backend.to_nx/2` path for a quantized
+      # output instead of the pass-through substitution.
+      weight =
+        Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+
+      requantize_and_return = fn qw ->
+        dense = EMLX.Quantization.dequantize(qw)
+        EMLX.Quantization.quantize(Nx.add(dense, 10), [])
+      end
+
+      qw_out = Nx.Defn.jit(requantize_and_return, compiler: EMLX).(qw)
+      expected_dense = Nx.add(EMLX.dequantize(qw), 10)
+
+      assert Nx.shape(qw_out) == Nx.shape(qw)
+      assert qw_out.data.quantization_config
+      # tol accounts for genuine 4-bit requantization error (dequantize ->
+      # add 10 -> quantize again loses precision), unlike the bare
+      # passthrough test above where the underlying bits are untouched.
+      assert_all_close(EMLX.dequantize(qw_out), expected_dense, tol: 1.0e-3)
+    end
+
+    test "a quantized weight threaded through a while carry and dotted inside the body works" do
+      weight =
+        Nx.iota({64, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+
+      qw = EMLX.quantize(weight, [])
+      x = Nx.iota({4, 64}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+      n = Nx.tensor(3, backend: EMLX.Backend)
+
+      native = Nx.Defn.jit(&quantized_dot_in_while_body/3, compiler: EMLX).(x, qw, n)
+      eager = Nx.Defn.jit(&quantized_dot_in_while_body/3, compiler: Nx.Defn.Evaluator).(x, qw, n)
+
+      assert_all_close(native, eager)
+    end
+
     test "a quantized left operand still raises a clear ArgumentError (matches EMLX.Backend.dot/7)" do
       weight =
         Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
@@ -3358,7 +3957,13 @@ defmodule EMLX.Native.ExprTest do
       assert_all_close(native, eager)
     end
 
-    test "a runtime_call inside a while body re-enters the compiler correctly" do
+    # No longer a split point: `:runtime_call` is native-while-eligible (see
+    # `Expr.native_while_eligible?/2`), so this now lowers to a single native
+    # `:while` instruction instead of re-entering the compiler via
+    # `Nx.Defn.Graph`. Kept here (title notwithstanding) as an extra
+    # regression pin alongside the "lowers natively" test in the "Stage 08 —
+    # while" describe block above, which additionally asserts the wire shape.
+    test "a runtime_call inside a while body produces correct results" do
       weight =
         Nx.iota({2, 64}, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
 
@@ -3407,7 +4012,7 @@ defmodule EMLX.Native.ExprTest do
   defp dispatch_cache_entries_mentioning(shape) do
     :emlx_native_dispatch_cache
     |> :ets.tab2list()
-    |> Enum.filter(fn {key, _resource, _hooks, _runtime_calls} -> term_mentions?(key, shape) end)
+    |> Enum.filter(fn {key, _resource, _runtime_calls} -> term_mentions?(key, shape) end)
     |> Enum.map(&elem(&1, 0))
     |> Enum.uniq()
   end
