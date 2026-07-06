@@ -29,3 +29,6 @@ emlx-*.tar
 # Validation subproject build artifacts (not the mix.lock — that is committed).
 /**/_build/
 /**/deps/
+
+# Local working notes / investigation plans, not part of the public plan history.
+/.work/
