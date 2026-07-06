@@ -244,7 +244,9 @@ defmodule EMLX.Native.Expr do
   # intentionally does not match — fusion only pays off across many
   # iterations, and requiring a dynamic offset here is a cheap, sufficient
   # proxy for "this is a decode loop write" without inspecting scope depth.
-  defp match_cache_put_slice(%T{data: %Nx.Defn.Expr{op: :transpose, args: [put_slice_node, axes]}}) do
+  defp match_cache_put_slice(%T{
+         data: %Nx.Defn.Expr{op: :transpose, args: [put_slice_node, axes]}
+       }) do
     if Enum.to_list(axes) == @head_transpose_axes do
       case unwrap_generic_metadata(put_slice_node) do
         {:ok, aliases,
@@ -375,8 +377,12 @@ defmodule EMLX.Native.Expr do
     node_to_ref =
       state.node_to_ref
       |> Map.put(id, attn_ref)
-      |> then(&Enum.reduce(k_put_slice_chain, &1, fn n, acc -> Map.put(acc, n.data.id, k_upd_ref) end))
-      |> then(&Enum.reduce(v_put_slice_chain, &1, fn n, acc -> Map.put(acc, n.data.id, v_upd_ref) end))
+      |> then(
+        &Enum.reduce(k_put_slice_chain, &1, fn n, acc -> Map.put(acc, n.data.id, k_upd_ref) end)
+      )
+      |> then(
+        &Enum.reduce(v_put_slice_chain, &1, fn n, acc -> Map.put(acc, n.data.id, v_upd_ref) end)
+      )
 
     %{
       state
@@ -529,7 +535,13 @@ defmodule EMLX.Native.Expr do
         )
 
       :no_match ->
-        emit_metadata_instr(id, :fast_sdpa_causal_key_masked, [q_t, k_t, v_t, key_mask], attrs, state)
+        emit_metadata_instr(
+          id,
+          :fast_sdpa_causal_key_masked,
+          [q_t, k_t, v_t, key_mask],
+          attrs,
+          state
+        )
     end
   end
 
@@ -2089,7 +2101,13 @@ defmodule EMLX.Native.Expr do
           # is kept as this node's eager/`Nx.Defn.Evaluator`/`Nx.Defn.Grad`
           # fallback (never invoked on this native-compiled path); only the
           # opcode + static attrs reach the interpreter.
-          emit_native_multi_op_refs(operand_refs, native_opcode, native_attrs, output_templates, state)
+          emit_native_multi_op_refs(
+            operand_refs,
+            native_opcode,
+            native_attrs,
+            output_templates,
+            state
+          )
       end
 
     result_id =

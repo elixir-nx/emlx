@@ -554,9 +554,8 @@ defmodule EMLX.Fast do
 
   @doc false
   def kv_cache_sdpa_update_callback(
-        {%Nx.Tensor{} = q, %Nx.Tensor{} = new_k, %Nx.Tensor{} = new_v,
-         %Nx.Tensor{} = k_cache, %Nx.Tensor{} = v_cache, %Nx.Tensor{} = offset,
-         %Nx.Tensor{} = key_mask},
+        {%Nx.Tensor{} = q, %Nx.Tensor{} = new_k, %Nx.Tensor{} = new_v, %Nx.Tensor{} = k_cache,
+         %Nx.Tensor{} = v_cache, %Nx.Tensor{} = offset, %Nx.Tensor{} = key_mask},
         opts
       ) do
     scale = opts[:scale]
@@ -564,7 +563,12 @@ defmodule EMLX.Fast do
     t_max = elem(Nx.shape(k_cache), 1)
 
     start =
-      offset |> Nx.reshape({}) |> Nx.as_type({:s, 64}) |> Nx.to_number() |> max(0) |> min(t_max - 1)
+      offset
+      |> Nx.reshape({})
+      |> Nx.as_type({:s, 64})
+      |> Nx.to_number()
+      |> max(0)
+      |> min(t_max - 1)
 
     k_upd = Nx.put_slice(k_cache, [0, start, 0, 0], new_k)
     v_upd = Nx.put_slice(v_cache, [0, start, 0, 0], new_v)

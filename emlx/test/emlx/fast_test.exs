@@ -387,7 +387,13 @@ defmodule EMLX.FastTest do
       v_ref_t = Nx.transpose(v_ref, axes: [0, 2, 1, 3])
 
       attn_ref =
-        Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_ref_t, v_ref_t, scale, key_mask)
+        Fast.scaled_dot_product_attention_causal_key_masked(
+          q_t,
+          k_ref_t,
+          v_ref_t,
+          scale,
+          key_mask
+        )
 
       assert_all_close(
         Nx.slice_along_axis(k_upd, 2, 1, axis: 1) |> Nx.backend_transfer(),

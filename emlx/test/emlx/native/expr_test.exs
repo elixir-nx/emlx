@@ -3252,7 +3252,10 @@ defmodule EMLX.Native.ExprTest do
         q_t = Nx.transpose(q, axes: [0, 2, 1, 3])
         k_t = Nx.transpose(k_upd, axes: [0, 2, 1, 3])
         v_t = Nx.transpose(v_upd, axes: [0, 2, 1, 3])
-        attn = EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, 0.125, key_mask)
+
+        attn =
+          EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, 0.125, key_mask)
+
         {attn, k_upd, v_upd}
       end
 
@@ -3328,7 +3331,10 @@ defmodule EMLX.Native.ExprTest do
       EMLX.Native.Expr.reset_kv_cache_fusion_count()
 
       {fused_k, fused_v, fused_attn} =
-        Nx.Defn.jit(&EMLX.Native.ExprTest.kv_cache_while_auto_fuse/5, compiler: EMLX, device: :gpu).(
+        Nx.Defn.jit(&EMLX.Native.ExprTest.kv_cache_while_auto_fuse/5,
+          compiler: EMLX,
+          device: :gpu
+        ).(
           q,
           k0,
           v0,
