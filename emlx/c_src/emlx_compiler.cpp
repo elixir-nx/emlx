@@ -5,8 +5,8 @@
 // replays the cached compiled graph on subsequent calls.  eval_program is a
 // thin caller: compiled_fn(inputs) → eval → wrap outputs.
 //
-// Op dispatch uses a string→function registry instead of an integer opcode enum.
-// Adding a new op: register it in `op_registry` below.  No enum, no wire
+// Op dispatch uses a string→function registry instead of an integer opcode
+// enum. Adding a new op: register it in `op_registry` below.  No enum, no wire
 // integers, no lockstep parity table to maintain.
 
 #include "emlx_compiler.hpp"
@@ -26,7 +26,8 @@
 namespace emlx {
 namespace native {
 
-// ── Op registry ───────────────────────────────────────────────────────────────
+// ── Op registry
+// ───────────────────────────────────────────────────────────────
 //
 // Each entry maps an op name string (matching the atom used in the Elixir IR)
 // to a C++ function: (resolved_operands, integer_attrs) → result array.
@@ -34,11 +35,11 @@ namespace native {
 // attribute channel passed verbatim from the IR.
 //
 // This is the single source of truth for op semantics on the compiler path.
-// No explicit device: ops run on the default stream of the current worker thread.
+// No explicit device: ops run on the default stream of the current worker
+// thread.
 
-using OpFn = std::function<
-    mlx::core::array(const std::vector<mlx::core::array> &ops,
-                     const std::vector<Attr> &attrs)>;
+using OpFn = std::function<mlx::core::array(
+    const std::vector<mlx::core::array> &ops, const std::vector<Attr> &attrs)>;
 
 // Float opts (eps/scale/base) ride the int64 attr channel as their IEEE-754
 // double bits (see EMLX.Native.Expr.f64_bits/1).  Reverse the reinterpret here.
@@ -61,9 +62,10 @@ static inline float attr_to_float(int64_t bits) {
 // (equivalently: rotate_half = concat(-a[half..dims], a[..half]); out =
 // a[..dims]*cos_full + rotate_half*sin_full — the form used here, matching
 // emlx_fast.cpp's fast_rope_positions eager NIF body).
-// `a` is {B, T, H, D}; `angles` is {B, T, half} (already position*inv_freq*scale).
-// No new Metal kernel: this is the existing fast_rope_positions composition,
-// exposed as a compiled-graph opcode so prefill RoPE stays in one NIF replay.
+// `a` is {B, T, H, D}; `angles` is {B, T, half} (already
+// position*inv_freq*scale). No new Metal kernel: this is the existing
+// fast_rope_positions composition, exposed as a compiled-graph opcode so
+// prefill RoPE stays in one NIF replay.
 static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
                                                 const mlx::core::array &angles,
                                                 int dims) {
@@ -75,8 +77,10 @@ static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
   int D = a.shape(3);
   int half = dims / 2;
 
-  auto cos_bt1h = astype(reshape(cos(angles), to_shape({B, T, 1, half})), a.dtype());
-  auto sin_bt1h = astype(reshape(sin(angles), to_shape({B, T, 1, half})), a.dtype());
+  auto cos_bt1h =
+      astype(reshape(cos(angles), to_shape({B, T, 1, half})), a.dtype());
+  auto sin_bt1h =
+      astype(reshape(sin(angles), to_shape({B, T, 1, half})), a.dtype());
 
   auto cos_full = concatenate(std::vector<array>{cos_bt1h, cos_bt1h}, 3);
   auto sin_full = concatenate(std::vector<array>{sin_bt1h, sin_bt1h}, 3);
@@ -103,13 +107,15 @@ static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
 
 // Build a sliding window view.  padded has shape [...]; window and strides
 // have length n=padded.ndim().  Result shape: [o0,...,on-1, w0,...,wn-1].
-static mlx::core::array compiler_sliding_window_view(const mlx::core::array &padded,
-                                                     const std::vector<int> &window,
-                                                     const std::vector<int> &strides) {
+static mlx::core::array
+compiler_sliding_window_view(const mlx::core::array &padded,
+                             const std::vector<int> &window,
+                             const std::vector<int> &strides) {
   int n = padded.ndim();
   auto ps = padded.shape();
 
-  // Doubled element strides: output dims and window dims share the same strides.
+  // Doubled element strides: output dims and window dims share the same
+  // strides.
   auto orig_strides = padded.strides();
   std::vector<int64_t> view_strides(orig_strides.begin(), orig_strides.end());
   for (auto s : orig_strides)
@@ -130,7 +136,8 @@ static mlx::core::array compiler_sliding_window_view(const mlx::core::array &pad
   for (int i = 0; i < n; ++i)
     sl_strides.push_back(1);
 
-  return mlx::core::slice(strided, to_shape(starts), to_shape(stops), to_shape(sl_strides));
+  return mlx::core::slice(strided, to_shape(starts), to_shape(stops),
+                          to_shape(sl_strides));
 }
 
 // Decode attrs and run a window reduction (sum/product/max/min).
@@ -186,7 +193,8 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
       int w_i = (int)cur_shape[i];
       // New size after dilation on axis i.
       int new_size = w_i + (w_i - 1) * interior;
-      // Build dilated axis: start with zeros, then set positions 0, wd, 2*wd, ...
+      // Build dilated axis: start with zeros, then set positions 0, wd, 2*wd,
+      // ...
       auto arange_full = mlx::core::arange(0, new_size, 1, mlx::core::int32);
       // Positions occupied by real values: 0, wd, 2*wd, ...
       auto divisible = mlx::core::equal(
@@ -196,10 +204,11 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
       // Build dilated from current using take at strided positions.
       // Take the [0, wd, 2*wd, ...] positions from the window_mask axis i.
       auto src_idx = mlx::core::astype(
-          mlx::core::divide(arange_full, mlx::core::full({}, wd[i], mlx::core::int32)),
+          mlx::core::divide(arange_full,
+                            mlx::core::full({}, wd[i], mlx::core::int32)),
           mlx::core::uint32);
-      // For interior positions, take from mask (value 1); replace interior zeros.
-      // It's simpler to: take all, then where(divisible, val, 0).
+      // For interior positions, take from mask (value 1); replace interior
+      // zeros. It's simpler to: take all, then where(divisible, val, 0).
       auto taken = mlx::core::take(window_mask, src_idx, i);
       // Mask out non-original positions.
       // Broadcast divisible to match taken shape.
@@ -207,7 +216,8 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
       div_shape[i] = new_size;
       auto div_nd = mlx::core::reshape(divisible, to_shape(div_shape));
       auto div_bc = mlx::core::broadcast_to(div_nd, taken.shape());
-      window_mask = mlx::core::where(div_bc, taken, mlx::core::zeros({}, mlx::core::bool_));
+      window_mask = mlx::core::where(div_bc, taken,
+                                     mlx::core::zeros({}, mlx::core::bool_));
     }
   }
   // expanded_window is now the shape of window_mask.
@@ -225,15 +235,19 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
       return mlx::core::full({}, 1, t.dtype());
     case 2: // max: lowest representable value
       if (mlx::core::issubdtype(t.dtype(), mlx::core::floating)) {
-        return mlx::core::full({}, -std::numeric_limits<float>::infinity(), t.dtype());
+        return mlx::core::full({}, -std::numeric_limits<float>::infinity(),
+                               t.dtype());
       } else {
-        return mlx::core::full({}, std::numeric_limits<int32_t>::min(), t.dtype());
+        return mlx::core::full({}, std::numeric_limits<int32_t>::min(),
+                               t.dtype());
       }
     case 3: // min: highest representable value
       if (mlx::core::issubdtype(t.dtype(), mlx::core::floating)) {
-        return mlx::core::full({}, std::numeric_limits<float>::infinity(), t.dtype());
+        return mlx::core::full({}, std::numeric_limits<float>::infinity(),
+                               t.dtype());
       } else {
-        return mlx::core::full({}, std::numeric_limits<int32_t>::max(), t.dtype());
+        return mlx::core::full({}, std::numeric_limits<int32_t>::max(),
+                               t.dtype());
       }
     default:
       throw std::runtime_error("window_reduce_impl: unknown op_code");
@@ -241,13 +255,14 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
   };
   auto pad_val = make_pad_val();
 
-  auto padded = mlx::core::pad(t, all_axes, to_shape(low_pad), to_shape(high_pad), pad_val,
-                               "constant");
+  auto padded = mlx::core::pad(t, all_axes, to_shape(low_pad),
+                               to_shape(high_pad), pad_val, "constant");
 
   // Sliding window view: shape [o0,...,on-1, w0,...,wn-1].
   auto view = compiler_sliding_window_view(padded, expanded_window, strides);
 
-  // Broadcast window_mask (shape expanded_window) to match view: all batch dims are 1.
+  // Broadcast window_mask (shape expanded_window) to match view: all batch dims
+  // are 1.
   std::vector<int> mask_bc_shape(n, 1);
   for (int w : expanded_window)
     mask_bc_shape.push_back(w);
@@ -255,8 +270,11 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
   auto mask_bc = mlx::core::broadcast_to(mask_reshaped, view.shape());
 
   // Apply mask: replace masked-out positions with pad_val.
-  auto masked_view = mlx::core::where(mask_bc, view, mlx::core::broadcast_to(
-      mlx::core::reshape(pad_val, to_shape(std::vector<int>{})), view.shape()));
+  auto masked_view = mlx::core::where(
+      mask_bc, view,
+      mlx::core::broadcast_to(
+          mlx::core::reshape(pad_val, to_shape(std::vector<int>{})),
+          view.shape()));
 
   // Reduce over the last n dims (the window axes).
   std::vector<int> window_axes;
@@ -280,11 +298,11 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
 // Window scatter (max or min): replicate window_scatter_impl from emlx_nif.cpp.
 // attrs = [n_dims, lo0, hi0, …, s0, …, w0, …]
 // ops = [tensor_t, source, init_value]
-static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &tensor_t,
-                                                     const mlx::core::array &tensor_source,
-                                                     const mlx::core::array &tensor_init_value,
-                                                     const std::vector<Attr> &attrs,
-                                                     bool scatter_max) {
+static mlx::core::array
+window_scatter_impl_compiler(const mlx::core::array &tensor_t,
+                             const mlx::core::array &tensor_source,
+                             const mlx::core::array &tensor_init_value,
+                             const std::vector<Attr> &attrs, bool scatter_max) {
   int n = static_cast<int>(attrs[0]);
   std::vector<int> low_pad(n), high_pad(n), strides(n), window(n);
   int off = 1;
@@ -300,15 +318,16 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
   auto init_casted = mlx::core::astype(tensor_init_value, tensor_t.dtype());
   std::vector<int> all_axes(n);
   std::iota(all_axes.begin(), all_axes.end(), 0);
-  auto padded = mlx::core::pad(tensor_t, all_axes, to_shape(low_pad), to_shape(high_pad),
-                               init_casted, "constant");
+  auto padded = mlx::core::pad(tensor_t, all_axes, to_shape(low_pad),
+                               to_shape(high_pad), init_casted, "constant");
 
   auto padded_shape = padded.shape();
   std::vector<int> padded_shape_vec(padded_shape.begin(), padded_shape.end());
 
   auto window_view = compiler_sliding_window_view(padded, window, strides);
 
-  std::vector<int> out_shape(window_view.shape().begin(), window_view.shape().begin() + n);
+  std::vector<int> out_shape(window_view.shape().begin(),
+                             window_view.shape().begin() + n);
 
   int K = 1;
   for (int w : window)
@@ -325,7 +344,8 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
     auto m = mlx::core::min(windows_flat, std::vector<int>{n}, true);
     auto mask =
         mlx::core::astype(mlx::core::equal(windows_flat, m), mlx::core::uint32);
-    auto arange_k = mlx::core::astype(mlx::core::arange(0, K, 1), mlx::core::uint32);
+    auto arange_k =
+        mlx::core::astype(mlx::core::arange(0, K, 1), mlx::core::uint32);
     std::vector<int> arange_shape(n + 1, 1);
     arange_shape[n] = K;
     auto arange_nd = mlx::core::reshape(arange_k, to_shape(arange_shape));
@@ -339,8 +359,8 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
 
   std::vector<mlx::core::array> abs_indices;
   for (int a = 0; a < n; ++a) {
-    auto arange_a = mlx::core::astype(mlx::core::arange(0, (int)padded_shape[a], 1),
-                                      mlx::core::int32);
+    auto arange_a = mlx::core::astype(
+        mlx::core::arange(0, (int)padded_shape[a], 1), mlx::core::int32);
     std::vector<int> iota_shape(n, 1);
     iota_shape[a] = (int)padded_shape[a];
     auto iota_nd = mlx::core::reshape(arange_a, to_shape(iota_shape));
@@ -363,7 +383,8 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
 
   std::vector<int> scatter_axes(n);
   std::iota(scatter_axes.begin(), scatter_axes.end(), 0);
-  auto scattered = mlx::core::scatter_add(buffer, abs_indices, updates, scatter_axes);
+  auto scattered =
+      mlx::core::scatter_add(buffer, abs_indices, updates, scatter_axes);
 
   auto orig_shape = tensor_t.shape();
   std::vector<int> slice_starts = low_pad;
@@ -371,14 +392,15 @@ static mlx::core::array window_scatter_impl_compiler(const mlx::core::array &ten
   for (int i = 0; i < n; ++i)
     slice_stops[i] = low_pad[i] + (int)orig_shape[i];
   std::vector<int> slice_ones(n, 1);
-  return mlx::core::slice(scattered, to_shape(slice_starts), to_shape(slice_stops),
-                          to_shape(slice_ones));
+  return mlx::core::slice(scattered, to_shape(slice_starts),
+                          to_shape(slice_stops), to_shape(slice_ones));
 }
 
 // MLX linalg primitives are CPU-only.  Pin them to the CPU device so they
 // compose inside a compiled graph regardless of the graph's default (worker)
 // stream — validated to work for both :cpu and :gpu default devices.
-static const mlx::core::Device k_linalg_cpu(mlx::core::Device::DeviceType::cpu, 0);
+static const mlx::core::Device k_linalg_cpu(mlx::core::Device::DeviceType::cpu,
+                                            0);
 
 static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
@@ -1674,15 +1696,15 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      }},
 };
 
-// ── Multi-output op registry ──────────────────────────────────────────────────
+// ── Multi-output op registry
+// ──────────────────────────────────────────────────
 //
 // Ops that produce more than one result array (linalg factorizations).  Their
 // outputs are appended to the flat `results` accumulator in the returned order;
 // the Elixir lowerer assigns consecutive result indices to the matching output
 // refs (see to_native/1's list-result handling).  Pinned to the CPU device.
-using MultiOpFn = std::function<
-    std::vector<mlx::core::array>(const std::vector<mlx::core::array> &ops,
-                                  const std::vector<Attr> &attrs)>;
+using MultiOpFn = std::function<std::vector<mlx::core::array>(
+    const std::vector<mlx::core::array> &ops, const std::vector<Attr> &attrs)>;
 
 // Force each linalg output to contiguous layout (on the CPU stream).  MLX's
 // factorizations can return strided views; if such a view is a program output
@@ -1751,50 +1773,57 @@ public:
         constants_(std::move(constants)) {}
 
   void eval_cpu(const std::vector<mlx::core::array> &inputs,
-               std::vector<mlx::core::array> &outputs) override {
+                std::vector<mlx::core::array> &outputs) override {
     eval(inputs, outputs);
   }
   void eval_gpu(const std::vector<mlx::core::array> &inputs,
-               std::vector<mlx::core::array> &outputs) override {
+                std::vector<mlx::core::array> &outputs) override {
     eval(inputs, outputs);
   }
 
   // Side-effecting in the general case (a body may itself contain
   // `:runtime_call`) and, regardless, cheap to keep simple — never dedup/CSE.
-  bool is_equivalent(const mlx::core::Primitive &) const override { return false; }
+  bool is_equivalent(const mlx::core::Primitive &) const override {
+    return false;
+  }
 
   const char *name() const override { return "EMLXWhile"; }
 
 private:
+  bool evaluate_predicate(std::vector<mlx::core::array> &carry) {
+    auto outs =
+        interpret_instructions(cond_.instructions, cond_.outputs, captures_,
+                               constants_, /*inputs=*/nullptr, &carry);
+    if (outs.size() != 1)
+      throw std::runtime_error(
+          "emlx::native: :while condition sub-program must produce exactly "
+          "one output, got " +
+          std::to_string(outs.size()));
+
+    // Force the condition to a concrete boolean now: this is the only way
+    // to make the host-side control-flow decision (loop again or stop).
+    mlx::core::eval(outs[0]);
+
+    return outs[0].item<bool>();
+  }
+
+  void evaluate_body(std::vector<mlx::core::array> &carry) {
+    carry = interpret_instructions(body_.instructions, body_.outputs, captures_,
+                                   constants_, /*inputs=*/nullptr, &carry);
+    // Force the new carry every iteration rather than chaining lazy graphs
+    // across a data-dependent number of iterations: unevaluated chaining
+    // would grow the traced graph unboundedly *per eval_program call*
+    // (this loop runs after mlx::core::compile()'s one-time trace, so the
+    // growth would recur on every single call, not just once).
+    mlx::core::eval(carry);
+  }
+
   void eval(const std::vector<mlx::core::array> &inputs,
-           std::vector<mlx::core::array> &outputs) {
+            std::vector<mlx::core::array> &outputs) {
     std::vector<mlx::core::array> carry = inputs;
 
-    while (true) {
-      auto cond_outs = interpret_instructions(cond_.instructions, cond_.outputs,
-                                              captures_, constants_,
-                                              /*inputs=*/nullptr, &carry);
-      if (cond_outs.size() != 1)
-        throw std::runtime_error(
-            "emlx::native: :while condition sub-program must produce exactly "
-            "one output, got " +
-            std::to_string(cond_outs.size()));
-
-      // Force the condition to a concrete boolean now: this is the only way
-      // to make the host-side control-flow decision (loop again or stop).
-      mlx::core::eval(cond_outs[0]);
-      if (!cond_outs[0].item<bool>())
-        break;
-
-      carry = interpret_instructions(body_.instructions, body_.outputs,
-                                     captures_, constants_,
-                                     /*inputs=*/nullptr, &carry);
-      // Force the new carry every iteration rather than chaining lazy graphs
-      // across a data-dependent number of iterations: unevaluated chaining
-      // would grow the traced graph unboundedly *per eval_program call*
-      // (this loop runs after mlx::core::compile()'s one-time trace, so the
-      // growth would recur on every single call, not just once).
-      mlx::core::eval(carry);
+    while (evaluate_predicate(carry)) {
+      evaluate_body(carry);
     }
 
     for (size_t i = 0; i < outputs.size(); i++) {
@@ -1814,24 +1843,26 @@ public:
       : mlx::core::Primitive(stream), callback_index_(callback_index) {}
 
   void eval_cpu(const std::vector<mlx::core::array> &inputs,
-               std::vector<mlx::core::array> &outputs) override {
+                std::vector<mlx::core::array> &outputs) override {
     eval(inputs, outputs);
   }
   void eval_gpu(const std::vector<mlx::core::array> &inputs,
-               std::vector<mlx::core::array> &outputs) override {
+                std::vector<mlx::core::array> &outputs) override {
     eval(inputs, outputs);
   }
 
   // Side-effecting (fires an Elixir callback with observable effects) —
   // never dedup/CSE. This is also `Primitive::is_equivalent`'s own default,
   // kept explicit here for clarity rather than relied upon.
-  bool is_equivalent(const mlx::core::Primitive &) const override { return false; }
+  bool is_equivalent(const mlx::core::Primitive &) const override {
+    return false;
+  }
 
   const char *name() const override { return "EMLXRuntimeCall"; }
 
 private:
   void eval(const std::vector<mlx::core::array> &inputs,
-           std::vector<mlx::core::array> &outputs) {
+            std::vector<mlx::core::array> &outputs) {
     emlx::native::invoke_runtime_call(callback_index_, inputs, outputs);
   }
 
@@ -1887,7 +1918,8 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
        return contiguous_all({q, r});
      }},
 
-    // eigh (lower triangle): operands = [a]; outputs = [eigenvalues, eigenvectors].
+    // eigh (lower triangle): operands = [a]; outputs = [eigenvalues,
+    // eigenvectors].
     {"eigh",
      [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
        auto [w, v] = mlx::core::linalg::eigh(ops[0], "L", k_linalg_cpu);
@@ -1897,7 +1929,8 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // svd (full matrices): operands = [a]; outputs = [u, s, vt].
     {"svd",
      [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
-       return contiguous_all(mlx::core::linalg::svd(ops[0], /*compute_uv=*/true, k_linalg_cpu));
+       return contiguous_all(
+           mlx::core::linalg::svd(ops[0], /*compute_uv=*/true, k_linalg_cpu));
      }},
 
     // lu: operands = [a]; outputs = [pivots, l, u] (pivots is a uint32 index
@@ -1965,9 +1998,9 @@ static std::vector<mlx::core::array> interpret_instructions(
     if (name == "while") {
       const SubProgram &cond = instr.subprograms.at(0);
       const SubProgram &body = instr.subprograms.at(1);
-      auto primitive = std::make_shared<EMLXWhile>(
-          mlx::core::default_stream(k_linalg_cpu), cond, body, captures,
-          constants);
+      auto primitive =
+          std::make_shared<EMLXWhile>(mlx::core::default_stream(k_linalg_cpu),
+                                      cond, body, captures, constants);
 
       std::vector<mlx::core::Shape> shapes;
       std::vector<mlx::core::Dtype> dtypes;
@@ -1978,7 +2011,8 @@ static std::vector<mlx::core::array> interpret_instructions(
         dtypes.push_back(a.dtype());
       }
 
-      auto outs = mlx::core::array::make_arrays(shapes, dtypes, primitive, op_inputs);
+      auto outs =
+          mlx::core::array::make_arrays(shapes, dtypes, primitive, op_inputs);
       for (auto &o : outs)
         results.push_back(o);
       continue;
@@ -2003,7 +2037,8 @@ static std::vector<mlx::core::array> interpret_instructions(
   return outputs;
 }
 
-// ── Global compile-cache mutex ────────────────────────────────────────────────
+// ── Global compile-cache mutex
+// ────────────────────────────────────────────────
 //
 // mlx::core::detail::compile and compile_erase both mutate MLX's process-wide
 // compile cache.  compile_program runs on the worker thread; ~Expr runs on
@@ -2015,7 +2050,8 @@ static std::vector<mlx::core::array> interpret_instructions(
 // invocation that inserts the traced graph) are serialised through this mutex.
 static std::mutex s_mlx_compile_mutex;
 
-// ── Expr destructor ───────────────────────────────────────────────────────────
+// ── Expr destructor
+// ───────────────────────────────────────────────────────────
 //
 // Evicts the per-Expr entry from MLX's global compile cache so stale compiled
 // graphs don't accumulate.  Called by default_dtor<Expr> when the BEAM resource
@@ -2028,7 +2064,8 @@ Expr::~Expr() {
   }
 }
 
-// ── NIF implementations ───────────────────────────────────────────────────────
+// ── NIF implementations
+// ───────────────────────────────────────────────────────
 
 // compile_program — decodes the wire Program (see EMLX.Native.Program /
 // EMLX.Native.Expr.to_native/1, decoded directly by fine::Decoder<Program> in
@@ -2051,8 +2088,10 @@ static void validate_instructions(const std::vector<Instruction> &instructions,
             "emlx::native: :while instruction must have exactly 2 "
             "subprograms (cond, body), got " +
             std::to_string(instr.subprograms.size()));
-      validate_instructions(instr.subprograms[0].instructions, has_runtime_call);
-      validate_instructions(instr.subprograms[1].instructions, has_runtime_call);
+      validate_instructions(instr.subprograms[0].instructions,
+                            has_runtime_call);
+      validate_instructions(instr.subprograms[1].instructions,
+                            has_runtime_call);
       continue;
     }
 
@@ -2068,7 +2107,8 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   bool has_runtime_call = false;
   validate_instructions(program.instructions, has_runtime_call);
 
-  // Build constant arrays on the current (worker) thread using its default stream.
+  // Build constant arrays on the current (worker) thread using its default
+  // stream.
   std::vector<mlx::core::array> constants;
   constants.reserve(program.constants.size());
   for (const auto &[value, dtype] : program.constants) {
@@ -2126,14 +2166,14 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
 FINE_ASYNC_NIF(compile_program)
 
 // eval_program — calls the MLX-compiled function against runtime inputs.
-// MLX traces on the first call and replays the cached graph on subsequent calls.
-// Returns lazy output array refs — materialization is deferred to the caller
-// (to_binary / Nx.to_number), matching the Evaluator's deferred-eval pattern.
+// MLX traces on the first call and replays the cached graph on subsequent
+// calls. Returns lazy output array refs — materialization is deferred to the
+// caller (to_binary / Nx.to_number), matching the Evaluator's deferred-eval
+// pattern.
 //
 // argv[0] : program_ref  (emlx::native::Expr resource)
 // argv[1] : input_refs   (list of MLX array resource refs — runtime inputs)
-ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
-                          const ERL_NIF_TERM argv[]) {
+ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
   try {
     Expr *prog;
     if (!enif_get_resource(env, argv[0], resource_object<Expr>::type,
@@ -2141,7 +2181,6 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
       return nx::nif::error(env, "Invalid Expr resource");
 
     LIST_PARAM(1, std::vector<mlx::core::array>, inputs);
-
 
     // Force-evaluate all inputs on the worker thread before passing them to the
     // compiled function.  MLX tensors created via Elixir (e.g. Nx.tensor/2) may

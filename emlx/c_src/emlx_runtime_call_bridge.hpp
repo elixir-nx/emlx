@@ -79,6 +79,24 @@ struct PendingRuntimeCall {
 inline void invoke_runtime_call(int64_t callback_index,
                                 const std::vector<mlx::core::array> &inputs,
                                 std::vector<mlx::core::array> &outputs) {
+  // `EMLXRuntimeCall` is pinned to its own dedicated `k_linalg_cpu` stream
+  // (emlx_compiler.cpp), separate from whichever stream actually computed
+  // each `inputs[i]` (e.g. the calling worker's own bound stream, for any
+  // operand that isn't a bare top-level parameter/capture -- those need no
+  // computation at all, so they're trivially visible with no barrier).
+  // `array::is_available()`/`status()` only report *that* array's own
+  // producer stream finished scheduling it; they say nothing about whether
+  // that write has been synchronized so that *this*, different stream can
+  // safely read it via `in.data<uint8_t>()` below. Without this barrier, a
+  // genuinely computed (non-parameter) operand intermittently reads back as
+  // all-zero (the destination buffer's initial contents) -- reproduced with
+  // as little as `Nx.runtime_call(t, Nx.multiply(Nx.add(a, b), 2), ...)`.
+  // A full `synchronize()` is coarser than strictly necessary (it waits on
+  // every active stream, not just each operand's own), but `invoke_runtime_call`
+  // already pays for a much more expensive blocking Elixir round-trip right
+  // below, so this is not a meaningful additional cost.
+  mlx::core::synchronize();
+
   if (g_current_caller_pid == nullptr) {
     throw std::runtime_error(
         "emlx::native: runtime_call primitive fired with no caller pid in "
