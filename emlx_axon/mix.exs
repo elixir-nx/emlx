@@ -1,7 +1,7 @@
 defmodule EMLXAxon.MixProject do
   use Mix.Project
 
-  @version "0.3.0"
+  @version "0.4.0"
   @source_url "https://github.com/elixir-nx/emlx"
 
   def project do
@@ -42,8 +42,8 @@ defmodule EMLXAxon.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:emlx, path: "../emlx"},
-      {:nx, github: "elixir-nx/nx", branch: "main", sparse: "nx", override: true},
+      {:emlx, "~> 0.4.0"},
+      # {:emlx, path: "../emlx"},
       {:axon, "~> 0.7"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}

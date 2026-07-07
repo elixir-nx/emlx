@@ -8,7 +8,7 @@ Mix.install(
     # {:emlx, github: "elixir-nx/emlx", branch: "main", sparse: "emlx", override: true},
     # {:emlx_axon, github: "elixir-nx/emlx", branch: "main", sparse: "emlx_axon", override: true},
     
-    {:nx, github: "elixir-nx/nx", branch: "main", sparse: "nx", override: true},
+    {:nx, "~> 0.12", override: true},
     {:axon, "~> 0.7"},
     {:bumblebee, "~> 0.7"},
     {:emily, "~> 0.7"},
