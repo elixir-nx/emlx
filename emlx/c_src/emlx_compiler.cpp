@@ -1468,8 +1468,15 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            {}, -std::numeric_limits<float>::infinity(), mask_dtype);
        auto additive = mlx::core::where(keep, zero_val, neginf_val);
 
-       return mlx::core::fast::scaled_dot_product_attention(
+       auto attn_t = mlx::core::fast::scaled_dot_product_attention(
            q, k, v, scale, "array", additive, std::nullopt);
+
+       // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
+       // in Flash-Attention when seq_len >= Metal tile size, but semantically
+       // = 0) -- happens for left-padded prefill query rows that have no
+       // causally-visible *and* key_mask-valid key at all.
+       return mlx::core::where(mlx::core::isnan(attn_t),
+                               mlx::core::zeros_like(attn_t), attn_t);
      }},
 
     // sdpa (causal + key_mask, + sinks): operands = [q, k, v, key_mask,
@@ -1504,8 +1511,12 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            {}, -std::numeric_limits<float>::infinity(), mask_dtype);
        auto additive = mlx::core::where(keep, zero_val, neginf_val);
 
-       return mlx::core::fast::scaled_dot_product_attention(
+       auto attn_t = mlx::core::fast::scaled_dot_product_attention(
            q, k, v, scale, "array", additive, sinks);
+
+       // See "fast_sdpa_causal_key_masked" above: NaN-guard all-masked rows.
+       return mlx::core::where(mlx::core::isnan(attn_t),
+                               mlx::core::zeros_like(attn_t), attn_t);
      }},
 
     // rope (scalar offset): operands = [a];
@@ -1999,6 +2010,15 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
 
        auto attn_out = mlx::core::fast::scaled_dot_product_attention(
            q_t, k_t, v_t, scale, "array", additive, std::nullopt);
+
+       // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
+       // in Flash-Attention when seq_len >= Metal tile size, but semantically
+       // = 0) -- happens for left-padded prefill query rows that have no
+       // causally-visible *and* key_mask-valid key at all. See
+       // "fast_sdpa_causal_key_masked" above for the unfused version of this
+       // same guard.
+       attn_out = mlx::core::where(mlx::core::isnan(attn_out),
+                                   mlx::core::zeros_like(attn_out), attn_out);
 
        return {attn_out, k_upd, v_upd};
      }},

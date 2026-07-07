@@ -324,7 +324,7 @@ defmodule EMLXAxon.TextGeneration do
         # `Nx.Batch` stays lazy until a defn/jit entry; `jit_apply(identity)` is the
         # supported way to concatenate stacked entries into concrete tensors.
         %{"input_ids" => input_ids} =
-          Nx.Defn.jit_apply(&Function.identity/1, [batch], opts[:defn_options])
+          Nx.Defn.jit_apply(&Function.identity/1, [batch], Keyword.get(opts, :defn_options, []))
 
         ensure_single_batch!(input_ids)
 

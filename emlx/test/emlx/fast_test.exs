@@ -311,6 +311,44 @@ defmodule EMLX.FastTest do
       assert Nx.shape(out) == {1, 16, 1, 64}
       assert Nx.type(out) == {:f, 16}
     end
+
+    @tag :metal
+    test "left-padded prefill: padding query rows do not produce NaN (regression)" do
+      # Reproduces the "!!!!" degenerate-output bug found in bb+rewrite
+      # generation: for a left-padded prefill (T_q = T_kv, key_mask marks
+      # only a right-aligned suffix as valid), the padding query rows (whose
+      # own position is < the first valid key) have an EMPTY causal ∩
+      # key_mask intersection -- their additive mask row is all -inf, so
+      # softmax(-inf, ..., -inf) = NaN. Uncaught, this NaN then contaminates
+      # every subsequent decode step through the KV cache, producing garbage
+      # output for the entire generation (observed non-deterministically,
+      # correlated with T_kv hitting certain Metal SDPA tile-size boundaries).
+      # Shapes mirror Qwen3-0.6B: 16 query heads, 8 KV heads (GQA groups=2),
+      # head_dim=128 -- matches the real reproduction (constant/uniform
+      # values and/or non-GQA head counts did not reproduce the bug).
+      t_kv = 80
+      valid_len = 19
+      key = Nx.Random.key(42)
+
+      {q, key} = Nx.Random.normal(key, shape: {1, 16, t_kv, 128}, type: :bf16)
+      {k, key} = Nx.Random.normal(key, shape: {1, 8, t_kv, 128}, type: :bf16)
+      {v, _key} = Nx.Random.normal(key, shape: {1, 8, t_kv, 128}, type: :bf16)
+      q = gpu(q)
+      k = gpu(k)
+      v = gpu(v)
+      scale = 1.0 / :math.sqrt(128)
+
+      mask_row =
+        for i <- 0..(t_kv - 1) do
+          if i >= t_kv - valid_len, do: 1, else: 0
+        end
+
+      key_mask = Nx.tensor([mask_row]) |> gpu()
+
+      out = Fast.scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask)
+
+      refute out |> Nx.is_nan() |> Nx.any() |> Nx.to_number() == 1
+    end
   end
 
   describe "EMLX.kv_cache_sdpa_update/7" do

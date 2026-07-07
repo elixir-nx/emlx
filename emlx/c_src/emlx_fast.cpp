@@ -339,8 +339,14 @@ mlx::core::array fast_sdpa_causal_key_masked_impl(
     auto neginf_val = full({}, -std::numeric_limits<float>::infinity(), mask_dtype);
     auto additive = where(keep, zero_val, neginf_val);
 
-    return fast::scaled_dot_product_attention(
+    auto attn_t = fast::scaled_dot_product_attention(
         *q, *k, *v, (float)scale, "array", additive, sinks_opt, device);
+
+    // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN in
+    // Flash-Attention when seq_len >= Metal tile size, but semantically = 0).
+    // This happens for left-padded prefill rows, where a padding query
+    // position has no causally-visible *and* key_mask-valid keys at all.
+    return where(isnan(attn_t), zeros_like(attn_t, device), attn_t, device);
   }
 }
 FINE_ASYNC_NIF(fast_sdpa_causal_key_masked)
