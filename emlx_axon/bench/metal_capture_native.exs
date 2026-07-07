@@ -6,7 +6,15 @@
 #
 # Run:
 #   cd emlx_axon
-#   mix run bench/metal_capture_native.exs
+#   MTL_CAPTURE_ENABLED=1 mix run bench/metal_capture_native.exs
+#
+# Required env var:
+#   MTL_CAPTURE_ENABLED=1  — Apple's process-level Metal capture gate. MUST be
+#                            set before the BEAM (and therefore the Metal
+#                            device) starts — it is read once at process
+#                            startup and cannot be enabled lazily from inside
+#                            this script. Without it, EMLX.metal_start_capture/1
+#                            raises (does not silently no-op, on MLX 0.31.2).
 #
 # Optional env vars:
 #   EMLX_QWEN3_MODEL_PATH  — path to Qwen3-0.6B-MLX-4bit checkout

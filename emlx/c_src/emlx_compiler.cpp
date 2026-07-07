@@ -1468,8 +1468,15 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            {}, -std::numeric_limits<float>::infinity(), mask_dtype);
        auto additive = mlx::core::where(keep, zero_val, neginf_val);
 
-       return mlx::core::fast::scaled_dot_product_attention(
+       auto attn_t = mlx::core::fast::scaled_dot_product_attention(
            q, k, v, scale, "array", additive, std::nullopt);
+
+       // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
+       // in Flash-Attention when seq_len >= Metal tile size, but semantically
+       // = 0) -- happens for left-padded prefill query rows that have no
+       // causally-visible *and* key_mask-valid key at all.
+       return mlx::core::where(mlx::core::isnan(attn_t),
+                               mlx::core::zeros_like(attn_t), attn_t);
      }},
 
     // sdpa (causal + key_mask, + sinks): operands = [q, k, v, key_mask,
@@ -1504,8 +1511,12 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
            {}, -std::numeric_limits<float>::infinity(), mask_dtype);
        auto additive = mlx::core::where(keep, zero_val, neginf_val);
 
-       return mlx::core::fast::scaled_dot_product_attention(
+       auto attn_t = mlx::core::fast::scaled_dot_product_attention(
            q, k, v, scale, "array", additive, sinks);
+
+       // See "fast_sdpa_causal_key_masked" above: NaN-guard all-masked rows.
+       return mlx::core::where(mlx::core::isnan(attn_t),
+                               mlx::core::zeros_like(attn_t), attn_t);
      }},
 
     // rope (scalar offset): operands = [a];
@@ -1938,6 +1949,78 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     {"lu",
      [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
        return contiguous_all(mlx::core::linalg::lu(ops[0], k_linalg_cpu));
+     }},
+    // The head-transpose needed for `fast::scaled_dot_product_attention`
+    // (which requires {B, N, T, D}) is done internally on q and on the
+    // *already-written* k_upd/v_upd -- this is the same single full-cache
+    // transpose the unfused path already pays for (its own
+    // `build_sdpa_layer` transposes the post-update K/V cache before
+    // calling SDPA); fusing does not add a second one, since k_upd/v_upd
+    // are returned pre-transpose.
+    {"kv_cache_sdpa_update",
+     [](const auto &ops, const auto &attrs) -> std::vector<mlx::core::array> {
+       const auto &q = ops[0];
+       const auto &new_k = ops[1];
+       const auto &new_v = ops[2];
+       const auto &k_cache = ops[3];
+       const auto &v_cache = ops[4];
+       const auto &offset = ops[5];
+       const auto &key_mask = ops[6];
+       float scale = attr_to_float(attrs[0]);
+       int kv_offset = static_cast<int>(attrs[1]);
+
+       int T_max = static_cast<int>(k_cache.shape(1));
+       int T_q_write = static_cast<int>(new_k.shape(1));
+
+       // Dynamic write-start {0, clamp(offset, 0, T_max-T_q_write), 0, 0} --
+       // same clamp-and-concatenate construction as op_registry["put_slice"]
+       // (T_max-T_q_write, not T_max-1, so the write itself never runs past
+       // the cache's last valid row when T_q_write > 1, e.g. prefill).
+       auto s = mlx::core::reshape(mlx::core::astype(offset, mlx::core::int32), {1});
+       auto max_s = mlx::core::full({1}, T_max - T_q_write, mlx::core::int32);
+       auto zero1 = mlx::core::zeros({1}, mlx::core::int32);
+       auto offset_clamped = mlx::core::minimum(mlx::core::maximum(s, zero1), max_s);
+       auto start = mlx::core::concatenate({zero1, offset_clamped, zero1, zero1}, 0);
+
+       std::vector<int> all_axes = {0, 1, 2, 3};
+       auto k_upd = mlx::core::slice_update(k_cache, new_k, start, all_axes);
+       auto v_upd = mlx::core::slice_update(v_cache, new_v, start, all_axes);
+
+       // Head-transpose for SDPA: {B, T, N, D} -> {B, N, T, D}. Mirrors
+       // build_sdpa_layer's own Nx.transpose(axes: [0, 2, 1, 3]) exactly.
+       std::vector<int> head_transpose = {0, 2, 1, 3};
+       auto q_t = mlx::core::transpose(q, head_transpose);
+       auto k_t = mlx::core::transpose(k_upd, head_transpose);
+       auto v_t = mlx::core::transpose(v_upd, head_transpose);
+
+       // Combined causal + key_mask additive mask -- verbatim copy of
+       // "fast_sdpa_causal_key_masked"'s formula above (T_kv = T_max here).
+       auto km = mlx::core::reshape(key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)});
+       int T_q = q_t.shape(2);
+       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32), {1, 1, T_q, 1});
+       auto col = mlx::core::reshape(mlx::core::arange(T_max, mlx::core::int32), {1, 1, 1, T_max});
+       auto causal_bool = mlx::core::less_equal(
+           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32)));
+       auto keep = mlx::core::logical_and(km, causal_bool);
+       auto mask_dtype = q_t.dtype();
+       auto zero_val = mlx::core::zeros({}, mask_dtype);
+       auto neginf_val =
+           mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype);
+       auto additive = mlx::core::where(keep, zero_val, neginf_val);
+
+       auto attn_out = mlx::core::fast::scaled_dot_product_attention(
+           q_t, k_t, v_t, scale, "array", additive, std::nullopt);
+
+       // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
+       // in Flash-Attention when seq_len >= Metal tile size, but semantically
+       // = 0) -- happens for left-padded prefill query rows that have no
+       // causally-visible *and* key_mask-valid key at all. See
+       // "fast_sdpa_causal_key_masked" above for the unfused version of this
+       // same guard.
+       attn_out = mlx::core::where(mlx::core::isnan(attn_out),
+                                   mlx::core::zeros_like(attn_out), attn_out);
+
+       return {attn_out, k_upd, v_upd};
      }},
 };
 

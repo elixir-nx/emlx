@@ -2406,4 +2406,38 @@ defmodule EMLX do
   def set_cache_limit(limit) when is_integer(limit) and limit >= 0 do
     EMLX.NIF.set_cache_limit(limit) |> unwrap!()
   end
+
+  @doc """
+  Starts a Metal GPU frame capture, writing the trace to `path` (a
+  `.gputrace` bundle openable in Xcode's GPU Debugger via File → Open).
+
+  Requires `MTL_CAPTURE_ENABLED=1` to be set in the process environment
+  *before* the BEAM starts — Apple's Metal framework reads this gate once at
+  process startup (macOS 14+), and setting it later (e.g. from within
+  Elixir) has no effect. On MLX 0.31.2, forgetting to set it raises a clear
+  `EMLX.NIFError` (`"[metal::start_capture] Failed to start: Capture layer
+  is not inserted."`) rather than silently no-op'ing — confirmed by direct
+  test, contradicting this NIF's original design assumption that
+  `start_capture`/`stop_capture` never throw on ordinary misconfiguration.
+  Still worth confirming `path` exists and is non-empty after
+  `metal_stop_capture/0` as a belt-and-suspenders check, since a future MLX
+  version could change this behavior back to a silent no-op.
+
+  ## Examples
+
+      # export MTL_CAPTURE_ENABLED=1   (before starting the BEAM)
+      EMLX.metal_start_capture("/tmp/trace.gputrace")
+      # ... run some MLX work ...
+      EMLX.metal_stop_capture()
+  """
+  def metal_start_capture(path) when is_binary(path) do
+    EMLX.NIF.metal_start_capture(path) |> unwrap!()
+  end
+
+  @doc """
+  Stops a Metal GPU frame capture started with `metal_start_capture/1`.
+
+  See `metal_start_capture/1` for the `MTL_CAPTURE_ENABLED` precondition.
+  """
+  def metal_stop_capture, do: EMLX.NIF.metal_stop_capture() |> unwrap!()
 end

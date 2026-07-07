@@ -80,7 +80,8 @@ defmodule EMLX.Native.Expr do
       while_nesting_depth: 0,
       stable_positions: %{},
       hook_chain_ref: nil,
-      hooked_value_refs: %{}
+      hooked_value_refs: %{},
+      refcounts: compute_refcounts(ordered)
     }
 
     state = Enum.reduce(ordered, state, &expand_node/2)
@@ -156,6 +157,252 @@ defmodule EMLX.Native.Expr do
       _, acc ->
         acc
     end)
+  end
+
+  # Same-scope reference count per node id — how many *other* nodes in
+  # `ordered` (or a `:while` subprogram's own `inner_ordered`) reference a
+  # given node as one of their `args`, via the same generic `Tree.apply_args`
+  # walk `EMLX.Defn.Tree.post_order/2` itself uses. Deliberately does **not**
+  # count a node being a top-level/subprogram *output leaf* (that's resolved
+  # via `node_to_ref` after the whole reduce, not via another node's args —
+  # see `lower/3`'s/`lower_while_subprogram/3`'s own `output_refs`/leaf
+  # lookups) — only used by the `:kv_cache_sdpa_update` peephole fusion
+  # (below) to verify it's safe to delete a node's already-emitted
+  # instruction (i.e. confirm the fused SDPA node is genuinely its *only*
+  # same-scope consumer) without needing to patch up some other, unrelated
+  # consumer that a naive fusion would otherwise leave dangling.
+  defp compute_refcounts(ordered) do
+    Enum.reduce(ordered, %{}, fn
+      # Mirrors `EMLX.Defn.Tree.visit_scope_deps/3`'s own two special cases
+      # exactly (`:fun` has no same-scope deps; `scope_dependencies/1`
+      # redirects `:metadata`/`__EMLX__` nodes to their `operands` list
+      # instead of their literal `args`) -- generic `Tree.apply_args/4` alone
+      # doesn't know about either, so it would (wrongly) report 0 references
+      # to a `:metadata` node's `__EMLX__` operands (e.g. an SDPA node's own
+      # Q/K/V), even though `post_order/2` *does* visit them as this node's
+      # dependencies. Must stay in lockstep with that module's traversal or
+      # the `kv_cache_sdpa_update` fusion's refcount==1 safety checks below
+      # silently never pass.
+      %T{data: %Nx.Defn.Expr{op: :fun}}, acc ->
+        acc
+
+      node, acc ->
+        deps =
+          case scope_dependencies(node) do
+            {:ok, deps} -> deps
+            :default -> apply_args_deps(node)
+          end
+
+        Enum.reduce(deps, acc, fn dep, a -> Map.update(a, dep.data.id, 1, &(&1 + 1)) end)
+    end)
+  end
+
+  defp apply_args_deps(node) do
+    {_, deps} =
+      Nx.Defn.Tree.apply_args(node, :scope, [], fn dep, acc -> {dep, [dep | acc]} end)
+
+    deps
+  end
+
+  # ── kv_cache_sdpa_update peephole fusion helpers ────────────────────────────
+  #
+  # Used by the `:fast_sdpa_causal_key_masked` `expand_node/2` clause below —
+  # kept out of the `expand_node/2` clause run itself so as not to break up
+  # that group (see this module's other private helpers, similarly kept
+  # outside the run).
+
+  @head_transpose_axes [0, 2, 1, 3]
+
+  defp match_kv_cache_sdpa_fusion(q_t, k_t, v_t, state) do
+    with {:ok, q} <- match_head_transpose(q_t),
+         {:ok, k_put_slice_chain, k_cache, k_offset, new_k} <- match_cache_put_slice(k_t),
+         {:ok, v_put_slice_chain, v_cache, v_offset, new_v} <- match_cache_put_slice(v_t),
+         true <- not match?(%T{data: %Nx.Defn.Expr{op: :constant}}, k_offset),
+         true <- k_offset.data.id == v_offset.data.id,
+         true <- Map.get(state.refcounts, q_t.data.id, 0) == 1,
+         true <- Map.get(state.refcounts, k_t.data.id, 0) == 1,
+         true <- Map.get(state.refcounts, v_t.data.id, 0) == 1,
+         true <- Map.get(state.refcounts, hd(k_put_slice_chain).data.id, 0) == 1,
+         true <- Map.get(state.refcounts, hd(v_put_slice_chain).data.id, 0) == 1 do
+      {:ok, q, new_k, new_v, k_cache, v_cache, k_offset, k_put_slice_chain, v_put_slice_chain}
+    else
+      _ -> :no_match
+    end
+  end
+
+  defp match_head_transpose(%T{data: %Nx.Defn.Expr{op: :transpose, args: [inner, axes]}}) do
+    if Enum.to_list(axes) == @head_transpose_axes, do: {:ok, inner}, else: :no_match
+  end
+
+  defp match_head_transpose(_), do: :no_match
+
+  # `k_t`/`v_t` (already known to be `transpose(_, [0,2,1,3])` by the time
+  # this is called) must wrap exactly `put_slice(cache, [0, offset, 0, 0],
+  # new_val)` — a dynamic (tensor-valued) `offset` at the T axis (axis 1,
+  # Bumblebee-native layout) and static 0 everywhere else. A static-integer
+  # `offset` (e.g. a one-shot prefill call, not inside a decode `:while`)
+  # intentionally does not match — fusion only pays off across many
+  # iterations, and requiring a dynamic offset here is a cheap, sufficient
+  # proxy for "this is a decode loop write" without inspecting scope depth.
+  defp match_cache_put_slice(%T{
+         data: %Nx.Defn.Expr{op: :transpose, args: [put_slice_node, axes]}
+       }) do
+    if Enum.to_list(axes) == @head_transpose_axes do
+      case unwrap_generic_metadata(put_slice_node) do
+        {:ok, aliases,
+         %T{data: %Nx.Defn.Expr{op: :put_slice, args: [cache, [ax0, offset, ax2, ax3], new_val]}} =
+             raw} ->
+          if static_zero?(ax0) and not static_zero?(offset) and static_zero?(ax2) and
+               static_zero?(ax3) do
+            {:ok, [raw | aliases], cache, offset, new_val}
+          else
+            :no_match
+          end
+
+        _ ->
+          :no_match
+      end
+    else
+      :no_match
+    end
+  end
+
+  defp match_cache_put_slice(_), do: :no_match
+
+  # Bumblebee/Axon wraps a named layer's output (e.g.
+  # `update_attention_cache`'s `put_slice`, whose result threads into both
+  # this SDPA read *and* the decode loop's carried cache state) in a
+  # generic `:metadata` node (`%{axon_layer: ...}`, no `__EMLX__`/
+  # `__EMLX_QUANT__` key) purely for introspection -- `expand_node/2`'s
+  # catch-all `:metadata` clause below aliases its id straight to the
+  # wrapped node's ref without emitting an instruction of its own. See
+  # through any number of these to find the real op, collecting every
+  # wrapper id along the way so `fuse_kv_cache_sdpa_instr/15` can redirect
+  # *all* of them (not just the raw `:put_slice`'s id) to the fused op's
+  # output ref -- otherwise a consumer reading through a wrapper id would
+  # keep resolving to the now-pruned `:put_slice` instruction's stale ref.
+  defp unwrap_generic_metadata(node, acc \\ [])
+
+  defp unwrap_generic_metadata(
+         %T{data: %Nx.Defn.Expr{op: :metadata, args: [inner, meta]}} = node,
+         acc
+       )
+       when not is_map_key(meta, :__EMLX__) and not is_map_key(meta, :__EMLX_QUANT__) do
+    unwrap_generic_metadata(inner, [node | acc])
+  end
+
+  defp unwrap_generic_metadata(node, acc), do: {:ok, acc, node}
+
+  # Traced `Nx.put_slice(cache, [0, offset, 0, 0], new)` calls normalize
+  # *every* `start_indices` entry to an `Nx.Defn.Expr` (constant tensors for
+  # the literal `0`s, not left as plain host integers) -- so a static "0" here
+  # is `%T{data: %Nx.Defn.Expr{op: :constant, args: [0]}}`, never a bare `0`.
+  defp static_zero?(0), do: true
+  defp static_zero?(%T{data: %Nx.Defn.Expr{op: :constant, args: [0]}}), do: true
+  defp static_zero?(_), do: false
+
+  # Test-observable fusion counter — bumped once per successful fusion
+  # (typically once per attention layer per model *compile*, not per token:
+  # a `:while` decode-loop body is lowered once and replayed natively). Cheap
+  # enough to leave unconditional (rare-write `:persistent_term`, and this
+  # only ever runs during `EMLX.Native.Expr.lower/3`, not on the hot decode
+  # path itself) — lets `EMLX.Native.ExprTest` assert the peephole actually
+  # fired, rather than silently falling through to the unfused path the
+  # whole time and only ever exercising `match_kv_cache_sdpa_fusion/4`'s
+  # `:no_match` branch.
+  @doc false
+  def kv_cache_fusion_count, do: :persistent_term.get(:emlx_kv_cache_fusion_count, 0)
+
+  @doc false
+  def reset_kv_cache_fusion_count, do: :persistent_term.put(:emlx_kv_cache_fusion_count, 0)
+
+  defp bump_kv_cache_fusion_count! do
+    :persistent_term.put(:emlx_kv_cache_fusion_count, kv_cache_fusion_count() + 1)
+  end
+
+  defp fuse_kv_cache_sdpa_instr(
+         id,
+         q,
+         new_k,
+         new_v,
+         k_cache,
+         v_cache,
+         offset,
+         key_mask,
+         attrs,
+         q_t,
+         k_t,
+         v_t,
+         k_put_slice_chain,
+         v_put_slice_chain,
+         state
+       ) do
+    bump_kv_cache_fusion_count!()
+
+    operands =
+      [q, new_k, new_v, k_cache, v_cache, offset, key_mask]
+      |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
+
+    # Refs of the 5 now-dead instructions (Q's transpose; K/V's transpose +
+    # put_slice each) to strip from `state.instructions` -- otherwise the
+    # interpreter would still dispatch all 6 original ops *plus* this new
+    # fused one, a net dispatch-count *increase*, not the intended decrease.
+    # `hd/1` of each chain is enough here: every alias in a chain still
+    # resolves (pre-fusion) to the same single put_slice ref.
+    dead_refs =
+      MapSet.new(
+        Enum.map(
+          [q_t, k_t, v_t, hd(k_put_slice_chain), hd(v_put_slice_chain)],
+          &Map.fetch!(state.node_to_ref, &1.data.id)
+        )
+      )
+
+    pruned_instructions =
+      Enum.reject(state.instructions, fn {ref_or_refs, _op, _operands, _attrs} ->
+        case ref_or_refs do
+          refs when is_list(refs) -> Enum.any?(refs, &MapSet.member?(dead_refs, &1))
+          ref -> MapSet.member?(dead_refs, ref)
+        end
+      end)
+
+    attn_ref = make_ref()
+    k_upd_ref = make_ref()
+    v_upd_ref = make_ref()
+
+    # Every id in a put_slice chain (the raw `:put_slice` plus any generic
+    # `:metadata` wrapper ids around it) must be redirected to the new
+    # fused ref, not just the raw node's -- a wrapper id may be the one a
+    # *different* consumer (e.g. the decode loop's carried cache state)
+    # actually reads through.
+    node_to_ref =
+      state.node_to_ref
+      |> Map.put(id, attn_ref)
+      |> then(
+        &Enum.reduce(k_put_slice_chain, &1, fn n, acc -> Map.put(acc, n.data.id, k_upd_ref) end)
+      )
+      |> then(
+        &Enum.reduce(v_put_slice_chain, &1, fn n, acc -> Map.put(acc, n.data.id, v_upd_ref) end)
+      )
+
+    %{
+      state
+      | instructions: [
+          {[attn_ref, k_upd_ref, v_upd_ref], :kv_cache_sdpa_update, operands, attrs}
+          | pruned_instructions
+        ],
+        node_to_ref: node_to_ref
+    }
+  end
+
+  defp emit_metadata_instr(id, opcode, operands, attrs, state) do
+    ref = make_ref()
+    operand_refs = Enum.map(operands, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    %{
+      state
+      | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, ref)
+    }
   end
 
   # ── node expansion ────────────────────────────────────────────────────────
@@ -234,6 +481,70 @@ defmodule EMLX.Native.Expr do
     }
   end
 
+  # ── kv_cache_sdpa_update peephole fusion ────────────────────────────────────
+  # EMLXAxon's `build_sdpa_layer/5` always wraps its causal+key_mask SDPA
+  # call as `transpose(sdpa(transpose(q), transpose(k), transpose(v), ...))`
+  # (head-transpose in, head-transpose out — see that function), and its K/V
+  # arguments trace back to `Bumblebee.Layers.Decoder.update_attention_cache/5`
+  # (i.e. `Nx.put_slice(cache, [0, offset, 0, 0], new)`) whenever this SDPA
+  # node sits directly downstream of a KV-cache write, as in any decode loop.
+  # When that exact shape is confirmed (see `match_kv_cache_sdpa_fusion/4`,
+  # including refcount==1 safety checks — this is purely an optimization, so
+  # any mismatch silently falls through to the generic lowering below, never
+  # an error), rewrite `put_slice(K)` + `put_slice(V)` + `transpose` ×3 (Q,
+  # post-write K, post-write V) + this SDPA node — 6 native-IR instructions —
+  # into one `multi_op_registry["kv_cache_sdpa_update"]` (`emlx_compiler.cpp`)
+  # instruction.
+  defp expand_node(
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: :metadata,
+             args: [
+               _inner,
+               %{
+                 __EMLX__: %{
+                   op: :fast_sdpa_causal_key_masked,
+                   operands: [q_t, k_t, v_t, key_mask],
+                   attrs: attrs
+                 }
+               }
+             ]
+           }
+         },
+         state
+       ) do
+    case match_kv_cache_sdpa_fusion(q_t, k_t, v_t, state) do
+      {:ok, q, new_k, new_v, k_cache, v_cache, offset, k_put_slice, v_put_slice} ->
+        fuse_kv_cache_sdpa_instr(
+          id,
+          q,
+          new_k,
+          new_v,
+          k_cache,
+          v_cache,
+          offset,
+          key_mask,
+          attrs,
+          q_t,
+          k_t,
+          v_t,
+          k_put_slice,
+          v_put_slice,
+          state
+        )
+
+      :no_match ->
+        emit_metadata_instr(
+          id,
+          :fast_sdpa_causal_key_masked,
+          [q_t, k_t, v_t, key_mask],
+          attrs,
+          state
+        )
+    end
+  end
+
   defp expand_node(
          %T{
            data: %Nx.Defn.Expr{
@@ -244,14 +555,7 @@ defmodule EMLX.Native.Expr do
          },
          state
        ) do
-    ref = make_ref()
-    operand_refs = Enum.map(operands, &Map.fetch!(state.node_to_ref, &1.data.id))
-
-    %{
-      state
-      | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, ref)
-    }
+    emit_metadata_instr(id, opcode, operands, attrs, state)
   end
 
   # `EMLX.Quantization.quantize/2`'s traced representation — see
@@ -1754,36 +2058,57 @@ defmodule EMLX.Native.Expr do
 
     operand_refs = Enum.map(operand_leaves, &Map.fetch!(state.node_to_ref, &1.data.id))
 
-    # A bare `%T{op: :parameter}` leaf is only a genuine top-level position
-    # when it IS a top-level parameter; inside a `:while` sub-program, `arg`'s
-    # parameters have their own local 0..N-1 numbering, unrelated to this
-    # program's real input list. `stable_positions` (populated by the
-    # top-level :parameter clause and propagated through invariant `while`
-    # carries by `expand_while_native/6`) resolves the correct position in
-    # both cases, and is `nil` when no such stable identity exists (e.g. the
-    # operand is computed, or a while carry that actually changes per
-    # iteration) -- see EMLX.handle_runtime_call/6's `positions` doc.
-    arg_param_positions =
-      Enum.map(operand_leaves, &Map.get(state.stable_positions, &1.data.id))
-
     output_templates =
       case out_template do
         %Nx.Tensor{} = t -> [t]
         container -> Composite.flatten_list([container])
       end
 
-    args_template = Composite.traverse(tensor_expr, &Nx.to_template/1)
-
     {result_refs, state} =
-      emit_runtime_call_refs(
-        operand_refs,
-        arg_param_positions,
-        args_template,
-        callback,
-        opts,
-        output_templates,
-        state
-      )
+      case Keyword.pop(opts, :__emlx_native_multi_op__) do
+        {nil, _opts} ->
+          # A bare `%T{op: :parameter}` leaf is only a genuine top-level
+          # position when it IS a top-level parameter; inside a `:while`
+          # sub-program, `arg`'s parameters have their own local 0..N-1
+          # numbering, unrelated to this program's real input list.
+          # `stable_positions` (populated by the top-level :parameter clause
+          # and propagated through invariant `while` carries by
+          # `expand_while_native/6`) resolves the correct position in both
+          # cases, and is `nil` when no such stable identity exists (e.g. the
+          # operand is computed, or a while carry that actually changes per
+          # iteration) -- see EMLX.handle_runtime_call/6's `positions` doc.
+          arg_param_positions =
+            Enum.map(operand_leaves, &Map.get(state.stable_positions, &1.data.id))
+
+          args_template = Composite.traverse(tensor_expr, &Nx.to_template/1)
+
+          emit_runtime_call_refs(
+            operand_refs,
+            arg_param_positions,
+            args_template,
+            callback,
+            opts,
+            output_templates,
+            state
+          )
+
+        {{native_opcode, native_attrs}, _opts} ->
+          # Escape hatch for a genuine `multi_op_registry` C++ op (no BEAM
+          # round-trip, unlike the `EMLXRuntimeCall`/`invoke_runtime_call`
+          # path above) that still wants `Nx.runtime_call`'s existing
+          # multi-output container/`:elem` machinery and eager/grad-fallback
+          # callback for free, instead of duplicating that plumbing. `callback`
+          # is kept as this node's eager/`Nx.Defn.Evaluator`/`Nx.Defn.Grad`
+          # fallback (never invoked on this native-compiled path); only the
+          # opcode + static attrs reach the interpreter.
+          emit_native_multi_op_refs(
+            operand_refs,
+            native_opcode,
+            native_attrs,
+            output_templates,
+            state
+          )
+      end
 
     result_id =
       case out_template do
@@ -1859,6 +2184,26 @@ defmodule EMLX.Native.Expr do
       state
       | instructions: [{result_refs, :runtime_call, operand_refs, attrs} | state.instructions],
         runtime_calls: [runtime_call | state.runtime_calls]
+    }
+
+    {result_refs, state}
+  end
+
+  # Sibling of `emit_runtime_call_refs/7` for the `:__emlx_native_multi_op__`
+  # escape hatch (see the `:runtime_call` `expand_node/2` clause above):
+  # emits one plain multi-output instruction dispatched to `opcode`
+  # (expected to resolve via `emlx_compiler.cpp`'s `multi_op_registry`, the
+  # same mechanism already backing `qr`/`svd`/`lu` -- pure native C++, no
+  # `EMLXRuntimeCall`/BEAM round-trip, unlike `emit_runtime_call_refs/7`).
+  # `attrs` are static (baked in at trace time, like every other op's attrs);
+  # any per-iteration-dynamic values must instead be threaded as extra
+  # `operand_refs` (see `:put_slice`'s dynamic-start-index pattern).
+  defp emit_native_multi_op_refs(operand_refs, opcode, attrs, output_templates, state) do
+    result_refs = Enum.map(output_templates, fn _ -> make_ref() end)
+
+    state = %{
+      state
+      | instructions: [{result_refs, opcode, operand_refs, attrs} | state.instructions]
     }
 
     {result_refs, state}
@@ -2525,7 +2870,12 @@ defmodule EMLX.Native.Expr do
     inner_state =
       Enum.reduce(
         inner_ordered,
-        %{state | node_to_ref: local_base, instructions: []},
+        %{
+          state
+          | node_to_ref: local_base,
+            instructions: [],
+            refcounts: compute_refcounts(inner_ordered)
+        },
         fn node, st ->
           if MapSet.member?(param_id_set, node.data.id), do: st, else: expand_node(node, st)
         end

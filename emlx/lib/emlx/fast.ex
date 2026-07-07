@@ -56,6 +56,9 @@ defmodule EMLX.Fast do
   - `scaled_dot_product_attention_causal_key_masked/5` — causal SDPA; checks key_mask at C++ level, fast-paths to pure causal when all-ones
   - `scaled_dot_product_attention_causal_key_masked/6` — same, plus `opts` (`:sinks`)
   - `swiglu/2` — fused SwiGLU: `silu(gate) * up`
+  - `kv_cache_sdpa_update/8` — fused decode-time KV-cache write + causal SDPA
+    read, 3 outputs (`{attn_out, k_cache_updated, v_cache_updated}`) —
+    inference/decode-loop only, no grad support
   - `einsum/2` — variadic-operand Einstein summation (`mlx::core::einsum`);
     **eager-only, not defn-safe** (see its docs)
 
@@ -454,6 +457,133 @@ defmodule EMLX.Fast do
 
     dtype = Nx.type(q)
     if Nx.type(out) != dtype, do: Nx.as_type(out, dtype), else: out
+  end
+
+  # ── Fused decode-time KV-cache update + SDPA ────────────────────────────────
+  #
+  # SPIKE for `.work/performance_gap/01-attention-block-fusion-via-compiler.md`
+  # (Procedure step 3), built after that stage's Results already concluded the
+  # write-donation fix has no plausible mechanism to help (donation cannot
+  # survive `:while`-carry storage regardless of which primitive performs the
+  # write — see that doc's "Fix surface"/"Recommendation" sections) — kept as
+  # a real, working artifact per explicit instruction to build it anyway, not
+  # because a throughput win is expected. Unlike every other function in this
+  # module, this one does NOT use the single-output `:__EMLX__` metadata
+  # mechanism (`emlx_metadata/4` above) — that mechanism produces exactly one
+  # physical `ref` (see `EMLX.Native.Expr`'s `:metadata` expand_node clause),
+  # and this op has 3 outputs (attn_out, k_upd, v_upd). Instead it uses
+  # `Nx.runtime_call/4`'s `:__emlx_native_multi_op__` escape hatch (see that
+  # same module's `:runtime_call` expand_node clause), which reuses
+  # `Nx.runtime_call`'s existing multi-output container/`:elem` machinery
+  # while still lowering to one `multi_op_registry` C++ instruction — no BEAM
+  # round-trip, same as every other op here, just without the extra metadata
+  # wrapper layer (which the multi-output case can't use).
+  #
+  # No `Nx.Defn.grad` support — this op only targets the (non-differentiable,
+  # forward-only) decode/generation loop.
+
+  @doc """
+  Fused decode-time KV-cache write (2× `put_slice`) + causal-masked SDPA read,
+  as one native op — the traced-graph analog of the hand-written
+  `EMLX.kv_cache_sdpa_update/7` eager NIF, but operating on the *full*
+  fixed-size preallocated cache with a *dynamic* (array-valued) `offset`
+  instead of a host int, so it can sit inside a compiled `:while` decode
+  loop without forcing a host readback per iteration.
+
+  All tensors use **Bumblebee-native, heads-NOT-transposed** layout (matching
+  `Bumblebee.Layers.Decoder.attention_cache/4`'s `{batch, seq, heads, head_dim}`
+  cache shape and `EMLXAxon`'s `build_sdpa_layer/5` pre-transpose inputs) — the
+  head-transpose SDPA itself needs is done internally, once, on `q` and on the
+  already-written `k_upd`/`v_upd`; the returned caches stay untransposed so
+  they can feed a `:while` carry directly with no extra transpose.
+
+  - `q`        — `{B, T_q,  N_q,  D}` (T_q = 1 for decode; not enforced)
+  - `new_k`    — `{B, T_q,  N_kv, D}`
+  - `new_v`    — `{B, T_q,  N_kv, D}`
+  - `k_cache`  — `{B, T_max, N_kv, D}`
+  - `v_cache`  — `{B, T_max, N_kv, D}`
+  - `offset`   — scalar/`{1}` int tensor — write position along the `T_max` axis
+  - `key_mask` — `{B, T_max}` — 1 = valid (readable), 0 = masked
+  - `scale`    — pre-computed scalar
+
+  Returns `{attn_out, k_cache_updated, v_cache_updated}` — `attn_out` is
+  **head-transposed**, `{B, N_q, T_q, D}` (matching what the unfused
+  `scaled_dot_product_attention_causal_key_masked/6` metadata node itself
+  already returns; callers transpose it back same as today), while the
+  updated caches keep `k_cache`/`v_cache`'s own (untransposed) shape.
+
+  Eager: composes plain `Nx.put_slice` ×2 (clamped host offset) +
+  `scaled_dot_product_attention_causal_key_masked/6` — deliberately
+  independent of the traced path's C++ formula below, so it doubles as an
+  correctness oracle for the native `multi_op_registry["kv_cache_sdpa_update"]`
+  kernel (same combined causal+key_mask formula, reimplemented once in
+  Elixir/Nx and once in C++).
+
+  Traced: lowers to one `multi_op_registry["kv_cache_sdpa_update"]`
+  (`emlx_compiler.cpp`) native IR instruction.
+  """
+  deftransform kv_cache_sdpa_update(q, new_k, new_v, k_cache, v_cache, offset, key_mask, scale) do
+    t_q = elem(Nx.shape(q), 1)
+    t_max = elem(Nx.shape(k_cache), 1)
+    kv_offset = if t_q == 1, do: t_max - 1, else: 0
+
+    offset = offset |> Nx.reshape({1}) |> Nx.as_type({:s, 32})
+    args = {q, new_k, new_v, k_cache, v_cache, offset, key_mask}
+
+    if traced?([q, new_k, new_v, k_cache, v_cache, offset, key_mask]) do
+      {qb, qt, qn, qd} = Nx.shape(q)
+      attn_template = Nx.template({qb, qn, qt, qd}, Nx.type(q))
+
+      out_template = {attn_template, Nx.to_template(k_cache), Nx.to_template(v_cache)}
+
+      Nx.runtime_call(
+        out_template,
+        args,
+        [
+          scale: scale,
+          kv_offset: kv_offset,
+          __emlx_native_multi_op__:
+            {:kv_cache_sdpa_update, [NativeExpr.f64_bits(scale), kv_offset]}
+        ],
+        &kv_cache_sdpa_update_callback/2
+      )
+    else
+      kv_cache_sdpa_update_callback(args, scale: scale, kv_offset: kv_offset)
+    end
+  end
+
+  @doc false
+  def kv_cache_sdpa_update_callback(
+        {%Nx.Tensor{} = q, %Nx.Tensor{} = new_k, %Nx.Tensor{} = new_v, %Nx.Tensor{} = k_cache,
+         %Nx.Tensor{} = v_cache, %Nx.Tensor{} = offset, %Nx.Tensor{} = key_mask},
+        opts
+      ) do
+    scale = opts[:scale]
+    kv_offset = opts[:kv_offset]
+    t_max = elem(Nx.shape(k_cache), 1)
+
+    start =
+      offset
+      |> Nx.reshape({})
+      |> Nx.as_type({:s, 64})
+      |> Nx.to_number()
+      |> max(0)
+      |> min(t_max - 1)
+
+    k_upd = Nx.put_slice(k_cache, [0, start, 0, 0], new_k)
+    v_upd = Nx.put_slice(v_cache, [0, start, 0, 0], new_v)
+
+    q_t = Nx.transpose(q, axes: [0, 2, 1, 3])
+    k_t = Nx.transpose(k_upd, axes: [0, 2, 1, 3])
+    v_t = Nx.transpose(v_upd, axes: [0, 2, 1, 3])
+
+    attn_out =
+      sdpa_causal_key_masked_callback({q_t, k_t, v_t, key_mask},
+        scale: scale,
+        kv_offset: kv_offset
+      )
+
+    {attn_out, k_upd, v_upd}
   end
 
   # ── RoPE ────────────────────────────────────────────────────────────────────

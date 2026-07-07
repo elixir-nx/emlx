@@ -311,6 +311,44 @@ defmodule EMLX.FastTest do
       assert Nx.shape(out) == {1, 16, 1, 64}
       assert Nx.type(out) == {:f, 16}
     end
+
+    @tag :metal
+    test "left-padded prefill: padding query rows do not produce NaN (regression)" do
+      # Reproduces the "!!!!" degenerate-output bug found in bb+rewrite
+      # generation: for a left-padded prefill (T_q = T_kv, key_mask marks
+      # only a right-aligned suffix as valid), the padding query rows (whose
+      # own position is < the first valid key) have an EMPTY causal ∩
+      # key_mask intersection -- their additive mask row is all -inf, so
+      # softmax(-inf, ..., -inf) = NaN. Uncaught, this NaN then contaminates
+      # every subsequent decode step through the KV cache, producing garbage
+      # output for the entire generation (observed non-deterministically,
+      # correlated with T_kv hitting certain Metal SDPA tile-size boundaries).
+      # Shapes mirror Qwen3-0.6B: 16 query heads, 8 KV heads (GQA groups=2),
+      # head_dim=128 -- matches the real reproduction (constant/uniform
+      # values and/or non-GQA head counts did not reproduce the bug).
+      t_kv = 80
+      valid_len = 19
+      key = Nx.Random.key(42)
+
+      {q, key} = Nx.Random.normal(key, shape: {1, 16, t_kv, 128}, type: :bf16)
+      {k, key} = Nx.Random.normal(key, shape: {1, 8, t_kv, 128}, type: :bf16)
+      {v, _key} = Nx.Random.normal(key, shape: {1, 8, t_kv, 128}, type: :bf16)
+      q = gpu(q)
+      k = gpu(k)
+      v = gpu(v)
+      scale = 1.0 / :math.sqrt(128)
+
+      mask_row =
+        for i <- 0..(t_kv - 1) do
+          if i >= t_kv - valid_len, do: 1, else: 0
+        end
+
+      key_mask = Nx.tensor([mask_row]) |> gpu()
+
+      out = Fast.scaled_dot_product_attention_causal_key_masked(q, k, v, scale, key_mask)
+
+      refute out |> Nx.is_nan() |> Nx.any() |> Nx.to_number() == 1
+    end
   end
 
   describe "EMLX.kv_cache_sdpa_update/7" do
@@ -351,6 +389,63 @@ defmodule EMLX.FastTest do
         Nx.backend_transfer(new_v),
         atol: 1.0e-5
       )
+    end
+  end
+
+  describe "EMLX.Fast.kv_cache_sdpa_update/8 (eager)" do
+    test "writes new_k/new_v at offset and matches put_slice+causal_key_masked reference" do
+      # Bumblebee-native layout: {B, T, N, D} (heads NOT transposed).
+      q = Nx.iota({1, 1, 2, 4}, type: :f32) |> Nx.divide(100) |> gpu()
+      new_k = Nx.iota({1, 1, 1, 4}, type: :f32) |> Nx.divide(200) |> gpu()
+      new_v = Nx.iota({1, 1, 1, 4}, type: :f32) |> Nx.divide(300) |> gpu()
+      k_cache = Nx.iota({1, 5, 1, 4}, type: :f32) |> Nx.divide(50) |> gpu()
+      v_cache = Nx.iota({1, 5, 1, 4}, type: :f32) |> Nx.divide(60) |> gpu()
+      offset = Nx.tensor(2, type: :s32) |> gpu()
+      key_mask = Nx.tensor([[1, 1, 1, 0, 0]], type: :s32) |> gpu()
+      scale = 1.0 / :math.sqrt(4)
+
+      {attn, k_upd, v_upd} =
+        Fast.kv_cache_sdpa_update(q, new_k, new_v, k_cache, v_cache, offset, key_mask, scale)
+
+      # attn_out is head-transposed ({B, N, T, D}), matching the unfused
+      # metadata node's own output convention; k_upd/v_upd stay
+      # Bumblebee-native ({B, T, N, D}), matching the cache's own shape.
+      assert Nx.shape(attn) == {1, 2, 1, 4}
+      assert Nx.shape(k_upd) == {1, 5, 1, 4}
+      assert Nx.shape(v_upd) == {1, 5, 1, 4}
+
+      # Compute the unfused reference (reusing new_k/new_v/k_cache/v_cache)
+      # *before* any `Nx.backend_transfer/1` call below, since that deallocates
+      # its (single) argument's underlying EMLX resource -- see
+      # `EMLX.Backend.backend_transfer/3`.
+      k_ref = Nx.put_slice(k_cache, [0, 2, 0, 0], new_k)
+      v_ref = Nx.put_slice(v_cache, [0, 2, 0, 0], new_v)
+      q_t = Nx.transpose(q, axes: [0, 2, 1, 3])
+      k_ref_t = Nx.transpose(k_ref, axes: [0, 2, 1, 3])
+      v_ref_t = Nx.transpose(v_ref, axes: [0, 2, 1, 3])
+
+      attn_ref =
+        Fast.scaled_dot_product_attention_causal_key_masked(
+          q_t,
+          k_ref_t,
+          v_ref_t,
+          scale,
+          key_mask
+        )
+
+      assert_all_close(
+        Nx.slice_along_axis(k_upd, 2, 1, axis: 1) |> Nx.backend_transfer(),
+        Nx.backend_transfer(new_k),
+        atol: 1.0e-5
+      )
+
+      assert_all_close(
+        Nx.slice_along_axis(v_upd, 2, 1, axis: 1) |> Nx.backend_transfer(),
+        Nx.backend_transfer(new_v),
+        atol: 1.0e-5
+      )
+
+      assert_all_close(Nx.backend_transfer(attn), Nx.backend_transfer(attn_ref), atol: 1.0e-3)
     end
   end
 

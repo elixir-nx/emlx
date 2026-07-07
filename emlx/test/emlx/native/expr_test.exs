@@ -112,6 +112,91 @@ defmodule EMLX.Native.ExprTest do
     result
   end
 
+  # P01 restart (Procedure step 3) spike: `EMLX.Fast.kv_cache_sdpa_update/8`
+  # (native multi-op escape hatch) threaded through a compiled `:while`
+  # `:carry` across 3 iterations, one fused call per iteration -- the shape
+  # of its actual intended use (a decode loop, one call per layer per step).
+  # `while` (`Nx.Defn.Kernel`) only works inside a real `defn` body, hence
+  # this being a module-level defn rather than an anonymous fn built inside
+  # the test itself (see the sibling `..._ref/5` below for the unfused
+  # comparison point, called from the same describe block).
+  defn kv_cache_while_fused(q, k0, v0, k_cache0, v_cache0) do
+    {_q, _k0, _v0, k_final, v_final, attn_sum, _i} =
+      while {q, k0, v0, k_cache = k_cache0, v_cache = v_cache0,
+             acc = Nx.broadcast(0.0, {1, 2, 1, 8}), i = 0},
+            Nx.less(i, 3) do
+        offset = i
+        key_mask = Nx.less_equal(Nx.iota({1, 5}, type: :s32), offset)
+
+        {attn, k_cache, v_cache} =
+          EMLX.Fast.kv_cache_sdpa_update(q, k0, v0, k_cache, v_cache, offset, key_mask, 0.125)
+
+        {q, k0, v0, k_cache, v_cache, Nx.add(acc, attn), i + 1}
+      end
+
+    {k_final, v_final, attn_sum}
+  end
+
+  # Unfused reference for `kv_cache_while_fused/5` above: plain
+  # `Nx.put_slice` ×2 + `EMLX.Fast.scaled_dot_product_attention_causal_key_masked/5`
+  # composed by hand inside the identical `:while` skeleton.
+  defn kv_cache_while_ref(q, k0, v0, k_cache0, v_cache0) do
+    {_q, _k0, _v0, k_final, v_final, attn_sum, _i} =
+      while {q, k0, v0, k_cache = k_cache0, v_cache = v_cache0,
+             acc = Nx.broadcast(0.0, {1, 2, 1, 8}), i = 0},
+            Nx.less(i, 3) do
+        offset = i
+        key_mask = Nx.less_equal(Nx.iota({1, 5}, type: :s32), offset)
+        k_cache = Nx.put_slice(k_cache, [0, offset, 0, 0], k0)
+        v_cache = Nx.put_slice(v_cache, [0, offset, 0, 0], v0)
+
+        attn =
+          EMLX.Fast.scaled_dot_product_attention_causal_key_masked(
+            Nx.transpose(q, axes: [0, 2, 1, 3]),
+            Nx.transpose(k_cache, axes: [0, 2, 1, 3]),
+            Nx.transpose(v_cache, axes: [0, 2, 1, 3]),
+            0.125,
+            key_mask
+          )
+
+        {q, k0, v0, k_cache, v_cache, Nx.add(acc, attn), i + 1}
+      end
+
+    {k_final, v_final, attn_sum}
+  end
+
+  # Auto-fusion probe for the `kv_cache_sdpa_update` *peephole* pass (see
+  # `EMLX.Native.Expr`'s `:fast_sdpa_causal_key_masked` `expand_node/2`
+  # clause) — unlike `kv_cache_while_fused/5` above (which calls
+  # `EMLX.Fast.kv_cache_sdpa_update/8` directly), this hand-composes plain
+  # `Nx.put_slice` ×2 + `Nx.transpose` ×3 + `scaled_dot_product_attention_causal_key_masked/5`
+  # exactly as `EMLXAxon.build_sdpa_layer/5` does, so it exercises the
+  # pattern-detector itself, not just the escape-hatch it targets. Should
+  # produce numerically identical results to `kv_cache_while_ref/5` (byte for
+  # byte the same computation) while triggering the fusion internally.
+  defn kv_cache_while_auto_fuse(q, k0, v0, k_cache0, v_cache0) do
+    {_q, _k0, _v0, k_final, v_final, attn_sum, _i} =
+      while {q, k0, v0, k_cache = k_cache0, v_cache = v_cache0,
+             acc = Nx.broadcast(0.0, {1, 2, 1, 8}), i = 0},
+            Nx.less(i, 3) do
+        offset = i
+        key_mask = Nx.less_equal(Nx.iota({1, 5}, type: :s32), offset)
+        k_cache = Nx.put_slice(k_cache, [0, offset, 0, 0], k0)
+        v_cache = Nx.put_slice(v_cache, [0, offset, 0, 0], v0)
+
+        q_t = Nx.transpose(q, axes: [0, 2, 1, 3])
+        k_t = Nx.transpose(k_cache, axes: [0, 2, 1, 3])
+        v_t = Nx.transpose(v_cache, axes: [0, 2, 1, 3])
+
+        attn =
+          EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, 0.125, key_mask)
+
+        {q, k0, v0, k_cache, v_cache, Nx.add(acc, attn), i + 1}
+      end
+
+    {k_final, v_final, attn_sum}
+  end
+
   defn quantized_matmul_surrounded(x, qw) do
     EMLX.Quantization.quantized_matmul(x, qw) |> Nx.add(1.0) |> Nx.multiply(2.0)
   end
@@ -3103,6 +3188,175 @@ defmodule EMLX.Native.ExprTest do
       native_ap = Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(q, k, v, all_present, sinks)
       eager_ap = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(q, k, v, all_present, sinks)
       assert_all_close(native_ap, eager_ap, tol: 1.0e-3)
+    end
+
+    # P01 restart (Procedure step 3) spike: multi-output escape hatch
+    # (`Nx.runtime_call`'s `:__emlx_native_multi_op__` opt, see
+    # `EMLX.Native.Expr`'s `:runtime_call` expand_node clause) lowering
+    # straight to `multi_op_registry["kv_cache_sdpa_update"]`
+    # (emlx_compiler.cpp) — unlike every other test in this describe block,
+    # this op does NOT go through the single-output `:__EMLX__` metadata
+    # mechanism (see `EMLX.Fast.kv_cache_sdpa_update/8`'s moduledoc comment).
+    test "kv_cache_sdpa_update: fused native replay matches eager and matches put_slice+sdpa reference" do
+      fun = fn q, new_k, new_v, k_cache, v_cache, offset, key_mask ->
+        EMLX.Fast.kv_cache_sdpa_update(
+          q,
+          new_k,
+          new_v,
+          k_cache,
+          v_cache,
+          offset,
+          key_mask,
+          0.125
+        )
+      end
+
+      # Bumblebee-native layout: {B, T, N, D} (heads NOT transposed).
+      q = Nx.iota({1, 1, 2, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      new_k = Nx.iota({1, 1, 1, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      new_v = Nx.iota({1, 1, 1, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      k_cache = Nx.iota({1, 5, 1, 8}, type: :f32) |> Nx.divide(70) |> gpu_t()
+      v_cache = Nx.iota({1, 5, 1, 8}, type: :f32) |> Nx.divide(60) |> gpu_t()
+      offset = Nx.tensor(2, type: :s32) |> gpu_t()
+      key_mask = Nx.tensor([[1, 1, 1, 0, 0]], type: :s32) |> gpu_t()
+
+      {native_attn, native_k, native_v} =
+        Nx.Defn.jit(fun, compiler: EMLX, device: :gpu).(
+          q,
+          new_k,
+          new_v,
+          k_cache,
+          v_cache,
+          offset,
+          key_mask
+        )
+
+      {eager_attn, eager_k, eager_v} =
+        Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(
+          q,
+          new_k,
+          new_v,
+          k_cache,
+          v_cache,
+          offset,
+          key_mask
+        )
+
+      assert_all_close(native_attn, eager_attn, tol: 1.0e-3)
+      assert_all_close(native_k, eager_k, tol: 1.0e-5)
+      assert_all_close(native_v, eager_v, tol: 1.0e-5)
+
+      prim_fun = fn q, new_k, new_v, k_cache, v_cache, key_mask ->
+        k_upd = Nx.put_slice(k_cache, [0, 2, 0, 0], new_k)
+        v_upd = Nx.put_slice(v_cache, [0, 2, 0, 0], new_v)
+        q_t = Nx.transpose(q, axes: [0, 2, 1, 3])
+        k_t = Nx.transpose(k_upd, axes: [0, 2, 1, 3])
+        v_t = Nx.transpose(v_upd, axes: [0, 2, 1, 3])
+
+        attn =
+          EMLX.Fast.scaled_dot_product_attention_causal_key_masked(q_t, k_t, v_t, 0.125, key_mask)
+
+        {attn, k_upd, v_upd}
+      end
+
+      {prim_attn, prim_k, prim_v} =
+        Nx.Defn.jit(prim_fun, compiler: EMLX, device: :gpu).(
+          q,
+          new_k,
+          new_v,
+          k_cache,
+          v_cache,
+          key_mask
+        )
+
+      assert_all_close(native_attn, prim_attn, tol: 1.0e-3)
+      assert_all_close(native_k, prim_k, tol: 1.0e-5)
+      assert_all_close(native_v, prim_v, tol: 1.0e-5)
+    end
+
+    # Same op threaded through a compiled `:while`'s `:carry` (the shape of
+    # its actual intended use — a Qwen3-style decode loop, one fused call
+    # per layer per step) instead of a single top-level call, to verify the
+    # native multi-op escape hatch survives `:while`'s carry/keepalive
+    # machinery (result-ref list, per-iteration replay) across several
+    # iterations, not just one bare top-level call.
+    test "kv_cache_sdpa_update inside a compiled :while decode loop matches an unfused reference loop" do
+      q = Nx.iota({1, 1, 2, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k0 = Nx.iota({1, 1, 1, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v0 = Nx.iota({1, 1, 1, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      k_cache0 = Nx.broadcast(0.0, {1, 5, 1, 8}) |> Nx.as_type(:f32) |> gpu_t()
+      v_cache0 = Nx.broadcast(0.0, {1, 5, 1, 8}) |> Nx.as_type(:f32) |> gpu_t()
+
+      {fused_k, fused_v, fused_attn} =
+        Nx.Defn.jit(&EMLX.Native.ExprTest.kv_cache_while_fused/5, compiler: EMLX, device: :gpu).(
+          q,
+          k0,
+          v0,
+          k_cache0,
+          v_cache0
+        )
+
+      {ref_k, ref_v, ref_attn} =
+        Nx.Defn.jit(&EMLX.Native.ExprTest.kv_cache_while_ref/5, compiler: EMLX, device: :gpu).(
+          q,
+          k0,
+          v0,
+          k_cache0,
+          v_cache0
+        )
+
+      assert_all_close(fused_k, ref_k, tol: 1.0e-3)
+      assert_all_close(fused_v, ref_v, tol: 1.0e-3)
+      assert_all_close(fused_attn, ref_attn, tol: 1.0e-3)
+    end
+
+    # Exercises the *peephole detector* itself (`match_kv_cache_sdpa_fusion/4`
+    # and friends), as opposed to the tests above which call
+    # `EMLX.Fast.kv_cache_sdpa_update/8` directly and never touch the
+    # pattern-matcher at all. `kv_cache_while_auto_fuse/5` hand-composes
+    # `Nx.put_slice` ×2 + `Nx.transpose` ×3 + causal SDPA exactly like
+    # `EMLXAxon.build_sdpa_layer/5` does — if the detector's pattern (or the
+    # refcount==1 safety checks) ever drifts from what that function
+    # actually produces, this is the test that should catch it via the
+    # fusion-count assertion below (a pure numeric comparison against
+    # `kv_cache_while_ref/5` would still pass even if the fusion silently
+    # never fired).
+    test "kv_cache_sdpa_update peephole fusion fires on EMLXAxon's build_sdpa_layer-shaped pattern" do
+      q = Nx.iota({1, 1, 2, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
+      k0 = Nx.iota({1, 1, 1, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
+      v0 = Nx.iota({1, 1, 1, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
+      k_cache0 = Nx.broadcast(0.0, {1, 5, 1, 8}) |> Nx.as_type(:f32) |> gpu_t()
+      v_cache0 = Nx.broadcast(0.0, {1, 5, 1, 8}) |> Nx.as_type(:f32) |> gpu_t()
+
+      EMLX.Native.Expr.reset_kv_cache_fusion_count()
+
+      {fused_k, fused_v, fused_attn} =
+        Nx.Defn.jit(&EMLX.Native.ExprTest.kv_cache_while_auto_fuse/5,
+          compiler: EMLX,
+          device: :gpu
+        ).(
+          q,
+          k0,
+          v0,
+          k_cache0,
+          v_cache0
+        )
+
+      assert EMLX.Native.Expr.kv_cache_fusion_count() > 0,
+             "expected the kv_cache_sdpa_update peephole to fire at least once"
+
+      {ref_k, ref_v, ref_attn} =
+        Nx.Defn.jit(&EMLX.Native.ExprTest.kv_cache_while_ref/5, compiler: EMLX, device: :gpu).(
+          q,
+          k0,
+          v0,
+          k_cache0,
+          v_cache0
+        )
+
+      assert_all_close(fused_k, ref_k, tol: 1.0e-3)
+      assert_all_close(fused_v, ref_v, tol: 1.0e-3)
+      assert_all_close(fused_attn, ref_attn, tol: 1.0e-3)
     end
 
     test "rope (scalar offset): fused replay matches eager" do

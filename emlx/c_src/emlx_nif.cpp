@@ -1335,6 +1335,33 @@ NIF(set_cache_limit) {
   return nx::nif::ok(env, enif_make_uint64(env, prev));
 }
 
+// Starts a Metal GPU frame capture, writing the trace to `path` (a
+// `.gputrace` bundle). Requires `MTL_CAPTURE_ENABLED=1` in the process
+// environment *before* the BEAM (and therefore the Metal device) started —
+// Apple's capture gate is read once at process startup and cannot be
+// enabled lazily. On MLX 0.31.2, missing this precondition throws (caught
+// by CATCH() below and surfaced as a normal EMLX.NIFError), not a silent
+// no-op. See EMLX.metal_start_capture/1's moduledoc for details.
+NIF(metal_start_capture) {
+  std::string path;
+  if (!nx::nif::get(env, argv[0], path)) {
+    return nx::nif::error(env, "Unable to get path param.");
+  }
+  try {
+    mlx::core::metal::start_capture(path);
+    return nx::nif::ok(env);
+  }
+  CATCH()
+}
+
+NIF(metal_stop_capture) {
+  try {
+    mlx::core::metal::stop_capture();
+    return nx::nif::ok(env);
+  }
+  CATCH()
+}
+
 NIF(strides) {
   TENSOR_PARAM(0, t);
 
@@ -1828,8 +1855,12 @@ NIF(eval_program) { return emlx::native::eval_program(env, argc, argv); }
 ASYNC_NIF(eval_program)
 
 static ErlNifFunc nif_funcs[] = {
-    {"eval", 2, eval_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"eval_many", 2, eval_many_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    // No dirty-scheduler flag: eval/eval_many post to a dedicated Worker
+    // OS thread via async_dispatch (emlx_async.hpp) and return immediately —
+    // the calling BEAM scheduler never blocks on the actual MLX work, same
+    // as the ~150 sibling ASYNC_NIF ops below (item 3.8 fold-in).
+    {"eval", 2, eval_async},
+    {"eval_many", 2, eval_many_async},
     {"to_device", 3, to_device_async},
     {"to_blob", 2, to_blob_async},
     {"to_blob", 3, to_blob_async},
@@ -1979,6 +2010,8 @@ static ErlNifFunc nif_funcs[] = {
     {"reset_peak_memory", 0, reset_peak_memory},
     {"set_memory_limit", 1, set_memory_limit},
     {"set_cache_limit", 1, set_cache_limit},
+    {"metal_start_capture", 1, metal_start_capture},
+    {"metal_stop_capture", 0, metal_stop_capture},
 
     // ── Worker control NIFs.
     {"command_queue_new", 1, command_queue_new},
@@ -2006,9 +2039,11 @@ static ErlNifFunc nif_funcs[] = {
     {"kv_cache_sdpa_update", 9, kv_cache_sdpa_update_async},
 
     // ── Native compiler NIFs.
-    {"compile_program", 2, emlx::native::compile_program_async,
-     ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"eval_program", 3, eval_program_async, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    // No dirty-scheduler flag on either: both are FINE_ASYNC_NIF/ASYNC_NIF-
+    // wrapped (post to a Worker OS thread, return immediately) — same
+    // reasoning as eval/eval_many above (item 3.8 fold-in).
+    {"compile_program", 2, emlx::native::compile_program_async},
+    {"eval_program", 3, eval_program_async},
     // resolve_runtime_call is NOT worker-routed: it only decodes a reply and
     // memcpy's it into pre-registered buffers/notifies a condvar — no MLX
     // graph work, so it can run directly on the calling BEAM scheduler.
