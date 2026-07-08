@@ -1,5 +1,6 @@
 #include "emlx_compiler.hpp"
 #include "emlx_nif_shared.hpp"
+#include "emlx_fast/llama.hpp"
 #include "emlx_fast/qwen3.hpp"
 #include "emlx_plugin_registry.hpp"
 
@@ -2063,6 +2064,12 @@ static ErlNifFunc nif_funcs[] = {
     {"qwen3_final_greedy", 6, qwen3_final_greedy_async},
     {"qwen3_attention_residual", 5, qwen3_attention_residual_async},
     {"qwen3_attention_block", 17, qwen3_attention_block_async},
+    {"llama_layer", 19, llama_layer_async},
+    {"llama_forward_greedy_ids", 13, llama_forward_greedy_ids_async},
+    {"llama_forward_greedy_ids_chunk", 14, llama_forward_greedy_ids_chunk_async},
+    {"llama_forward_greedy_ids_token_id", 13, llama_forward_greedy_ids_token_id_async},
+    {"llama_forward_greedy_token_id", 13, llama_forward_greedy_token_id_async},
+    {"llama_final_greedy", 6, llama_final_greedy_async},
     // load_plugin `dlopen`s a named, standalone native plugin (see
     // emlx_plugin_registry.hpp); not worker-routed since it does no MLX
     // graph work.

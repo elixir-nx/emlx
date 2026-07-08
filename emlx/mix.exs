@@ -5,6 +5,12 @@ defmodule EMLX.MixProject do
   @version "0.4.0"
   @mlx_version "0.31.2"
   @source_url "https://github.com/elixir-nx/emlx"
+  @native_source_patterns [
+    "Makefile",
+    "c_src/**/*.cpp",
+    "c_src/**/*.hpp",
+    "c_src/**/*.h"
+  ]
 
   require Logger
 
@@ -40,6 +46,7 @@ defmodule EMLX.MixProject do
           "MLX_VARIANT" => libmlx_config.variant,
           "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
           "EMLX_VERSION" => @version,
+          "EMLX_NATIVE_SOURCE_HASH" => native_source_hash(),
           "LIBMLX_ENABLE_DEBUG" => to_string(libmlx_config.features.debug?),
           "FINE_INCLUDE_DIR" => Fine.include_dir()
         }
@@ -74,6 +81,38 @@ defmodule EMLX.MixProject do
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
+  end
+
+  defp native_source_hash do
+    case System.get_env("EMLX_NATIVE_SOURCE_HASH") do
+      nil -> compute_native_source_hash()
+      hash -> hash
+    end
+  end
+
+  defp compute_native_source_hash do
+    __DIR__
+    |> native_source_paths()
+    |> Enum.reduce(:crypto.hash_init(:sha256), fn path, ctx ->
+      relative = Path.relative_to(path, __DIR__)
+
+      ctx
+      |> :crypto.hash_update(relative)
+      |> :crypto.hash_update(<<0>>)
+      |> :crypto.hash_update(File.read!(path))
+      |> :crypto.hash_update(<<0>>)
+    end)
+    |> :crypto.hash_final()
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, 12)
+  end
+
+  defp native_source_paths(root) do
+    @native_source_patterns
+    |> Enum.flat_map(&Path.wildcard(Path.join(root, &1)))
+    |> Enum.filter(&File.regular?/1)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   defp docs do

@@ -73,12 +73,17 @@ jobs:
 
       - name: Install emlx_axon dependencies
         working-directory: emlx_axon
+        env:
+          EMLX_AXON_LOCAL_EMLX: "true"
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
+          rm -rf deps/emlx _build/dev/lib/emlx _build/test/lib/emlx
           mix deps.get
 
       - name: Check formatting
         working-directory: emlx_axon
+        env:
+          EMLX_AXON_LOCAL_EMLX: "true"
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           mix format --check-formatted
@@ -86,6 +91,7 @@ jobs:
       - name: Run emlx_axon tests
         working-directory: emlx_axon
         env:
+          EMLX_AXON_LOCAL_EMLX: "true"
           EMLX_TEST_DEFAULT_GPU: "true"
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"

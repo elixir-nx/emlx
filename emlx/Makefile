@@ -7,7 +7,7 @@ esc = $(subst $(space),\$(space),$(1))
 
 # Private configuration
 PRIV_DIR = $(MIX_APP_PATH)/priv
-BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)/objs
+BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)-$(EMLX_NATIVE_SOURCE_HASH)/objs
 EMLX_SO = $(PRIV_DIR)/libemlx.so
 EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
 # Headers are copied alongside the lib (unlike the lib copy, these are not
@@ -55,8 +55,8 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_fast/qwen3_plugin_abi.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_fast/llama.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_fast/qwen3_plugin_abi.hpp c_src/emlx_fast/llama.hpp c_src/emlx_fast/llama_plugin_abi.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 
 # Main targets

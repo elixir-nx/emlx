@@ -15,8 +15,8 @@ defmodule EMLXAxon.MixProject do
       aliases: aliases(),
       description: "Axon model rewrites to swap supported nodes for EMLX.Fast Metal shaders",
       package: package(),
-      # elixir_make — builds the standalone qwen3 compute plugin
-      # (c_src/qwen3_plugin.cpp), `dlopen`'d at runtime by emlx's
+      # elixir_make — builds the standalone model compute plugins
+      # (c_src/*_plugin.cpp), `dlopen`'d at runtime by emlx's
       # `EMLX.NIF.load_plugin/2` (see lib/emlx_axon/application.ex). A
       # function ref so `Application.app_dir(:emlx, ...)` (needs the
       # :emlx dep already compiled) isn't called while this project/0
@@ -28,7 +28,9 @@ defmodule EMLXAxon.MixProject do
         %{
           "MLX_INCLUDE_DIR" => Path.join(emlx_priv_dir, "mlx/include"),
           "MLX_LIB_DIR" => Path.join(emlx_priv_dir, "mlx/lib"),
-          "QWEN3_ABI_INCLUDE_DIR" => Path.join(Mix.Project.deps_paths()[:emlx], "c_src/emlx_fast")
+          "QWEN3_ABI_INCLUDE_DIR" =>
+            Path.join(Mix.Project.deps_paths()[:emlx], "c_src/emlx_fast"),
+          "LLAMA_ABI_INCLUDE_DIR" => Path.join(Mix.Project.deps_paths()[:emlx], "c_src/emlx_fast")
         }
       end,
       compilers: [:elixir_make] ++ Mix.compilers()
@@ -42,12 +44,19 @@ defmodule EMLXAxon.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:emlx, "~> 0.4.0"},
-      # {:emlx, path: "../emlx"},
+      emlx_dep(),
       {:axon, "~> 0.7"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
+  end
+
+  defp emlx_dep do
+    if System.get_env("EMLX_AXON_LOCAL_EMLX") == "true" do
+      {:emlx, path: "../emlx", override: true}
+    else
+      {:emlx, "~> 0.4.0"}
+    end
   end
 
   def cli do

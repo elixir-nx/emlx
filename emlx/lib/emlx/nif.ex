@@ -336,6 +336,111 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
+  # ── Llama fused native NIFs ────────────────────────────────────────────────
+  # Elixir wrappers live in `EMLX.Native.Llama`; the NIF/C++ names keep the
+  # `llama_` prefix (`emlx/c_src/emlx_fast/llama.cpp`).
+
+  def llama_layer(
+        _worker,
+        _hidden,
+        _norm1,
+        _q,
+        _k,
+        _v,
+        _o,
+        _k_cache,
+        _v_cache,
+        _norm2,
+        _gate,
+        _up,
+        _down,
+        _offset,
+        _scale,
+        _head_dim,
+        _rope_freqs,
+        _eps,
+        _device
+      ) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def llama_forward_greedy_ids(
+        _worker,
+        _ids,
+        _embed,
+        _layers,
+        _kv_cache,
+        _norm,
+        _lm_head,
+        _offset,
+        _scale,
+        _head_dim,
+        _rope_freqs,
+        _eps,
+        _device
+      ) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def llama_forward_greedy_ids_chunk(
+        _worker,
+        _ids,
+        _embed,
+        _layers,
+        _kv_cache,
+        _norm,
+        _lm_head,
+        _offset,
+        _count,
+        _scale,
+        _head_dim,
+        _rope_freqs,
+        _eps,
+        _device
+      ) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def llama_forward_greedy_ids_token_id(
+        _worker,
+        _ids,
+        _embed,
+        _layers,
+        _kv_cache,
+        _norm,
+        _lm_head,
+        _offset,
+        _scale,
+        _head_dim,
+        _rope_freqs,
+        _eps,
+        _device
+      ) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def llama_forward_greedy_token_id(
+        _worker,
+        _token_id,
+        _embed,
+        _layers,
+        _kv_cache,
+        _norm,
+        _lm_head,
+        _offset,
+        _scale,
+        _head_dim,
+        _rope_freqs,
+        _eps,
+        _device
+      ) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  def llama_final_greedy(_worker, _hidden, _norm, _lm_head, _eps, _device) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
   # load_plugin — `dlopen`s a standalone, name-keyed native plugin (no
   # erl_nif dependency) and caches its vtable under `name` (see
   # emlx_plugin_registry.hpp). Callers that decode/dispatch into a
