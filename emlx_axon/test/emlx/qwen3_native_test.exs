@@ -594,6 +594,18 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert chunk_tokens == manual_tokens
     end
 
+    test "qwen3_forward_greedy_ids_chunk_quantized supports 1023 ordered token outputs" do
+      count = 1023
+      tokens = qwen3_quantized_chunk_call(qwen3_quantized_chunk_fixtures(count), count)
+
+      expected_prefix =
+        qwen3_quantized_chunk_manual_tokens(qwen3_quantized_chunk_fixtures(), 3)
+
+      assert length(tokens) == count
+      assert Enum.all?(tokens, &(length(&1) == 1))
+      assert Enum.take(tokens, 3) == expected_prefix
+    end
+
     test "qwen3_attention_residual matches pure Nx reference" do
       {hidden, attn_out, o_proj} =
         Nx.with_default_backend(Nx.BinaryBackend, fn ->
@@ -1134,7 +1146,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
   # `qwen3_quantized_attention_fixtures/2`, plus a small embedding table and a
   # quantized `lm_head` (`{vocab, H}`, already in the `{out, in}` convention
   # `EMLX.quantize/2` expects — no transpose needed, unlike the projections).
-  defp qwen3_quantized_chunk_fixtures do
+  defp qwen3_quantized_chunk_fixtures(cache_capacity \\ 8) do
     base =
       qwen3_quantized_attention_fixtures([
         :q_proj,
@@ -1158,10 +1170,15 @@ defmodule EMLXAxon.Qwen3NativeTest do
 
     norm = Nx.iota({32}, type: :f32) |> Nx.add(50) |> Nx.divide(10) |> gpu()
 
-    # Enough KV cache capacity for `offset + count` across the test's decode
-    # steps (capacity 8 comfortably covers `count = 3`).
-    k_cache = Nx.broadcast(0.0, {1, 1, 8, 16}) |> Nx.as_type(:f32) |> gpu()
-    v_cache = Nx.broadcast(0.0, {1, 1, 8, 16}) |> Nx.as_type(:f32) |> gpu()
+    k_cache =
+      Nx.broadcast(0.0, {1, 1, cache_capacity, 16})
+      |> Nx.as_type(:f32)
+      |> gpu()
+
+    v_cache =
+      Nx.broadcast(0.0, {1, 1, cache_capacity, 16})
+      |> Nx.as_type(:f32)
+      |> gpu()
 
     %{
       base

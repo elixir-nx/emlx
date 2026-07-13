@@ -20,8 +20,6 @@ namespace {
 constexpr size_t kNameMax = 128;
 constexpr size_t kDebugNameMax = 256;
 constexpr uint32_t kCallbacksMax = 256;
-constexpr uint32_t kOperandsMax = 4096;
-constexpr uint32_t kOutputsMax = 1024;
 constexpr size_t kErrorMax = 4096;
 constexpr size_t kCallPluginNifSuffixSize =
     sizeof(" in NIF.call_plugin/5") - 1;
@@ -175,6 +173,10 @@ uint32_t invoke_count_policy(EMLXOperandCountFn policy,
         callback_failure_error(plugin_name, callback_name, policy_detail,
                                error_limit));
   }
+  if (count == 0)
+    throw std::runtime_error("plugin callback \"" + plugin_name + "/" +
+                             callback_name + "\" derived zero " + kind +
+                             " count");
   return count;
 }
 
@@ -386,7 +388,8 @@ load_generic_candidate(const std::string &requested_name,
       throw std::runtime_error("plugin callback debug_name is not valid UTF-8");
     if (!valid_name(callback->name) || source.schema_version != 1 ||
         source.attr_schema_version != 1 || !source.callback ||
-        source.operand_count > kOperandsMax || source.output_count > kOutputsMax ||
+        source.operand_count > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 ||
+        source.output_count > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1 ||
         source.device_capabilities == 0 ||
         (source.device_capabilities & ~EMLX_PLUGIN_DEVICE_KNOWN_V1) != 0)
       throw std::runtime_error("plugin callback descriptor is invalid");
@@ -471,8 +474,15 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
       emlx_invoke_plugin_count_policy(
           callback.operand_count_from_attrs, attr_view, callback.operand_count,
           "operand", plugin_name, callback_name, callback_error_max);
-  if (expected_operands > kOperandsMax || operands.size() != expected_operands)
+  if (expected_operands > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 ||
+      operands.size() != expected_operands)
     throw std::runtime_error("plugin callback operand count mismatch");
+  const uint32_t expected_outputs =
+      emlx_invoke_plugin_count_policy(
+          callback.output_count_from_attrs, attr_view, callback.output_count,
+          "output", plugin_name, callback_name, callback_error_max);
+  if (expected_outputs > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1)
+    throw std::runtime_error("plugin callback output count exceeds its limit");
   if (!emlx::g_current_worker)
     throw std::runtime_error("plugin execution has no current worker");
   const uint32_t device_bit = device.type == mlx::core::Device::DeviceType::cpu
@@ -500,11 +510,7 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     throw std::runtime_error(
         emlx_plugin_callback_failure_error(
             plugin_name, callback_name, error, callback_error_max));
-  const uint32_t expected_outputs =
-      emlx_invoke_plugin_count_policy(
-          callback.output_count_from_attrs, attr_view, callback.output_count,
-          "output", plugin_name, callback_name, callback_error_max);
-  if (expected_outputs > kOutputsMax || outputs.size() != expected_outputs)
+  if (outputs.size() != expected_outputs)
     throw std::runtime_error("plugin callback returned the wrong output count");
   return outputs;
 }

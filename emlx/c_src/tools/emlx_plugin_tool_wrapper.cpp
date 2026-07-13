@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -8,7 +9,9 @@
 #include <limits.h>
 #include <string>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -95,6 +98,32 @@ std::string fresh_directory(const char *prefix) {
   return result;
 }
 
+struct IsolatedEnvironment {
+  std::string root;
+  std::vector<std::string> entries;
+
+  IsolatedEnvironment() = default;
+  IsolatedEnvironment(const IsolatedEnvironment &) = delete;
+  IsolatedEnvironment &operator=(const IsolatedEnvironment &) = delete;
+
+  IsolatedEnvironment(IsolatedEnvironment &&other) noexcept
+      : root(std::move(other.root)), entries(std::move(other.entries)) {
+    other.root.clear();
+  }
+
+  IsolatedEnvironment &operator=(IsolatedEnvironment &&) = delete;
+
+  void cleanup() noexcept {
+    if (root.empty())
+      return;
+    std::error_code error;
+    fs::remove_all(root, error);
+    root.clear();
+  }
+
+  ~IsolatedEnvironment() { cleanup(); }
+};
+
 bool safe_value(const char *value) {
   if (!value || !*value)
     return false;
@@ -113,20 +142,18 @@ void add_path_environment(std::vector<std::string> &environment,
   environment.emplace_back(std::string(name) + "=" + canonical.string());
 }
 
-std::vector<std::string> build_environment() {
-  std::vector<std::string> environment = {
-      "LC_ALL=C", "LANG=C", "TMPDIR=" + fresh_directory("emlx-plugin-tmp"),
-      "HOME=" + fresh_directory("emlx-plugin-home")};
+IsolatedEnvironment build_environment() {
+  std::vector<std::string> optional_entries;
 #if defined(__APPLE__)
-  add_path_environment(environment, "SDKROOT");
-  add_path_environment(environment, "DEVELOPER_DIR");
+  add_path_environment(optional_entries, "SDKROOT");
+  add_path_environment(optional_entries, "DEVELOPER_DIR");
   if (const char *target = std::getenv("MACOSX_DEPLOYMENT_TARGET");
       safe_value(target)) {
     if (!std::all_of(target, target + std::strlen(target), [](unsigned char c) {
           return (c >= '0' && c <= '9') || c == '.';
         }))
       fail("MACOSX_DEPLOYMENT_TARGET is malformed");
-    environment.emplace_back(std::string("MACOSX_DEPLOYMENT_TARGET=") + target);
+    optional_entries.emplace_back(std::string("MACOSX_DEPLOYMENT_TARGET=") + target);
   }
 #elif defined(__linux__)
   if (const char *epoch = std::getenv("SOURCE_DATE_EPOCH"); safe_value(epoch)) {
@@ -134,9 +161,28 @@ std::vector<std::string> build_environment() {
           return c >= '0' && c <= '9';
         }))
       fail("SOURCE_DATE_EPOCH is malformed");
-    environment.emplace_back(std::string("SOURCE_DATE_EPOCH=") + epoch);
+    optional_entries.emplace_back(std::string("SOURCE_DATE_EPOCH=") + epoch);
   }
 #endif
+
+  IsolatedEnvironment environment;
+  environment.root = fresh_directory("emlx-plugin-env");
+  const fs::path temporary = fs::path(environment.root) / "tmp";
+  const fs::path home = fs::path(environment.root) / "home";
+  std::error_code error;
+  if (!fs::create_directory(temporary, error) || error) {
+    environment.cleanup();
+    fail("cannot create isolated temporary directory");
+  }
+  error.clear();
+  if (!fs::create_directory(home, error) || error) {
+    environment.cleanup();
+    fail("cannot create isolated home directory");
+  }
+  environment.entries = {"LC_ALL=C", "LANG=C", "TMPDIR=" + temporary.string(),
+                         "HOME=" + home.string()};
+  environment.entries.insert(environment.entries.end(), optional_entries.begin(),
+                             optional_entries.end());
   return environment;
 }
 
@@ -195,15 +241,45 @@ int main(int argc, char **argv) {
   std::vector<char *> argument_pointers;
   std::vector<char *> environment_pointers;
   argument_pointers.reserve(arguments.size() + 1);
-  environment_pointers.reserve(environment.size() + 1);
+  environment_pointers.reserve(environment.entries.size() + 1);
   for (auto &argument : arguments)
     argument_pointers.push_back(argument.data());
   argument_pointers.push_back(nullptr);
-  for (auto &entry : environment)
+  for (auto &entry : environment.entries)
     environment_pointers.push_back(entry.data());
   environment_pointers.push_back(nullptr);
 
-  execve(canonical_real.c_str(), argument_pointers.data(),
-         environment_pointers.data());
-  fail(std::string("execve failed: ") + std::strerror(errno));
+  const pid_t child = fork();
+  if (child < 0) {
+    environment.cleanup();
+    fail(std::string("fork failed: ") + std::strerror(errno));
+  }
+  if (child == 0) {
+    execve(canonical_real.c_str(), argument_pointers.data(),
+           environment_pointers.data());
+    std::cerr << "emlx_plugin_tool_wrapper: execve failed: "
+              << std::strerror(errno) << "\n";
+    _exit(2);
+  }
+
+  int status = 0;
+  pid_t waited;
+  do {
+    waited = waitpid(child, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  if (waited < 0) {
+    environment.cleanup();
+    fail(std::string("waitpid failed: ") + std::strerror(errno));
+  }
+
+  environment.cleanup();
+  if (WIFEXITED(status))
+    return WEXITSTATUS(status);
+  if (WIFSIGNALED(status)) {
+    const int signal_number = WTERMSIG(status);
+    std::signal(signal_number, SIG_DFL);
+    if (raise(signal_number) != 0)
+      return 128 + signal_number;
+  }
+  return 2;
 }

@@ -53,3 +53,13 @@ int emlx_initialize_nif_runtime(ErlNifEnv *env,
     return fail_load("internal_error");
   }
 }
+
+int emlx_reject_nif_upgrade(ErlNifEnv *env, void **priv_data,
+                            void **old_priv_data,
+                            ERL_NIF_TERM load_info) noexcept {
+  (void)env;
+  (void)priv_data;
+  (void)old_priv_data;
+  (void)load_info;
+  return -1;
+}

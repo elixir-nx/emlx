@@ -23,9 +23,14 @@ inline constexpr uint32_t EMLX_PLUGIN_DEVICE_CPU_V1 = 1U << 0;
 inline constexpr uint32_t EMLX_PLUGIN_DEVICE_GPU_METAL_V1 = 1U << 1;
 inline constexpr uint32_t EMLX_PLUGIN_DEVICE_KNOWN_V1 =
     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1;
+inline constexpr uint32_t EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 = 8192;
+inline constexpr uint32_t EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1 = 1024;
 
 using EMLXMLXRuntimeAnchor = const char *(*)();
 
+// Views are borrowed from EMLX and remain valid only for the duration of the
+// count-policy or callback invocation that receives them. Plugins must not
+// retain the data pointer or references to its elements after that invocation.
 template <typename T> struct EMLXPluginView {
   const T *data;
   uint64_t size;
@@ -40,20 +45,32 @@ using EMLXPluginArrayView = EMLXPluginView<mlx::core::array>;
 using EMLXPluginInt64View = EMLXPluginView<int64_t>;
 
 struct EMLXPluginExecutionContext {
+  // Both pointers are borrowed for one callback invocation. They must not be
+  // retained by the plugin or used after the callback returns.
   const mlx::core::Device *device;
   const mlx::core::Stream *stream;
 };
 
 struct EMLXPluginCall {
+  // The views and execution context are borrowed for one callback invocation.
+  // Plugins must not retain pointers or references into this call.
   EMLXPluginArrayView operands;
   EMLXPluginInt64View attrs;
   const EMLXPluginExecutionContext *execution;
 };
 
+// Count policies and callbacks may run concurrently on EMLX worker threads.
+// Implementations must therefore be reentrant and thread-safe. Expected
+// failures are reported by returning false and assigning error. Exceptions
+// must not cross this ABI boundary; EMLX catches them only as a defensive last
+// resort.
 using EMLXOutputCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
                                    std::string &);
 using EMLXOperandCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
                                     std::string &);
+// The operands, attrs, execution context, outputs container, and error string
+// are owned by EMLX and may not be retained. Arrays appended to outputs keep
+// their normal MLX reference ownership after the callback returns.
 using EMLXPluginCallback = bool (*)(const EMLXPluginCall &,
                                     std::vector<mlx::core::array> &,
                                     std::string &);
@@ -90,6 +107,8 @@ struct EMLXPluginCompatibility {
 };
 
 struct EMLXPluginDescriptor {
+  // Descriptor strings, the callback table, policy functions, and callback
+  // functions must remain valid for the lifetime of the VM process.
   EMLXPluginStringView name;
   EMLXPluginCompatibility compatibility;
   EMLXMLXRuntimeAnchor mlx_runtime_anchor;

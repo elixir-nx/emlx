@@ -11,7 +11,9 @@ defmodule EMLXAxon.Qwen3.Model do
   generation sampler or configured chunk boundary.
   """
 
-  alias EMLXAxon.Qwen3.Sampler
+  alias EMLXAxon.Qwen3.{NativeChunkRunner, Sampler}
+
+  @native_chunk_limit NativeChunkRunner.max_chunk_size()
 
   @type layer ::
           {Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(),
@@ -93,8 +95,8 @@ defmodule EMLXAxon.Qwen3.Model do
   Initialise a native KV cache for dense greedy generation.
 
   This returns raw EMLX tensor refs instead of wrapping each cache buffer as an
-  `%Nx.Tensor{}`. The native greedy Qwen3 NIFs accept this shape directly.
-  Unsupported states fall back to `init_kv_cache/2`.
+  `%Nx.Tensor{}`. The Qwen3 plugin compatibility wrappers accept this shape
+  directly. Unsupported states fall back to `init_kv_cache/2`.
   """
   def init_native_kv_cache(%State{} = state, max_len) do
     if native_forward_greedy?(state) do
@@ -187,8 +189,14 @@ defmodule EMLXAxon.Qwen3.Model do
   avoiding one Elixir/NIF boundary crossing per decoded token.
   """
   def forward_greedy_chunk(input_ids, kv_cache, current_len, count, %State{} = state)
-      when is_integer(count) and count > 0 do
+      when is_integer(count) and count > 0 and count <= @native_chunk_limit do
     forward_native_greedy_chunk(input_ids, kv_cache, current_len, count, state)
+  end
+
+  def forward_greedy_chunk(_input_ids, _kv_cache, _current_len, count, %State{})
+      when is_integer(count) and count > @native_chunk_limit do
+    raise ArgumentError,
+          "a single native Qwen3 chunk supports at most #{@native_chunk_limit} tokens, got: #{count}"
   end
 
   defp forward_hidden(input_ids, kv_cache, current_len, %State{} = state) do

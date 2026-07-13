@@ -25,6 +25,20 @@ defmodule EMLX.NativeLifecycleTest do
     assert output =~ "{:status_after, {:ready, 1, 1}}"
   end
 
+  test "NIF upgrade is rejected without invalidating existing native state", context do
+    upgrade_fixture = context.fixture <> "_upgrade"
+    File.cp!(context.fixture <> ".so", upgrade_fixture <> ".so")
+
+    {output, 0} = run_upgrade_subprocess(context.fixture, upgrade_fixture, context.plugin)
+
+    assert output =~ "{:load, :ok}"
+    assert output =~ "{:registration, :ok}"
+    assert output =~ "Library upgrade-call unsuccessful (-1)"
+    assert output =~ "{:upgrade_modules, [EMLX.NativeLifecycleFixture]}"
+    assert output =~ "{:status_after, {:ready, 1, 1}}"
+    assert output =~ "{:registration_after, :ok}"
+  end
+
   test "registry-only mode leaves host state uninitialized", context do
     {output, 0} = run_subprocess(context.fixture, context.plugin, :registry_only)
 
@@ -104,6 +118,44 @@ defmodule EMLX.NativeLifecycleTest do
         IO.inspect({:status_after, EMLX.NativeLifecycleFixture.status()})
       end
     end
+    """
+
+    System.cmd(
+      System.find_executable("elixir") || raise("missing Elixir executable"),
+      ["-e", script],
+      stderr_to_stdout: true
+    )
+  end
+
+  defp run_upgrade_subprocess(fixture, upgrade_fixture, plugin) do
+    script = """
+    defmodule EMLX.NativeLifecycleFixture do
+      def load(path, mode), do: :erlang.load_nif(String.to_charlist(path), mode)
+      def status(), do: :erlang.nif_error(:not_loaded)
+      def duplicate_publication(), do: :erlang.nif_error(:not_loaded)
+      def register_plugin(_name, _path), do: :erlang.nif_error(:not_loaded)
+    end
+
+    IO.inspect({:load, EMLX.NativeLifecycleFixture.load(#{inspect(fixture)}, :normal)})
+    IO.inspect({:registration, EMLX.NativeLifecycleFixture.register_plugin("lifecycle-proof", #{inspect(plugin)})})
+    upgrade_source = ~S'''
+    defmodule EMLX.NativeLifecycleFixture do
+      @on_load :load_upgrade
+      def load_upgrade(), do: :erlang.load_nif(#{inspect(upgrade_fixture)}, :normal)
+      def status(), do: :erlang.nif_error(:not_loaded)
+      def duplicate_publication(), do: :erlang.nif_error(:not_loaded)
+      def register_plugin(_name, _path), do: :erlang.nif_error(:not_loaded)
+    end
+    '''
+
+    upgrade_modules =
+      upgrade_source
+      |> Code.compile_string()
+      |> Enum.map(&elem(&1, 0))
+
+    IO.inspect({:upgrade_modules, upgrade_modules})
+    IO.inspect({:status_after, EMLX.NativeLifecycleFixture.status()})
+    IO.inspect({:registration_after, EMLX.NativeLifecycleFixture.register_plugin("lifecycle-proof", #{inspect(plugin)})})
     """
 
     System.cmd(

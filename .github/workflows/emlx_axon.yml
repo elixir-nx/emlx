@@ -7,12 +7,34 @@ on:
     paths:
       - 'emlx/lib/**'
       - 'emlx/c_src/**'
+      - 'emlx/Makefile'
+      - 'emlx/mix_helpers/**'
       - 'emlx/mix.exs'
       - 'emlx/mix.lock'
       - 'emlx_axon/lib/**'
       - 'emlx_axon/test/**'
+      - 'emlx_axon/c_src/**'
+      - 'emlx_axon/Makefile'
+      - 'emlx_axon/mix_helpers/**'
       - 'emlx_axon/mix.exs'
       - 'emlx_axon/mix.lock'
+      - '.github/workflows/emlx_axon.yml'
+  pull_request:
+    paths:
+      - 'emlx/lib/**'
+      - 'emlx/c_src/**'
+      - 'emlx/Makefile'
+      - 'emlx/mix_helpers/**'
+      - 'emlx/mix.exs'
+      - 'emlx/mix.lock'
+      - 'emlx_axon/lib/**'
+      - 'emlx_axon/test/**'
+      - 'emlx_axon/c_src/**'
+      - 'emlx_axon/Makefile'
+      - 'emlx_axon/mix_helpers/**'
+      - 'emlx_axon/mix.exs'
+      - 'emlx_axon/mix.lock'
+      - '.github/workflows/emlx_axon.yml'
   workflow_dispatch:
 
 concurrency:
@@ -25,6 +47,9 @@ jobs:
     runs-on: macos-26
     env:
       MIX_ENV: test
+      # This workflow validates EMLX and EMLXAxon changes together. The Hex
+      # release does not contain branch-only native plugin APIs yet.
+      EMLX_AXON_LOCAL_EMLX: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +79,7 @@ jobs:
           path: |
             ${{ github.workspace }}/emlx/deps
             ${{ github.workspace }}/emlx/_build
-          key: ${{ runner.os }}-emlx-axon-emlx-${{ hashFiles('emlx/mix.lock', 'emlx/mix.exs', 'emlx/c_src/**') }}-v1
+          key: ${{ runner.os }}-emlx-axon-emlx-${{ hashFiles('emlx/mix.lock', 'emlx/mix.exs', 'emlx/Makefile', 'emlx/c_src/**', 'emlx/mix_helpers/**') }}-v2
 
       - name: Cache emlx_axon deps and build
         uses: actions/cache@v4
@@ -62,14 +87,14 @@ jobs:
           path: |
             ${{ github.workspace }}/emlx_axon/deps
             ${{ github.workspace }}/emlx_axon/_build
-          key: ${{ runner.os }}-emlx-axon-${{ hashFiles('emlx_axon/mix.lock', 'emlx_axon/mix.exs') }}-v1
+          key: ${{ runner.os }}-emlx-axon-${{ hashFiles('emlx_axon/mix.lock', 'emlx_axon/mix.exs', 'emlx_axon/Makefile', 'emlx_axon/c_src/**', 'emlx_axon/mix_helpers/**') }}-v2
 
       - name: Build EMLX
         working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           mix deps.get
-          mix compile
+          mix compile --warnings-as-errors
 
       - name: Install emlx_axon dependencies
         working-directory: emlx_axon

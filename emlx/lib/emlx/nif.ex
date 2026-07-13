@@ -12,6 +12,15 @@ defmodule EMLX.NIF do
   end
 
   @on_load :load_nifs
+  @doc """
+  Loads the EMLX native image.
+
+  EMLX deliberately rejects NIF hot upgrades because MLX arrays, command
+  queues, compiled programs, and plugin callbacks retain process-lifetime
+  native state. Upgrading EMLX therefore requires restarting the BEAM VM.
+  Stopping and starting applications without replacing the loaded EMLX native
+  image remains supported.
+  """
   def load_nifs do
     path = :filename.join(:code.priv_dir(:emlx), ~c"libemlx")
     :erlang.load_nif(path, 0)
@@ -337,13 +346,13 @@ defmodule EMLX.NIF do
   end
 
   # load_plugin — `dlopen`s a standalone, name-keyed native plugin (no
-  # erl_nif dependency) and caches its vtable under `name` (see
-  # emlx_plugin_registry.hpp). Callers that decode/dispatch into a
-  # specific plugin's ABI (e.g. `qwen3_*` NIFs above, which fetch the
-  # "qwen3" plugin) error with `{:error, _}` until this has been called
-  # successfully for that name — for qwen3, see `EMLXAxon.Application`,
-  # which calls it eagerly at boot. Not worker-routed (no argv[0] worker
-  # ref): `dlopen` does no MLX graph work.
+  # erl_nif dependency), validates its generic descriptor, and publishes its
+  # callback map in the process-lifetime registry (see
+  # emlx_plugin_registry.hpp). `load_plugin/2` is the compatibility/expert form
+  # without an expected build identity. Packaged plugins use `load_plugin/3` so
+  # stale artifacts are rejected. Native calls fail until their plugin has been
+  # registered — for qwen3, `EMLXAxon.Application` loads it at boot. Loading is
+  # not worker-routed because `dlopen` performs no MLX graph work.
   def load_plugin(_name, _path) do
     :erlang.nif_error(:nif_not_loaded)
   end

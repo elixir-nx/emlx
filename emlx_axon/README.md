@@ -17,6 +17,22 @@ def deps do
 end
 ```
 
+## Development and release sequencing
+
+The monorepo CI sets `EMLX_AXON_LOCAL_EMLX=true` so EMLXAxon is compiled and
+tested against the sibling EMLX source tree. This is required while the generic
+plugin ABI is newer than the latest published EMLX package.
+
+Before publishing the matching EMLXAxon release, EMLX must first release the
+plugin ABI and build support used here. The EMLXAxon dependency lower bound can
+then be updated to that released version. The package already includes its
+plugin C++ source, Makefile, dependency policy, and Mix build helpers.
+
+EMLX native images do not support hot NIF upgrades because native tensors,
+command queues, compiled programs, and plugin callbacks retain VM lifetime
+state. Upgrade EMLX by restarting the BEAM VM. Stopping and starting
+`:emlx_axon` without replacing the EMLX native image is supported.
+
 ## Model download
 
 The examples and tests that run inference require local model checkpoints downloaded from HuggingFace.

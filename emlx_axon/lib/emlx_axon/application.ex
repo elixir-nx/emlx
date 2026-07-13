@@ -4,10 +4,11 @@ defmodule EMLXAxon.Application do
 
   Eagerly loads the standalone qwen3 compute plugin (`c_src/qwen3_plugin.cpp`,
   built as `priv/libemlx_qwen3.so`) into emlx's generic native plugin
-  registry via `EMLX.NIF.load_plugin/3`. Every `EMLX.Native.Qwen3.*` NIF
-  errors with `{:error, _}` until this has run — since `:emlx` is a
-  dependency of `:emlx_axon`, OTP starts it first, so `EMLX.NIF.load_plugin/3`
-  is always available by the time this runs.
+  registry via `EMLX.NIF.load_plugin/3`. The operations in
+  `EMLXAxon.Qwen3.Native` and the direct `EMLX.Native.Qwen3` compatibility
+  wrappers cannot dispatch until this has run. Since `:emlx` is a dependency
+  of `:emlx_axon`, OTP starts it first, so `EMLX.NIF.load_plugin/3` is
+  available by the time this runs.
   """
 
   use Application

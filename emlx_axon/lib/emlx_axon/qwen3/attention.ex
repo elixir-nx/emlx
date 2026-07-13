@@ -7,11 +7,12 @@ defmodule EMLXAxon.Qwen3.Attention do
   the cache without an extra transpose, and feeds directly into
   `EMLX.Fast.scaled_dot_product_attention` which expects `{B, N, T, D}`.
 
-  `forward/12` delegates to the native `EMLX.Native.Qwen3.kv_cache_attention`/
-  `attention_block` NIFs (`qwen3_plugin.cpp`), which transpose Q/K to
-  `{B, N, T, D}` and apply RoPE internally via `mlx::core::fast::rope`
-  (single Metal shader, no precomputed cos/sin needed) before the fused
-  cache-update + SDPA. The `offset` is the current cache fill length.
+  `forward/12` delegates to `EMLXAxon.Qwen3.Native` operations backed by the
+  Qwen3 plugin callbacks in `qwen3_plugin.cpp`. They transpose Q/K to
+  `{B, N, T, D}` and apply RoPE internally via `mlx::core::fast::rope` before
+  the fused cache update and SDPA. The `offset` is the current cache fill
+  length. `EMLX.Native.Qwen3` remains the compatibility wrapper for direct
+  eager callers.
   """
 
   alias EMLXAxon.Qwen3.Layers
@@ -120,7 +121,7 @@ defmodule EMLXAxon.Qwen3.Attention do
 
     # Fused Q/K transpose + RoPE + cache update + SDPA.
     #
-    # The NIF move-extracts k_cache / v_cache from their ENIF resources before
+    # The plugin callback updates k_cache / v_cache before
     # slice_update, enabling MLX's donation optimisation at eval time: the
     # existing 4 MB Metal buffer is reused in-place — no new allocation needed.
     # The slice and SDPA are fused in the same lazy graph, so they land in one

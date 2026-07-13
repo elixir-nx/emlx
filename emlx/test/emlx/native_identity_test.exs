@@ -95,6 +95,21 @@ defmodule EMLX.NativeIdentityTest do
     refute run!(context.tool, ["mlx-headers", List.last(roots)]) == first
   end
 
+  test "generated identity artifacts preserve their inode when content is unchanged", context do
+    output = Path.join(context.temporary, "content-aware/generated.hpp")
+    first_id = String.duplicate("1", 64)
+    second_id = String.duplicate("2", 64)
+
+    assert run!(context.tool, ["write-id-header", output, "GENERATED_ID", first_id]) == ""
+    first_inode = File.stat!(output).inode
+
+    assert run!(context.tool, ["write-id-header", output, "GENERATED_ID", first_id]) == ""
+    assert File.stat!(output).inode == first_inode
+
+    assert run!(context.tool, ["write-id-header", output, "GENERATED_ID", second_id]) == ""
+    refute File.stat!(output).inode == first_inode
+  end
+
   test "host depfile gate parses Make escaping and publishes atomically", context do
     root = Path.join(context.temporary, "dep root")
     mlx_root = Path.join(root, "selected include")

@@ -27,6 +27,11 @@ inline constexpr char kEmptyError[] = "empty_error";
 inline constexpr char kThrowAfterOutput[] = "throw_after_output";
 inline constexpr char kUnknownThrowAfterOutput[] = "unknown_throw_after_output";
 inline constexpr char kWrongOutputCount[] = "wrong_output_count";
+inline constexpr char kOversizedOperandPolicy[] = "oversized_operand_policy";
+inline constexpr char kOversizedOutputPolicy[] = "oversized_output_policy";
+inline constexpr char kZeroOperandPolicy[] = "zero_operand_policy";
+inline constexpr char kZeroOutputPolicy[] = "zero_output_policy";
+inline constexpr char kDynamicCounts[] = "dynamic_counts";
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_NAME)
 inline constexpr char kPrimaryCallbackName[] = "invalid/name";
 #else
@@ -151,6 +156,34 @@ bool throwing_output_policy(EMLXPluginInt64View, uint32_t &,
   throw std::runtime_error("intentional output policy exception");
 }
 
+bool oversized_operand_policy(EMLXPluginInt64View, uint32_t &count,
+                               std::string &) {
+  count = EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 + 1;
+  return true;
+}
+
+bool oversized_output_policy(EMLXPluginInt64View, uint32_t &count,
+                              std::string &) {
+  count = EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1 + 1;
+  return true;
+}
+
+bool zero_count_policy(EMLXPluginInt64View, uint32_t &count, std::string &) {
+  count = 0;
+  return true;
+}
+
+bool one_count_policy(EMLXPluginInt64View, uint32_t &count, std::string &) {
+  count = 1;
+  return true;
+}
+
+bool callback_must_not_run(const EMLXPluginCall &,
+                           std::vector<mlx::core::array> &,
+                           std::string &) {
+  throw std::runtime_error("oversized policy callback ran");
+}
+
 constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
 #if defined(EMLX_FIXTURE_NULL_CALLBACK)
     {string_view(kPrimaryCallbackName), 1, 1, 1, nullptr, 1, nullptr,
@@ -227,6 +260,24 @@ constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
     {string_view(kWrongOutputCount), 1, 1, 1, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
      wrong_output_count, {nullptr, 0}},
+    {string_view(kOversizedOperandPolicy), 1, 1, 0,
+     oversized_operand_policy, 1, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     callback_must_not_run, {nullptr, 0}},
+    {string_view(kOversizedOutputPolicy), 1, 1, 1, nullptr, 0,
+     oversized_output_policy,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     callback_must_not_run, {nullptr, 0}},
+    {string_view(kZeroOperandPolicy), 1, 1, 0, zero_count_policy, 1, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     callback_must_not_run, {nullptr, 0}},
+    {string_view(kZeroOutputPolicy), 1, 1, 1, nullptr, 0, zero_count_policy,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     callback_must_not_run, {nullptr, 0}},
+    {string_view(kDynamicCounts), 1, 1, 0, one_count_policy, 0,
+     one_count_policy,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add,
+     {nullptr, 0}},
 };
 
 #if defined(EMLX_FIXTURE_MISALIGNED_CALLBACKS)

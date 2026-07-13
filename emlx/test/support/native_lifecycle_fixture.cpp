@@ -70,4 +70,4 @@ ErlNifFunc functions[] = {{"status", 0, status},
 } // namespace
 
 ERL_NIF_INIT(Elixir.EMLX.NativeLifecycleFixture, functions, load, nullptr,
-             nullptr, nullptr)
+             emlx_reject_nif_upgrade, nullptr)

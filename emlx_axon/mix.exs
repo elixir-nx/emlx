@@ -1,3 +1,5 @@
+Code.require_file("mix_helpers/compiler_probe.exs", __DIR__)
+
 defmodule EMLXAxon.MixProject do
   use Mix.Project
 
@@ -24,17 +26,11 @@ defmodule EMLXAxon.MixProject do
       # deferral in its mix.exs.
       make_env: fn ->
         emlx_priv_dir = Application.app_dir(:emlx, "priv")
+        EMLXAxon.Mix.CompilerProbe.ensure_plugin_build_support!(emlx_priv_dir)
         emlx_source_dir = Mix.Project.deps_paths()[:emlx]
         compiler = System.get_env("CXX") || "c++"
         real_compiler = System.find_executable(compiler) || Mix.raise("cannot find C++ compiler")
-        {compiler_version, 0} = System.cmd(real_compiler, ["--version"], stderr_to_stdout: true)
-
-        compiler_family =
-          cond do
-            String.contains?(compiler_version, "clang") -> "clang"
-            String.contains?(compiler_version, "GCC") -> "gcc"
-            true -> Mix.raise("unsupported C++ compiler for the native plugin")
-          end
+        compiler_family = EMLXAxon.Mix.CompilerProbe.detect!(real_compiler)
 
         %{
           "MLX_INCLUDE_DIR" => Path.join(emlx_priv_dir, "mlx/include"),
@@ -70,6 +66,10 @@ defmodule EMLXAxon.MixProject do
     if System.get_env("EMLX_AXON_LOCAL_EMLX") == "true" do
       {:emlx, path: "../emlx", override: true}
     else
+      # Release sequencing: this source tree needs the generic plugin ABI added
+      # after v0.4.0. Keep the Hex requirement publishable until the maintainer
+      # assigns and releases that EMLX version, then raise this lower bound before
+      # publishing the matching EMLXAxon release.
       {:emlx, "~> 0.4.0"}
     end
   end
@@ -95,6 +95,7 @@ defmodule EMLXAxon.MixProject do
 
   defp package do
     [
+      files: ~w(lib c_src mix_helpers .formatter.exs mix.exs README.md LICENSE Makefile),
       links: %{"GitHub" => @source_url},
       licenses: ["Apache-2.0"],
       maintainers: ["Paulo Valente"]

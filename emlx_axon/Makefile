@@ -57,7 +57,6 @@ $(call esc,$(QWEN3_MLX_ID_HEADER)): $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx_
 
 $(call esc,$(SCAN_BUILD_ID_HEADER)): $(call esc,$(QWEN3_MLX_ID_HEADER)) FORCE
 	@ rm -rf "$(SCAN_DIR)"
-	@ rm -f "$(QWEN3_BUILD_ID_HEADER)" "$(QWEN3_BUILD_ID_FILE)" "$(VERIFY_STAMP)"
 	@ mkdir -p "$(SCAN_INCLUDE_DIR)"
 	"$(EMLX_BUILD_ID_TOOL)" write-id-header "$@" EMLX_QWEN3_PLUGIN_BUILD_ID 0000000000000000000000000000000000000000000000000000000000000000
 
@@ -80,9 +79,10 @@ $(call esc,$(FINAL_OBJ_DIR))/%.o: $(call esc,$(FINAL_DEP_DIR))/%.d $(PLUGIN_INSP
 	@ test -f "$@"
 	@ "$(PLUGIN_INSPECTOR)" object "$@"
 
-$(call esc,$(VERIFY_STAMP)): $(SCAN_DEPFILES) $(FINAL_DEPFILES) $(call esc,$(QWEN3_BUILD_ID_HEADER))
+$(call esc,$(VERIFY_STAMP)): $(SCAN_DEPFILES) $(FINAL_DEPFILES) $(call esc,$(QWEN3_BUILD_ID_HEADER)) $(call esc,$(QWEN3_BUILD_ID_FILE))
 	"$(EMLX_BUILD_ID_TOOL)" verify-plugin-deps "$(MLX_INCLUDE_DIR)" "$(SCAN_BUILD_ID_HEADER)" "$(QWEN3_BUILD_ID_HEADER)" $(PLUGIN_VERIFY_ARGS)
-	@ touch "$@"
+	@ build_id=$$(tr -d '\n' < "$(QWEN3_BUILD_ID_FILE)"); \
+	  "$(EMLX_BUILD_ID_TOOL)" write-id-header "$@" EMLX_QWEN3_VERIFIED_BUILD_ID "$$build_id"
 
 $(call esc,$(QWEN3_SO)): $(call esc,$(PRIV_DIR)) $(OBJECTS) $(call esc,$(VERIFY_STAMP)) $(call esc,$(QWEN3_BUILD_ID_FILE))
 	@ mkdir -p "$(PRIV_DIR)/mlx/lib"

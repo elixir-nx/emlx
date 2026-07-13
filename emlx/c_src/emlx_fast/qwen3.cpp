@@ -593,6 +593,31 @@ static void qwen3_split_forward_outputs(
   }
 }
 
+static void qwen3_split_chunk_outputs(
+    std::vector<mlx::core::array> &outputs, size_t token_count,
+    size_t layer_count, const mlx::core::Device &device,
+    std::vector<mlx::core::array> &tokens,
+    std::vector<mlx::core::array> &keys, std::vector<mlx::core::array> &values) {
+  if (outputs.size() != 1 + layer_count * 2)
+    throw std::runtime_error("qwen3 plugin returned the wrong chunk output count");
+  if (outputs[0].ndim() != 1 || outputs[0].shape(0) != token_count)
+    throw std::runtime_error("qwen3 plugin returned the wrong chunk token shape");
+
+  auto stacked_tokens = std::move(outputs[0]);
+  tokens.reserve(token_count);
+  keys.reserve(layer_count);
+  values.reserve(layer_count);
+  for (size_t index = 0; index < token_count; ++index) {
+    tokens.push_back(mlx::core::slice(
+        stacked_tokens, {static_cast<int>(index)},
+        {static_cast<int>(index + 1)}, device));
+  }
+  for (size_t index = 0; index < layer_count; ++index) {
+    keys.push_back(std::move(outputs[1 + index * 2]));
+    values.push_back(std::move(outputs[1 + index * 2 + 1]));
+  }
+}
+
 static int64_t qwen3_token_to_host(mlx::core::array token,
                                    const mlx::core::Device &device) {
   token = mlx::core::astype(token, mlx::core::int64, device);
@@ -762,8 +787,8 @@ NIF(qwen3_forward_greedy_ids_chunk) {
          qwen3_f64_bits(eps)},
         device);
     std::vector<mlx::core::array> token_out, k_out, v_out;
-    qwen3_split_forward_outputs(outputs, static_cast<size_t>(count), layer_count,
-                                token_out, k_out, v_out);
+    qwen3_split_chunk_outputs(outputs, static_cast<size_t>(count), layer_count,
+                              device, token_out, k_out, v_out);
 
     std::vector<ERL_NIF_TERM> token_terms;
     token_terms.reserve(token_out.size());
@@ -1131,8 +1156,8 @@ NIF(qwen3_forward_greedy_ids_chunk_quantized) {
     auto outputs = emlx_invoke_plugin_callback(
         "qwen3", "forward_greedy_chunk_generalized", operands, attrs, device);
     std::vector<mlx::core::array> token_out, k_out, v_out;
-    qwen3_split_forward_outputs(outputs, static_cast<size_t>(count),
-                                layer_count, token_out, k_out, v_out);
+    qwen3_split_chunk_outputs(outputs, static_cast<size_t>(count), layer_count,
+                              device, token_out, k_out, v_out);
 
     std::vector<ERL_NIF_TERM> token_terms;
     token_terms.reserve(token_out.size());

@@ -314,6 +314,79 @@ defmodule EMLXAxon.PluginMetadataTest do
     assert_all_close(Proof.scale_add(input, 2.0, 1.0), Nx.tensor([3.0, 5.0]))
   end
 
+  test "eager dispatch rejects oversized dynamic counts before callback execution" do
+    input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+
+    operand_error =
+      assert_raise EMLX.NIFError, fn ->
+        Proof.operation(input, "oversized_operand_policy")
+      end
+
+    assert operand_error.message =~ "operand count mismatch"
+    refute operand_error.message =~ "callback ran"
+
+    output_error =
+      assert_raise EMLX.NIFError, fn ->
+        Proof.operation(input, "oversized_output_policy")
+      end
+
+    assert output_error.message =~ "output count exceeds its limit"
+    refute output_error.message =~ "callback ran"
+    assert_all_close(Proof.scale_add(input, 2.0, 1.0), Nx.tensor([3.0, 5.0]))
+  end
+
+  test "eager dispatch rejects zero dynamic counts before callback execution" do
+    input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+
+    for {callback, kind} <- [
+          {"zero_operand_policy", "operand"},
+          {"zero_output_policy", "output"}
+        ] do
+      error =
+        assert_raise EMLX.NIFError, fn ->
+          Proof.operation(input, callback)
+        end
+
+      assert error.message =~ "derived zero #{kind} count"
+      refute error.message =~ "callback ran"
+      assert_all_close(input, Nx.tensor([1.0, 2.0]))
+      assert_all_close(Proof.scale_add(input, 2.0, 1.0), Nx.tensor([3.0, 5.0]))
+    end
+  end
+
+  test "compiled dispatch rejects zero dynamic counts before callback execution" do
+    input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+
+    for {callback, kind} <- [
+          {"zero_operand_policy", "operand"},
+          {"zero_output_policy", "output"}
+        ] do
+      error =
+        assert_raise EMLX.NIFError, fn ->
+          Nx.Defn.jit(fn value -> Proof.operation(value, callback) end, compiler: EMLX).(input)
+        end
+
+      assert error.message =~ "derived zero #{kind} count"
+      refute error.message =~ "callback ran"
+      assert_all_close(input, Nx.tensor([1.0, 2.0]))
+      assert_all_close(Proof.scale_add(input, 2.0, 1.0), Nx.tensor([3.0, 5.0]))
+    end
+  end
+
+  test "positive dynamic counts work eagerly and under the EMLX compiler" do
+    input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+
+    eager = Proof.operation(input, "dynamic_counts")
+
+    compiled =
+      Nx.Defn.jit(fn value -> Proof.operation(value, "dynamic_counts") end, compiler: EMLX).(
+        input
+      )
+
+    assert_all_close(eager, Nx.tensor([3.0, 5.0]))
+    assert_all_close(compiled, Nx.tensor([3.0, 5.0]))
+  end
+
   test "callback errors are bounded UTF-8 and identify empty failures" do
     input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
 

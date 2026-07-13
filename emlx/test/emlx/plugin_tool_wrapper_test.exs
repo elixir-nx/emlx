@@ -73,8 +73,8 @@ defmodule EMLX.PluginToolWrapperTest do
     environment = File.read!(env_file)
     assert environment =~ "LC_ALL=C\n"
     assert environment =~ "LANG=C\n"
-    assert environment =~ "TMPDIR=/tmp/emlx-plugin-tmp."
-    assert environment =~ "HOME=/tmp/emlx-plugin-home."
+    assert environment =~ ~r{TMPDIR=/tmp/emlx-plugin-env\.[^/]+/tmp\n}
+    assert environment =~ ~r{HOME=/tmp/emlx-plugin-env\.[^/]+/home\n}
     refute environment =~ "PATH="
     refute environment =~ "CPATH="
     refute environment =~ "CPLUS_INCLUDE_PATH="
@@ -82,6 +82,41 @@ defmodule EMLX.PluginToolWrapperTest do
     refute environment =~ "CXXFLAGS="
     refute environment =~ "LD_PRELOAD="
     refute environment =~ "UNLISTED_PLUGIN_TEST="
+    assert_isolated_environment_removed(environment)
+  end
+
+  test "removes the isolated environment after a tool failure", context do
+    args_file = Path.join(context.temporary, "failure-arguments")
+    env_file = Path.join(context.temporary, "failure-environment")
+    tool = fake_tool!(context.temporary, "failing tool", "exit 23")
+
+    {_output, status} =
+      System.cmd(
+        context.wrapper,
+        wrapper_args("compiler", "compile", tool, [args_file, env_file]),
+        stderr_to_stdout: true
+      )
+
+    assert status == 23
+    env = File.read!(env_file)
+    assert_isolated_environment_removed(env)
+  end
+
+  test "removes the isolated environment before propagating a tool signal", context do
+    args_file = Path.join(context.temporary, "signal-arguments")
+    env_file = Path.join(context.temporary, "signal-environment")
+    tool = fake_tool!(context.temporary, "signaled tool", "kill -TERM $$")
+
+    {_output, status} =
+      System.cmd(
+        context.wrapper,
+        wrapper_args("compiler", "compile", tool, [args_file, env_file]),
+        stderr_to_stdout: true
+      )
+
+    assert status == 128 + 15
+    env = File.read!(env_file)
+    assert_isolated_environment_removed(env)
   end
 
   test "rejects response files and LTO before invoking the real tool", context do
@@ -128,5 +163,35 @@ defmodule EMLX.PluginToolWrapperTest do
 
   defp wrapper_args(role, mode, real, arguments) do
     ["--role", role, "--mode", mode, "--real", real, "--" | arguments]
+  end
+
+  defp fake_tool!(temporary, name, final_command) do
+    path = Path.join(temporary, name)
+
+    File.write!(
+      path,
+      "#!/bin/sh\n" <>
+        "args_file=\"$1\"\n" <>
+        "env_file=\"$2\"\n" <>
+        "/usr/bin/env > \"$env_file\"\n" <>
+        final_command <> "\n"
+    )
+
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp assert_isolated_environment_removed(environment) do
+    values =
+      environment
+      |> String.split("\n", trim: true)
+      |> Map.new(fn entry ->
+        [name, value] = String.split(entry, "=", parts: 2)
+        {name, value}
+      end)
+
+    refute File.exists?(values["TMPDIR"])
+    refute File.exists?(values["HOME"])
+    refute File.exists?(Path.dirname(values["TMPDIR"]))
   end
 end

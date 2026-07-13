@@ -2067,7 +2067,8 @@ static void resolve_plugin_instruction(Instruction &instr) {
       attr_schema <= 0 || attr_schema > UINT32_MAX ||
       static_cast<uint32_t>(attr_schema) != callback.attr_schema_version)
     throw std::runtime_error("emlx::native: plugin callback schema mismatch");
-  if (output_count < 0 || output_count > 1024)
+  if (output_count < 0 ||
+      output_count > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1)
     throw std::runtime_error("emlx::native: plugin output count exceeds its limit");
 
   size_t cursor = 6;
@@ -2118,6 +2119,10 @@ static void resolve_plugin_instruction(Instruction &instr) {
   }
   if (instr.operands.size() != expected_operands)
     throw std::runtime_error("emlx::native: plugin operand count mismatch");
+  if (expected_operands > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1)
+    throw std::runtime_error("emlx::native: plugin operand count exceeds its limit");
+  if (expected_outputs > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1)
+    throw std::runtime_error("emlx::native: plugin output count exceeds its limit");
   if (templates.size() != expected_outputs)
     throw std::runtime_error("emlx::native: plugin output count mismatch");
 

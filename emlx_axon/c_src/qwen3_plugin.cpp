@@ -1384,6 +1384,17 @@ inline constexpr char kForwardDenseName[] = "forward_greedy_dense";
 inline constexpr char kChunkDenseName[] = "forward_greedy_chunk_dense";
 inline constexpr char kChunkGeneralizedName[] =
     "forward_greedy_chunk_generalized";
+inline constexpr int64_t kMaxLayerCount = 256;
+inline constexpr int64_t kMaxChunkTokenCount = 4096;
+inline constexpr uint32_t kMaxDenseChunkOperands =
+    4U + static_cast<uint32_t>(kMaxLayerCount) * 13U;
+inline constexpr uint32_t kMaxGeneralizedChunkOperands =
+    2U + static_cast<uint32_t>(kMaxLayerCount) * (6U + 7U * 3U) + 1U + 3U;
+inline constexpr uint32_t kMaxChunkOutputs =
+    1U + static_cast<uint32_t>(kMaxLayerCount) * 2U;
+static_assert(kMaxDenseChunkOperands <= EMLX_PLUGIN_OPERAND_COUNT_MAX_V1);
+static_assert(kMaxGeneralizedChunkOperands <= EMLX_PLUGIN_OPERAND_COUNT_MAX_V1);
+static_assert(kMaxChunkOutputs <= EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1);
 static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_COMPILER_FAMILY,
                                        EMLX_EXPECTED_COMPILER_FAMILY));
 static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_COMPILER_MAJOR,
@@ -1560,7 +1571,7 @@ bool generalized_chunk_operand_count(EMLXPluginInt64View attrs,
                                      uint32_t &count,
                                      std::string &error) {
   if (attrs.size < 9 || attrs.data[0] != 1 || attrs.data[1] <= 0 ||
-      attrs.data[1] > 256 || attrs.data[8] != attrs.data[1] * 7 + 1 ||
+      attrs.data[1] > kMaxLayerCount || attrs.data[8] != attrs.data[1] * 7 + 1 ||
       attrs.data[8] > 1793 ||
       attrs.size != 9 + static_cast<uint64_t>(attrs.data[8]) *
                             kLinearDescriptorWidth) {
@@ -1593,13 +1604,12 @@ bool generalized_chunk_output_count(EMLXPluginInt64View attrs,
                                     std::string &error) {
   uint32_t ignored_operands = 0;
   if (!generalized_chunk_operand_count(attrs, ignored_operands, error) ||
-      attrs.data[3] <= 0 || attrs.data[3] > 4096) {
+      attrs.data[3] <= 0 || attrs.data[3] > kMaxChunkTokenCount) {
     if (error.empty())
       error = "generalized chunk has an invalid token count";
     return false;
   }
-  count = static_cast<uint32_t>(attrs.data[3]) +
-          static_cast<uint32_t>(attrs.data[1]) * 2U;
+  count = 1U + static_cast<uint32_t>(attrs.data[1]) * 2U;
   return true;
 }
 
@@ -1905,7 +1915,7 @@ bool plugin_final_greedy(const EMLXPluginCall &call,
 
 bool dense_forward_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
                                  std::string &error) {
-  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > 256) {
+  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
     error = "dense forward attributes have an invalid layer count";
     return false;
   }
@@ -1915,7 +1925,7 @@ bool dense_forward_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
 
 bool dense_forward_output_count(EMLXPluginInt64View attrs, uint32_t &count,
                                 std::string &error) {
-  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > 256) {
+  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
     error = "dense forward attributes have an invalid layer count";
     return false;
   }
@@ -1925,7 +1935,7 @@ bool dense_forward_output_count(EMLXPluginInt64View attrs, uint32_t &count,
 
 bool dense_chunk_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
                                std::string &error) {
-  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > 256) {
+  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
     error = "dense chunk attributes have an invalid layer count";
     return false;
   }
@@ -1935,13 +1945,12 @@ bool dense_chunk_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
 
 bool dense_chunk_output_count(EMLXPluginInt64View attrs, uint32_t &count,
                               std::string &error) {
-  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > 256 ||
-      attrs.data[2] <= 0 || attrs.data[2] > 4096) {
+  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
+      attrs.data[2] <= 0 || attrs.data[2] > kMaxChunkTokenCount) {
     error = "dense chunk attributes have an invalid layer or token count";
     return false;
   }
-  count = static_cast<uint32_t>(attrs.data[2]) +
-          static_cast<uint32_t>(attrs.data[0]) * 2U;
+  count = 1U + static_cast<uint32_t>(attrs.data[0]) * 2U;
   return true;
 }
 
@@ -2039,8 +2048,9 @@ bool plugin_chunk_dense(const EMLXPluginCall &call,
           keys, values, error))
     return false;
   outputs.reserve(expected_outputs);
-  for (auto &token : tokens)
-    outputs.push_back(std::move(token));
+  outputs.push_back(mlx::core::reshape(
+      mlx::core::stack(tokens, 0, *call.execution->device), {count},
+      *call.execution->device));
   for (size_t index = 0; index < keys.size(); ++index) {
     outputs.push_back(std::move(keys[index]));
     outputs.push_back(std::move(values[index]));
@@ -2125,8 +2135,9 @@ bool plugin_chunk_generalized(const EMLXPluginCall &call,
           keys, values, error))
     return false;
   outputs.reserve(expected_outputs);
-  for (auto &token : tokens)
-    outputs.push_back(std::move(token));
+  outputs.push_back(mlx::core::reshape(
+      mlx::core::stack(tokens, 0, *call.execution->device), {count},
+      *call.execution->device));
   for (size_t index = 0; index < keys.size(); ++index) {
     outputs.push_back(std::move(keys[index]));
     outputs.push_back(std::move(values[index]));

@@ -7,7 +7,10 @@ esc = $(subst $(space),\$(space),$(1))
 
 # Private configuration
 PRIV_DIR = $(MIX_APP_PATH)/priv
-BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)/objs
+ifeq ($(strip $(EMLX_SOURCE_CACHE_ID)),)
+$(error EMLX_SOURCE_CACHE_ID is required)
+endif
+BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)-source-$(EMLX_SOURCE_CACHE_ID)/objs
 EMLX_SO = $(PRIV_DIR)/libemlx.so
 EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
 # Headers are copied alongside the lib (unlike the lib copy, these are not
@@ -82,15 +85,15 @@ $(call esc,$(PRIV_DIR)):
 	@ mkdir -p "$(PRIV_DIR)"
 
 $(call esc,$(EMLX_BUILD_ID_TOOL)): c_src/tools/emlx_build_identity.cpp c_src/emlx_sha256.cpp c_src/emlx_sha256.hpp c_src/emlx_depfile.cpp c_src/emlx_depfile.hpp c_src/emlx_plugin_toolchain.hpp
-	@ mkdir -p "$(dir $@)"
+	@ mkdir -p "$(BUILD_DIR)/tools"
 	$(CXX) -std=c++20 -O2 -I c_src c_src/tools/emlx_build_identity.cpp c_src/emlx_sha256.cpp c_src/emlx_depfile.cpp -o "$@"
 
 $(call esc,$(EMLX_PACKAGED_BUILD_ID_TOOL)): $(call esc,$(EMLX_BUILD_ID_TOOL))
-	@ mkdir -p "$(dir $@)"
+	@ mkdir -p "$(PRIV_DIR)/build_support"
 	@ cp "$<" "$@"
 
 $(call esc,$(EMLX_PLUGIN_TOOL_WRAPPER)): c_src/tools/emlx_plugin_tool_wrapper.cpp
-	@ mkdir -p "$(dir $@)"
+	@ mkdir -p "$(PRIV_DIR)/build_support"
 	$(CXX) -std=c++20 -O2 c_src/tools/emlx_plugin_tool_wrapper.cpp -o "$@"
 
 $(call esc,$(EMLX_PLUGIN_ABI_HEADER)): c_src/emlx_plugin_abi.hpp
@@ -107,7 +110,7 @@ $(call esc,$(EMLX_STAGED_COMPAT_HEADER)): $(call esc,$(MLX_SO)) $(call esc,$(EML
 
 $(call esc,$(EMLX_DEPFILE_DIR))/%.d: c_src/%.cpp $(HEADERS) $(call esc,$(EMLX_STAGED_COMPAT_HEADER))
 	@ mkdir -p "$(BUILD_DIR)/$(dir $*)"
-	@ mkdir -p "$(dir $@)"
+	@ mkdir -p "$(EMLX_DEPFILE_DIR)/$(dir $*)"
 	$(CXX) -I"$(EMLX_STAGING_DIR)" $(CFLAGS) -include "$(EMLX_STAGED_COMPAT_HEADER)" -MD -MF "$@" -MT "$<" -c "$<" -o "$(BUILD_DIR)/$*.o"
 
 $(call esc,$(BUILD_DIR))/%.o: $(call esc,$(EMLX_DEPFILE_DIR))/%.d
@@ -164,6 +167,9 @@ clean:
 	rm -rf "$(PRIV_DIR)"
 	rm -rf "$(BUILD_DIR)"
 
+print-build-dir:
+	@ printf '%s\n' "$(BUILD_DIR)"
+
 FORCE:
 
-.PHONY: all clean FORCE
+.PHONY: all clean print-build-dir FORCE

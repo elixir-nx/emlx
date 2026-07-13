@@ -110,7 +110,50 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     assert end_sync == per_token
   end
 
-  test "generation stops when any token in eos_token_id list is emitted" do
+  test "end host sync subdivides more than 4096 generalized decode tokens" do
+    {:ok, state} =
+      DenseLoader.from_model_info(%{
+        params: %Axon.ModelState{data: params()},
+        spec: spec()
+      })
+
+    state = %{
+      state
+      | config:
+          state.config
+          |> Map.put(:dense_layers?, false)
+          |> Map.put(:eos_token_id, -1)
+    }
+
+    input_ids =
+      Nx.tensor([[1]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    parent = self()
+    runner = fake_native_chunk_runner(parent, :generalized)
+
+    {tokens, metadata} =
+      Generate.generate_with_native_chunk_runner(
+        input_ids,
+        state,
+        [
+          max_new_tokens: 4098,
+          max_len: 4098,
+          sampler: :greedy,
+          host_sync: :end,
+          profile_timing: false
+        ],
+        runner
+      )
+
+    assert length(tokens) == 4098
+    assert metadata.finish_reason == :length
+    assert_receive {:native_chunk, :generalized, 1, 4096}
+    assert_receive {:native_chunk, :generalized, 4097, 1}
+    refute_receive {:native_chunk, :generalized, _, _}
+  end
+
+  test "per-token and end host sync stop when any EOS token is emitted" do
     {:ok, state} =
       DenseLoader.from_model_info(%{
         params: %Axon.ModelState{data: params()},
@@ -132,17 +175,19 @@ defmodule EMLXAxon.Qwen3GenerateTest do
 
     state = %{state | config: %{state.config | eos_token_id: [first_token, 151_645]}}
 
-    {tokens, metadata} =
-      Generate.generate(input_ids, state,
-        max_new_tokens: 5,
-        max_len: 8,
-        sampler: :greedy,
-        host_sync: :per_token,
-        profile_timing: false
-      )
+    for host_sync <- [:per_token, :end] do
+      {tokens, metadata} =
+        Generate.generate(input_ids, state,
+          max_new_tokens: 5,
+          max_len: 8,
+          sampler: :greedy,
+          host_sync: host_sync,
+          profile_timing: false
+        )
 
-    assert tokens == [first_token]
-    assert metadata.finish_reason == :stop
+      assert tokens == [first_token]
+      assert metadata.finish_reason == :stop
+    end
   end
 
   test "end host sync falls back to sync after each token when streaming callback is configured" do
@@ -211,25 +256,117 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       Nx.tensor([[1, 2]], type: :s64)
       |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
 
-    {per_token, _metadata} =
+    {per_token, per_token_metadata} =
       Generate.generate(input_ids, state,
         max_new_tokens: 5,
         max_len: 8,
         sampler: :greedy,
         host_sync: :per_token,
-        profile_timing: false
+        profile_timing: false,
+        return_kv_cache: true
       )
 
-    {chunked, _metadata} =
+    {chunked, chunked_metadata} =
       Generate.generate(input_ids, state,
         max_new_tokens: 5,
         max_len: 8,
         sampler: :greedy,
         host_sync: {:chunk, 2},
-        profile_timing: false
+        profile_timing: false,
+        return_kv_cache: true
       )
 
     assert chunked == per_token
+
+    Enum.zip(per_token_metadata.kv_cache, chunked_metadata.kv_cache)
+    |> Enum.each(fn {{per_token_k, per_token_v}, {chunked_k, chunked_v}} ->
+      assert_cache_close(per_token_k, chunked_k)
+      assert_cache_close(per_token_v, chunked_v)
+    end)
+  end
+
+  test "chunked host sync stops at the first EOS token" do
+    {:ok, state} =
+      DenseLoader.from_model_info(%{
+        params: %Axon.ModelState{data: params()},
+        spec: spec()
+      })
+
+    input_ids =
+      Nx.tensor([[1, 2]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    {[first_token], _metadata} =
+      Generate.generate(input_ids, state,
+        max_new_tokens: 1,
+        max_len: 8,
+        sampler: :greedy,
+        profile_timing: false
+      )
+
+    state = %{state | config: %{state.config | eos_token_id: first_token}}
+
+    {tokens, metadata} =
+      Generate.generate(input_ids, state,
+        max_new_tokens: 5,
+        max_len: 8,
+        sampler: :greedy,
+        host_sync: {:chunk, 4},
+        profile_timing: false
+      )
+
+    assert tokens == [first_token]
+    assert metadata.finish_reason == :stop
+  end
+
+  test "dense native chunk supports token counts across the former plugin output limit" do
+    for count <- [1022, 1023] do
+      {:ok, state} =
+        DenseLoader.from_model_info(%{
+          params: %Axon.ModelState{data: params()},
+          spec: spec()
+        })
+
+      input_ids =
+        Nx.tensor([[1]], type: :s64)
+        |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+      kv_cache = Model.init_native_kv_cache(state, count)
+      {tokens, updated_cache} = Model.forward_greedy_chunk(input_ids, kv_cache, 0, count, state)
+
+      assert length(tokens) == count
+      assert Enum.all?(tokens, &(Nx.shape(&1) == {}))
+      assert length(updated_cache) == 1
+      assert is_integer(Nx.to_number(hd(tokens)))
+      assert is_integer(Nx.to_number(List.last(tokens)))
+    end
+  end
+
+  test "dense native chunk output contract scales with layers rather than token count" do
+    {:ok, state} =
+      DenseLoader.from_model_info(%{
+        params: %Axon.ModelState{data: params()},
+        spec: spec()
+      })
+
+    state = %{state | layers: List.duplicate(hd(state.layers), 28)}
+
+    input_ids =
+      Nx.tensor([[1]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    {tokens, updated_cache} =
+      Model.forward_greedy_chunk(
+        input_ids,
+        Model.init_native_kv_cache(state, 3),
+        0,
+        3,
+        state
+      )
+
+    assert length(tokens) == 3
+    assert length(updated_cache) == 28
+    assert Enum.all?(tokens, &(Nx.shape(&1) == {}))
   end
 
   test "generation rejects batched input_ids with end host sync" do
@@ -308,6 +445,48 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     assert length(first_chunk) == 2
     assert length(second_chunk) == 2
     assert length(final_chunk) == 1
+  end
+
+  test "chunked host sync preserves a callback boundary larger than 4096" do
+    {:ok, state} =
+      DenseLoader.from_model_info(%{
+        params: %Axon.ModelState{data: params()},
+        spec: spec()
+      })
+
+    state = %{state | config: Map.put(state.config, :eos_token_id, -1)}
+
+    input_ids =
+      Nx.tensor([[1]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    parent = self()
+    runner = fake_native_chunk_runner(parent, :dense)
+
+    {tokens, metadata} =
+      Generate.generate_with_native_chunk_runner(
+        input_ids,
+        state,
+        [
+          max_new_tokens: 5000,
+          max_len: 5000,
+          sampler: :greedy,
+          host_sync: {:chunk, 5000},
+          profile_timing: false,
+          chunk_callback: fn token_ids -> send(parent, {:chunk, token_ids}) end
+        ],
+        runner
+      )
+
+    assert length(tokens) == 5000
+    assert metadata.finish_reason == :length
+    assert_receive {:native_chunk, :dense, 1, 4096}
+    assert_receive {:native_chunk, :dense, 4097, 903}
+    assert_receive {:chunk, chunk}
+    assert length(chunk) == 5000
+    assert chunk == tokens
+    refute_receive {:native_chunk, :dense, _, _}
+    refute_receive {:chunk, _extra}
   end
 
   test "chunked host sync can emit the first token immediately" do
@@ -674,6 +853,22 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     end
   end
 
+  test "a direct native chunk call rejects counts above the plugin limit" do
+    {:ok, state} =
+      DenseLoader.from_model_info(%{
+        params: %Axon.ModelState{data: params()},
+        spec: spec()
+      })
+
+    input_ids =
+      Nx.tensor([[1]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    assert_raise ArgumentError, ~r/supports at most 4096 tokens/, fn ->
+      Model.forward_greedy_chunk(input_ids, [], 0, 4097, state)
+    end
+  end
+
   test "generation rejects unsupported host sync modes" do
     {:ok, state} =
       DenseLoader.from_model_info(%{
@@ -754,6 +949,22 @@ defmodule EMLXAxon.Qwen3GenerateTest do
   end
 
   defp ones(shape), do: Nx.broadcast(Nx.tensor(1.0, type: :f16), shape)
+
+  defp fake_native_chunk_runner(parent, kind) do
+    fn _input_ids, kv_cache, offset, count, _state ->
+      send(parent, {:native_chunk, kind, offset, count})
+      token = Nx.tensor(offset + count, type: :s64)
+      {List.duplicate(token, count), kv_cache}
+    end
+  end
+
+  defp assert_cache_close(left, right) do
+    left = left |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend)
+    right = right |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend)
+
+    assert Nx.shape(left) == Nx.shape(right)
+    assert Nx.all_close(left, right, atol: 1.0e-3, rtol: 1.0e-3) |> Nx.to_number() == 1
+  end
 
   defp put(params, scope, name, tensor) do
     Map.update(params, scope, %{name => tensor}, &Map.put(&1, name, tensor))
