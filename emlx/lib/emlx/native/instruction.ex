@@ -24,7 +24,7 @@ defmodule EMLX.Native.Instruction do
   # floats); a few are MLX dtype atoms or quantized_matmul mode atoms (see
   # emlx_compiler.hpp's `Attr` type) — no int<->meaning lookup table needs to
   # be kept in sync between Elixir and C++ for those.
-  @type attr :: integer() | atom()
+  @type attr :: integer() | atom() | binary()
 
   @type t :: %__MODULE__{
           op: atom(),

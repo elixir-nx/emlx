@@ -18,6 +18,16 @@ EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
 # emlx_axon's Makefile/mix.exs, which locate these via
 # `Application.app_dir(:emlx, "priv/mlx/...")`.
 EMLX_INCLUDE_DIR = $(PRIV_DIR)/mlx/include
+EMLX_GENERATED_INCLUDE_DIR = $(PRIV_DIR)/include
+EMLX_COMPAT_HEADER = $(EMLX_GENERATED_INCLUDE_DIR)/emlx_plugin_build_compat.hpp
+EMLX_PLUGIN_ABI_HEADER = $(EMLX_GENERATED_INCLUDE_DIR)/emlx_plugin_abi.hpp
+EMLX_PLUGIN_TOOLCHAIN_HEADER = $(EMLX_GENERATED_INCLUDE_DIR)/emlx_plugin_toolchain.hpp
+EMLX_STAGING_DIR = $(BUILD_DIR)/compat-staging
+EMLX_STAGED_COMPAT_HEADER = $(EMLX_STAGING_DIR)/emlx_plugin_build_compat.hpp
+EMLX_DEPFILE_DIR = $(BUILD_DIR)/deps
+EMLX_BUILD_ID_TOOL = $(BUILD_DIR)/tools/emlx_build_identity
+EMLX_PACKAGED_BUILD_ID_TOOL = $(PRIV_DIR)/build_support/emlx_build_identity
+EMLX_PLUGIN_TOOL_WRAPPER = $(PRIV_DIR)/build_support/emlx_plugin_tool_wrapper
 
 # Only used if MLX_BUILD is true
 MLX_SRC_ARCHIVE = $(EMLX_CACHE_DIR)/mlx/$(MLX_VERSION)$(MLX_VARIANT).tar.gz
@@ -42,12 +52,15 @@ LDFLAGS = -L$(call esc,$(MLX_LIB_DIR)) -lmlx -shared
 
 # Platform-specific settings
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_S),Darwin)
+    EMLX_TARGET_TRIPLE = $(UNAME_M)-apple-darwin
     LDFLAGS += -undefined dynamic_lookup -flat_namespace -rpath @loader_path/mlx/lib
     LDFLAGS += -framework Metal -framework Foundation -framework Accelerate
 		MAKE_DEFAULT_JOBS = $(shell sysctl -n hw.ncpu)
 else
+    EMLX_TARGET_TRIPLE = $(UNAME_M)-unknown-linux-gnu
     LDFLAGS += -Wl,-rpath,'$$ORIGIN/mlx/lib'
 		MAKE_DEFAULT_JOBS = $(shell nproc)
 endif
@@ -55,20 +68,54 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_fast/qwen3_plugin_abi.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp c_src/emlx_native_image.cpp c_src/emlx_sha256.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_abi.hpp c_src/emlx_plugin_toolchain.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_native_image.hpp c_src/emlx_sha256.hpp c_src/emlx_depfile.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
+DEPFILES = $(patsubst c_src/%.cpp,$(call esc,$(EMLX_DEPFILE_DIR))/%.d,$(SOURCES))
+HOST_DEPFILE_ARGS = $(foreach source,$(SOURCES),"$(source)" "$(EMLX_DEPFILE_DIR)/$(patsubst c_src/%.cpp,%.d,$(source))")
 
 # Main targets
-all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_SO))
+all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_COMPAT_HEADER)) $(call esc,$(EMLX_PLUGIN_ABI_HEADER)) $(call esc,$(EMLX_PLUGIN_TOOLCHAIN_HEADER)) $(call esc,$(EMLX_PACKAGED_BUILD_ID_TOOL)) $(call esc,$(EMLX_PLUGIN_TOOL_WRAPPER)) $(call esc,$(EMLX_SO))
 	@ echo > /dev/null
 
 $(call esc,$(PRIV_DIR)):
 	@ mkdir -p "$(PRIV_DIR)"
 
-$(call esc,$(BUILD_DIR))/%.o: c_src/%.cpp $(HEADERS)
+$(call esc,$(EMLX_BUILD_ID_TOOL)): c_src/tools/emlx_build_identity.cpp c_src/emlx_sha256.cpp c_src/emlx_sha256.hpp c_src/emlx_depfile.cpp c_src/emlx_depfile.hpp c_src/emlx_plugin_toolchain.hpp
 	@ mkdir -p "$(dir $@)"
-	$(CXX) $(CFLAGS) -c "$<" -o "$@"
+	$(CXX) -std=c++20 -O2 -I c_src c_src/tools/emlx_build_identity.cpp c_src/emlx_sha256.cpp c_src/emlx_depfile.cpp -o "$@"
+
+$(call esc,$(EMLX_PACKAGED_BUILD_ID_TOOL)): $(call esc,$(EMLX_BUILD_ID_TOOL))
+	@ mkdir -p "$(dir $@)"
+	@ cp "$<" "$@"
+
+$(call esc,$(EMLX_PLUGIN_TOOL_WRAPPER)): c_src/tools/emlx_plugin_tool_wrapper.cpp
+	@ mkdir -p "$(dir $@)"
+	$(CXX) -std=c++20 -O2 c_src/tools/emlx_plugin_tool_wrapper.cpp -o "$@"
+
+$(call esc,$(EMLX_PLUGIN_ABI_HEADER)): c_src/emlx_plugin_abi.hpp
+	@ mkdir -p "$(EMLX_GENERATED_INCLUDE_DIR)"
+	@ cp "$<" "$@"
+
+$(call esc,$(EMLX_PLUGIN_TOOLCHAIN_HEADER)): c_src/emlx_plugin_toolchain.hpp
+	@ mkdir -p "$(EMLX_GENERATED_INCLUDE_DIR)"
+	@ cp "$<" "$@"
+
+$(call esc,$(EMLX_STAGED_COMPAT_HEADER)): $(call esc,$(MLX_SO)) $(call esc,$(EMLX_BUILD_ID_TOOL)) FORCE
+	@ mkdir -p "$(EMLX_STAGING_DIR)"
+	"$(EMLX_BUILD_ID_TOOL)" "$(MLX_SO)" "$(MLX_INCLUDE_DIR)" "$(MLX_VERSION)" "$(MLX_VARIANT)" "$(EMLX_TARGET_TRIPLE)" "$(EMLX_STAGED_COMPAT_HEADER)"
+
+$(call esc,$(EMLX_DEPFILE_DIR))/%.d: c_src/%.cpp $(HEADERS) $(call esc,$(EMLX_STAGED_COMPAT_HEADER))
+	@ mkdir -p "$(BUILD_DIR)/$(dir $*)"
+	@ mkdir -p "$(dir $@)"
+	$(CXX) -I"$(EMLX_STAGING_DIR)" $(CFLAGS) -include "$(EMLX_STAGED_COMPAT_HEADER)" -MD -MF "$@" -MT "$<" -c "$<" -o "$(BUILD_DIR)/$*.o"
+
+$(call esc,$(BUILD_DIR))/%.o: $(call esc,$(EMLX_DEPFILE_DIR))/%.d
+	@ test -f "$@"
+
+$(call esc,$(EMLX_COMPAT_HEADER)): $(OBJECTS) $(DEPFILES) $(call esc,$(EMLX_BUILD_ID_TOOL))
+	@ rm -f "$(EMLX_COMPAT_HEADER)"
+	"$(EMLX_BUILD_ID_TOOL)" verify-host-deps "$(MLX_INCLUDE_DIR)" "$(EMLX_STAGED_COMPAT_HEADER)" "$(EMLX_COMPAT_HEADER)" $(HOST_DEPFILE_ARGS)
 
 $(call esc,$(MLX_SRC_ARCHIVE)):
 	@ if [ "$(MLX_BUILD)" = "true" ]; then \
@@ -117,4 +164,6 @@ clean:
 	rm -rf "$(PRIV_DIR)"
 	rm -rf "$(BUILD_DIR)"
 
-.PHONY: all clean
+FORCE:
+
+.PHONY: all clean FORCE

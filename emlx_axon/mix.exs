@@ -24,11 +24,28 @@ defmodule EMLXAxon.MixProject do
       # deferral in its mix.exs.
       make_env: fn ->
         emlx_priv_dir = Application.app_dir(:emlx, "priv")
+        emlx_source_dir = Mix.Project.deps_paths()[:emlx]
+        compiler = System.get_env("CXX") || "c++"
+        real_compiler = System.find_executable(compiler) || Mix.raise("cannot find C++ compiler")
+        {compiler_version, 0} = System.cmd(real_compiler, ["--version"], stderr_to_stdout: true)
+
+        compiler_family =
+          cond do
+            String.contains?(compiler_version, "clang") -> "clang"
+            String.contains?(compiler_version, "GCC") -> "gcc"
+            true -> Mix.raise("unsupported C++ compiler for the native plugin")
+          end
 
         %{
           "MLX_INCLUDE_DIR" => Path.join(emlx_priv_dir, "mlx/include"),
           "MLX_LIB_DIR" => Path.join(emlx_priv_dir, "mlx/lib"),
-          "QWEN3_ABI_INCLUDE_DIR" => Path.join(Mix.Project.deps_paths()[:emlx], "c_src/emlx_fast")
+          "EMLX_PLUGIN_INCLUDE_DIR" => Path.join(emlx_priv_dir, "include"),
+          "EMLX_PLUGIN_TOOL_WRAPPER" =>
+            Path.join(emlx_priv_dir, "build_support/emlx_plugin_tool_wrapper"),
+          "EMLX_BUILD_ID_TOOL" => Path.join(emlx_priv_dir, "build_support/emlx_build_identity"),
+          "EMLX_PLUGIN_REAL_CXX" => real_compiler,
+          "EMLX_PLUGIN_COMPILER_FAMILY" => compiler_family,
+          "EMLX_SOURCE_DIR" => emlx_source_dir
         }
       end,
       compilers: [:elixir_make] ++ Mix.compilers()
@@ -42,12 +59,19 @@ defmodule EMLXAxon.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:emlx, "~> 0.4.0"},
-      # {:emlx, path: "../emlx"},
+      emlx_dep(),
       {:axon, "~> 0.7"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
+  end
+
+  defp emlx_dep do
+    if System.get_env("EMLX_AXON_LOCAL_EMLX") == "true" do
+      {:emlx, path: "../emlx", override: true}
+    else
+      {:emlx, "~> 0.4.0"}
+    end
   end
 
   def cli do

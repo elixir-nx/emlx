@@ -1,16 +1,69 @@
-#include "qwen3_plugin_abi.hpp"
+#include "emlx_plugin_abi.hpp"
+#include "emlx_plugin_build_compat.hpp"
+#include "emlx_plugin_toolchain.hpp"
+#include "emlx_qwen3_mlx_headers_build_id.hpp"
+#include "emlx_qwen3_plugin_build_id.hpp"
 
+#include <cstring>
+#include <climits>
 #include <limits>
 #include <optional>
 #include <sstream>
+
+namespace emlx_qwen3_plugin {
+
+struct LinearWeight {
+  bool quantized = false;
+  mlx::core::array *weight = nullptr;
+  mlx::core::array *scales = nullptr;
+  mlx::core::array *biases = nullptr;
+  int group_size = 0;
+  int bits = 0;
+  std::string mode;
+  bool transpose = false;
+};
+
+struct LayerParams {
+  mlx::core::array *norm1;
+  mlx::core::array *norm2;
+  mlx::core::array *q_norm;
+  mlx::core::array *k_norm;
+  mlx::core::array *q_proj;
+  mlx::core::array *k_proj;
+  mlx::core::array *v_proj;
+  mlx::core::array *o_proj;
+  mlx::core::array *gate_proj;
+  mlx::core::array *up_proj;
+  mlx::core::array *down_proj;
+};
+
+struct LayerParamsQ {
+  mlx::core::array *norm1;
+  mlx::core::array *norm2;
+  mlx::core::array *q_norm;
+  mlx::core::array *k_norm;
+  LinearWeight q_proj;
+  LinearWeight k_proj;
+  LinearWeight v_proj;
+  LinearWeight o_proj;
+  LinearWeight gate_proj;
+  LinearWeight up_proj;
+  LinearWeight down_proj;
+};
+
+struct KVCache {
+  mlx::core::array *k;
+  mlx::core::array *v;
+};
+
+} // namespace emlx_qwen3_plugin
 
 // Qwen3 compute plugin — pure MLX graph-building code, no Erlang/erl_nif
 // dependency whatsoever. Built as its own shared library (libemlx_qwen3.so,
 // see this project's Makefile) and `dlopen`'d by emlx's host NIF library
 // (emlx's c_src/emlx_fast/qwen3.cpp) via
-// `EMLX.NIF.load_plugin("qwen3", path)`. See qwen3_plugin_abi.hpp (in
-// emlx's c_src/emlx_fast, pulled in via this project's include path) for
-// the ABI and the rationale for this split.
+// `EMLX.NIF.load_plugin("qwen3", path)`. The generic plugin ABI is owned by
+// EMLX; all Qwen3 model schemas remain private to this translation unit.
 
 using namespace emlx_qwen3_plugin;
 
@@ -406,6 +459,130 @@ mlx::core::array build_prefill_mask(const mlx::core::array &q, int T_new, int va
   auto causal_bool = mlx::core::less_equal(
       col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
   return mlx::core::where(causal_bool, zero_val, neginf_val, device);
+}
+
+bool validate_tensor_offset(const mlx::core::array &offset, int capacity,
+                            int token_count, std::string &error) {
+  if (offset.size() != 1 ||
+      (offset.dtype() != mlx::core::int32 && offset.dtype() != mlx::core::int64)) {
+    error = "offset must be a scalar int32 or int64 tensor";
+    return false;
+  }
+  if (token_count <= 0 || capacity < token_count || capacity > INT_MAX) {
+    error = "cache capacity and token count are outside the supported range";
+    return false;
+  }
+  return true;
+}
+
+mlx::core::array clamp_offset(const mlx::core::array &offset, int maximum,
+                              const mlx::core::Device &device) {
+  auto offset_i32 = mlx::core::astype(offset, mlx::core::int32, device);
+  auto zero = mlx::core::array(0, mlx::core::int32);
+  auto upper = mlx::core::array(maximum, mlx::core::int32);
+  return mlx::core::minimum(mlx::core::maximum(offset_i32, zero, device), upper,
+                            device);
+}
+
+mlx::core::array rope_with_positions(const mlx::core::array &input,
+                                     const mlx::core::array &offset,
+                                     int dims, float theta,
+                                     const mlx::core::Device &device) {
+  const int batch = input.shape(0);
+  const int tokens = input.shape(1);
+  const int heads = input.shape(2);
+  const int half = dims / 2;
+  auto positions = mlx::core::add(
+      mlx::core::arange(tokens, mlx::core::int32, device), offset, device);
+  positions = mlx::core::reshape(positions, {1, tokens, 1}, device);
+  if (batch != 1)
+    positions = mlx::core::broadcast_to(positions, {batch, tokens, 1}, device);
+  auto frequency_index = mlx::core::arange(0, dims, 2, mlx::core::float32, device);
+  auto exponent = mlx::core::divide(
+      frequency_index, mlx::core::array(static_cast<float>(dims)), device);
+  auto inverse_frequency = mlx::core::exp(
+      mlx::core::multiply(
+          exponent, mlx::core::array(-std::log(theta), mlx::core::float32),
+          device),
+      device);
+  auto angles = mlx::core::multiply(
+      mlx::core::astype(positions, mlx::core::float32, device),
+      mlx::core::reshape(inverse_frequency, {1, 1, half}, device), device);
+  auto cosine = mlx::core::astype(
+      mlx::core::reshape(mlx::core::cos(angles, device), {batch, tokens, 1, half},
+                         device),
+      input.dtype(), device);
+  auto sine = mlx::core::astype(
+      mlx::core::reshape(mlx::core::sin(angles, device), {batch, tokens, 1, half},
+                         device),
+      input.dtype(), device);
+  auto cosine_full =
+      mlx::core::concatenate(std::vector<mlx::core::array>{cosine, cosine}, 3,
+                             device);
+  auto sine_full =
+      mlx::core::concatenate(std::vector<mlx::core::array>{sine, sine}, 3,
+                             device);
+  auto first = mlx::core::slice(input, {0, 0, 0, 0},
+                                {batch, tokens, heads, half}, device);
+  auto second = mlx::core::slice(input, {0, 0, 0, half},
+                                 {batch, tokens, heads, dims}, device);
+  auto rotated = mlx::core::concatenate(
+      std::vector<mlx::core::array>{mlx::core::negative(second, device), first},
+      3, device);
+  return mlx::core::add(mlx::core::multiply(input, cosine_full, device),
+                        mlx::core::multiply(rotated, sine_full, device), device);
+}
+
+bool tensor_offset_attention(
+    const mlx::core::array &query, const mlx::core::array &key,
+    const mlx::core::array &value, const mlx::core::array &k_cache,
+    const mlx::core::array &v_cache, const mlx::core::array &offset,
+    float scale, int head_dim, float theta, const mlx::core::Device &device,
+    mlx::core::array &attention, mlx::core::array &k_updated,
+    mlx::core::array &v_updated, std::string &error) {
+  if (!validate_qkv_cache_attention(query, key, value, k_cache, v_cache, 0,
+                                    head_dim, error))
+    return false;
+  const int batch = query.shape(0);
+  const int tokens = query.shape(1);
+  const int query_heads = query.shape(2);
+  const int kv_heads = key.shape(2);
+  const int width = query.shape(3);
+  const int capacity = k_cache.shape(2);
+  if (!validate_tensor_offset(offset, capacity, tokens, error))
+    return false;
+
+  auto safe_offset = clamp_offset(offset, capacity - tokens, device);
+  auto query_rope = rope_with_positions(query, safe_offset, head_dim, theta, device);
+  auto key_rope = rope_with_positions(key, safe_offset, head_dim, theta, device);
+  auto query_bn = mlx::core::transpose(query_rope, {0, 2, 1, 3}, device);
+  auto key_bn = mlx::core::transpose(key_rope, {0, 2, 1, 3}, device);
+  auto value_bn = mlx::core::transpose(value, {0, 2, 1, 3}, device);
+  auto start = mlx::core::reshape(safe_offset, {1}, device);
+  k_updated = mlx::core::slice_update(k_cache, key_bn, start, {2}, device);
+  v_updated = mlx::core::slice_update(v_cache, value_bn, start, {2}, device);
+
+  auto row = mlx::core::reshape(
+      mlx::core::add(mlx::core::arange(tokens, mlx::core::int32, device),
+                     safe_offset, device),
+      {1, 1, tokens, 1}, device);
+  auto column = mlx::core::reshape(
+      mlx::core::arange(capacity, mlx::core::int32, device),
+      {1, 1, 1, capacity}, device);
+  auto visible = mlx::core::less_equal(column, row, device);
+  auto mask = mlx::core::where(
+      visible, mlx::core::zeros({}, query.dtype(), device),
+      mlx::core::full({}, -std::numeric_limits<float>::infinity(), query.dtype(),
+                      device),
+      device);
+  auto attended = mlx::core::fast::scaled_dot_product_attention(
+      query_bn, k_updated, v_updated, scale, "array", mask, std::nullopt,
+      device);
+  attention = mlx::core::reshape(
+      mlx::core::transpose(attended, {0, 2, 1, 3}, device),
+      {batch, tokens, query_heads * width}, device);
+  (void)kv_heads;
+  return true;
 }
 
 mlx::core::array sdpa(const mlx::core::array &q_rope, const mlx::core::array &k_valid,
@@ -1192,19 +1369,857 @@ bool v_forward_greedy_ids_chunk_quantized(
   }
 }
 
-const VTable kVTable = {
-    v_kv_cache_attention,
-    v_mlp,
-    v_attention_residual,
-    v_attention_block,
-    v_layer_dense,
-    v_layer_quantized,
-    v_final_greedy,
-    v_forward_greedy_from_hidden,
-    v_forward_greedy_ids_chunk,
-    v_forward_greedy_ids_chunk_quantized,
+inline constexpr char kPluginName[] = "qwen3";
+inline constexpr char kMLPName[] = "mlp";
+inline constexpr char kKVCacheAttentionName[] = "kv_cache_attention";
+inline constexpr char kKVCacheAttentionTensorName[] =
+    "kv_cache_attention_tensor_offset";
+inline constexpr char kAttentionResidualName[] = "attention_residual";
+inline constexpr char kAttentionBlockName[] = "attention_block";
+inline constexpr char kLayerDenseName[] = "layer_dense";
+inline constexpr char kLayerDenseTensorName[] = "layer_dense_tensor_offset";
+inline constexpr char kLayerGeneralizedName[] = "layer_generalized";
+inline constexpr char kFinalGreedyName[] = "final_greedy";
+inline constexpr char kForwardDenseName[] = "forward_greedy_dense";
+inline constexpr char kChunkDenseName[] = "forward_greedy_chunk_dense";
+inline constexpr char kChunkGeneralizedName[] =
+    "forward_greedy_chunk_generalized";
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_COMPILER_FAMILY,
+                                       EMLX_EXPECTED_COMPILER_FAMILY));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_COMPILER_MAJOR,
+                                       EMLX_EXPECTED_COMPILER_MAJOR));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_TARGET_TRIPLE,
+                                       EMLX_EXPECTED_TARGET_TRIPLE));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_ARCHITECTURE_ABI,
+                                       EMLX_EXPECTED_ARCHITECTURE_ABI));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_CXX_LANGUAGE_MODE,
+                                       EMLX_EXPECTED_CXX_LANGUAGE_MODE));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_CXX_STDLIB_FAMILY,
+                                       EMLX_EXPECTED_CXX_STDLIB_FAMILY));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_CXX_STDLIB_ABI,
+                                       EMLX_EXPECTED_CXX_STDLIB_ABI));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_EXCEPTIONS_MODE,
+                                       EMLX_EXPECTED_EXCEPTIONS_MODE));
+static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_RTTI_MODE,
+                                       EMLX_EXPECTED_RTTI_MODE));
+
+template <size_t N>
+constexpr EMLXPluginStringView string_view(const char (&value)[N]) {
+  return {value, N - 1};
+}
+
+double f64_from_bits(int64_t bits) {
+  uint64_t raw = static_cast<uint64_t>(bits);
+  double value;
+  std::memcpy(&value, &raw, sizeof(value));
+  return value;
+}
+
+bool int32_attr(const EMLXPluginCall &call, size_t index, const char *name,
+                int &value, std::string &error) {
+  if (index >= call.attrs.size || call.attrs.data[index] < INT_MIN ||
+      call.attrs.data[index] > INT_MAX) {
+    error = std::string(name) + " is outside the int32 range";
+    return false;
+  }
+  value = static_cast<int>(call.attrs.data[index]);
+  return true;
+}
+
+constexpr size_t kLinearDescriptorWidth = 8;
+
+bool quantization_mode(int64_t value, std::string &mode,
+                       std::string &error) {
+  switch (value) {
+  case 0:
+    mode = "affine";
+    return true;
+  case 1:
+    mode = "mxfp4";
+    return true;
+  case 2:
+    mode = "mxfp8";
+    return true;
+  case 3:
+    mode = "nvfp4";
+    return true;
+  default:
+    error = "Qwen3 linear descriptor has an unknown quantization mode";
+    return false;
+  }
+}
+
+bool validate_linear_descriptor(EMLXPluginInt64View attrs, size_t &attr_index,
+                                uint32_t &operand_index,
+                                std::string &error) {
+  if (attr_index > attrs.size ||
+      attrs.size - attr_index < kLinearDescriptorWidth) {
+    error = "Qwen3 linear descriptor is truncated";
+    return false;
+  }
+  const int64_t kind = attrs.data[attr_index];
+  const int64_t weight_index = attrs.data[attr_index + 1];
+  const int64_t scales_index = attrs.data[attr_index + 2];
+  const int64_t biases_index = attrs.data[attr_index + 3];
+  const int64_t group_size = attrs.data[attr_index + 4];
+  const int64_t bits = attrs.data[attr_index + 5];
+  const int64_t mode = attrs.data[attr_index + 6];
+  const int64_t transpose = attrs.data[attr_index + 7];
+  attr_index += kLinearDescriptorWidth;
+
+  if (weight_index != operand_index || (transpose != 0 && transpose != 1)) {
+    error = "Qwen3 linear descriptor has noncanonical operand indexes or transpose";
+    return false;
+  }
+  ++operand_index;
+
+  if (kind == 0) {
+    if (scales_index != -1 || biases_index != -1 || group_size != 0 ||
+        bits != 0 || mode != 0) {
+      error = "Qwen3 dense linear descriptor has quantized fields";
+      return false;
+    }
+    return true;
+  }
+  if (kind != 1 || scales_index != operand_index || group_size <= 0 ||
+      group_size > INT_MAX || bits <= 0 || bits > 32 || 32 % bits != 0 ||
+      mode < 0 || mode > 3) {
+    error = "Qwen3 quantized linear descriptor is invalid";
+    return false;
+  }
+  ++operand_index;
+  if (biases_index == operand_index) {
+    ++operand_index;
+  } else if (biases_index != -1) {
+    error = "Qwen3 quantized linear descriptor has a noncanonical bias index";
+    return false;
+  }
+  return true;
+}
+
+bool parse_linear_descriptor(const EMLXPluginCall &call, size_t &attr_index,
+                             uint32_t &operand_index, LinearWeight &weight,
+                             std::string &error) {
+  const size_t descriptor_start = attr_index;
+  uint32_t next_operand = operand_index;
+  if (!validate_linear_descriptor(call.attrs, attr_index, next_operand, error))
+    return false;
+
+  const int64_t kind = call.attrs.data[descriptor_start];
+  const int64_t weight_index = call.attrs.data[descriptor_start + 1];
+  const int64_t scales_index = call.attrs.data[descriptor_start + 2];
+  const int64_t biases_index = call.attrs.data[descriptor_start + 3];
+  if (next_operand > call.operands.size) {
+    error = "Qwen3 linear descriptor references a missing operand";
+    return false;
+  }
+
+  weight.quantized = kind == 1;
+  weight.weight = const_cast<mlx::core::array *>(&call.operands.data[weight_index]);
+  weight.scales = kind == 1
+                      ? const_cast<mlx::core::array *>(
+                            &call.operands.data[scales_index])
+                      : nullptr;
+  weight.biases = biases_index >= 0
+                      ? const_cast<mlx::core::array *>(
+                            &call.operands.data[biases_index])
+                      : nullptr;
+  weight.group_size = static_cast<int>(call.attrs.data[descriptor_start + 4]);
+  weight.bits = static_cast<int>(call.attrs.data[descriptor_start + 5]);
+  if (!quantization_mode(call.attrs.data[descriptor_start + 6], weight.mode,
+                         error))
+    return false;
+  weight.transpose = call.attrs.data[descriptor_start + 7] == 1;
+  operand_index = next_operand;
+  return true;
+}
+
+bool generalized_layer_operand_count(EMLXPluginInt64View attrs,
+                                     uint32_t &count,
+                                     std::string &error) {
+  if (attrs.size != 7 + 7 * kLinearDescriptorWidth || attrs.data[0] != 1 ||
+      attrs.data[6] != 7) {
+    error = "generalized layer attributes have an invalid schema";
+    return false;
+  }
+  size_t attr_index = 7;
+  uint32_t operand_index = 7;
+  for (size_t index = 0; index < 7; ++index) {
+    if (!validate_linear_descriptor(attrs, attr_index, operand_index, error))
+      return false;
+  }
+  if (attr_index != attrs.size) {
+    error = "generalized layer attributes have trailing fields";
+    return false;
+  }
+  count = operand_index;
+  return true;
+}
+
+bool generalized_chunk_operand_count(EMLXPluginInt64View attrs,
+                                     uint32_t &count,
+                                     std::string &error) {
+  if (attrs.size < 9 || attrs.data[0] != 1 || attrs.data[1] <= 0 ||
+      attrs.data[1] > 256 || attrs.data[8] != attrs.data[1] * 7 + 1 ||
+      attrs.data[8] > 1793 ||
+      attrs.size != 9 + static_cast<uint64_t>(attrs.data[8]) *
+                            kLinearDescriptorWidth) {
+    error = "generalized chunk attributes have an invalid schema";
+    return false;
+  }
+  size_t attr_index = 9;
+  uint32_t operand_index = 2;
+  for (int64_t layer = 0; layer < attrs.data[1]; ++layer) {
+    if (operand_index > UINT32_MAX - 6) {
+      error = "generalized chunk operand count overflows";
+      return false;
+    }
+    operand_index += 6;
+    for (size_t projection = 0; projection < 7; ++projection) {
+      if (!validate_linear_descriptor(attrs, attr_index, operand_index, error))
+        return false;
+    }
+  }
+  ++operand_index;
+  if (!validate_linear_descriptor(attrs, attr_index, operand_index, error) ||
+      attr_index != attrs.size)
+    return false;
+  count = operand_index;
+  return true;
+}
+
+bool generalized_chunk_output_count(EMLXPluginInt64View attrs,
+                                    uint32_t &count,
+                                    std::string &error) {
+  uint32_t ignored_operands = 0;
+  if (!generalized_chunk_operand_count(attrs, ignored_operands, error) ||
+      attrs.data[3] <= 0 || attrs.data[3] > 4096) {
+    if (error.empty())
+      error = "generalized chunk has an invalid token count";
+    return false;
+  }
+  count = static_cast<uint32_t>(attrs.data[3]) +
+          static_cast<uint32_t>(attrs.data[1]) * 2U;
+  return true;
+}
+
+bool plugin_mlp(const EMLXPluginCall &call,
+                std::vector<mlx::core::array> &outputs,
+                std::string &error) {
+  if (call.operands.size != 5 || call.attrs.size != 1 || !call.execution ||
+      !call.execution->device || !call.execution->stream) {
+    error = "qwen3/mlp expects five operands, epsilon, and an execution context";
+    return false;
+  }
+  mlx::core::array output = call.operands.data[0];
+  if (!v_mlp(call.operands.data[0], call.operands.data[1],
+             call.operands.data[2], call.operands.data[3],
+             call.operands.data[4], f64_from_bits(call.attrs.data[0]),
+             *call.execution->device, output, error))
+    return false;
+  outputs.push_back(std::move(output));
+  return true;
+}
+
+bool plugin_kv_cache_attention(const EMLXPluginCall &call,
+                               std::vector<mlx::core::array> &outputs,
+                               std::string &error) {
+  if (call.operands.size != 5 || call.attrs.size != 4 || !call.execution ||
+      !call.execution->device) {
+    error = "qwen3/kv_cache_attention has an invalid call contract";
+    return false;
+  }
+  auto k_cache = call.operands.data[3];
+  auto v_cache = call.operands.data[4];
+  auto output = call.operands.data[0];
+  auto k_updated = k_cache;
+  auto v_updated = v_cache;
+  int offset = 0;
+  int head_dim = 0;
+  if (!int32_attr(call, 0, "offset", offset, error) ||
+      !int32_attr(call, 2, "head_dim", head_dim, error))
+    return false;
+  if (!v_kv_cache_attention(
+          call.operands.data[0], call.operands.data[1], call.operands.data[2],
+          k_cache, v_cache, offset, f64_from_bits(call.attrs.data[1]), head_dim,
+          f64_from_bits(call.attrs.data[3]), *call.execution->device, output,
+          k_updated, v_updated, error))
+    return false;
+  outputs.push_back(std::move(output));
+  outputs.push_back(std::move(k_updated));
+  outputs.push_back(std::move(v_updated));
+  return true;
+}
+
+bool plugin_kv_cache_attention_tensor(const EMLXPluginCall &call,
+                                      std::vector<mlx::core::array> &outputs,
+                                      std::string &error) {
+  if (call.operands.size != 6 || call.attrs.size != 3 || !call.execution ||
+      !call.execution->device) {
+    error = "qwen3/kv_cache_attention_tensor_offset has an invalid call contract";
+    return false;
+  }
+  int head_dim = 0;
+  if (!int32_attr(call, 1, "head_dim", head_dim, error))
+    return false;
+  auto attention = call.operands.data[0];
+  auto k_updated = call.operands.data[3];
+  auto v_updated = call.operands.data[4];
+  if (!tensor_offset_attention(
+          call.operands.data[0], call.operands.data[1], call.operands.data[2],
+          call.operands.data[3], call.operands.data[4], call.operands.data[5],
+          f64_from_bits(call.attrs.data[0]), head_dim,
+          f64_from_bits(call.attrs.data[2]), *call.execution->device, attention,
+          k_updated, v_updated, error))
+    return false;
+  outputs.push_back(std::move(attention));
+  outputs.push_back(std::move(k_updated));
+  outputs.push_back(std::move(v_updated));
+  return true;
+}
+
+bool plugin_attention_residual(const EMLXPluginCall &call,
+                               std::vector<mlx::core::array> &outputs,
+                               std::string &error) {
+  if (call.operands.size != 3 || call.attrs.size != 0 || !call.execution ||
+      !call.execution->device) {
+    error = "qwen3/attention_residual has an invalid call contract";
+    return false;
+  }
+  auto output = call.operands.data[0];
+  if (!v_attention_residual(call.operands.data[0], call.operands.data[1],
+                            call.operands.data[2], *call.execution->device,
+                            output, error))
+    return false;
+  outputs.push_back(std::move(output));
+  return true;
+}
+
+bool plugin_attention_block(const EMLXPluginCall &call,
+                            std::vector<mlx::core::array> &outputs,
+                            std::string &error) {
+  if (call.operands.size != 10 || call.attrs.size != 5 || !call.execution ||
+      !call.execution->device) {
+    error = "qwen3/attention_block has an invalid call contract";
+    return false;
+  }
+  auto k_cache = call.operands.data[8];
+  auto v_cache = call.operands.data[9];
+  auto output = call.operands.data[0];
+  auto k_updated = k_cache;
+  auto v_updated = v_cache;
+  int offset = 0;
+  int head_dim = 0;
+  if (!int32_attr(call, 0, "offset", offset, error) ||
+      !int32_attr(call, 2, "head_dim", head_dim, error))
+    return false;
+  if (!v_attention_block(
+          call.operands.data[0], call.operands.data[1], call.operands.data[2],
+          call.operands.data[3], call.operands.data[4], call.operands.data[5],
+          call.operands.data[6], call.operands.data[7], k_cache, v_cache,
+          offset, f64_from_bits(call.attrs.data[1]), head_dim,
+          f64_from_bits(call.attrs.data[3]),
+          f64_from_bits(call.attrs.data[4]), *call.execution->device, output,
+          k_updated, v_updated, error))
+    return false;
+  outputs.push_back(std::move(output));
+  outputs.push_back(std::move(k_updated));
+  outputs.push_back(std::move(v_updated));
+  return true;
+}
+
+bool plugin_layer_dense(const EMLXPluginCall &call,
+                        std::vector<mlx::core::array> &outputs,
+                        std::string &error) {
+  if (call.operands.size != 14 || call.attrs.size != 5 || !call.execution ||
+      !call.execution->device) {
+    error = "qwen3/layer_dense has an invalid call contract";
+    return false;
+  }
+  std::vector<mlx::core::array> operands(call.operands.data,
+                                         call.operands.data + call.operands.size);
+  LayerParams layer{&operands[1],  &operands[10], &operands[6],
+                    &operands[7],  &operands[2],  &operands[3],
+                    &operands[4],  &operands[5],  &operands[11],
+                    &operands[12], &operands[13]};
+  KVCache cache{&operands[8], &operands[9]};
+  auto output = operands[0];
+  auto k_updated = operands[8];
+  auto v_updated = operands[9];
+  int offset = 0;
+  int head_dim = 0;
+  if (!int32_attr(call, 0, "offset", offset, error) ||
+      !int32_attr(call, 2, "head_dim", head_dim, error))
+    return false;
+  if (!v_layer_dense(
+          operands[0], layer, cache, offset, f64_from_bits(call.attrs.data[1]),
+          head_dim, f64_from_bits(call.attrs.data[3]),
+          f64_from_bits(call.attrs.data[4]), *call.execution->device, output,
+          k_updated, v_updated, error))
+    return false;
+  outputs.push_back(std::move(output));
+  outputs.push_back(std::move(k_updated));
+  outputs.push_back(std::move(v_updated));
+  return true;
+}
+
+bool plugin_layer_dense_tensor(const EMLXPluginCall &call,
+                               std::vector<mlx::core::array> &outputs,
+                               std::string &error) {
+  if (call.operands.size != 15 || call.attrs.size != 4 || !call.execution ||
+      !call.execution->device) {
+    error = "qwen3/layer_dense_tensor_offset has an invalid call contract";
+    return false;
+  }
+  int head_dim = 0;
+  if (!int32_attr(call, 1, "head_dim", head_dim, error))
+    return false;
+  std::vector<mlx::core::array> operands(call.operands.data,
+                                         call.operands.data + call.operands.size);
+  LayerParams layer{&operands[1],  &operands[10], &operands[6],
+                    &operands[7],  &operands[2],  &operands[3],
+                    &operands[4],  &operands[5],  &operands[11],
+                    &operands[12], &operands[13]};
+  KVCache cache{&operands[8], &operands[9]};
+  if (!validate_dense_layer(operands[0], layer, cache, 0, head_dim, error) ||
+      !validate_tensor_offset(operands[14], operands[8].shape(2),
+                              operands[0].shape(1), error))
+    return false;
+
+  const auto &device = *call.execution->device;
+  const float eps = f64_from_bits(call.attrs.data[3]);
+  auto normalized =
+      mlx::core::fast::rms_norm(operands[0], operands[1], eps, device);
+  const int batch = operands[0].shape(0);
+  const int tokens = operands[0].shape(1);
+  const int query_heads = operands[2].shape(1) / head_dim;
+  const int kv_heads = operands[3].shape(1) / head_dim;
+  auto query = mlx::core::reshape(linear_in_out(normalized, operands[2], device),
+                                  {batch, tokens, query_heads, head_dim}, device);
+  auto key = mlx::core::reshape(linear_in_out(normalized, operands[3], device),
+                                {batch, tokens, kv_heads, head_dim}, device);
+  auto value = mlx::core::reshape(linear_in_out(normalized, operands[4], device),
+                                  {batch, tokens, kv_heads, head_dim}, device);
+  query = mlx::core::fast::rms_norm(query, operands[6], eps, device);
+  key = mlx::core::fast::rms_norm(key, operands[7], eps, device);
+  auto attention = operands[0];
+  auto k_updated = operands[8];
+  auto v_updated = operands[9];
+  if (!tensor_offset_attention(
+          query, key, value, operands[8], operands[9], operands[14],
+          f64_from_bits(call.attrs.data[0]), head_dim,
+          f64_from_bits(call.attrs.data[2]), device, attention, k_updated,
+          v_updated, error))
+    return false;
+  auto attention_hidden = mlx::core::add(
+      operands[0], linear_in_out(attention, operands[5], device), device);
+  auto normalized_mlp =
+      mlx::core::fast::rms_norm(attention_hidden, operands[10], eps, device);
+  auto gate = linear_in_out(normalized_mlp, operands[11], device);
+  auto up = linear_in_out(normalized_mlp, operands[12], device);
+  auto activated = mlx::core::multiply(
+      mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device), up,
+      device);
+  auto output = mlx::core::add(
+      attention_hidden, linear_in_out(activated, operands[13], device), device);
+  outputs.push_back(std::move(output));
+  outputs.push_back(std::move(k_updated));
+  outputs.push_back(std::move(v_updated));
+  return true;
+}
+
+bool plugin_layer_generalized(const EMLXPluginCall &call,
+                              std::vector<mlx::core::array> &outputs,
+                              std::string &error) {
+  uint32_t expected_operands = 0;
+  if (!generalized_layer_operand_count(call.attrs, expected_operands, error) ||
+      call.operands.size != expected_operands || !call.execution ||
+      !call.execution->device) {
+    if (error.empty())
+      error = "qwen3/layer_generalized has an invalid call contract";
+    return false;
+  }
+  int offset = 0;
+  int head_dim = 0;
+  if (!int32_attr(call, 1, "offset", offset, error) ||
+      !int32_attr(call, 3, "head_dim", head_dim, error))
+    return false;
+
+  LayerParamsQ layer;
+  layer.norm1 = const_cast<mlx::core::array *>(&call.operands.data[1]);
+  layer.q_norm = const_cast<mlx::core::array *>(&call.operands.data[2]);
+  layer.k_norm = const_cast<mlx::core::array *>(&call.operands.data[3]);
+  layer.norm2 = const_cast<mlx::core::array *>(&call.operands.data[6]);
+  size_t attr_index = 7;
+  uint32_t operand_index = 7;
+  if (!parse_linear_descriptor(call, attr_index, operand_index, layer.q_proj,
+                               error) ||
+      !parse_linear_descriptor(call, attr_index, operand_index, layer.k_proj,
+                               error) ||
+      !parse_linear_descriptor(call, attr_index, operand_index, layer.v_proj,
+                               error) ||
+      !parse_linear_descriptor(call, attr_index, operand_index, layer.o_proj,
+                               error) ||
+      !parse_linear_descriptor(call, attr_index, operand_index,
+                               layer.gate_proj, error) ||
+      !parse_linear_descriptor(call, attr_index, operand_index, layer.up_proj,
+                               error) ||
+      !parse_linear_descriptor(call, attr_index, operand_index,
+                               layer.down_proj, error))
+    return false;
+
+  KVCache cache{const_cast<mlx::core::array *>(&call.operands.data[4]),
+                const_cast<mlx::core::array *>(&call.operands.data[5])};
+  auto output = call.operands.data[0];
+  auto k_updated = call.operands.data[4];
+  auto v_updated = call.operands.data[5];
+  if (!v_layer_quantized(
+          call.operands.data[0], layer, cache, offset,
+          f64_from_bits(call.attrs.data[2]), head_dim,
+          f64_from_bits(call.attrs.data[4]),
+          f64_from_bits(call.attrs.data[5]), *call.execution->device, output,
+          k_updated, v_updated, error))
+    return false;
+  outputs.push_back(std::move(output));
+  outputs.push_back(std::move(k_updated));
+  outputs.push_back(std::move(v_updated));
+  return true;
+}
+
+bool plugin_final_greedy(const EMLXPluginCall &call,
+                         std::vector<mlx::core::array> &outputs,
+                         std::string &error) {
+  if (call.operands.size != 3 || call.attrs.size != 1 || !call.execution ||
+      !call.execution->device) {
+    error = "qwen3/final_greedy has an invalid call contract";
+    return false;
+  }
+  auto output = call.operands.data[0];
+  if (!v_final_greedy(call.operands.data[0], call.operands.data[1],
+                      call.operands.data[2], f64_from_bits(call.attrs.data[0]),
+                      *call.execution->device, output, error))
+    return false;
+  outputs.push_back(std::move(output));
+  return true;
+}
+
+bool dense_forward_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
+                                 std::string &error) {
+  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > 256) {
+    error = "dense forward attributes have an invalid layer count";
+    return false;
+  }
+  count = 3U + static_cast<uint32_t>(attrs.data[0]) * 13U;
+  return true;
+}
+
+bool dense_forward_output_count(EMLXPluginInt64View attrs, uint32_t &count,
+                                std::string &error) {
+  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > 256) {
+    error = "dense forward attributes have an invalid layer count";
+    return false;
+  }
+  count = 1U + static_cast<uint32_t>(attrs.data[0]) * 2U;
+  return true;
+}
+
+bool dense_chunk_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
+                               std::string &error) {
+  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > 256) {
+    error = "dense chunk attributes have an invalid layer count";
+    return false;
+  }
+  count = 4U + static_cast<uint32_t>(attrs.data[0]) * 13U;
+  return true;
+}
+
+bool dense_chunk_output_count(EMLXPluginInt64View attrs, uint32_t &count,
+                              std::string &error) {
+  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > 256 ||
+      attrs.data[2] <= 0 || attrs.data[2] > 4096) {
+    error = "dense chunk attributes have an invalid layer or token count";
+    return false;
+  }
+  count = static_cast<uint32_t>(attrs.data[2]) +
+          static_cast<uint32_t>(attrs.data[0]) * 2U;
+  return true;
+}
+
+void parse_dense_layers(std::vector<mlx::core::array> &operands, size_t start,
+                        size_t layer_count, std::vector<LayerParams> &layers,
+                        std::vector<KVCache> &caches) {
+  layers.reserve(layer_count);
+  caches.reserve(layer_count);
+  for (size_t layer_index = 0; layer_index < layer_count; ++layer_index) {
+    const size_t base = start + layer_index * 13;
+    layers.push_back({&operands[base],     &operands[base + 1],
+                      &operands[base + 2], &operands[base + 3],
+                      &operands[base + 4], &operands[base + 5],
+                      &operands[base + 6], &operands[base + 7],
+                      &operands[base + 8], &operands[base + 9],
+                      &operands[base + 10]});
+    caches.push_back({&operands[base + 11], &operands[base + 12]});
+  }
+}
+
+bool plugin_forward_dense(const EMLXPluginCall &call,
+                          std::vector<mlx::core::array> &outputs,
+                          std::string &error) {
+  uint32_t expected_operands = 0;
+  uint32_t expected_outputs = 0;
+  if (!dense_forward_operand_count(call.attrs, expected_operands, error) ||
+      !dense_forward_output_count(call.attrs, expected_outputs, error) ||
+      call.operands.size != expected_operands || !call.execution ||
+      !call.execution->device)
+    return false;
+  int offset = 0;
+  int head_dim = 0;
+  if (!int32_attr(call, 1, "offset", offset, error) ||
+      !int32_attr(call, 3, "head_dim", head_dim, error))
+    return false;
+  const size_t layer_count = static_cast<size_t>(call.attrs.data[0]);
+  std::vector<mlx::core::array> operands(call.operands.data,
+                                         call.operands.data + call.operands.size);
+  std::vector<LayerParams> layers;
+  std::vector<KVCache> caches;
+  parse_dense_layers(operands, 1, layer_count, layers, caches);
+  const size_t tail = 1 + layer_count * 13;
+  mlx::core::array token(0);
+  int64_t ignored_token_id = 0;
+  std::vector<mlx::core::array> keys;
+  std::vector<mlx::core::array> values;
+  if (!v_forward_greedy_from_hidden(
+          operands[0], layers, caches, operands[tail], operands[tail + 1],
+          offset, f64_from_bits(call.attrs.data[2]), head_dim,
+          f64_from_bits(call.attrs.data[4]), f64_from_bits(call.attrs.data[5]),
+          false, *call.execution->device, token, ignored_token_id, keys, values,
+          error))
+    return false;
+  outputs.reserve(expected_outputs);
+  outputs.push_back(std::move(token));
+  for (size_t index = 0; index < keys.size(); ++index) {
+    outputs.push_back(std::move(keys[index]));
+    outputs.push_back(std::move(values[index]));
+  }
+  return true;
+}
+
+bool plugin_chunk_dense(const EMLXPluginCall &call,
+                        std::vector<mlx::core::array> &outputs,
+                        std::string &error) {
+  uint32_t expected_operands = 0;
+  uint32_t expected_outputs = 0;
+  if (!dense_chunk_operand_count(call.attrs, expected_operands, error) ||
+      !dense_chunk_output_count(call.attrs, expected_outputs, error) ||
+      call.operands.size != expected_operands || !call.execution ||
+      !call.execution->device)
+    return false;
+  int offset = 0;
+  int count = 0;
+  int head_dim = 0;
+  if (!int32_attr(call, 1, "offset", offset, error) ||
+      !int32_attr(call, 2, "count", count, error) ||
+      !int32_attr(call, 4, "head_dim", head_dim, error))
+    return false;
+  const size_t layer_count = static_cast<size_t>(call.attrs.data[0]);
+  std::vector<mlx::core::array> operands(call.operands.data,
+                                         call.operands.data + call.operands.size);
+  std::vector<LayerParams> layers;
+  std::vector<KVCache> caches;
+  parse_dense_layers(operands, 2, layer_count, layers, caches);
+  const size_t tail = 2 + layer_count * 13;
+  std::vector<mlx::core::array> tokens;
+  std::vector<mlx::core::array> keys;
+  std::vector<mlx::core::array> values;
+  if (!v_forward_greedy_ids_chunk(
+          operands[0], operands[1], layers, caches, operands[tail],
+          operands[tail + 1], offset, count, f64_from_bits(call.attrs.data[3]),
+          head_dim, f64_from_bits(call.attrs.data[5]),
+          f64_from_bits(call.attrs.data[6]), *call.execution->device, tokens,
+          keys, values, error))
+    return false;
+  outputs.reserve(expected_outputs);
+  for (auto &token : tokens)
+    outputs.push_back(std::move(token));
+  for (size_t index = 0; index < keys.size(); ++index) {
+    outputs.push_back(std::move(keys[index]));
+    outputs.push_back(std::move(values[index]));
+  }
+  return true;
+}
+
+bool plugin_chunk_generalized(const EMLXPluginCall &call,
+                              std::vector<mlx::core::array> &outputs,
+                              std::string &error) {
+  uint32_t expected_operands = 0;
+  uint32_t expected_outputs = 0;
+  if (!generalized_chunk_operand_count(call.attrs, expected_operands, error) ||
+      !generalized_chunk_output_count(call.attrs, expected_outputs, error) ||
+      call.operands.size != expected_operands || !call.execution ||
+      !call.execution->device) {
+    if (error.empty())
+      error = "qwen3/forward_greedy_chunk_generalized has an invalid call contract";
+    return false;
+  }
+  int offset = 0;
+  int count = 0;
+  int head_dim = 0;
+  if (!int32_attr(call, 2, "offset", offset, error) ||
+      !int32_attr(call, 3, "count", count, error) ||
+      !int32_attr(call, 5, "head_dim", head_dim, error))
+    return false;
+
+  const size_t layer_count = static_cast<size_t>(call.attrs.data[1]);
+  std::vector<LayerParamsQ> layers;
+  std::vector<KVCache> caches;
+  layers.reserve(layer_count);
+  caches.reserve(layer_count);
+  size_t attr_index = 9;
+  uint32_t operand_index = 2;
+  for (size_t layer_index = 0; layer_index < layer_count; ++layer_index) {
+    LayerParamsQ layer;
+    layer.norm1 = const_cast<mlx::core::array *>(
+        &call.operands.data[operand_index++]);
+    layer.norm2 = const_cast<mlx::core::array *>(
+        &call.operands.data[operand_index++]);
+    layer.q_norm = const_cast<mlx::core::array *>(
+        &call.operands.data[operand_index++]);
+    layer.k_norm = const_cast<mlx::core::array *>(
+        &call.operands.data[operand_index++]);
+    auto *k_cache = const_cast<mlx::core::array *>(
+        &call.operands.data[operand_index++]);
+    auto *v_cache = const_cast<mlx::core::array *>(
+        &call.operands.data[operand_index++]);
+    if (!parse_linear_descriptor(call, attr_index, operand_index,
+                                 layer.q_proj, error) ||
+        !parse_linear_descriptor(call, attr_index, operand_index,
+                                 layer.k_proj, error) ||
+        !parse_linear_descriptor(call, attr_index, operand_index,
+                                 layer.v_proj, error) ||
+        !parse_linear_descriptor(call, attr_index, operand_index,
+                                 layer.o_proj, error) ||
+        !parse_linear_descriptor(call, attr_index, operand_index,
+                                 layer.gate_proj, error) ||
+        !parse_linear_descriptor(call, attr_index, operand_index,
+                                 layer.up_proj, error) ||
+        !parse_linear_descriptor(call, attr_index, operand_index,
+                                 layer.down_proj, error))
+      return false;
+    layers.push_back(std::move(layer));
+    caches.push_back({k_cache, v_cache});
+  }
+  auto &norm = call.operands.data[operand_index++];
+  LinearWeight lm_head;
+  if (!parse_linear_descriptor(call, attr_index, operand_index, lm_head,
+                               error))
+    return false;
+
+  std::vector<mlx::core::array> tokens;
+  std::vector<mlx::core::array> keys;
+  std::vector<mlx::core::array> values;
+  if (!v_forward_greedy_ids_chunk_quantized(
+          call.operands.data[0], call.operands.data[1], layers, caches, norm,
+          lm_head, offset, count, f64_from_bits(call.attrs.data[4]), head_dim,
+          f64_from_bits(call.attrs.data[6]),
+          f64_from_bits(call.attrs.data[7]), *call.execution->device, tokens,
+          keys, values, error))
+    return false;
+  outputs.reserve(expected_outputs);
+  for (auto &token : tokens)
+    outputs.push_back(std::move(token));
+  for (size_t index = 0; index < keys.size(); ++index) {
+    outputs.push_back(std::move(keys[index]));
+    outputs.push_back(std::move(values[index]));
+  }
+  return true;
+}
+
+constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
+    {string_view(kMLPName), 1, 1, 5, nullptr, 1, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, plugin_mlp,
+     {nullptr, 0}},
+    {string_view(kKVCacheAttentionName), 1, 1, 5, nullptr, 3, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_kv_cache_attention, {nullptr, 0}},
+    {string_view(kKVCacheAttentionTensorName), 1, 1, 6, nullptr, 3, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_kv_cache_attention_tensor, {nullptr, 0}},
+    {string_view(kAttentionResidualName), 1, 1, 3, nullptr, 1, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_attention_residual, {nullptr, 0}},
+    {string_view(kAttentionBlockName), 1, 1, 10, nullptr, 3, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_attention_block, {nullptr, 0}},
+    {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_layer_dense, {nullptr, 0}},
+    {string_view(kLayerDenseTensorName), 1, 1, 15, nullptr, 3, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_layer_dense_tensor, {nullptr, 0}},
+    {string_view(kLayerGeneralizedName), 1, 1, 0,
+     generalized_layer_operand_count, 3, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_layer_generalized, {nullptr, 0}},
+    {string_view(kFinalGreedyName), 1, 1, 3, nullptr, 1, nullptr,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_final_greedy, {nullptr, 0}},
+    {string_view(kForwardDenseName), 1, 1, 0, dense_forward_operand_count, 0,
+     dense_forward_output_count,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_forward_dense, {nullptr, 0}},
+    {string_view(kChunkDenseName), 1, 1, 0, dense_chunk_operand_count, 0,
+     dense_chunk_output_count,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_chunk_dense, {nullptr, 0}},
+    {string_view(kChunkGeneralizedName), 1, 1, 0,
+     generalized_chunk_operand_count, 0, generalized_chunk_output_count,
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     plugin_chunk_generalized, {nullptr, 0}},
 };
+
+constinit const EMLXPluginDescriptor kDescriptor{
+    string_view(kPluginName),
+    {EMLX_PLUGIN_ABI_V1,
+     EMLX_PLUGIN_HEADER_ABI_V1,
+     EMLX_PLUGIN_HEADER_ABI_HASH_V1,
+     string_view(EMLX_EXPECTED_MLX_VERSION),
+     string_view(EMLX_EXPECTED_MLX_VARIANT),
+     string_view(EMLX_EXPECTED_MLX_BUILD_ID),
+     string_view(EMLX_QWEN3_MLX_HEADERS_BUILD_ID),
+     string_view(EMLX_EXPECTED_TARGET_TRIPLE),
+     sizeof(void *) * 8,
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+     EMLX_ENDIAN_BIG,
+#else
+     EMLX_ENDIAN_LITTLE,
+#endif
+     string_view(EMLX_ACTUAL_COMPILER_FAMILY),
+     string_view(EMLX_ACTUAL_CXX_STDLIB_ABI),
+     sizeof(EMLXPluginDescriptor),
+     sizeof(EMLXPluginCallbackDescriptor),
+     string_view(EMLX_QWEN3_PLUGIN_BUILD_ID)},
+    static_cast<EMLXMLXRuntimeAnchor>(&mlx::core::version),
+    static_cast<uint32_t>(sizeof(kCallbacks) / sizeof(kCallbacks[0])),
+    kCallbacks};
+
+constinit const EMLXPluginBootstrapV1 kBootstrap{
+    EMLX_PLUGIN_MAGIC_V1,
+    sizeof(EMLXPluginBootstrapV1),
+    EMLX_PLUGIN_ABI_V1,
+    EMLX_PLUGIN_HEADER_ABI_HASH_V1,
+    EMLX_PLUGIN_LAYOUT_ABI_HASH_V1,
+    sizeof(void *) * 8,
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    EMLX_ENDIAN_BIG,
+#else
+    EMLX_ENDIAN_LITTLE,
+#endif
+    sizeof(EMLXPluginDescriptor),
+    &kDescriptor};
 
 } // namespace
 
-extern "C" const VTable *emlx_plugin_vtable() { return &kVTable; }
+extern "C" EMLX_PLUGIN_EXPORT const EMLXPluginBootstrapV1 *
+emlx_plugin_descriptor_v1() noexcept {
+  return &kBootstrap;
+}

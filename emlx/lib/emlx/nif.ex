@@ -347,4 +347,14 @@ defmodule EMLX.NIF do
   def load_plugin(_name, _path) do
     :erlang.nif_error(:nif_not_loaded)
   end
+
+  @doc false
+  def load_plugin(_name, _path, _expected_plugin_build_id) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc false
+  def call_plugin(_worker, _plugin, _callback, _operands, _attrs, _device) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
 end

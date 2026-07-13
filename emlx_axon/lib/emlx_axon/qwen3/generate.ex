@@ -490,41 +490,25 @@ defmodule EMLXAxon.Qwen3.Generate do
         if sampler == :greedy and not profile_timing? do
           chunk_count = min(n, chunk_size - pending_count)
 
-          case Model.forward_greedy_chunk(decode_input, kv, cur, chunk_count, state) do
-            {next_tokens, kv_new} ->
-              {last_token, pending_tokens} =
-                append_reversed_with_last(next_tokens, pending_tokens)
+          {next_tokens, kv_new} =
+            Model.forward_greedy_chunk(decode_input, kv, cur, chunk_count, state)
 
-              decode_tensor_chunks(
-                n - chunk_count,
-                last_token,
-                pending_tokens,
-                pending_count + chunk_count,
-                host_tokens,
-                acc_times,
-                kv_new,
-                cur + chunk_count,
-                rng_key,
-                ctx,
-                chunk_size
-              )
+          {last_token, pending_tokens} =
+            append_reversed_with_last(next_tokens, pending_tokens)
 
-            :fallback ->
-              decode_tensor_chunk_step(
-                n,
-                decode_input,
-                pending_tokens,
-                pending_count,
-                host_tokens,
-                acc_times,
-                kv,
-                cur,
-                rng_key,
-                ctx,
-                ts,
-                chunk_size
-              )
-          end
+          decode_tensor_chunks(
+            n - chunk_count,
+            last_token,
+            pending_tokens,
+            pending_count + chunk_count,
+            host_tokens,
+            acc_times,
+            kv_new,
+            cur + chunk_count,
+            rng_key,
+            ctx,
+            chunk_size
+          )
         else
           decode_tensor_chunk_step(
             n,

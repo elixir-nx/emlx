@@ -395,13 +395,21 @@ defmodule EMLX.Native.Expr do
   end
 
   defp emit_metadata_instr(id, opcode, operands, attrs, state) do
-    ref = make_ref()
     operand_refs = Enum.map(operands, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    refs =
+      case {opcode, Enum.at(attrs, 5)} do
+        {:plugin, count} when is_integer(count) and count > 1 ->
+          for _ <- 1..count, do: make_ref()
+
+        _ ->
+          make_ref()
+      end
 
     %{
       state
-      | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, ref)
+      | instructions: [{refs, opcode, operand_refs, attrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, refs)
     }
   end
 

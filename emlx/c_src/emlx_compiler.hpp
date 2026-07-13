@@ -8,6 +8,7 @@
 // from thin NIF wrappers in emlx_nif.cpp.
 
 #include "emlx_nif_shared.hpp"
+#include "emlx_plugin_registry.hpp"
 #include <variant>
 
 namespace emlx {
@@ -46,6 +47,7 @@ class Attr {
 public:
   Attr(int64_t v) : value_(v) {}
   Attr(fine::Atom a) : value_(std::move(a)) {}
+  Attr(std::string binary) : value_(std::move(binary)) {}
 
   operator int64_t() const { return std::get<int64_t>(value_); }
 
@@ -54,9 +56,18 @@ public:
   }
 
   std::string as_mode() const { return std::get<fine::Atom>(value_).to_string(); }
+  const std::string &as_binary() const { return std::get<std::string>(value_); }
+  bool is_int() const { return std::holds_alternative<int64_t>(value_); }
+  bool is_atom() const { return std::holds_alternative<fine::Atom>(value_); }
+  bool is_binary() const { return std::holds_alternative<std::string>(value_); }
 
 private:
-  std::variant<int64_t, fine::Atom> value_;
+  std::variant<int64_t, fine::Atom, std::string> value_;
+};
+
+struct PluginOutputTemplate {
+  mlx::core::Dtype dtype;
+  mlx::core::Shape shape;
 };
 
 struct Instruction;
@@ -84,6 +95,9 @@ struct Instruction {
   // Only non-empty for `op == "while"`: exactly two entries, `[cond, body]`.
   // Empty (the common case) for every other op.
   std::vector<SubProgram> subprograms;
+  EMLXResolvedPluginCallback resolved_plugin;
+  std::vector<int64_t> plugin_attrs;
+  std::vector<PluginOutputTemplate> plugin_outputs;
 };
 
 struct Program {
@@ -166,6 +180,11 @@ template <> struct Decoder<emlx::native::Attr> {
     ErlNifSInt64 v;
     if (enif_get_int64(env, term, &v)) {
       return emlx::native::Attr(static_cast<int64_t>(v));
+    }
+    ErlNifBinary binary;
+    if (enif_inspect_binary(env, term, &binary)) {
+      return emlx::native::Attr(
+          std::string(reinterpret_cast<const char *>(binary.data), binary.size));
     }
     return emlx::native::Attr(fine::decode<fine::Atom>(env, term));
   }

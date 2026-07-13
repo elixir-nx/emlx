@@ -4,28 +4,14 @@ defmodule EMLXAxon.Qwen3.Model do
 
   ## Defn / JIT strategy
 
-  For the quantized (MLX-4bit) and dense native-greedy paths actually
-  exercised by `bench/validate_qwen3.exs`, **every** hot-path call is a plain
-  eager function call against concrete `EMLX.Backend` tensors —
-  `EMLX.Native.Qwen3.*` NIFs, `EMLX.Fast.*` fused kernels, `Nx.dot` (quantized
-  dispatch) — with no `Nx.Defn.Expr` tracing or `Nx.Defn.Compiler` involved
-  anywhere in the loop. `Layers.swiglu/2` (the sole remaining `defn` in
-  `Layers`/`Attention`) is dead code (`mlp/5` below calls
-  `EMLX.Fast.swiglu/2` directly, not `Layers.swiglu/2`), and
-  `Sampler.top_p_gpu/3` is only reached by the `:top_p_gpu` sampler, not
-  `:greedy`. This is why a `:compiler` option threaded into
-  `EMLXAxon.TextGeneration.serving/3` would be a no-op regardless of whether
-  it's read out of `opts`: there is no `Nx.Defn` call site downstream for it
-  to select a compiler for.
-
-  `Nx.put_slice` KV-cache update (dynamic start index) and the valid-slice
-  read (dynamic end index) also always ran eagerly, independent of the above.
-
-  GPU sync: `EMLX.eval` is called once per token at the sampler boundary so
-  the full lazy MLX graph spans all 28 layers before any CPU sync.
+  The direct generation helpers execute eagerly against concrete
+  `EMLX.Backend` tensors. Their fused model operations are implemented by
+  `EMLXAxon.Qwen3.Native`, which uses the same lazy plugin callbacks for eager
+  calls and EMLX compiled programs. Host synchronization remains at the
+  generation sampler or configured chunk boundary.
   """
 
-  alias EMLXAxon.Qwen3.{Layers, Attention, Sampler}
+  alias EMLXAxon.Qwen3.Sampler
 
   @type layer ::
           {Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(), Nx.Tensor.t(),
@@ -202,11 +188,7 @@ defmodule EMLXAxon.Qwen3.Model do
   """
   def forward_greedy_chunk(input_ids, kv_cache, current_len, count, %State{} = state)
       when is_integer(count) and count > 0 do
-    if native_forward_greedy_chunk?(state) do
-      forward_native_greedy_chunk(input_ids, kv_cache, current_len, count, state)
-    else
-      :fallback
-    end
+    forward_native_greedy_chunk(input_ids, kv_cache, current_len, count, state)
   end
 
   defp forward_hidden(input_ids, kv_cache, current_len, %State{} = state) do
@@ -242,16 +224,6 @@ defmodule EMLXAxon.Qwen3.Model do
 
   defp native_forward_greedy?(%State{config: cfg, lm_head: lm_head}),
     do: cfg[:dense_layers?] == true and not EMLX.Quantization.quantized?(lm_head)
-
-  # Relaxed gate for `forward_greedy_chunk/5` only: `qwen3_layer_quantized`/
-  # `qwen3_forward_greedy_ids_chunk_quantized` handle dense, quantized, and
-  # mixed per-projection weights (including a quantized `lm_head`)
-  # uniformly, so every `State` qualifies for the native chunked decode path
-  # — unlike `native_forward_greedy?/1` above, which still gates the
-  # single-step native paths (`forward_greedy`/`_token_id`/`_decode_token_id`)
-  # that call the dense-only `qwen3_forward_greedy_ids*` NIFs and are
-  # untouched by this change.
-  defp native_forward_greedy_chunk?(%State{}), do: true
 
   defp forward_native_greedy(input_ids, kv_cache, current_len, %State{} = state) do
     %State{embed_tokens: embed_tokens, layers: layers, norm: norm, lm_head: lm_head, config: cfg} =
@@ -549,39 +521,31 @@ defmodule EMLXAxon.Qwen3.Model do
     scale = 1.0 / :math.sqrt(head_dim)
     theta = cfg.rope_theta
 
-    {hidden_ref, k_cache_ref, v_cache_ref} =
-      EMLX.Native.Qwen3.layer(
-        EMLX.Backend.from_nx(hidden),
-        EMLX.Backend.from_nx(norm1),
-        EMLX.Backend.from_nx(q_proj),
-        EMLX.Backend.from_nx(k_proj),
-        EMLX.Backend.from_nx(v_proj),
-        EMLX.Backend.from_nx(o_proj),
-        EMLX.Backend.from_nx(q_norm),
-        EMLX.Backend.from_nx(k_norm),
-        EMLX.Backend.from_nx(k_cache),
-        EMLX.Backend.from_nx(v_cache),
-        EMLX.Backend.from_nx(norm2),
-        EMLX.Backend.from_nx(gate_proj),
-        EMLX.Backend.from_nx(up_proj),
-        EMLX.Backend.from_nx(down_proj),
-        current_len,
-        scale,
-        head_dim,
-        theta,
-        cfg.rms_norm_eps
-      )
-
-    {
-      EMLX.Backend.to_nx(hidden_ref),
-      EMLX.Backend.to_nx(k_cache_ref),
-      EMLX.Backend.to_nx(v_cache_ref)
-    }
+    EMLXAxon.Qwen3.Native.layer_dense(
+      hidden,
+      norm1,
+      q_proj,
+      k_proj,
+      v_proj,
+      o_proj,
+      q_norm,
+      k_norm,
+      k_cache,
+      v_cache,
+      norm2,
+      gate_proj,
+      up_proj,
+      down_proj,
+      current_len,
+      scale,
+      head_dim,
+      theta,
+      cfg.rms_norm_eps
+    )
   end
 
   # Generalized variant of `layer/16`: q/k/v/o/gate/up/down each independently
-  # accept a dense or quantized (`EMLX.quantize/2`) `Nx.Tensor`, via
-  # `EMLX.Native.Qwen3.layer_quantized/19`.
+  # accept a dense or quantized (`EMLX.quantize/2`) `Nx.Tensor`.
   defp layer_generalized(
          hidden,
          norm1,
@@ -604,34 +568,27 @@ defmodule EMLXAxon.Qwen3.Model do
     scale = 1.0 / :math.sqrt(head_dim)
     theta = cfg.rope_theta
 
-    {hidden_ref, k_cache_ref, v_cache_ref} =
-      EMLX.Native.Qwen3.layer_quantized(
-        EMLX.Backend.from_nx(hidden),
-        norm1,
-        q_proj,
-        k_proj,
-        v_proj,
-        o_proj,
-        q_norm,
-        k_norm,
-        EMLX.Backend.from_nx(k_cache),
-        EMLX.Backend.from_nx(v_cache),
-        norm2,
-        gate_proj,
-        up_proj,
-        down_proj,
-        current_len,
-        scale,
-        head_dim,
-        theta,
-        cfg.rms_norm_eps
-      )
-
-    {
-      EMLX.Backend.to_nx(hidden_ref),
-      EMLX.Backend.to_nx(k_cache_ref),
-      EMLX.Backend.to_nx(v_cache_ref)
-    }
+    EMLXAxon.Qwen3.Native.layer_generalized(
+      hidden,
+      norm1,
+      q_proj,
+      k_proj,
+      v_proj,
+      o_proj,
+      q_norm,
+      k_norm,
+      k_cache,
+      v_cache,
+      norm2,
+      gate_proj,
+      up_proj,
+      down_proj,
+      current_len,
+      scale,
+      head_dim,
+      theta,
+      cfg.rms_norm_eps
+    )
   end
 
   defp dense_transformer_layer(
@@ -643,54 +600,26 @@ defmodule EMLXAxon.Qwen3.Model do
           down_proj},
          {head_dim, scale, theta, eps}
        ) do
-    {hidden_ref, k_cache_ref, v_cache_ref} =
-      EMLX.Native.Qwen3.layer(
-        EMLX.Backend.from_nx(hidden),
-        EMLX.Backend.from_nx(norm1),
-        EMLX.Backend.from_nx(q_proj),
-        EMLX.Backend.from_nx(k_proj),
-        EMLX.Backend.from_nx(v_proj),
-        EMLX.Backend.from_nx(o_proj),
-        EMLX.Backend.from_nx(q_norm),
-        EMLX.Backend.from_nx(k_norm),
-        EMLX.Backend.from_nx(k_cache),
-        EMLX.Backend.from_nx(v_cache),
-        EMLX.Backend.from_nx(norm2),
-        EMLX.Backend.from_nx(gate_proj),
-        EMLX.Backend.from_nx(up_proj),
-        EMLX.Backend.from_nx(down_proj),
-        current_len,
-        scale,
-        head_dim,
-        theta,
-        eps
-      )
-
-    {
-      EMLX.Backend.to_nx(hidden_ref),
-      EMLX.Backend.to_nx(k_cache_ref),
-      EMLX.Backend.to_nx(v_cache_ref)
-    }
-  end
-
-  defp mlp(hidden, norm2, gate_proj, up_proj, down_proj, eps) do
-    if Enum.any?([gate_proj, up_proj, down_proj], &EMLX.Quantization.quantized?/1) do
-      xn2 = Layers.rms_norm(hidden, norm2, eps)
-      gate = Nx.dot(xn2, [2], gate_proj, [1])
-      up = Nx.dot(xn2, [2], up_proj, [1])
-      mlp = EMLX.Fast.swiglu(gate, up)
-      Nx.add(hidden, Nx.dot(mlp, [2], down_proj, [1]))
-    else
-      hidden
-      |> EMLX.Backend.from_nx()
-      |> EMLX.Native.Qwen3.mlp(
-        EMLX.Backend.from_nx(norm2),
-        EMLX.Backend.from_nx(gate_proj),
-        EMLX.Backend.from_nx(up_proj),
-        EMLX.Backend.from_nx(down_proj),
-        eps
-      )
-      |> EMLX.Backend.to_nx()
-    end
+    EMLXAxon.Qwen3.Native.layer_dense(
+      hidden,
+      norm1,
+      q_proj,
+      k_proj,
+      v_proj,
+      o_proj,
+      q_norm,
+      k_norm,
+      k_cache,
+      v_cache,
+      norm2,
+      gate_proj,
+      up_proj,
+      down_proj,
+      current_len,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
   end
 end

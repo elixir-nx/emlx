@@ -1,0 +1,12 @@
+EMLX_PLUGIN_DEPENDENCY_POLICY_V1
+darwin.mlx=@rpath/libmlx.dylib
+darwin.rpath=@loader_path/mlx/lib
+darwin.system=/usr/lib/libc++.1.dylib
+darwin.framework=/System/Library/Frameworks/Accelerate.framework
+darwin.framework=/System/Library/Frameworks/Foundation.framework
+linux.mlx=libmlx.so
+linux.rpath=$ORIGIN/mlx/lib
+linux.system=libstdc++.so.6
+linux.system=libgcc_s.so.1
+linux.system=libm.so.6
+linux.system=libc.so.6

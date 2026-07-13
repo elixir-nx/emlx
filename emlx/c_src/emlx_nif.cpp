@@ -2,6 +2,9 @@
 #include "emlx_nif_shared.hpp"
 #include "emlx_fast/qwen3.hpp"
 #include "emlx_plugin_registry.hpp"
+#include "emlx_native_image.hpp"
+#include "emlx_plugin_build_compat.hpp"
+#include "emlx_sha256.hpp"
 
 #include <iostream>
 #include <map>
@@ -1031,11 +1034,44 @@ static int open_resources(ErlNifEnv *env) {
 }
 
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
-  if (open_resources(env) != 0) {
-    return -1;
+  (void)priv_data;
+  (void)load_info;
+  try {
+    std::array<uint8_t, 32> expected_hash{};
+    if (!emlx_sha256_parse_hex(EMLX_EXPECTED_MLX_BUILD_ID, expected_hash)) {
+      std::fputs("EMLX NIF load failed: invalid expected MLX build identity\n", stderr);
+      std::fflush(stderr);
+      return -1;
+    }
+    std::shared_ptr<const EMLXHostRuntimeIdentity> candidate;
+    EMLXNativeImageError error;
+    if (!emlx_capture_host_runtime_identity(expected_hash, candidate, error)) {
+      std::fprintf(stderr, "EMLX NIF load failed: %s\n",
+                   emlx_native_image_error_name(error.code));
+      std::fflush(stderr);
+      return -1;
+    }
+    if (open_resources(env) != 0) {
+      std::fputs("EMLX NIF load failed: resource_open_failed\n", stderr);
+      std::fflush(stderr);
+      return -1;
+    }
+    if (!emlx_publish_host_runtime_identity(std::move(candidate), error)) {
+      std::fprintf(stderr, "EMLX NIF load failed: %s\n",
+                   emlx_native_image_error_name(error.code));
+      std::fflush(stderr);
+      return -1;
+    }
+    return 0;
+  } catch (const std::bad_alloc &) {
+    std::fputs("EMLX NIF load failed: allocation_failed\n", stderr);
+  } catch (const std::exception &) {
+    std::fputs("EMLX NIF load failed: internal_error\n", stderr);
+  } catch (...) {
+    std::fputs("EMLX NIF load failed: internal_error\n", stderr);
   }
-
-  return 0;
+  std::fflush(stderr);
+  return -1;
 }
 
 int upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM load_info) {
@@ -1045,7 +1081,7 @@ int upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM
   (void)(old_priv_data);
   (void)(load_info);
 
-  return 0;
+  return -1;
 }
 
 UNARY_OP(abs)
@@ -2066,6 +2102,8 @@ static ErlNifFunc nif_funcs[] = {
     // load_plugin `dlopen`s a named, standalone native plugin (see
     // emlx_plugin_registry.hpp); not worker-routed since it does no MLX
     // graph work.
-    {"load_plugin", 2, load_plugin}};
+    {"load_plugin", 2, load_plugin},
+    {"load_plugin", 3, load_plugin_with_build_id},
+    {"call_plugin", 6, call_plugin_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

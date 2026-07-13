@@ -1,9 +1,96 @@
 #include "qwen3.hpp"
 #include "../emlx_nif_shared.hpp"
 #include "../emlx_plugin_registry.hpp"
-#include "qwen3_plugin_abi.hpp"
 
 #include <memory>
+#include <cstring>
+
+namespace emlx_qwen3_plugin {
+
+struct LinearWeight {
+  bool quantized = false;
+  mlx::core::array *weight = nullptr;
+  mlx::core::array *scales = nullptr;
+  mlx::core::array *biases = nullptr;
+  int group_size = 0;
+  int bits = 0;
+  std::string mode;
+  bool transpose = false;
+};
+
+struct LayerParams {
+  mlx::core::array *norm1;
+  mlx::core::array *norm2;
+  mlx::core::array *q_norm;
+  mlx::core::array *k_norm;
+  mlx::core::array *q_proj;
+  mlx::core::array *k_proj;
+  mlx::core::array *v_proj;
+  mlx::core::array *o_proj;
+  mlx::core::array *gate_proj;
+  mlx::core::array *up_proj;
+  mlx::core::array *down_proj;
+};
+
+struct LayerParamsQ {
+  mlx::core::array *norm1;
+  mlx::core::array *norm2;
+  mlx::core::array *q_norm;
+  mlx::core::array *k_norm;
+  LinearWeight q_proj;
+  LinearWeight k_proj;
+  LinearWeight v_proj;
+  LinearWeight o_proj;
+  LinearWeight gate_proj;
+  LinearWeight up_proj;
+  LinearWeight down_proj;
+};
+
+struct KVCache {
+  mlx::core::array *k;
+  mlx::core::array *v;
+};
+
+} // namespace emlx_qwen3_plugin
+
+static int64_t qwen3_f64_bits(double value) {
+  int64_t bits;
+  std::memcpy(&bits, &value, sizeof(value));
+  return bits;
+}
+
+static int64_t qwen3_quantization_mode(const std::string &mode) {
+  if (mode == "affine") return 0;
+  if (mode == "mxfp4") return 1;
+  if (mode == "mxfp8") return 2;
+  if (mode == "nvfp4") return 3;
+  throw std::invalid_argument("unsupported Qwen3 quantization mode: " + mode);
+}
+
+static void qwen3_append_linear_weight(
+    const emlx_qwen3_plugin::LinearWeight &weight,
+    std::vector<mlx::core::array> &operands, std::vector<int64_t> &attrs) {
+  const int64_t weight_index = static_cast<int64_t>(operands.size());
+  operands.push_back(*weight.weight);
+
+  int64_t scales_index = -1;
+  int64_t biases_index = -1;
+  if (weight.quantized) {
+    scales_index = static_cast<int64_t>(operands.size());
+    operands.push_back(*weight.scales);
+    if (weight.biases) {
+      biases_index = static_cast<int64_t>(operands.size());
+      operands.push_back(*weight.biases);
+    }
+  }
+
+  attrs.insert(attrs.end(),
+               {weight.quantized ? 1 : 0, weight_index, scales_index,
+                biases_index, weight.quantized ? weight.group_size : 0,
+                weight.quantized ? weight.bits : 0,
+                weight.quantized ? qwen3_quantization_mode(weight.mode) : 0,
+                weight.transpose ? 1 : 0});
+}
 
 // Qwen3 model accelerators used by emlx_axon. This file is the *host* side
 // of the qwen3 NIF/plugin split: it owns everything that touches Erlang
@@ -11,29 +98,14 @@
 // tensor resources) and calls through to the standalone "qwen3" plugin — a
 // dynamically loaded shared library with no Erlang dependency at all,
 // living in emlx_axon (c_src/qwen3_plugin.cpp there) — for every actual MLX
-// computation. See qwen3_plugin_abi.hpp for the ABI.
+// computation through the generic EMLX plugin callback registry.
 //
 // This split exists so the qwen3 compute can live in emlx_axon as its own
 // build artifact without dragging erl_nif/resource-type plumbing along
 // with it. The plugin is loaded generically via `EMLX.NIF.load_plugin/2`
 // (see emlx_plugin_registry.hpp) under the name `"qwen3"`; this file only
-// knows how to *decode* qwen3's specific argument shapes, not how a plugin
-// gets loaded.
-
-// qwen3_plugin — every qwen3_* NIF calls this first to fetch the "qwen3"
-// plugin's vtable; it must have been loaded via
-// `EMLX.NIF.load_plugin("qwen3", path)` before any of these can run (see
-// EMLXAxon.Application, which loads it eagerly at boot). Returns `nullptr`
-// (and fills `out_error`) if it hasn't been loaded (yet).
-static const emlx_qwen3_plugin::VTable *qwen3_plugin(ErlNifEnv *env, ERL_NIF_TERM *out_error) {
-  const void *vtable = emlx_get_plugin("qwen3");
-  if (vtable != nullptr) {
-    return reinterpret_cast<const emlx_qwen3_plugin::VTable *>(vtable);
-  }
-  *out_error =
-      nx::nif::error(env, "qwen3 plugin not loaded — call EMLX.NIF.load_plugin(\"qwen3\", path) first");
-  return nullptr;
-}
+// knows how to *decode* Qwen3's compatibility argument shapes, not how a
+// plugin gets loaded or represented.
 
 // ── Term decoding helpers ─────────────────────────────────────────────────
 // These stay host-side: they read directly off `TENSOR_TYPE`-backed
@@ -286,12 +358,6 @@ static bool qwen3_require_rank2_positive(const mlx::core::array &tensor, const c
 //
 // Returns {attn_out, k_upd, v_upd}.
 NIF(qwen3_kv_cache_attention) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, q);
   TENSOR_PARAM(1, new_k);
   TENSOR_PARAM(2, new_v);
@@ -304,17 +370,14 @@ NIF(qwen3_kv_cache_attention) {
   DEVICE_PARAM(9, device);
 
   try {
-    mlx::core::array out(0), k_upd(0), v_upd(0);
-    std::string error;
-    if (!plugin->kv_cache_attention(*q, *new_k, *new_v, *k_cache, *v_cache, offset, scale,
-                                             head_dim, theta, device, out, k_upd, v_upd, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "kv_cache_attention", {*q, *new_k, *new_v, *k_cache, *v_cache},
+        {offset, qwen3_f64_bits(scale), head_dim, qwen3_f64_bits(theta)}, device);
 
     ERL_NIF_TERM result_tuple[3];
-    result_tuple[0] = create_tensor_resource(env, out);
-    result_tuple[1] = create_tensor_resource(env, k_upd);
-    result_tuple[2] = create_tensor_resource(env, v_upd);
+    result_tuple[0] = create_tensor_resource(env, std::move(outputs[0]));
+    result_tuple[1] = create_tensor_resource(env, std::move(outputs[1]));
+    result_tuple[2] = create_tensor_resource(env, std::move(outputs[2]));
 
     return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
   }
@@ -324,12 +387,6 @@ ASYNC_NIF(qwen3_kv_cache_attention)
 
 // qwen3_mlp — dense Qwen3 MLP block: RMSNorm + gate/up + SwiGLU + down + residual.
 NIF(qwen3_mlp) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, hidden);
   TENSOR_PARAM(1, norm);
   TENSOR_PARAM(2, gate_proj);
@@ -339,14 +396,10 @@ NIF(qwen3_mlp) {
   DEVICE_PARAM(6, device);
 
   try {
-    mlx::core::array out(0);
-    std::string error;
-    if (!plugin->mlp(*hidden, *norm, *gate_proj, *up_proj, *down_proj, eps, device, out,
-                              error)) {
-      return nx::nif::error(env, error.c_str());
-    }
-
-    TENSOR(out);
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "mlp", {*hidden, *norm, *gate_proj, *up_proj, *down_proj},
+        {qwen3_f64_bits(eps)}, device);
+    TENSOR(std::move(outputs[0]));
   }
   CATCH()
 }
@@ -358,12 +411,6 @@ ASYNC_NIF(qwen3_mlp)
 //
 // Returns {hidden_out, k_upd, v_upd}.
 NIF(qwen3_layer) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, hidden);
   TENSOR_PARAM(1, norm1);
   TENSOR_PARAM(2, q_proj);
@@ -386,21 +433,18 @@ NIF(qwen3_layer) {
   DEVICE_PARAM(19, device);
 
   try {
-    emlx_qwen3_plugin::LayerParams layer{norm1, norm2, q_norm, k_norm, q_proj,
-                                          k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj};
-    emlx_qwen3_plugin::KVCache kv{k_cache, v_cache};
-
-    mlx::core::array out(0), k_upd(0), v_upd(0);
-    std::string error;
-    if (!plugin->layer_dense(*hidden, layer, kv, offset, scale, head_dim, theta, eps,
-                                      device, out, k_upd, v_upd, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "layer_dense",
+        {*hidden, *norm1, *q_proj, *k_proj, *v_proj, *o_proj, *q_norm,
+         *k_norm, *k_cache, *v_cache, *norm2, *gate_proj, *up_proj, *down_proj},
+        {offset, qwen3_f64_bits(scale), head_dim, qwen3_f64_bits(theta),
+         qwen3_f64_bits(eps)},
+        device);
 
     ERL_NIF_TERM result_tuple[3];
-    result_tuple[0] = create_tensor_resource(env, out);
-    result_tuple[1] = create_tensor_resource(env, k_upd);
-    result_tuple[2] = create_tensor_resource(env, v_upd);
+    result_tuple[0] = create_tensor_resource(env, std::move(outputs[0]));
+    result_tuple[1] = create_tensor_resource(env, std::move(outputs[1]));
+    result_tuple[2] = create_tensor_resource(env, std::move(outputs[2]));
 
     return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
   }
@@ -415,12 +459,6 @@ ASYNC_NIF(qwen3_layer)
 //
 // Returns {hidden_out, k_upd, v_upd}.
 NIF(qwen3_layer_quantized) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, hidden);
 
   Qwen3TensorHandles handles;
@@ -477,19 +515,26 @@ NIF(qwen3_layer_quantized) {
   DEVICE_PARAM(19, device);
 
   try {
-    emlx_qwen3_plugin::KVCache kv{k_cache, v_cache};
+    std::vector<mlx::core::array> operands{
+        *hidden, *layer.norm1, *layer.q_norm, *layer.k_norm,
+        *k_cache, *v_cache, *layer.norm2};
+    std::vector<int64_t> attrs{1, offset, qwen3_f64_bits(scale), head_dim,
+                               qwen3_f64_bits(theta), qwen3_f64_bits(eps), 7};
+    qwen3_append_linear_weight(layer.q_proj, operands, attrs);
+    qwen3_append_linear_weight(layer.k_proj, operands, attrs);
+    qwen3_append_linear_weight(layer.v_proj, operands, attrs);
+    qwen3_append_linear_weight(layer.o_proj, operands, attrs);
+    qwen3_append_linear_weight(layer.gate_proj, operands, attrs);
+    qwen3_append_linear_weight(layer.up_proj, operands, attrs);
+    qwen3_append_linear_weight(layer.down_proj, operands, attrs);
 
-    mlx::core::array out(0), k_upd(0), v_upd(0);
-    std::string error;
-    if (!plugin->layer_quantized(*hidden, layer, kv, offset, scale, head_dim, theta, eps,
-                                          device, out, k_upd, v_upd, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "layer_generalized", operands, attrs, device);
 
     ERL_NIF_TERM result_tuple[3];
-    result_tuple[0] = create_tensor_resource(env, out);
-    result_tuple[1] = create_tensor_resource(env, k_upd);
-    result_tuple[2] = create_tensor_resource(env, v_upd);
+    result_tuple[0] = create_tensor_resource(env, std::move(outputs[0]));
+    result_tuple[1] = create_tensor_resource(env, std::move(outputs[1]));
+    result_tuple[2] = create_tensor_resource(env, std::move(outputs[2]));
 
     return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
   }
@@ -508,16 +553,57 @@ static ERL_NIF_TERM qwen3_wrap_kv_terms(
   return enif_make_list_from_array(env, kv_terms.data(), kv_terms.size());
 }
 
+static std::vector<mlx::core::array> qwen3_dense_forward_operands(
+    const mlx::core::array &first, const std::vector<emlx_qwen3_plugin::LayerParams> &layers,
+    const std::vector<emlx_qwen3_plugin::KVCache> &caches,
+    const mlx::core::array &norm, const mlx::core::array &lm_head,
+    const mlx::core::array *second = nullptr) {
+  std::vector<mlx::core::array> operands;
+  operands.reserve((second ? 4 : 3) + layers.size() * 13);
+  operands.push_back(first);
+  if (second)
+    operands.push_back(*second);
+  for (size_t index = 0; index < layers.size(); ++index) {
+    const auto &layer = layers[index];
+    operands.insert(operands.end(),
+                    {*layer.norm1, *layer.norm2, *layer.q_norm, *layer.k_norm,
+                     *layer.q_proj, *layer.k_proj, *layer.v_proj, *layer.o_proj,
+                     *layer.gate_proj, *layer.up_proj, *layer.down_proj,
+                     *caches[index].k, *caches[index].v});
+  }
+  operands.push_back(norm);
+  operands.push_back(lm_head);
+  return operands;
+}
+
+static void qwen3_split_forward_outputs(
+    std::vector<mlx::core::array> &outputs, size_t token_count,
+    size_t layer_count, std::vector<mlx::core::array> &tokens,
+    std::vector<mlx::core::array> &keys, std::vector<mlx::core::array> &values) {
+  if (outputs.size() != token_count + layer_count * 2)
+    throw std::runtime_error("qwen3 plugin returned the wrong full-forward output count");
+  tokens.reserve(token_count);
+  keys.reserve(layer_count);
+  values.reserve(layer_count);
+  for (size_t index = 0; index < token_count; ++index)
+    tokens.push_back(std::move(outputs[index]));
+  for (size_t index = 0; index < layer_count; ++index) {
+    keys.push_back(std::move(outputs[token_count + index * 2]));
+    values.push_back(std::move(outputs[token_count + index * 2 + 1]));
+  }
+}
+
+static int64_t qwen3_token_to_host(mlx::core::array token,
+                                   const mlx::core::Device &device) {
+  token = mlx::core::astype(token, mlx::core::int64, device);
+  mlx::core::eval(token);
+  return token.item<int64_t>();
+}
+
 // qwen3_forward_greedy_ids — embedding lookup + dense forward through all layers +
 // final greedy token. Returns {token_ids, kv_cache} where token_ids has
 // shape {B}.
 NIF(qwen3_forward_greedy_ids) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, input_ids);
   TENSOR_PARAM(1, embed_tokens);
   PARAM(6, int, offset);
@@ -587,16 +673,16 @@ NIF(qwen3_forward_greedy_ids) {
     auto embedded = mlx::core::reshape(
         mlx::core::take(*embed_tokens, ids, 0, device), {B, T, embed_tokens->shape(1)}, device);
 
-    mlx::core::array token_out(0);
-    int64_t token_id_out = 0;
-    std::vector<mlx::core::array> k_out, v_out;
-    if (!plugin->forward_greedy_from_hidden(
-            embedded, layers, kvs, *norm, *lm_head, offset, scale, head_dim, theta, eps, false,
-            device, token_out, token_id_out, k_out, v_out, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "forward_greedy_dense",
+        qwen3_dense_forward_operands(embedded, layers, kvs, *norm, *lm_head),
+        {static_cast<int64_t>(layer_count), offset, qwen3_f64_bits(scale),
+         head_dim, qwen3_f64_bits(theta), qwen3_f64_bits(eps)},
+        device);
+    std::vector<mlx::core::array> tokens, k_out, v_out;
+    qwen3_split_forward_outputs(outputs, 1, layer_count, tokens, k_out, v_out);
 
-    ERL_NIF_TERM token_term = create_tensor_resource(env, token_out);
+    ERL_NIF_TERM token_term = create_tensor_resource(env, std::move(tokens[0]));
     return nx::nif::ok(env, enif_make_tuple2(env, token_term, qwen3_wrap_kv_terms(env, k_out, v_out)));
   }
   CATCH()
@@ -607,12 +693,6 @@ ASYNC_NIF(qwen3_forward_greedy_ids)
 // single token id tensor without returning to Elixir between decode steps.
 // Returns {token_id_refs, kv_cache}.
 NIF(qwen3_forward_greedy_ids_chunk) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, input_ids);
   TENSOR_PARAM(1, embed_tokens);
   PARAM(6, int, offset);
@@ -673,13 +753,17 @@ NIF(qwen3_forward_greedy_ids_chunk) {
       initial_kv.push_back(kv);
     }
 
-    std::string error;
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "forward_greedy_chunk_dense",
+        qwen3_dense_forward_operands(*input_ids, layers, initial_kv, *norm,
+                                     *lm_head, embed_tokens),
+        {static_cast<int64_t>(layer_count), offset, count,
+         qwen3_f64_bits(scale), head_dim, qwen3_f64_bits(theta),
+         qwen3_f64_bits(eps)},
+        device);
     std::vector<mlx::core::array> token_out, k_out, v_out;
-    if (!plugin->forward_greedy_ids_chunk(
-            *input_ids, *embed_tokens, layers, initial_kv, *norm, *lm_head, offset, count, scale,
-            head_dim, theta, eps, device, token_out, k_out, v_out, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    qwen3_split_forward_outputs(outputs, static_cast<size_t>(count), layer_count,
+                                token_out, k_out, v_out);
 
     std::vector<ERL_NIF_TERM> token_terms;
     token_terms.reserve(token_out.size());
@@ -697,12 +781,6 @@ ASYNC_NIF(qwen3_forward_greedy_ids_chunk)
 // qwen3_forward_greedy_ids_token_id — same as qwen3_forward_greedy_ids, but
 // returns the sampled token id as a BEAM integer.
 NIF(qwen3_forward_greedy_ids_token_id) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, input_ids);
   TENSOR_PARAM(1, embed_tokens);
   PARAM(6, int, offset);
@@ -772,14 +850,15 @@ NIF(qwen3_forward_greedy_ids_token_id) {
     auto embedded = mlx::core::reshape(
         mlx::core::take(*embed_tokens, ids, 0, device), {B, T, embed_tokens->shape(1)}, device);
 
-    mlx::core::array token_out(0);
-    int64_t token_id_out = 0;
-    std::vector<mlx::core::array> k_out, v_out;
-    if (!plugin->forward_greedy_from_hidden(
-            embedded, layers, kvs, *norm, *lm_head, offset, scale, head_dim, theta, eps, true,
-            device, token_out, token_id_out, k_out, v_out, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "forward_greedy_dense",
+        qwen3_dense_forward_operands(embedded, layers, kvs, *norm, *lm_head),
+        {static_cast<int64_t>(layer_count), offset, qwen3_f64_bits(scale),
+         head_dim, qwen3_f64_bits(theta), qwen3_f64_bits(eps)},
+        device);
+    std::vector<mlx::core::array> tokens, k_out, v_out;
+    qwen3_split_forward_outputs(outputs, 1, layer_count, tokens, k_out, v_out);
+    const int64_t token_id_out = qwen3_token_to_host(std::move(tokens[0]), device);
 
     return nx::nif::ok(
         env, enif_make_tuple2(env, nx::nif::make(env, token_id_out), qwen3_wrap_kv_terms(env, k_out, v_out)));
@@ -792,12 +871,6 @@ ASYNC_NIF(qwen3_forward_greedy_ids_token_id)
 // token as a BEAM integer, avoiding host Nx tensor construction and backend
 // transfer for the single token greedy decode hot path.
 NIF(qwen3_forward_greedy_token_id) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   PARAM(0, int64_t, token_id);
   TENSOR_PARAM(1, embed_tokens);
   PARAM(6, int, offset);
@@ -867,14 +940,15 @@ NIF(qwen3_forward_greedy_token_id) {
     auto embedded = mlx::core::reshape(
         mlx::core::take(*embed_tokens, ids, 0, device), {1, 1, embed_tokens->shape(1)}, device);
 
-    mlx::core::array token_out(0);
-    int64_t token_id_out = 0;
-    std::vector<mlx::core::array> k_out, v_out;
-    if (!plugin->forward_greedy_from_hidden(
-            embedded, layers, kvs, *norm, *lm_head, offset, scale, head_dim, theta, eps, true,
-            device, token_out, token_id_out, k_out, v_out, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "forward_greedy_dense",
+        qwen3_dense_forward_operands(embedded, layers, kvs, *norm, *lm_head),
+        {static_cast<int64_t>(layer_count), offset, qwen3_f64_bits(scale),
+         head_dim, qwen3_f64_bits(theta), qwen3_f64_bits(eps)},
+        device);
+    std::vector<mlx::core::array> tokens, k_out, v_out;
+    qwen3_split_forward_outputs(outputs, 1, layer_count, tokens, k_out, v_out);
+    const int64_t token_id_out = qwen3_token_to_host(std::move(tokens[0]), device);
 
     return nx::nif::ok(
         env, enif_make_tuple2(env, nx::nif::make(env, token_id_out), qwen3_wrap_kv_terms(env, k_out, v_out)));
@@ -885,12 +959,6 @@ ASYNC_NIF(qwen3_forward_greedy_token_id)
 
 // qwen3_final_greedy — final RMSNorm + dense lm_head + argmax for greedy decode.
 NIF(qwen3_final_greedy) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, hidden);
   TENSOR_PARAM(1, norm);
   TENSOR_PARAM(2, lm_head);
@@ -898,13 +966,10 @@ NIF(qwen3_final_greedy) {
   DEVICE_PARAM(4, device);
 
   try {
-    mlx::core::array out(0);
-    std::string error;
-    if (!plugin->final_greedy(*hidden, *norm, *lm_head, eps, device, out, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
-
-    TENSOR(out);
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "final_greedy", {*hidden, *norm, *lm_head},
+        {qwen3_f64_bits(eps)}, device);
+    TENSOR(std::move(outputs[0]));
   }
   CATCH()
 }
@@ -912,25 +977,16 @@ ASYNC_NIF(qwen3_final_greedy)
 
 // qwen3_attention_residual — dense attention output projection + residual add.
 NIF(qwen3_attention_residual) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, hidden);
   TENSOR_PARAM(1, attn_out);
   TENSOR_PARAM(2, o_proj);
   DEVICE_PARAM(3, device);
 
   try {
-    mlx::core::array out(0);
-    std::string error;
-    if (!plugin->attention_residual(*hidden, *attn_out, *o_proj, device, out, error)) {
-      return nx::nif::error(env, error.c_str());
-    }
-
-    TENSOR(out);
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "attention_residual", {*hidden, *attn_out, *o_proj}, {},
+        device);
+    TENSOR(std::move(outputs[0]));
   }
   CATCH()
 }
@@ -942,12 +998,6 @@ ASYNC_NIF(qwen3_attention_residual)
 //
 // Returns {hidden_out, k_upd, v_upd}.
 NIF(qwen3_attention_block) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, hidden);
   TENSOR_PARAM(1, norm);
   TENSOR_PARAM(2, q_proj);
@@ -966,19 +1016,18 @@ NIF(qwen3_attention_block) {
   DEVICE_PARAM(15, device);
 
   try {
-    mlx::core::array out(0), k_upd(0), v_upd(0);
-    std::string error;
-    if (!plugin->attention_block(*hidden, *norm, *q_proj, *k_proj, *v_proj, *o_proj,
-                                          *q_norm, *k_norm, *k_cache, *v_cache, offset, scale,
-                                          head_dim, theta, eps, device, out, k_upd, v_upd,
-                                          error)) {
-      return nx::nif::error(env, error.c_str());
-    }
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "attention_block",
+        {*hidden, *norm, *q_proj, *k_proj, *v_proj, *o_proj, *q_norm, *k_norm,
+         *k_cache, *v_cache},
+        {offset, qwen3_f64_bits(scale), head_dim, qwen3_f64_bits(theta),
+         qwen3_f64_bits(eps)},
+        device);
 
     ERL_NIF_TERM result_tuple[3];
-    result_tuple[0] = create_tensor_resource(env, out);
-    result_tuple[1] = create_tensor_resource(env, k_upd);
-    result_tuple[2] = create_tensor_resource(env, v_upd);
+    result_tuple[0] = create_tensor_resource(env, std::move(outputs[0]));
+    result_tuple[1] = create_tensor_resource(env, std::move(outputs[1]));
+    result_tuple[2] = create_tensor_resource(env, std::move(outputs[2]));
 
     return nx::nif::ok(env, enif_make_tuple3(env, result_tuple[0], result_tuple[1], result_tuple[2]));
   }
@@ -993,12 +1042,6 @@ ASYNC_NIF(qwen3_attention_block)
 //
 // Returns {token_id_refs, kv_cache}.
 NIF(qwen3_forward_greedy_ids_chunk_quantized) {
-  ERL_NIF_TERM plugin_error;
-  const emlx_qwen3_plugin::VTable *plugin = qwen3_plugin(env, &plugin_error);
-  if (plugin == nullptr) {
-    return plugin_error;
-  }
-
   TENSOR_PARAM(0, input_ids);
   TENSOR_PARAM(1, embed_tokens);
   PARAM(6, int, offset);
@@ -1063,13 +1106,33 @@ NIF(qwen3_forward_greedy_ids_chunk_quantized) {
       initial_kv.push_back(kv);
     }
 
-    std::string error;
-    std::vector<mlx::core::array> token_out, k_out, v_out;
-    if (!plugin->forward_greedy_ids_chunk_quantized(
-            *input_ids, *embed_tokens, layers, initial_kv, *norm, lm_head, offset, count, scale,
-            head_dim, theta, eps, device, token_out, k_out, v_out, error)) {
-      return nx::nif::error(env, error.c_str());
+    std::vector<mlx::core::array> operands{*input_ids, *embed_tokens};
+    std::vector<int64_t> attrs{
+        1, static_cast<int64_t>(layer_count), offset, count,
+        qwen3_f64_bits(scale), head_dim, qwen3_f64_bits(theta),
+        qwen3_f64_bits(eps), static_cast<int64_t>(layer_count) * 7 + 1};
+    for (size_t index = 0; index < layers.size(); ++index) {
+      const auto &layer = layers[index];
+      operands.insert(operands.end(), {*layer.norm1, *layer.norm2,
+                                       *layer.q_norm, *layer.k_norm,
+                                       *initial_kv[index].k,
+                                       *initial_kv[index].v});
+      qwen3_append_linear_weight(layer.q_proj, operands, attrs);
+      qwen3_append_linear_weight(layer.k_proj, operands, attrs);
+      qwen3_append_linear_weight(layer.v_proj, operands, attrs);
+      qwen3_append_linear_weight(layer.o_proj, operands, attrs);
+      qwen3_append_linear_weight(layer.gate_proj, operands, attrs);
+      qwen3_append_linear_weight(layer.up_proj, operands, attrs);
+      qwen3_append_linear_weight(layer.down_proj, operands, attrs);
     }
+    operands.push_back(*norm);
+    qwen3_append_linear_weight(lm_head, operands, attrs);
+
+    auto outputs = emlx_invoke_plugin_callback(
+        "qwen3", "forward_greedy_chunk_generalized", operands, attrs, device);
+    std::vector<mlx::core::array> token_out, k_out, v_out;
+    qwen3_split_forward_outputs(outputs, static_cast<size_t>(count),
+                                layer_count, token_out, k_out, v_out);
 
     std::vector<ERL_NIF_TERM> token_terms;
     token_terms.reserve(token_out.size());
