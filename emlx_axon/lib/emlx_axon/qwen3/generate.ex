@@ -94,6 +94,7 @@ defmodule EMLXAxon.Qwen3.Generate do
       )
       when is_function(native_chunk_runner, 5) do
     ensure_single_batch!(input_ids)
+    state = Model.prepare_native(state)
 
     requested_max_new =
       opts
@@ -367,12 +368,12 @@ defmodule EMLXAxon.Qwen3.Generate do
     if sampler == :greedy and not profile_timing? and fused_end_sync?(state) do
       [last_token | _] = acc_tokens
 
-      {next_tokens, kv_new, next_cur} =
+      {next_token_chunks, _last_token, kv_new, next_cur} =
         run_native_chunks(last_token, kv, cur, n, state, native_chunk_runner)
 
       decode_tensors(
         0,
-        Enum.reduce(next_tokens, acc_tokens, fn token, acc -> [token | acc] end),
+        Enum.reduce(next_token_chunks, acc_tokens, fn tokens, acc -> [tokens | acc] end),
         acc_times,
         kv_new,
         next_cur,
@@ -534,7 +535,7 @@ defmodule EMLXAxon.Qwen3.Generate do
         if sampler == :greedy and not profile_timing? do
           chunk_count = min(n, chunk_size - pending_count)
 
-          {next_tokens, kv_new, next_cur} =
+          {next_token_chunks, last_token, kv_new, next_cur} =
             run_native_chunks(
               last_token,
               kv,
@@ -544,8 +545,8 @@ defmodule EMLXAxon.Qwen3.Generate do
               native_chunk_runner
             )
 
-          {last_token, pending_tokens} =
-            append_reversed_with_last(next_tokens, pending_tokens)
+          pending_tokens =
+            Enum.reduce(next_token_chunks, pending_tokens, fn tokens, acc -> [tokens | acc] end)
 
           decode_tensor_chunks(
             n - chunk_count,
@@ -580,20 +581,6 @@ defmodule EMLXAxon.Qwen3.Generate do
         end
     end
   end
-
-  defp append_reversed_with_last([token | rest], pending_tokens) do
-    append_reversed_with_last(rest, token, [token | pending_tokens])
-  end
-
-  defp append_reversed_with_last([], _pending_tokens) do
-    raise ArgumentError, "expected at least one generated token in a greedy chunk"
-  end
-
-  defp append_reversed_with_last([token | rest], _last_token, pending_tokens) do
-    append_reversed_with_last(rest, token, [token | pending_tokens])
-  end
-
-  defp append_reversed_with_last([], last_token, pending_tokens), do: {last_token, pending_tokens}
 
   defp decode_tensor_chunk_step(
          n,

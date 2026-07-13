@@ -46,7 +46,8 @@ public:
     // setup
     if (!enif_get_resource(env, arg, resource_object<mlx::core::array>::type,
                            (void **)&ptr)) {
-      err = nx::nif::error(env, "Unable to get tensor param in NIF");
+      error_message_ = "Unable to get tensor param in NIF";
+      err = nx::nif::error(env, error_message_.c_str());
       return;
     }
 
@@ -56,7 +57,8 @@ public:
     if (refcount->load() == 0) {
       // already deallocated
       ptr = nullptr;
-      err = nx::nif::error(env, "Tensor has been deallocated");
+      error_message_ = "Tensor has been deallocated";
+      err = nx::nif::error(env, error_message_.c_str());
       return;
     }
 
@@ -72,7 +74,7 @@ public:
   // would double-decrement the atomic refcount on destruction.
   TensorP(TensorP &&other) noexcept
       : ptr(other.ptr), refcount(other.refcount), deleted(other.deleted),
-        err(other.err) {
+        err(other.err), error_message_(std::move(other.error_message_)) {
     other.ptr = nullptr;
   }
   TensorP &operator=(TensorP &&other) noexcept {
@@ -81,6 +83,7 @@ public:
       refcount = other.refcount;
       deleted = other.deleted;
       err = other.err;
+      error_message_ = std::move(other.error_message_);
       other.ptr = nullptr;
     }
     return *this;
@@ -114,12 +117,14 @@ public:
   bool is_valid() const { return ptr != nullptr; }
 
   ERL_NIF_TERM error() { return err; }
+  const std::string &error_message() const { return error_message_; }
 
 private:
   mlx::core::array *ptr;
   std::atomic<int> *refcount;
   std::atomic_flag *deleted;
   ERL_NIF_TERM err;
+  std::string error_message_;
 };
 
 #define CATCH()                                                              \
@@ -264,7 +269,7 @@ template <> struct Decoder<TensorArg> {
   static TensorArg decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
     TensorP tp(env, term);
     if (!tp.is_valid()) {
-      throw std::invalid_argument("Unable to get tensor param in NIF");
+      throw std::invalid_argument(tp.error_message());
     }
     auto *ptr = tp.data();
     return TensorArg{std::move(tp), ptr};

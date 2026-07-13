@@ -12,7 +12,7 @@ Add `emlx_axon` as a dependency in your `mix.exs`:
 def deps do
   [
     {:emlx_axon, github: "elixir-nx/emlx", sparse: "emlx_axon", branch: "main"},
-    {:emlx, github: "elixir-nx/emlx", branch: "main"}
+    {:emlx, github: "elixir-nx/emlx", branch: "main", override: true}
   ]
 end
 ```

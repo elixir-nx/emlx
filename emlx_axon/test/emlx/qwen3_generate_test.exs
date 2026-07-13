@@ -20,7 +20,7 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     assert token_id == Nx.to_number(token)
   end
 
-  test "native KV cache uses raw refs for greedy dense generation" do
+  test "native KV cache uses EMLX tensors for plugin generation" do
     {:ok, state} =
       DenseLoader.from_model_info(%{
         params: %Axon.ModelState{data: params()},
@@ -28,8 +28,8 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       })
 
     [{k_cache, v_cache}] = Model.init_native_kv_cache(state, 8)
-    assert {:gpu, k_ref} = k_cache
-    assert {:gpu, v_ref} = v_cache
+    assert %Nx.Tensor{data: %EMLX.Backend{ref: {:gpu, k_ref}}} = k_cache
+    assert %Nx.Tensor{data: %EMLX.Backend{ref: {:gpu, v_ref}}} = v_cache
     assert is_reference(k_ref)
     assert is_reference(v_ref)
 
@@ -334,11 +334,9 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       kv_cache = Model.init_native_kv_cache(state, count)
       {tokens, updated_cache} = Model.forward_greedy_chunk(input_ids, kv_cache, 0, count, state)
 
-      assert length(tokens) == count
-      assert Enum.all?(tokens, &(Nx.shape(&1) == {}))
+      assert Nx.shape(tokens) == {count}
       assert length(updated_cache) == 1
-      assert is_integer(Nx.to_number(hd(tokens)))
-      assert is_integer(Nx.to_number(List.last(tokens)))
+      assert Enum.all?(Nx.to_flat_list(tokens), &is_integer/1)
     end
   end
 
@@ -364,9 +362,8 @@ defmodule EMLXAxon.Qwen3GenerateTest do
         state
       )
 
-    assert length(tokens) == 3
+    assert Nx.shape(tokens) == {3}
     assert length(updated_cache) == 28
-    assert Enum.all?(tokens, &(Nx.shape(&1) == {}))
   end
 
   test "generation rejects batched input_ids with end host sync" do
@@ -670,7 +667,7 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       Nx.tensor([[1]], type: :s64)
       |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
 
-    assert_raise FunctionClauseError, fn ->
+    assert_raise ArgumentError, ~r/expected a Qwen3 layer tuple with 11 tensors/, fn ->
       Model.forward_greedy(input_ids, kv_cache, 0, bad_state)
     end
   end
@@ -686,7 +683,7 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       Nx.tensor([[1]], type: :s64)
       |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
 
-    assert_raise EMLX.NIFError, ~r/layers and kv_cache length mismatch/, fn ->
+    assert_raise ArgumentError, ~r/layers and KV cache must have the same nonzero length/, fn ->
       Model.forward_greedy(input_ids, [], 0, state)
     end
   end
@@ -699,7 +696,11 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       })
 
     [layer] = state.layers
-    bad_q_proj = Nx.iota({4, 5}, type: :f16)
+
+    bad_q_proj =
+      Nx.iota({4, 5}, type: :f16)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
     bad_state = %{state | layers: [put_elem(layer, 4, bad_q_proj)]}
     kv_cache = Model.init_native_kv_cache(bad_state, 8)
 
@@ -747,7 +748,7 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       Nx.tensor([[1]], type: :s64)
       |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
 
-    EMLX.deallocate(k_cache)
+    Nx.backend_deallocate(k_cache)
 
     assert_raise EMLX.NIFError, ~r/Tensor has been deallocated/, fn ->
       Model.forward_greedy(input_ids, kv_cache, 0, state)
@@ -792,7 +793,7 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     end
   end
 
-  test "native token id return path rejects batched inputs" do
+  test "native chunk forward rejects batched inputs before plugin dispatch" do
     {:ok, state} =
       DenseLoader.from_model_info(%{
         params: %Axon.ModelState{data: params()},
@@ -803,53 +804,8 @@ defmodule EMLXAxon.Qwen3GenerateTest do
       Nx.tensor([[1], [2]], type: :s64)
       |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
 
-    assert_raise ArgumentError,
-                 ~r/forward_greedy_ids_token_id requires batch size 1, got batch size 2/,
-                 fn ->
-                   EMLX.Native.Qwen3.forward_greedy_ids_token_id(
-                     EMLX.Backend.from_nx(input_ids),
-                     EMLX.Backend.from_nx(state.embed_tokens),
-                     [],
-                     [],
-                     EMLX.Backend.from_nx(state.norm),
-                     EMLX.Backend.from_nx(state.lm_head),
-                     0,
-                     1.0 / :math.sqrt(state.config.head_dim),
-                     state.config.head_dim,
-                     state.config.rope_theta,
-                     state.config.rms_norm_eps
-                   )
-                 end
-  end
-
-  test "native chunk token id return path rejects batched inputs" do
-    {:ok, state} =
-      DenseLoader.from_model_info(%{
-        params: %Axon.ModelState{data: params()},
-        spec: spec()
-      })
-
-    input_ids =
-      Nx.tensor([[1], [2]], type: :s64)
-      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
-
-    embed_ref = EMLX.Backend.from_nx(state.embed_tokens)
-
-    assert_raise ArgumentError, ~r/forward_greedy_ids_chunk requires batch size 1/, fn ->
-      EMLX.Native.Qwen3.forward_greedy_ids_chunk(
-        EMLX.Backend.from_nx(input_ids),
-        embed_ref,
-        [],
-        [],
-        EMLX.Backend.from_nx(state.norm),
-        EMLX.Backend.from_nx(state.lm_head),
-        0,
-        1,
-        1.0 / :math.sqrt(state.config.head_dim),
-        state.config.head_dim,
-        state.config.rope_theta,
-        state.config.rms_norm_eps
-      )
+    assert_raise ArgumentError, ~r/must have shape \{1, 1\}/, fn ->
+      Model.forward_greedy_chunk(input_ids, [], 0, 1, %{state | layers: []})
     end
   end
 
@@ -951,16 +907,16 @@ defmodule EMLXAxon.Qwen3GenerateTest do
   defp ones(shape), do: Nx.broadcast(Nx.tensor(1.0, type: :f16), shape)
 
   defp fake_native_chunk_runner(parent, kind) do
-    fn _input_ids, kv_cache, offset, count, _state ->
+    fn input_ids, kv_cache, offset, count, _state ->
       send(parent, {:native_chunk, kind, offset, count})
-      token = Nx.tensor(offset + count, type: :s64)
-      {List.duplicate(token, count), kv_cache}
+      token = Nx.squeeze(input_ids)
+      {Nx.broadcast(token, {count}), kv_cache}
     end
   end
 
   defp assert_cache_close(left, right) do
-    left = left |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend)
-    right = right |> EMLX.Backend.to_nx() |> Nx.backend_transfer(Nx.BinaryBackend)
+    left = Nx.backend_transfer(left, Nx.BinaryBackend)
+    right = Nx.backend_transfer(right, Nx.BinaryBackend)
 
     assert Nx.shape(left) == Nx.shape(right)
     assert Nx.all_close(left, right, atol: 1.0e-3, rtol: 1.0e-3) |> Nx.to_number() == 1

@@ -52,6 +52,7 @@ defmodule EMLXAxon.Qwen3.Native do
                  head_dim,
                  theta
                ) do
+    validate_attention_inputs!(query, key, value, k_cache, v_cache)
     {batch, tokens, heads, width} = Nx.shape(query)
     output = Nx.template({batch, tokens, heads * width}, Nx.type(query))
 
@@ -266,57 +267,166 @@ defmodule EMLXAxon.Qwen3.Native do
     )
   end
 
+  deftransform final_greedy(hidden, norm, lm_head, eps) do
+    {batch, _tokens, _hidden_size} = Nx.shape(hidden)
+
+    single_operation(
+      "final_greedy",
+      [hidden, norm, lm_head],
+      [Plugin.f64_bits(eps)],
+      Nx.template({batch}, {:u, 32})
+    )
+  end
+
   @doc false
-  deftransform layer_dense_tensor_offset(
+  deftransform forward_greedy_dense(
                  hidden,
-                 norm1,
-                 q_proj,
-                 k_proj,
-                 v_proj,
-                 o_proj,
-                 q_norm,
-                 k_norm,
-                 k_cache,
-                 v_cache,
-                 norm2,
-                 gate_proj,
-                 up_proj,
-                 down_proj,
+                 layers,
+                 kv_cache,
+                 norm,
+                 lm_head,
                  offset,
                  scale,
                  head_dim,
                  theta,
                  eps
                ) do
-    validate_tensor_offset!(offset, hidden, k_cache)
+    {operands, cache_templates, layer_count} =
+      flatten_dense_layers(hidden, layers, kv_cache, norm, lm_head)
 
-    multi_operation(
-      "layer_dense_tensor_offset",
-      [
-        hidden,
-        norm1,
-        q_proj,
-        k_proj,
-        v_proj,
-        o_proj,
-        q_norm,
-        k_norm,
-        k_cache,
-        v_cache,
-        norm2,
-        gate_proj,
-        up_proj,
-        down_proj,
-        offset
-      ],
-      [
-        Plugin.f64_bits(scale),
-        head_dim,
-        Plugin.f64_bits(theta),
-        Plugin.f64_bits(eps)
-      ],
-      {Nx.to_template(hidden), Nx.to_template(k_cache), Nx.to_template(v_cache)}
-    )
+    {batch, _tokens, _hidden_size} = Nx.shape(hidden)
+    token_template = Nx.template({batch}, {:u, 32})
+    templates = [token_template | cache_templates]
+
+    outputs =
+      flat_multi_operation(
+        "forward_greedy_dense",
+        operands,
+        [
+          layer_count,
+          offset,
+          Plugin.f64_bits(scale),
+          head_dim,
+          Plugin.f64_bits(theta),
+          Plugin.f64_bits(eps)
+        ],
+        templates
+      )
+
+    unpack_forward_outputs(outputs, layer_count)
+  end
+
+  @doc false
+  deftransform forward_greedy_chunk_dense(
+                 input_ids,
+                 embed_tokens,
+                 layers,
+                 kv_cache,
+                 norm,
+                 lm_head,
+                 offset,
+                 count,
+                 scale,
+                 head_dim,
+                 theta,
+                 eps
+               ) do
+    validate_chunk_input!(input_ids, kv_cache, offset, count)
+
+    {layer_operands, cache_templates, layer_count} =
+      flatten_dense_layers([], layers, kv_cache, norm, lm_head)
+
+    operands = [input_ids, embed_tokens | layer_operands]
+    templates = [Nx.template({count}, {:u, 32}) | cache_templates]
+
+    outputs =
+      flat_multi_operation(
+        "forward_greedy_chunk_dense",
+        operands,
+        [
+          layer_count,
+          offset,
+          count,
+          Plugin.f64_bits(scale),
+          head_dim,
+          Plugin.f64_bits(theta),
+          Plugin.f64_bits(eps)
+        ],
+        templates
+      )
+
+    unpack_forward_outputs(outputs, layer_count)
+  end
+
+  @doc false
+  def prepare_generalized_chunk(layers, lm_head) when is_list(layers) do
+    {prepared_layers, descriptors, next_operand} =
+      Enum.reduce(layers, {[], [], 2}, fn layer, {segments, descriptors, operand_index} ->
+        {norm1, norm2, q_norm, k_norm, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
+         down_proj} = validate_layer!(layer)
+
+        linears =
+          Enum.map(
+            [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj],
+            &prepare_linear(&1, false)
+          )
+
+        {linear_operands, linear_descriptors, next_operand} =
+          prepare_linear_segment(linears, operand_index + 6)
+
+        segment = {[norm1, norm2, q_norm, k_norm], linear_operands}
+        {[segment | segments], descriptors ++ linear_descriptors, next_operand}
+      end)
+
+    {lm_head_operands, lm_head_descriptor, _next_operand} =
+      prepare_linear_segment([prepare_linear(lm_head, true)], next_operand + 1)
+
+    {:qwen3_generalized_chunk, Enum.reverse(prepared_layers), lm_head_operands,
+     descriptors ++ lm_head_descriptor}
+  end
+
+  @doc false
+  deftransform forward_greedy_chunk_generalized(
+                 input_ids,
+                 embed_tokens,
+                 layers,
+                 kv_cache,
+                 norm,
+                 lm_head,
+                 offset,
+                 count,
+                 scale,
+                 head_dim,
+                 theta,
+                 eps
+               ) do
+    validate_chunk_input!(input_ids, kv_cache, offset, count)
+
+    {operands, descriptors, cache_templates, layer_count} =
+      flatten_generalized_chunk(layers, kv_cache, input_ids, embed_tokens, norm, lm_head)
+
+    templates = [Nx.template({count}, {:u, 32}) | cache_templates]
+
+    outputs =
+      flat_multi_operation(
+        "forward_greedy_chunk_generalized",
+        operands,
+        [
+          1,
+          layer_count,
+          offset,
+          count,
+          Plugin.f64_bits(scale),
+          head_dim,
+          Plugin.f64_bits(theta),
+          Plugin.f64_bits(eps),
+          layer_count * 7 + 1
+          | descriptors
+        ],
+        templates
+      )
+
+    unpack_forward_outputs(outputs, layer_count)
   end
 
   @doc false
@@ -396,6 +506,11 @@ defmodule EMLXAxon.Qwen3.Native do
     end
   end
 
+  defp flat_multi_operation(callback, tensors, attrs, templates) do
+    multi_operation(callback, tensors, attrs, List.to_tuple(templates))
+    |> Tuple.to_list()
+  end
+
   @doc false
   def operation_callback(operands, opts) do
     outputs =
@@ -421,7 +536,18 @@ defmodule EMLXAxon.Qwen3.Native do
   end
 
   defp append_linear({operands, descriptors}, tensor, transpose) do
+    append_prepared_linear({operands, descriptors}, prepare_linear(tensor, transpose))
+  end
+
+  defp prepare_linear(tensor, transpose) do
     {physical, group_size, bits, mode, quantized?} = physical_linear(tensor)
+    {physical, group_size, bits, mode, quantized?, transpose}
+  end
+
+  defp append_prepared_linear(
+         {operands, descriptors},
+         {physical, group_size, bits, mode, quantized?, transpose}
+       ) do
     weight_index = length(operands)
     [weight | optional] = physical
     operands = operands ++ [weight]
@@ -452,6 +578,250 @@ defmodule EMLXAxon.Qwen3.Native do
     ]
 
     {operands, descriptors ++ descriptor}
+  end
+
+  defp flatten_generalized_chunk(
+         {:qwen3_generalized_chunk, prepared_layers, lm_head_operands, descriptors},
+         kv_cache,
+         input_ids,
+         embed_tokens,
+         norm,
+         _lm_head
+       ) do
+    unless length(prepared_layers) == length(kv_cache) and prepared_layers != [] do
+      raise ArgumentError,
+            "Qwen3 layers and KV cache must have the same nonzero length, got " <>
+              "#{length(prepared_layers)} prepared layers and #{length(kv_cache)} caches"
+    end
+
+    {layer_segments, cache_templates} =
+      Enum.zip_with(prepared_layers, kv_cache, fn {fixed, linear_operands}, cache ->
+        {k_cache, v_cache} = cache_tensors!(cache)
+
+        {[fixed, [k_cache, v_cache], linear_operands],
+         [Nx.to_template(k_cache), Nx.to_template(v_cache)]}
+      end)
+      |> Enum.unzip()
+
+    operands = List.flatten([[input_ids, embed_tokens], layer_segments, [norm], lm_head_operands])
+    {operands, descriptors, List.flatten(cache_templates), length(prepared_layers)}
+  end
+
+  defp flatten_generalized_chunk(
+         layers,
+         kv_cache,
+         input_ids,
+         embed_tokens,
+         norm,
+         lm_head
+       ) do
+    {operands, descriptors, cache_templates, layer_count} =
+      flatten_generalized_layers(
+        layers,
+        kv_cache,
+        [input_ids, embed_tokens],
+        [],
+        []
+      )
+
+    {operands, descriptors} = append_linear({operands ++ [norm], descriptors}, lm_head, true)
+    {operands, descriptors, cache_templates, layer_count}
+  end
+
+  defp prepare_linear_segment(linears, operand_index) do
+    Enum.reduce(linears, {[], [], operand_index}, fn
+      {physical, group_size, bits, mode, quantized?, transpose}, {operands, descriptors, index} ->
+        physical_count = length(physical)
+        scales_index = if physical_count >= 2, do: index + 1, else: -1
+        biases_index = if physical_count == 3, do: index + 2, else: -1
+
+        descriptor = [
+          if(quantized?, do: 1, else: 0),
+          index,
+          scales_index,
+          biases_index,
+          group_size,
+          bits,
+          quantization_mode(mode),
+          if(quantized? or transpose, do: 1, else: 0)
+        ]
+
+        {operands ++ physical, descriptors ++ descriptor, index + physical_count}
+    end)
+  end
+
+  defp flatten_dense_layers(first, layers, kv_cache, norm, lm_head) do
+    {reversed_operands, reversed_templates, layer_count} =
+      do_flatten_dense_layers(layers, kv_cache, [], [], 0)
+
+    if layer_count == 0 do
+      raise ArgumentError, "Qwen3 layers and KV cache must not be empty"
+    end
+
+    operands =
+      case first do
+        [] -> :lists.reverse(reversed_operands) ++ [norm, lm_head]
+        tensor -> [tensor | :lists.reverse(reversed_operands)] ++ [norm, lm_head]
+      end
+
+    {operands, :lists.reverse(reversed_templates), layer_count}
+  end
+
+  defp do_flatten_dense_layers([], [], operands, templates, layer_count),
+    do: {operands, templates, layer_count}
+
+  defp do_flatten_dense_layers(
+         [layer | layers],
+         [cache | caches],
+         operands,
+         templates,
+         layer_count
+       ) do
+    {norm1, norm2, q_norm, k_norm, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj} =
+      validate_layer!(layer)
+
+    {k_cache, v_cache} = cache_tensors!(cache)
+
+    fields = [
+      norm1,
+      norm2,
+      q_norm,
+      k_norm,
+      q_proj,
+      k_proj,
+      v_proj,
+      o_proj,
+      gate_proj,
+      up_proj,
+      down_proj,
+      k_cache,
+      v_cache
+    ]
+
+    do_flatten_dense_layers(
+      layers,
+      caches,
+      Enum.reverse(fields, operands),
+      [Nx.to_template(v_cache), Nx.to_template(k_cache) | templates],
+      layer_count + 1
+    )
+  end
+
+  defp do_flatten_dense_layers(layers, caches, _operands, _templates, _layer_count) do
+    raise ArgumentError,
+          "Qwen3 layers and KV cache must have the same nonzero length, got " <>
+            "#{length(layers)} remaining layers and #{length(caches)} remaining caches"
+  end
+
+  defp flatten_generalized_layers([], [], operands, descriptors, cache_templates) do
+    layer_count = div(length(cache_templates), 2)
+
+    if layer_count == 0 do
+      raise ArgumentError, "Qwen3 layers and KV cache must not be empty"
+    end
+
+    {operands, descriptors, cache_templates, layer_count}
+  end
+
+  defp flatten_generalized_layers(
+         [layer | layers],
+         [cache | caches],
+         operands,
+         descriptors,
+         cache_templates
+       ) do
+    {norm1, norm2, q_norm, k_norm, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj} =
+      validate_layer!(layer)
+
+    {k_cache, v_cache} = cache_tensors!(cache)
+
+    {operands, descriptors} =
+      {operands ++ [norm1, norm2, q_norm, k_norm, k_cache, v_cache], descriptors}
+      |> append_linear(q_proj, false)
+      |> append_linear(k_proj, false)
+      |> append_linear(v_proj, false)
+      |> append_linear(o_proj, false)
+      |> append_linear(gate_proj, false)
+      |> append_linear(up_proj, false)
+      |> append_linear(down_proj, false)
+
+    flatten_generalized_layers(
+      layers,
+      caches,
+      operands,
+      descriptors,
+      cache_templates ++ [Nx.to_template(k_cache), Nx.to_template(v_cache)]
+    )
+  end
+
+  defp flatten_generalized_layers(layers, caches, _operands, _descriptors, _templates) do
+    raise ArgumentError,
+          "Qwen3 layers and KV cache must have the same nonzero length, got " <>
+            "#{length(layers)} remaining layers and #{length(caches)} remaining caches"
+  end
+
+  defp validate_layer!(layer) when is_tuple(layer) and tuple_size(layer) == 11, do: layer
+
+  defp validate_layer!(layer) do
+    raise ArgumentError,
+          "expected a Qwen3 layer tuple with 11 tensors, got: #{inspect(layer)}"
+  end
+
+  defp cache_tensors!({%Nx.Tensor{} = k_cache, %Nx.Tensor{} = v_cache}),
+    do: {k_cache, v_cache}
+
+  defp cache_tensors!({{device, k_ref}, {device, v_ref}})
+       when is_atom(device) and is_reference(k_ref) and is_reference(v_ref) do
+    {EMLX.Backend.to_nx({device, k_ref}), EMLX.Backend.to_nx({device, v_ref})}
+  end
+
+  defp cache_tensors!(cache) do
+    raise ArgumentError,
+          "expected a Qwen3 KV cache pair on one EMLX device, got: #{inspect(cache)}"
+  end
+
+  defp unpack_forward_outputs([token | cache_outputs], layer_count)
+       when length(cache_outputs) == layer_count * 2 do
+    {token, cache_outputs |> unpack_cache_outputs([]) |> List.to_tuple()}
+  end
+
+  defp unpack_forward_outputs(outputs, layer_count) do
+    raise ArgumentError,
+          "Qwen3 plugin returned #{length(outputs)} outputs, expected #{1 + layer_count * 2}"
+  end
+
+  defp unpack_cache_outputs([k_cache, v_cache | outputs], caches),
+    do: unpack_cache_outputs(outputs, [{k_cache, v_cache} | caches])
+
+  defp unpack_cache_outputs([], caches), do: :lists.reverse(caches)
+
+  defp validate_chunk_input!(input_ids, kv_cache, offset, count) do
+    unless Nx.shape(input_ids) == {1, 1} do
+      raise ArgumentError,
+            "Qwen3 chunk input_ids must have shape {1, 1}, got: #{inspect(Nx.shape(input_ids))}"
+    end
+
+    unless is_integer(offset) and offset >= 0 do
+      raise ArgumentError, "Qwen3 chunk offset must be a nonnegative integer"
+    end
+
+    unless is_integer(count) and count > 0 do
+      raise ArgumentError, "Qwen3 chunk count must be a positive integer"
+    end
+
+    case kv_cache do
+      [cache | _] ->
+        {k_cache, _v_cache} = cache_tensors!(cache)
+        capacity = elem(Nx.shape(k_cache), 2)
+
+        if offset > capacity - count do
+          raise ArgumentError,
+                "Qwen3 chunk requires cache length #{offset + count}, capacity is #{capacity}"
+        end
+
+      [] ->
+        raise ArgumentError, "Qwen3 layers and KV cache must not be empty"
+    end
   end
 
   defp physical_linear(%Nx.Tensor{
@@ -553,5 +923,19 @@ defmodule EMLXAxon.Qwen3.Native do
       raise ArgumentError,
             "expected 1 <= token_count <= cache_capacity <= INT32_MAX"
     end
+  end
+
+  defp validate_attention_inputs!(query, key, value, k_cache, v_cache) do
+    Enum.each(
+      [query: query, key: key, value: value, k_cache: k_cache, v_cache: v_cache],
+      fn {name, tensor} ->
+        unless match?(%Nx.Tensor{}, tensor) and tuple_size(Nx.shape(tensor)) == 4 do
+          shape = if match?(%Nx.Tensor{}, tensor), do: Nx.shape(tensor), else: :not_a_tensor
+
+          raise ArgumentError,
+                "Qwen3 #{name} expects rank 4, got shape: #{inspect(shape)}"
+        end
+      end
+    )
   end
 end

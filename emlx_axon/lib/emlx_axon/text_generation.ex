@@ -310,6 +310,7 @@ defmodule EMLXAxon.TextGeneration do
                         compatible with `Bumblebee.Text.generation/4` (default `:native`)
   """
   def serving(tokenizer, state, opts \\ []) do
+    state = Model.prepare_native(state)
     max_new = max_new_tokens!(opts, 100)
     configured_max_len = Keyword.get(opts, :max_len, 2048)
     sampler = Keyword.get(opts, :sampler, :greedy)

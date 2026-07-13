@@ -71,8 +71,8 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp c_src/emlx_native_image.cpp c_src/emlx_nif_lifecycle.cpp c_src/emlx_sha256.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_abi.hpp c_src/emlx_plugin_toolchain.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_native_image.hpp c_src/emlx_nif_lifecycle.hpp c_src/emlx_sha256.hpp c_src/emlx_depfile.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp c_src/emlx_native_image.cpp c_src/emlx_nif_lifecycle.cpp c_src/emlx_sha256.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_abi.hpp c_src/emlx_plugin_toolchain.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_native_image.hpp c_src/emlx_nif_lifecycle.hpp c_src/emlx_sha256.hpp c_src/emlx_depfile.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 DEPFILES = $(patsubst c_src/%.cpp,$(call esc,$(EMLX_DEPFILE_DIR))/%.d,$(SOURCES))
 HOST_DEPFILE_ARGS = $(foreach source,$(SOURCES),"$(source)" "$(EMLX_DEPFILE_DIR)/$(patsubst c_src/%.cpp,%.d,$(source))")

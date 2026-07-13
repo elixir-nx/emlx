@@ -3,7 +3,7 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
 
   import Nx.Defn
 
-  alias EMLXAxon.Qwen3.Native
+  alias EMLXAxon.Qwen3.{Model, Native}
 
   defn compiled_mlp(hidden, norm, gate, up, down) do
     Native.mlp(hidden, norm, gate, up, down, 1.0e-5)
@@ -46,6 +46,55 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
       {next_attention, carried_query, carried_key, carried_value, next_k, next_v,
        current_offset + 1}
     end
+  end
+
+  defn compiled_forward_dense(hidden, layer, k_cache, v_cache, norm, lm_head) do
+    Native.forward_greedy_dense(
+      hidden,
+      [layer],
+      [{k_cache, v_cache}],
+      norm,
+      lm_head,
+      0,
+      0.7071067811865475,
+      2,
+      10_000.0,
+      1.0e-6
+    )
+  end
+
+  defn compiled_chunk_dense(input_ids, embed, layer, k_cache, v_cache, norm, lm_head) do
+    Native.forward_greedy_chunk_dense(
+      input_ids,
+      embed,
+      [layer],
+      [{k_cache, v_cache}],
+      norm,
+      lm_head,
+      0,
+      3,
+      0.7071067811865475,
+      2,
+      10_000.0,
+      1.0e-6
+    )
+  end
+
+  defn compiled_chunk_generalized(input_ids, embed, layer, k_cache, v_cache, norm, lm_head) do
+    Native.forward_greedy_chunk_generalized(
+      input_ids,
+      embed,
+      [layer],
+      [{k_cache, v_cache}],
+      norm,
+      lm_head,
+      0,
+      3,
+      0.7071067811865475,
+      2,
+      10_000.0,
+      1.0e-6
+    )
   end
 
   test "dense MLP matches an Nx reference eagerly and under EMLX compilation" do
@@ -138,30 +187,7 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
         v_cache
       )
 
-    {old_attention, old_k, old_v} =
-      EMLX.Native.Qwen3.kv_cache_attention(
-        EMLX.Backend.from_nx(query),
-        EMLX.Backend.from_nx(key),
-        EMLX.Backend.from_nx(value),
-        EMLX.Backend.from_nx(k_cache),
-        EMLX.Backend.from_nx(v_cache),
-        0,
-        scale,
-        2,
-        10_000.0
-      )
-      |> then(fn {attention, updated_k, updated_v} ->
-        {
-          EMLX.Backend.to_nx(attention),
-          EMLX.Backend.to_nx(updated_k),
-          EMLX.Backend.to_nx(updated_v)
-        }
-      end)
-
-    Enum.zip(Tuple.to_list(eager), [old_attention, old_k, old_v])
-    |> Enum.each(fn {actual, expected} -> assert_close(actual, expected) end)
-
-    Enum.zip(Tuple.to_list(compiled), [old_attention, old_k, old_v])
+    Enum.zip(Tuple.to_list(compiled), Tuple.to_list(eager))
     |> Enum.each(fn {actual, expected} -> assert_close(actual, expected) end)
 
     {_attention, updated_k, updated_v} = eager
@@ -216,6 +242,74 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
     assert_close(updated_k, expected_k)
     assert_close(updated_v, expected_v)
     assert Nx.to_number(final_offset) == 2
+  end
+
+  test "full forward preserves token and per-layer cache ordering when compiled" do
+    fixture = dense_forward_fixture()
+
+    eager =
+      Native.forward_greedy_dense(
+        fixture.hidden,
+        [fixture.layer],
+        [{fixture.k_cache, fixture.v_cache}],
+        fixture.norm,
+        fixture.lm_head,
+        0,
+        0.7071067811865475,
+        2,
+        10_000.0,
+        1.0e-6
+      )
+
+    compiled =
+      Nx.Defn.jit(&compiled_forward_dense/6, compiler: EMLX).(
+        fixture.hidden,
+        fixture.layer,
+        fixture.k_cache,
+        fixture.v_cache,
+        fixture.norm,
+        fixture.lm_head
+      )
+
+    assert_forward_close(compiled, eager, {1})
+  end
+
+  test "dense and generalized chunk callbacks preserve ordered tokens and caches when compiled" do
+    fixture = dense_forward_fixture()
+
+    for {eager_fun, compiled_fun} <- [
+          {&Native.forward_greedy_chunk_dense/12, &compiled_chunk_dense/7},
+          {&Native.forward_greedy_chunk_generalized/12, &compiled_chunk_generalized/7}
+        ] do
+      eager =
+        eager_fun.(
+          fixture.input_ids,
+          fixture.embed,
+          [fixture.layer],
+          [{fixture.k_cache, fixture.v_cache}],
+          fixture.norm,
+          fixture.lm_head,
+          0,
+          3,
+          0.7071067811865475,
+          2,
+          10_000.0,
+          1.0e-6
+        )
+
+      compiled =
+        Nx.Defn.jit(compiled_fun, compiler: EMLX).(
+          fixture.input_ids,
+          fixture.embed,
+          fixture.layer,
+          fixture.k_cache,
+          fixture.v_cache,
+          fixture.norm,
+          fixture.lm_head
+        )
+
+      assert_forward_close(compiled, eager, {3})
+    end
   end
 
   test "internal tensor offsets are safely clamped and validated" do
@@ -365,6 +459,34 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
     refute Enum.any?(wire.instructions, &(&1.op == :runtime_call))
   end
 
+  test "native preparation follows the same dense-only dispatch predicate" do
+    dense = plan_state()
+
+    assert %Model.State{native: nil} = Model.prepare_native(dense)
+
+    head_quantized = %{dense | lm_head: quantized_projection({32, 32}, 201, :f16)}
+    head_prepared = Model.prepare_native(head_quantized)
+    assert_generalized_plan(head_prepared)
+    assert Model.prepare_native(head_prepared) === head_prepared
+
+    quantized = quantized_plan_state(dense)
+    assert_generalized_plan(Model.prepare_native(quantized))
+
+    [layer] = dense.layers
+    {norm1, norm2, q_norm, k_norm, _q_proj, k_proj, v_proj, o_proj, gate, up, down} = layer
+
+    mixed = %{
+      dense
+      | layers: [
+          {norm1, norm2, q_norm, k_norm, quantized_projection({32, 32}, 202, :f16), k_proj,
+           v_proj, o_proj, gate, up, down}
+        ],
+        config: %{dense.config | dense_layers?: false}
+    }
+
+    assert_generalized_plan(Model.prepare_native(mixed))
+  end
+
   defp reference_mlp(hidden, norm, gate, up, down, eps) do
     squared = Nx.multiply(hidden, hidden)
 
@@ -382,6 +504,101 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
       |> Nx.multiply(up_value)
 
     Nx.add(hidden, Nx.dot(activated, [2], down, [0]))
+  end
+
+  defp dense_forward_fixture do
+    hidden = gpu_iota({1, 1, 4}, 20, :f32)
+    norm1 = gpu_iota({4}, 10, :f32)
+    norm2 = gpu_iota({4}, 12, :f32)
+    q_norm = gpu_iota({2}, 14, :f32)
+    k_norm = gpu_iota({2}, 16, :f32)
+
+    layer = {
+      norm1,
+      norm2,
+      q_norm,
+      k_norm,
+      gpu_iota({4, 4}, 100, :f32),
+      gpu_iota({4, 2}, 110, :f32),
+      gpu_iota({4, 2}, 120, :f32),
+      gpu_iota({4, 4}, 130, :f32),
+      gpu_iota({4, 6}, 140, :f32),
+      gpu_iota({4, 6}, 150, :f32),
+      gpu_iota({6, 4}, 160, :f32)
+    }
+
+    zero = Nx.tensor(0.0, type: :f32, backend: {EMLX.Backend, device: :gpu})
+
+    %{
+      hidden: hidden,
+      input_ids: Nx.tensor([[1]], type: :s64, backend: {EMLX.Backend, device: :gpu}),
+      embed: gpu_iota({8, 4}, 200, :f32),
+      layer: layer,
+      k_cache: Nx.broadcast(zero, {1, 1, 4, 2}),
+      v_cache: Nx.broadcast(zero, {1, 1, 4, 2}),
+      norm: gpu_iota({4}, 18, :f32),
+      lm_head: gpu_iota({8, 4}, 190, :f32)
+    }
+  end
+
+  defp plan_state do
+    layer = {
+      gpu_iota({32}, 10, :f16),
+      gpu_iota({32}, 12, :f16),
+      gpu_iota({16}, 14, :f16),
+      gpu_iota({16}, 16, :f16),
+      gpu_iota({32, 32}, 101, :f16),
+      gpu_iota({32, 16}, 102, :f16),
+      gpu_iota({32, 16}, 103, :f16),
+      gpu_iota({32, 32}, 104, :f16),
+      gpu_iota({32, 32}, 105, :f16),
+      gpu_iota({32, 32}, 106, :f16),
+      gpu_iota({32, 32}, 107, :f16)
+    }
+
+    %Model.State{
+      embed_tokens: gpu_iota({32, 32}, 108, :f16),
+      layers: [layer],
+      norm: gpu_iota({32}, 109, :f16),
+      lm_head: gpu_iota({32, 32}, 110, :f16),
+      config: %{dense_layers?: true}
+    }
+  end
+
+  defp quantized_plan_state(dense) do
+    [layer] = dense.layers
+
+    {norm1, norm2, q_norm, k_norm, _q_proj, _k_proj, _v_proj, _o_proj, _gate, _up, _down} =
+      layer
+
+    %{
+      dense
+      | layers: [
+          {norm1, norm2, q_norm, k_norm, quantized_projection({32, 32}, 111, :f16),
+           quantized_projection({32, 16}, 112, :f16), quantized_projection({32, 16}, 113, :f16),
+           quantized_projection({32, 32}, 114, :f16), quantized_projection({32, 32}, 115, :f16),
+           quantized_projection({32, 32}, 116, :f16), quantized_projection({32, 32}, 117, :f16)}
+        ],
+        lm_head: quantized_projection({32, 32}, 118, :f16),
+        config: %{dense.config | dense_layers?: false}
+    }
+  end
+
+  defp assert_generalized_plan(%Model.State{
+         native: %{generalized_chunk: {:qwen3_generalized_chunk, [_layer], _head, descriptors}}
+       }) do
+    assert descriptors != []
+  end
+
+  defp assert_forward_close(
+         {actual_token, {{actual_k, actual_v}}},
+         {expected_token, {{expected_k, expected_v}}},
+         token_shape
+       ) do
+    assert Nx.shape(actual_token) == token_shape
+    assert Nx.to_flat_list(actual_token) == Nx.to_flat_list(expected_token)
+    assert_close(actual_k, expected_k)
+    assert_close(actual_v, expected_v)
   end
 
   defp emlx_tensor(value), do: Nx.tensor(value, type: :f32, backend: EMLX.Backend)

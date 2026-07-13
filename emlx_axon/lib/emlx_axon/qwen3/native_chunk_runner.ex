@@ -21,19 +21,26 @@ defmodule EMLXAxon.Qwen3.NativeChunkRunner do
   end
 
   defp do_run(_last_token, kv_cache, current_len, 0, _forward, tokens) do
-    {:lists.reverse(tokens), kv_cache, current_len}
+    case tokens do
+      [last_chunk | _] ->
+        last_token = last_chunk[-1]
+        {:lists.reverse(tokens), last_token, kv_cache, current_len}
+
+      [] ->
+        raise ArgumentError, "native Qwen3 chunk returned no tokens"
+    end
   end
 
   defp do_run(last_token, kv_cache, current_len, remaining, forward, tokens) do
     count = min(remaining, @max_chunk_size)
     {next_tokens, kv_cache} = forward.(last_token, kv_cache, current_len, count)
 
-    unless is_list(next_tokens) and length(next_tokens) == count do
+    unless match?(%Nx.Tensor{}, next_tokens) and Nx.shape(next_tokens) == {count} do
       raise ArgumentError,
             "native Qwen3 chunk returned #{chunk_length(next_tokens)} tokens, expected #{count}"
     end
 
-    {last_token, tokens} = prepend_tokens(next_tokens, tokens)
+    last_token = next_tokens[-1]
 
     do_run(
       last_token,
@@ -41,24 +48,10 @@ defmodule EMLXAxon.Qwen3.NativeChunkRunner do
       current_len + count,
       remaining - count,
       forward,
-      tokens
+      [next_tokens | tokens]
     )
   end
 
-  defp prepend_tokens([token | rest], tokens) do
-    prepend_tokens(rest, token, [token | tokens])
-  end
-
-  defp prepend_tokens([], _tokens) do
-    raise ArgumentError, "native Qwen3 chunk returned no tokens"
-  end
-
-  defp prepend_tokens([token | rest], _last_token, tokens) do
-    prepend_tokens(rest, token, [token | tokens])
-  end
-
-  defp prepend_tokens([], last_token, tokens), do: {last_token, tokens}
-
-  defp chunk_length(tokens) when is_list(tokens), do: length(tokens)
-  defp chunk_length(_tokens), do: "a non-list value"
+  defp chunk_length(%Nx.Tensor{} = tokens), do: "tensor shape #{inspect(Nx.shape(tokens))}"
+  defp chunk_length(_tokens), do: "a non-tensor value"
 end

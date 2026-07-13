@@ -11,8 +11,7 @@ defmodule EMLXAxon.Qwen3.Attention do
   Qwen3 plugin callbacks in `qwen3_plugin.cpp`. They transpose Q/K to
   `{B, N, T, D}` and apply RoPE internally via `mlx::core::fast::rope` before
   the fused cache update and SDPA. The `offset` is the current cache fill
-  length. `EMLX.Native.Qwen3` remains the compatibility wrapper for direct
-  eager callers.
+  length.
   """
 
   alias EMLXAxon.Qwen3.Layers

@@ -61,7 +61,7 @@ struct KVCache {
 // Qwen3 compute plugin — pure MLX graph-building code, no Erlang/erl_nif
 // dependency whatsoever. Built as its own shared library (libemlx_qwen3.so,
 // see this project's Makefile) and `dlopen`'d by emlx's host NIF library
-// (emlx's c_src/emlx_fast/qwen3.cpp) via
+// through
 // `EMLX.NIF.load_plugin("qwen3", path)`. The generic plugin ABI is owned by
 // EMLX; all Qwen3 model schemas remain private to this translation unit.
 
@@ -1096,10 +1096,9 @@ bool v_forward_greedy_from_hidden(const mlx::core::array &hidden, std::vector<La
     auto logits = linear_out_in(normed, lm_head, device);
     auto token = mlx::core::argmax(logits, 1, false, device);
 
-    eval_arrays.push_back(token);
-    mlx::core::async_eval(eval_arrays);
-
     if (return_token_id) {
+      eval_arrays.push_back(token);
+      mlx::core::async_eval(eval_arrays);
       token_id_out = token_to_int64(token);
     } else {
       token_out = token;
@@ -1221,15 +1220,6 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
       current_offset += 1;
     }
 
-    std::vector<mlx::core::array> eval_arrays;
-    eval_arrays.reserve(token_arrays.size() + (layer_count * 2));
-    eval_arrays.insert(eval_arrays.end(), token_arrays.begin(), token_arrays.end());
-    for (size_t layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
-      eval_arrays.push_back(k_cache[layer_idx]);
-      eval_arrays.push_back(v_cache[layer_idx]);
-    }
-    mlx::core::async_eval(eval_arrays);
-
     token_out = std::move(token_arrays);
     k_out = std::move(k_cache);
     v_out = std::move(v_cache);
@@ -1347,15 +1337,6 @@ bool v_forward_greedy_ids_chunk_quantized(
       current_offset += 1;
     }
 
-    std::vector<mlx::core::array> eval_arrays;
-    eval_arrays.reserve(token_arrays.size() + (layer_count * 2));
-    eval_arrays.insert(eval_arrays.end(), token_arrays.begin(), token_arrays.end());
-    for (size_t layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
-      eval_arrays.push_back(k_cache[layer_idx]);
-      eval_arrays.push_back(v_cache[layer_idx]);
-    }
-    mlx::core::async_eval(eval_arrays);
-
     token_out = std::move(token_arrays);
     k_out = std::move(k_cache);
     v_out = std::move(v_cache);
@@ -1377,7 +1358,6 @@ inline constexpr char kKVCacheAttentionTensorName[] =
 inline constexpr char kAttentionResidualName[] = "attention_residual";
 inline constexpr char kAttentionBlockName[] = "attention_block";
 inline constexpr char kLayerDenseName[] = "layer_dense";
-inline constexpr char kLayerDenseTensorName[] = "layer_dense_tensor_offset";
 inline constexpr char kLayerGeneralizedName[] = "layer_generalized";
 inline constexpr char kFinalGreedyName[] = "final_greedy";
 inline constexpr char kForwardDenseName[] = "forward_greedy_dense";
@@ -1773,71 +1753,6 @@ bool plugin_layer_dense(const EMLXPluginCall &call,
   return true;
 }
 
-bool plugin_layer_dense_tensor(const EMLXPluginCall &call,
-                               std::vector<mlx::core::array> &outputs,
-                               std::string &error) {
-  if (call.operands.size != 15 || call.attrs.size != 4 || !call.execution ||
-      !call.execution->device) {
-    error = "qwen3/layer_dense_tensor_offset has an invalid call contract";
-    return false;
-  }
-  int head_dim = 0;
-  if (!int32_attr(call, 1, "head_dim", head_dim, error))
-    return false;
-  std::vector<mlx::core::array> operands(call.operands.data,
-                                         call.operands.data + call.operands.size);
-  LayerParams layer{&operands[1],  &operands[10], &operands[6],
-                    &operands[7],  &operands[2],  &operands[3],
-                    &operands[4],  &operands[5],  &operands[11],
-                    &operands[12], &operands[13]};
-  KVCache cache{&operands[8], &operands[9]};
-  if (!validate_dense_layer(operands[0], layer, cache, 0, head_dim, error) ||
-      !validate_tensor_offset(operands[14], operands[8].shape(2),
-                              operands[0].shape(1), error))
-    return false;
-
-  const auto &device = *call.execution->device;
-  const float eps = f64_from_bits(call.attrs.data[3]);
-  auto normalized =
-      mlx::core::fast::rms_norm(operands[0], operands[1], eps, device);
-  const int batch = operands[0].shape(0);
-  const int tokens = operands[0].shape(1);
-  const int query_heads = operands[2].shape(1) / head_dim;
-  const int kv_heads = operands[3].shape(1) / head_dim;
-  auto query = mlx::core::reshape(linear_in_out(normalized, operands[2], device),
-                                  {batch, tokens, query_heads, head_dim}, device);
-  auto key = mlx::core::reshape(linear_in_out(normalized, operands[3], device),
-                                {batch, tokens, kv_heads, head_dim}, device);
-  auto value = mlx::core::reshape(linear_in_out(normalized, operands[4], device),
-                                  {batch, tokens, kv_heads, head_dim}, device);
-  query = mlx::core::fast::rms_norm(query, operands[6], eps, device);
-  key = mlx::core::fast::rms_norm(key, operands[7], eps, device);
-  auto attention = operands[0];
-  auto k_updated = operands[8];
-  auto v_updated = operands[9];
-  if (!tensor_offset_attention(
-          query, key, value, operands[8], operands[9], operands[14],
-          f64_from_bits(call.attrs.data[0]), head_dim,
-          f64_from_bits(call.attrs.data[2]), device, attention, k_updated,
-          v_updated, error))
-    return false;
-  auto attention_hidden = mlx::core::add(
-      operands[0], linear_in_out(attention, operands[5], device), device);
-  auto normalized_mlp =
-      mlx::core::fast::rms_norm(attention_hidden, operands[10], eps, device);
-  auto gate = linear_in_out(normalized_mlp, operands[11], device);
-  auto up = linear_in_out(normalized_mlp, operands[12], device);
-  auto activated = mlx::core::multiply(
-      mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device), up,
-      device);
-  auto output = mlx::core::add(
-      attention_hidden, linear_in_out(activated, operands[13], device), device);
-  outputs.push_back(std::move(output));
-  outputs.push_back(std::move(k_updated));
-  outputs.push_back(std::move(v_updated));
-  return true;
-}
-
 bool plugin_layer_generalized(const EMLXPluginCall &call,
                               std::vector<mlx::core::array> &outputs,
                               std::string &error) {
@@ -2164,9 +2079,6 @@ constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
     {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
      plugin_layer_dense, {nullptr, 0}},
-    {string_view(kLayerDenseTensorName), 1, 1, 15, nullptr, 3, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_layer_dense_tensor, {nullptr, 0}},
     {string_view(kLayerGeneralizedName), 1, 1, 0,
      generalized_layer_operand_count, 3, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,

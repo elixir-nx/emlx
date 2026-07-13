@@ -4,7 +4,7 @@ defmodule EMLXAxon.Qwen3.DenseLoader do
   Bumblebee Qwen3 dense parameters or Hugging Face safetensors files.
 
   Bumblebee stores dense linear kernels in `{in, out}` convention. The native
-  dense Qwen3 bridge keeps that layout so MLX can use direct
+  Qwen3 path keeps that layout so MLX can use direct
   `matmul(input, weight)` calls without adding a transpose node for every
   projection in the decode graph.
   """
