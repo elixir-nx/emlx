@@ -19,6 +19,8 @@ SCAN_OBJ_DIR = $(SCAN_DIR)/objs
 FINAL_DEP_DIR = $(PRIV_DIR)/deps
 FINAL_OBJ_DIR = $(PRIV_DIR)/objs
 VERIFY_STAMP = $(PRIV_DIR)/.qwen3-plugin-deps-verified
+PLUGIN_INSPECTOR = c_src/inspect_plugin.sh
+PLUGIN_DEPENDENCY_POLICY = c_src/plugin_dependency_policy_v1.txt
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -59,12 +61,13 @@ $(call esc,$(SCAN_BUILD_ID_HEADER)): $(call esc,$(QWEN3_MLX_ID_HEADER)) FORCE
 	@ mkdir -p "$(SCAN_INCLUDE_DIR)"
 	"$(EMLX_BUILD_ID_TOOL)" write-id-header "$@" EMLX_QWEN3_PLUGIN_BUILD_ID 0000000000000000000000000000000000000000000000000000000000000000
 
-$(call esc,$(SCAN_DEP_DIR))/%.d: c_src/%.cpp $(HEADERS) $(call esc,$(SCAN_BUILD_ID_HEADER)) $(call esc,$(QWEN3_MLX_ID_HEADER))
+$(call esc,$(SCAN_DEP_DIR))/%.d: c_src/%.cpp $(HEADERS) $(PLUGIN_INSPECTOR) $(call esc,$(SCAN_BUILD_ID_HEADER)) $(call esc,$(QWEN3_MLX_ID_HEADER))
 	@ mkdir -p "$(SCAN_OBJ_DIR)/$(dir $*)" "$(dir $@)"
 	"$(EMLX_PLUGIN_TOOL_WRAPPER)" --role compiler --mode scan --real "$(EMLX_PLUGIN_REAL_CXX)" -- $(BASE_CFLAGS) -I"$(SCAN_INCLUDE_DIR)" -I"$(GENERATED_INCLUDE_DIR)" -MD -MF "$@" -MT "$<" -c "$<" -o "$(SCAN_OBJ_DIR)/$*.o"
+	@ "$(PLUGIN_INSPECTOR)" object "$(SCAN_OBJ_DIR)/$*.o" || { rm -f "$@" "$(SCAN_OBJ_DIR)/$*.o"; exit 1; }
 
-$(call esc,$(QWEN3_BUILD_ID_HEADER)): $(SCAN_DEPFILES) $(call esc,$(QWEN3_MLX_ID_HEADER)) c_src/plugin_dependency_policy_v1.txt Makefile
-	"$(EMLX_BUILD_ID_TOOL)" plugin-build-id "$(CURDIR)" "$(EMLX_SOURCE_DIR)" "$(MLX_INCLUDE_DIR)" "$(SCAN_BUILD_ID_HEADER)" "$(QWEN3_MLX_ID_HEADER)" "$(EMLX_PLUGIN_INCLUDE_DIR)/emlx_plugin_build_compat.hpp" "$@" "$(QWEN3_BUILD_ID_FILE)" --policy "$(EMLX_SOURCE_DIR)/c_src/tools/emlx_plugin_tool_wrapper.cpp" --policy "$(EMLX_SOURCE_DIR)/c_src/emlx_plugin_toolchain.hpp" --policy "$(CURDIR)/c_src/plugin_dependency_policy_v1.txt" --policy "$(CURDIR)/Makefile" --flag "compiler-family=$(EMLX_PLUGIN_COMPILER_FAMILY)" --flag "target=$(TARGET_TRIPLE)" --flag "language=c++20" --flag "optimization=O3" --flag "visibility=hidden" --flag "exceptions=enabled" --flag "rtti=enabled" $(PLUGIN_SCAN_ARGS)
+$(call esc,$(QWEN3_BUILD_ID_HEADER)): $(SCAN_DEPFILES) $(call esc,$(QWEN3_MLX_ID_HEADER)) $(PLUGIN_DEPENDENCY_POLICY) Makefile
+	"$(EMLX_BUILD_ID_TOOL)" plugin-build-id "$(CURDIR)" "$(EMLX_SOURCE_DIR)" "$(MLX_INCLUDE_DIR)" "$(SCAN_BUILD_ID_HEADER)" "$(QWEN3_MLX_ID_HEADER)" "$(EMLX_PLUGIN_INCLUDE_DIR)/emlx_plugin_build_compat.hpp" "$@" "$(QWEN3_BUILD_ID_FILE)" --policy "$(EMLX_SOURCE_DIR)/c_src/tools/emlx_plugin_tool_wrapper.cpp" --policy "$(EMLX_SOURCE_DIR)/c_src/emlx_plugin_toolchain.hpp" --policy "$(CURDIR)/$(PLUGIN_DEPENDENCY_POLICY)" --policy "$(CURDIR)/$(PLUGIN_INSPECTOR)" --policy "$(CURDIR)/Makefile" --flag "compiler-family=$(EMLX_PLUGIN_COMPILER_FAMILY)" --flag "target=$(TARGET_TRIPLE)" --flag "language=c++20" --flag "optimization=O3" --flag "visibility=hidden" --flag "exceptions=enabled" --flag "rtti=enabled" $(PLUGIN_SCAN_ARGS)
 
 $(call esc,$(QWEN3_BUILD_ID_FILE)): $(call esc,$(QWEN3_BUILD_ID_HEADER))
 	@ test -f "$@"
@@ -73,8 +76,9 @@ $(call esc,$(FINAL_DEP_DIR))/%.d: c_src/%.cpp $(HEADERS) $(call esc,$(QWEN3_BUIL
 	@ mkdir -p "$(FINAL_OBJ_DIR)/$(dir $*)" "$(dir $@)"
 	"$(EMLX_PLUGIN_TOOL_WRAPPER)" --role compiler --mode compile --real "$(EMLX_PLUGIN_REAL_CXX)" -- $(BASE_CFLAGS) -I"$(GENERATED_INCLUDE_DIR)" -MD -MF "$@" -MT "$<" -c "$<" -o "$(FINAL_OBJ_DIR)/$*.o"
 
-$(call esc,$(FINAL_OBJ_DIR))/%.o: $(call esc,$(FINAL_DEP_DIR))/%.d
+$(call esc,$(FINAL_OBJ_DIR))/%.o: $(call esc,$(FINAL_DEP_DIR))/%.d $(PLUGIN_INSPECTOR)
 	@ test -f "$@"
+	@ "$(PLUGIN_INSPECTOR)" object "$@"
 
 $(call esc,$(VERIFY_STAMP)): $(SCAN_DEPFILES) $(FINAL_DEPFILES) $(call esc,$(QWEN3_BUILD_ID_HEADER))
 	"$(EMLX_BUILD_ID_TOOL)" verify-plugin-deps "$(MLX_INCLUDE_DIR)" "$(SCAN_BUILD_ID_HEADER)" "$(QWEN3_BUILD_ID_HEADER)" $(PLUGIN_VERIFY_ARGS)
@@ -84,6 +88,7 @@ $(call esc,$(QWEN3_SO)): $(call esc,$(PRIV_DIR)) $(OBJECTS) $(call esc,$(VERIFY_
 	@ mkdir -p "$(PRIV_DIR)/mlx/lib"
 	@ cp -a "$(MLX_LIB_DIR)"/* "$(PRIV_DIR)/mlx/lib"
 	"$(EMLX_PLUGIN_TOOL_WRAPPER)" --role linker --mode link --real "$(EMLX_PLUGIN_REAL_CXX)" -- $(OBJECTS) -o "$@" $(LDFLAGS)
+	@ "$(PLUGIN_INSPECTOR)" image "$@" "$(PLUGIN_DEPENDENCY_POLICY)" || { rm -f "$@"; exit 1; }
 
 clean:
 	rm -rf "$(PRIV_DIR)" "$(SCAN_DIR)"

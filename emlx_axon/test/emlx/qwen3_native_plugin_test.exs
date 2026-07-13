@@ -280,20 +280,20 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
   end
 
   @tag :metal
-  test "quantized layer keeps physical weights reachable when compiled" do
-    hidden = gpu_iota({1, 1, 32}, 400)
-    norm1 = gpu_iota({32}, 10)
-    norm2 = gpu_iota({32}, 12)
-    q_norm = gpu_iota({16}, 20)
-    k_norm = gpu_iota({16}, 22)
-    q_proj = quantized_projection({32, 32}, 101)
-    k_proj = quantized_projection({32, 16}, 102)
-    v_proj = quantized_projection({32, 16}, 103)
-    o_proj = quantized_projection({32, 32}, 104)
-    gate_proj = quantized_projection({32, 32}, 105)
-    up_proj = quantized_projection({32, 32}, 106)
-    down_proj = quantized_projection({32, 32}, 107)
-    zero = Nx.tensor(0.0, type: :f32, backend: {EMLX.Backend, device: :gpu})
+  test "quantized layer keeps physical weights and promoted output dtype when compiled" do
+    hidden = gpu_iota({1, 1, 32}, 400, :bf16)
+    norm1 = gpu_iota({32}, 10, :bf16)
+    norm2 = gpu_iota({32}, 12, :bf16)
+    q_norm = gpu_iota({16}, 20, :bf16)
+    k_norm = gpu_iota({16}, 22, :bf16)
+    q_proj = quantized_projection({32, 32}, 101, :f16)
+    k_proj = quantized_projection({32, 16}, 102, :f16)
+    v_proj = quantized_projection({32, 16}, 103, :f16)
+    o_proj = quantized_projection({32, 32}, 104, :f16)
+    gate_proj = quantized_projection({32, 32}, 105, :f16)
+    up_proj = quantized_projection({32, 32}, 106, :f16)
+    down_proj = quantized_projection({32, 32}, 107, :f16)
+    zero = Nx.tensor(0.0, type: :f16, backend: {EMLX.Backend, device: :gpu})
     k_cache = Nx.broadcast(zero, {1, 1, 3, 16})
     v_cache = Nx.broadcast(zero, {1, 1, 3, 16})
 
@@ -344,6 +344,9 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
     compiled =
       Nx.Defn.jit(compiled_layer, compiler: EMLX, device: :gpu).(List.to_tuple(operands))
 
+    assert Nx.type(elem(eager, 0)) == {:f, 32}
+    assert Nx.type(elem(compiled, 0)) == {:f, 32}
+
     Enum.zip(Tuple.to_list(compiled), Tuple.to_list(eager))
     |> Enum.each(fn {actual, expected} ->
       assert Nx.all_close(actual, expected, atol: 5.0e-2, rtol: 5.0e-2)
@@ -383,17 +386,17 @@ defmodule EMLXAxon.Qwen3NativePluginTest do
 
   defp emlx_tensor(value), do: Nx.tensor(value, type: :f32, backend: EMLX.Backend)
 
-  defp gpu_iota(shape, divisor) do
+  defp gpu_iota(shape, divisor, type) do
     shape
-    |> Nx.iota(type: :f32, backend: Nx.BinaryBackend)
+    |> Nx.iota(type: type, backend: Nx.BinaryBackend)
     |> Nx.add(1)
     |> Nx.divide(divisor)
     |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
   end
 
-  defp quantized_projection({input, output}, divisor) do
+  defp quantized_projection({input, output}, divisor, type) do
     {input, output}
-    |> gpu_iota(divisor)
+    |> gpu_iota(divisor, type)
     |> Nx.transpose()
     |> EMLX.quantize(type: {:s, 4}, group_size: 32, mode: "affine")
   end

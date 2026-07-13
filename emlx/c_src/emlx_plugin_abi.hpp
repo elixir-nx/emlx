@@ -252,22 +252,127 @@ constexpr uint64_t emlx_plugin_layout_hash_v1() {
 inline constexpr uint64_t EMLX_PLUGIN_LAYOUT_ABI_HASH_V1 =
     emlx_plugin_layout_hash_v1();
 
+constexpr uint64_t emlx_plugin_layout_conformance_vector_v1() {
+  constexpr uint64_t offsets[] = {0, 8, 24};
+  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 8,
+                                   offsets, 3);
+}
+
 static_assert(std::is_standard_layout_v<EMLXPluginBootstrapV1>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginBootstrapV1>);
 static_assert(sizeof(EMLXPluginBootstrapV1) == 56);
 static_assert(alignof(EMLXPluginBootstrapV1) == 8);
+static_assert(offsetof(EMLXPluginBootstrapV1, magic) == 0);
+static_assert(offsetof(EMLXPluginBootstrapV1, bootstrap_size) == 8);
+static_assert(offsetof(EMLXPluginBootstrapV1, plugin_abi_version) == 12);
+static_assert(offsetof(EMLXPluginBootstrapV1, header_abi_hash) == 16);
+static_assert(offsetof(EMLXPluginBootstrapV1, layout_abi_hash) == 24);
+static_assert(offsetof(EMLXPluginBootstrapV1, pointer_width_bits) == 32);
+static_assert(offsetof(EMLXPluginBootstrapV1, endianness) == 36);
+static_assert(offsetof(EMLXPluginBootstrapV1, descriptor_size) == 40);
 static_assert(offsetof(EMLXPluginBootstrapV1, descriptor) == 48);
 static_assert(std::is_standard_layout_v<EMLXPluginStringView>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginStringView>);
 static_assert(sizeof(EMLXPluginStringView) == 16);
 static_assert(alignof(EMLXPluginStringView) == 8);
+static_assert(offsetof(EMLXPluginStringView, data) == 0);
+static_assert(offsetof(EMLXPluginStringView, size) == 8);
 static_assert(std::is_standard_layout_v<EMLXPluginArrayView>);
+static_assert(std::is_trivially_copyable_v<EMLXPluginArrayView>);
+static_assert(sizeof(EMLXPluginArrayView) == 16);
+static_assert(alignof(EMLXPluginArrayView) == 8);
+static_assert(offsetof(EMLXPluginArrayView, data) == 0);
+static_assert(offsetof(EMLXPluginArrayView, size) == 8);
 static_assert(std::is_standard_layout_v<EMLXPluginInt64View>);
+static_assert(std::is_trivially_copyable_v<EMLXPluginInt64View>);
+static_assert(sizeof(EMLXPluginInt64View) == 16);
+static_assert(alignof(EMLXPluginInt64View) == 8);
+static_assert(offsetof(EMLXPluginInt64View, data) == 0);
+static_assert(offsetof(EMLXPluginInt64View, size) == 8);
 static_assert(std::is_standard_layout_v<EMLXPluginExecutionContext>);
+static_assert(std::is_trivially_copyable_v<EMLXPluginExecutionContext>);
+static_assert(sizeof(EMLXPluginExecutionContext) == 16);
+static_assert(alignof(EMLXPluginExecutionContext) == 8);
+static_assert(offsetof(EMLXPluginExecutionContext, device) == 0);
+static_assert(offsetof(EMLXPluginExecutionContext, stream) == 8);
 static_assert(std::is_standard_layout_v<EMLXPluginCall>);
+static_assert(std::is_trivially_copyable_v<EMLXPluginCall>);
+static_assert(sizeof(EMLXPluginCall) == 40);
+static_assert(alignof(EMLXPluginCall) == 8);
+static_assert(offsetof(EMLXPluginCall, operands) == 0);
+static_assert(offsetof(EMLXPluginCall, attrs) == 16);
+static_assert(offsetof(EMLXPluginCall, execution) == 32);
 static_assert(std::is_standard_layout_v<EMLXPluginCallbackDescriptor>);
+static_assert(std::is_trivially_copyable_v<EMLXPluginCallbackDescriptor>);
+static_assert(sizeof(EMLXPluginCallbackDescriptor) == 88);
+static_assert(alignof(EMLXPluginCallbackDescriptor) == 8);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, name) == 0);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, schema_version) == 16);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, attr_schema_version) == 20);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, operand_count) == 24);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, operand_count_from_attrs) ==
+              32);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, output_count) == 40);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, output_count_from_attrs) ==
+              48);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, device_capabilities) == 56);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, callback) == 64);
+static_assert(offsetof(EMLXPluginCallbackDescriptor, debug_name) == 72);
 static_assert(std::is_standard_layout_v<EMLXPluginCompatibility>);
+static_assert(std::is_trivially_copyable_v<EMLXPluginCompatibility>);
+static_assert(sizeof(EMLXPluginCompatibility) == 168);
+static_assert(alignof(EMLXPluginCompatibility) == 8);
+static_assert(offsetof(EMLXPluginCompatibility, plugin_abi_version) == 0);
+static_assert(offsetof(EMLXPluginCompatibility, header_abi_version) == 4);
+static_assert(offsetof(EMLXPluginCompatibility, header_abi_hash) == 8);
+static_assert(offsetof(EMLXPluginCompatibility, mlx_version) == 16);
+static_assert(offsetof(EMLXPluginCompatibility, mlx_variant) == 32);
+static_assert(offsetof(EMLXPluginCompatibility, mlx_build_id) == 48);
+static_assert(offsetof(EMLXPluginCompatibility, mlx_headers_build_id) == 64);
+static_assert(offsetof(EMLXPluginCompatibility, target_triple) == 80);
+static_assert(offsetof(EMLXPluginCompatibility, pointer_width_bits) == 96);
+static_assert(offsetof(EMLXPluginCompatibility, endianness) == 100);
+static_assert(offsetof(EMLXPluginCompatibility, compiler_abi_family) == 104);
+static_assert(offsetof(EMLXPluginCompatibility, cxx_standard_library_abi) == 120);
+static_assert(offsetof(EMLXPluginCompatibility, plugin_descriptor_size) == 136);
+static_assert(offsetof(EMLXPluginCompatibility, callback_descriptor_size) == 144);
+static_assert(offsetof(EMLXPluginCompatibility, plugin_build_id) == 152);
 static_assert(std::is_standard_layout_v<EMLXPluginDescriptor>);
+static_assert(std::is_trivially_copyable_v<EMLXPluginDescriptor>);
+static_assert(sizeof(EMLXPluginDescriptor) == 208);
+static_assert(alignof(EMLXPluginDescriptor) == 8);
+static_assert(offsetof(EMLXPluginDescriptor, name) == 0);
+static_assert(offsetof(EMLXPluginDescriptor, compatibility) == 16);
+static_assert(offsetof(EMLXPluginDescriptor, mlx_runtime_anchor) == 184);
+static_assert(offsetof(EMLXPluginDescriptor, callback_count) == 192);
+static_assert(offsetof(EMLXPluginDescriptor, callbacks) == 200);
+
+static_assert(emlx_plugin_layout_conformance_vector_v1() ==
+              0x072ddc26bff8c5c1ULL);
+static_assert([] {
+  constexpr uint64_t offsets[] = {0, 8, 24};
+  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 41, 8,
+                                   offsets, 3) !=
+         emlx_plugin_layout_conformance_vector_v1();
+}());
+static_assert([] {
+  constexpr uint64_t offsets[] = {0, 8, 24};
+  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 16,
+                                   offsets, 3) !=
+         emlx_plugin_layout_conformance_vector_v1();
+}());
+static_assert([] {
+  constexpr uint64_t offsets[] = {0, 8, 24, 32};
+  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 8,
+                                   offsets, 4) !=
+         emlx_plugin_layout_conformance_vector_v1();
+}());
+static_assert([] {
+  constexpr uint64_t offsets[] = {0, 8, 25};
+  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 8,
+                                   offsets, 3) !=
+         emlx_plugin_layout_conformance_vector_v1();
+}());
 
 extern "C" EMLX_PLUGIN_EXPORT const EMLXPluginBootstrapV1 *
 emlx_plugin_descriptor_v1() noexcept;

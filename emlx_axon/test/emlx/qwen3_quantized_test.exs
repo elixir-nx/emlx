@@ -46,16 +46,16 @@ defmodule EMLXAxon.Qwen3QuantizedTest do
     # Greedy must be deterministic across runs
     assert tokens1 == tokens2
 
-    # Reference tokens from this emlx implementation's forward pass.
-    # Captured on M4 Max, 64 GB, macOS 26.3, EMLX 0.2.0 / MLX 0.31.2.
+    # Reference tokens from the upstream EMLX 0.4 forward pass.
+    # Captured on M4 Max with MLX 0.31.2.
     #
     # Note: tokens differ from `mlx_lm` because embed_tokens is dequantised to
     # f16 at load time (vs bf16 in mlx_lm), and fast-ops (rms_norm, rope, sdpa)
     # may accumulate in f32 then cast back. Tokens are internally consistent
     # and deterministic on this hardware + software stack.
     #
-    # Captured on M4 Max, 64 GB, macOS 26.3, EMLX 0.2.0 / MLX 0.31.2, A4 fast-ops.
-    # To regenerate: run `mix test --only quantized_inference` and copy `left:`.
+    # To regenerate, compare the same checkpoint and prompt on upstream main
+    # before updating this branch's expected values.
     assert tokens1 == [
              481,
              2585,
@@ -63,20 +63,20 @@ defmodule EMLXAxon.Qwen3QuantizedTest do
              468,
              97772,
              3705,
-             279,
-             990,
-             315,
-             5746,
+             1465,
+             11589,
              304,
              264,
-             15473,
-             4128,
+             7299,
+             60804,
+             291,
+             4573,
              30,
              481,
              3555,
              374,
              279,
-             7428
+             6672
            ]
   end
 

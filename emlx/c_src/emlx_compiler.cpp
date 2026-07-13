@@ -2052,6 +2052,9 @@ static void resolve_plugin_instruction(Instruction &instr) {
 
   const std::string &plugin_name = attrs[1].as_binary();
   const std::string &callback_name = attrs[2].as_binary();
+  if (!emlx_valid_plugin_name(plugin_name) ||
+      !emlx_valid_plugin_name(callback_name))
+    throw std::runtime_error("emlx::native: plugin names are not canonical");
   auto resolved = emlx_resolve_plugin_callback(plugin_name, callback_name);
   const auto &callback = *resolved.callback;
 
@@ -2101,41 +2104,17 @@ static void resolve_plugin_instruction(Instruction &instr) {
 
   uint32_t expected_operands = callback.operand_count;
   if (expected_operands == 0) {
-    std::string error;
-    bool ok = false;
-    try {
-      ok = callback.operand_count_from_attrs(
-          {callback_attrs.data(), callback_attrs.size()}, expected_operands,
-          error);
-    } catch (const std::bad_alloc &) {
-      throw std::runtime_error(
-          "emlx::native: plugin operand policy allocation failed");
-    } catch (const std::exception &exception) {
-      error = exception.what();
-    } catch (...) {
-      error = "unknown plugin operand policy exception";
-    }
-    if (!ok)
-      throw std::runtime_error("emlx::native: plugin operand policy failed: " + error);
+    expected_operands = emlx_invoke_plugin_count_policy(
+        callback.operand_count_from_attrs,
+        {callback_attrs.data(), callback_attrs.size()}, expected_operands,
+        "operand", plugin_name, callback_name);
   }
   uint32_t expected_outputs = callback.output_count;
   if (expected_outputs == 0) {
-    std::string error;
-    bool ok = false;
-    try {
-      ok = callback.output_count_from_attrs(
-          {callback_attrs.data(), callback_attrs.size()}, expected_outputs,
-          error);
-    } catch (const std::bad_alloc &) {
-      throw std::runtime_error(
-          "emlx::native: plugin output policy allocation failed");
-    } catch (const std::exception &exception) {
-      error = exception.what();
-    } catch (...) {
-      error = "unknown plugin output policy exception";
-    }
-    if (!ok)
-      throw std::runtime_error("emlx::native: plugin output policy failed: " + error);
+    expected_outputs = emlx_invoke_plugin_count_policy(
+        callback.output_count_from_attrs,
+        {callback_attrs.data(), callback_attrs.size()}, expected_outputs,
+        "output", plugin_name, callback_name);
   }
   if (instr.operands.size() != expected_operands)
     throw std::runtime_error("emlx::native: plugin operand count mismatch");
@@ -2169,16 +2148,16 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
   bool ok = false;
   try {
     ok = callback.callback(call, candidates, error);
+  } catch (const std::bad_alloc &) {
+    error = "plugin callback allocation failed";
   } catch (const std::exception &exception) {
     error = exception.what();
   } catch (...) {
     error = "unknown plugin callback exception";
   }
   if (!ok)
-    throw std::runtime_error("plugin callback \"" +
-                             instr.resolved_plugin.plugin->name + "/" +
-                             callback.name + "\" failed: " +
-                             (error.empty() ? "no error detail" : error));
+    throw std::runtime_error(emlx_plugin_callback_failure_error(
+        instr.resolved_plugin.plugin->name, callback.name, error));
   if (candidates.size() != instr.plugin_outputs.size())
     throw std::runtime_error("emlx::native: plugin callback returned the wrong output count");
   for (size_t i = 0; i < candidates.size(); ++i) {

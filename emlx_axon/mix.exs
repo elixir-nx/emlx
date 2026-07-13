@@ -17,7 +17,7 @@ defmodule EMLXAxon.MixProject do
       package: package(),
       # elixir_make — builds the standalone qwen3 compute plugin
       # (c_src/qwen3_plugin.cpp), `dlopen`'d at runtime by emlx's
-      # `EMLX.NIF.load_plugin/2` (see lib/emlx_axon/application.ex). A
+      # `EMLX.NIF.load_plugin/3` (see lib/emlx_axon/application.ex). A
       # function ref so `Application.app_dir(:emlx, ...)` (needs the
       # :emlx dep already compiled) isn't called while this project/0
       # map is being built — mirrors emlx's own `Fine.include_dir()`

@@ -246,6 +246,8 @@ defmodule EMLXAxon.Qwen3.Native do
     end
 
     [hidden, _norm1, _q_norm, _k_norm, k_cache, v_cache | _weights] = operands
+    output_type = generalized_output_type(operands, descriptors)
+    output = Nx.template(Nx.shape(hidden), output_type)
 
     multi_operation(
       "layer_generalized",
@@ -260,7 +262,7 @@ defmodule EMLXAxon.Qwen3.Native do
         7
         | descriptors
       ],
-      {Nx.to_template(hidden), Nx.to_template(k_cache), Nx.to_template(v_cache)}
+      {output, Nx.to_template(k_cache), Nx.to_template(v_cache)}
     )
   end
 
@@ -494,6 +496,50 @@ defmodule EMLXAxon.Qwen3.Native do
   defp quantization_mode(mode) do
     raise ArgumentError, "unsupported Qwen3 quantization mode: #{inspect(mode)}"
   end
+
+  # MLX affine quantized matmul promotes the activation with its scale and bias
+  # dtypes. Track those promotions across the fused layer so the static plugin
+  # output template matches the lazy MLX result.
+  defp generalized_output_type(operands, descriptors) do
+    base_type =
+      operands
+      |> Enum.take(7)
+      |> Enum.map(&Nx.type/1)
+      |> Enum.reduce(&mlx_merge_type/2)
+
+    descriptors
+    |> Enum.chunk_every(8)
+    |> Enum.reduce(base_type, fn descriptor, type ->
+      case descriptor do
+        [0, weight_index, -1, -1, _group_size, _bits, _mode, _transpose] ->
+          mlx_merge_type(type, operands |> Enum.fetch!(weight_index) |> Nx.type())
+
+        [1, _weight_index, scales_index, biases_index, _group_size, _bits, 0, _transpose] ->
+          type
+          |> mlx_merge_type(operands |> Enum.fetch!(scales_index) |> Nx.type())
+          |> maybe_merge_bias_type(operands, biases_index)
+
+        [1, _weight_index, _scales_index, _biases_index, _group_size, _bits, mode, _transpose]
+        when mode in 1..3 ->
+          type
+
+        _other ->
+          raise ArgumentError, "invalid generalized Qwen3 linear descriptor"
+      end
+    end)
+  end
+
+  defp maybe_merge_bias_type(type, _operands, -1), do: type
+
+  defp maybe_merge_bias_type(type, operands, index) do
+    mlx_merge_type(type, operands |> Enum.fetch!(index) |> Nx.type())
+  end
+
+  # MLX follows JAX promotion here, while Nx currently promotes this pair to
+  # f16. The native callback must advertise the dtype MLX will actually return.
+  defp mlx_merge_type({:bf, 16}, {:f, 16}), do: {:f, 32}
+  defp mlx_merge_type({:f, 16}, {:bf, 16}), do: {:f, 32}
+  defp mlx_merge_type(left, right), do: Nx.Type.merge(left, right)
 
   defp validate_tensor_offset!(offset, token_tensor, k_cache) do
     unless Nx.shape(offset) in [{}, {1}] and Nx.type(offset) in [{:s, 32}, {:s, 64}] do

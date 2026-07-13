@@ -23,6 +23,8 @@ constexpr uint32_t kCallbacksMax = 256;
 constexpr uint32_t kOperandsMax = 4096;
 constexpr uint32_t kOutputsMax = 1024;
 constexpr size_t kErrorMax = 4096;
+constexpr size_t kCallPluginNifSuffixSize =
+    sizeof(" in NIF.call_plugin/5") - 1;
 
 std::unordered_map<std::string, std::shared_ptr<const EMLXLoadedPlugin>>
     g_plugins;
@@ -95,19 +97,85 @@ bool valid_utf8(const std::string &value) {
   return true;
 }
 
-std::string bounded_error(const std::string &value) {
-  std::string result = value.substr(0, kErrorMax);
+std::string bounded_error(const std::string &value, size_t limit = kErrorMax) {
+  static constexpr char kTruncationMarker[] = "... [truncated]";
+  constexpr size_t marker_size = sizeof(kTruncationMarker) - 1;
+
+  if (limit == 0)
+    return {};
+  if (!valid_utf8(value))
+    return "plugin returned invalid UTF-8 error detail";
+
+  const bool truncated = value.size() > limit;
+  size_t prefix_size = value.size();
+  if (truncated) {
+    if (limit <= marker_size)
+      return std::string(kTruncationMarker, limit);
+    prefix_size = limit - marker_size;
+    while (prefix_size > 0 && prefix_size < value.size() &&
+           (static_cast<uint8_t>(value[prefix_size]) & 0xc0U) == 0x80U)
+      --prefix_size;
+  }
+
+  std::string result = value.substr(0, prefix_size);
   for (char &byte : result) {
     const unsigned char unsigned_byte = static_cast<unsigned char>(byte);
-    if (unsigned_byte < 0x20 && byte != '\n' && byte != '\t')
+    if ((unsigned_byte < 0x20 && byte != '\n' && byte != '\t') ||
+        unsigned_byte == 0x7f)
       byte = '?';
   }
-  if (!valid_utf8(result))
-    return "plugin returned invalid UTF-8 error detail";
-  if (value.size() > kErrorMax)
-    result.replace(result.size() - std::min<size_t>(3, result.size()),
-                   std::min<size_t>(3, result.size()), "...");
+  if (truncated)
+    result.append(kTruncationMarker);
   return result;
+}
+
+std::string callback_failure_error(const std::string &plugin_name,
+                                   const std::string &callback_name,
+                                   const std::string &detail, size_t limit) {
+  const std::string prefix = "plugin callback \"" + plugin_name + "/" +
+                             callback_name + "\" failed";
+  if (detail.empty())
+    return prefix + " without error detail";
+
+  const std::string separator = ": ";
+  const size_t detail_limit =
+      prefix.size() + separator.size() < limit
+          ? limit - prefix.size() - separator.size()
+          : 0;
+  return prefix + separator + bounded_error(detail, detail_limit);
+}
+
+uint32_t invoke_count_policy(EMLXOperandCountFn policy,
+                             EMLXPluginInt64View attrs,
+                             uint32_t fixed_count, const char *kind,
+                             const std::string &plugin_name,
+                             const std::string &callback_name,
+                             size_t error_limit) {
+  if (!policy)
+    return fixed_count;
+
+  uint32_t count = 0;
+  std::string error;
+  bool ok = false;
+  try {
+    ok = policy(attrs, count, error);
+  } catch (const std::bad_alloc &) {
+    throw std::runtime_error(std::string("plugin callback ") + kind +
+                             " policy allocation failed");
+  } catch (const std::exception &exception) {
+    error = exception.what();
+  } catch (...) {
+    error = std::string("unknown plugin ") + kind + " policy exception";
+  }
+  if (!ok) {
+    const std::string policy_detail =
+        error.empty() ? std::string(kind) + " policy returned no error detail"
+                      : std::string(kind) + " policy failed: " + error;
+    throw std::runtime_error(
+        callback_failure_error(plugin_name, callback_name, policy_detail,
+                               error_limit));
+  }
+  return count;
 }
 
 constexpr uint32_t host_endianness() {
@@ -218,48 +286,48 @@ load_generic_candidate(const std::string &requested_name,
       0)
     throw std::runtime_error("plugin descriptor pointer is not aligned");
 
-  const auto *descriptor =
-      reinterpret_cast<const EMLXPluginDescriptor *>(bootstrap.descriptor);
-  if (descriptor->compatibility.plugin_abi_version != EMLX_PLUGIN_ABI_V1 ||
-      descriptor->compatibility.header_abi_version !=
+  EMLXPluginDescriptor descriptor{};
+  std::memcpy(&descriptor, bootstrap.descriptor, sizeof(descriptor));
+  if (descriptor.compatibility.plugin_abi_version != EMLX_PLUGIN_ABI_V1 ||
+      descriptor.compatibility.header_abi_version !=
           EMLX_PLUGIN_HEADER_ABI_V1 ||
-      descriptor->compatibility.header_abi_hash !=
+      descriptor.compatibility.header_abi_hash !=
           EMLX_PLUGIN_HEADER_ABI_HASH_V1 ||
-      descriptor->compatibility.plugin_descriptor_size !=
+      descriptor.compatibility.plugin_descriptor_size !=
           sizeof(EMLXPluginDescriptor) ||
-      descriptor->compatibility.callback_descriptor_size !=
+      descriptor.compatibility.callback_descriptor_size !=
           sizeof(EMLXPluginCallbackDescriptor) ||
-      descriptor->compatibility.pointer_width_bits != sizeof(void *) * 8 ||
-      descriptor->compatibility.endianness != host_endianness())
+      descriptor.compatibility.pointer_width_bits != sizeof(void *) * 8 ||
+      descriptor.compatibility.endianness != host_endianness())
     throw std::runtime_error("plugin descriptor is incompatible with EMLX");
 
   const std::string descriptor_name =
-      copy_required_string(descriptor->name, kNameMax, "name");
+      copy_required_string(descriptor.name, kNameMax, "name");
   if (!valid_name(descriptor_name) || descriptor_name != requested_name)
     throw std::runtime_error("plugin descriptor name does not match requested name");
 
   const std::string build_id = copy_required_string(
-      descriptor->compatibility.plugin_build_id, 64, "plugin_build_id");
+      descriptor.compatibility.plugin_build_id, 64, "plugin_build_id");
   if (!valid_build_id(build_id) ||
       (!expected_build_id.empty() && build_id != expected_build_id))
     throw std::runtime_error("plugin build identity does not match expected identity");
 
   const std::string mlx_version = copy_required_string(
-      descriptor->compatibility.mlx_version, 256, "mlx_version");
+      descriptor.compatibility.mlx_version, 256, "mlx_version");
   const std::string mlx_variant = copy_required_string(
-      descriptor->compatibility.mlx_variant, 256, "mlx_variant");
+      descriptor.compatibility.mlx_variant, 256, "mlx_variant");
   const std::string mlx_build_id = copy_required_string(
-      descriptor->compatibility.mlx_build_id, 64, "mlx_build_id");
+      descriptor.compatibility.mlx_build_id, 64, "mlx_build_id");
   const std::string mlx_headers_build_id = copy_required_string(
-      descriptor->compatibility.mlx_headers_build_id, 64,
+      descriptor.compatibility.mlx_headers_build_id, 64,
       "mlx_headers_build_id");
   const std::string target = copy_required_string(
-      descriptor->compatibility.target_triple, 256, "target_triple");
+      descriptor.compatibility.target_triple, 256, "target_triple");
   const std::string compiler = copy_required_string(
-      descriptor->compatibility.compiler_abi_family, 256,
+      descriptor.compatibility.compiler_abi_family, 256,
       "compiler_abi_family");
   const std::string standard_library = copy_required_string(
-      descriptor->compatibility.cxx_standard_library_abi, 256,
+      descriptor.compatibility.cxx_standard_library_abi, 256,
       "cxx_standard_library_abi");
   if (!valid_build_id(mlx_build_id) || !valid_build_id(mlx_headers_build_id) ||
       !valid_ascii(mlx_version) || !valid_ascii(mlx_variant) ||
@@ -278,23 +346,23 @@ load_generic_candidate(const std::string &requested_name,
   auto host_identity = emlx_host_runtime_identity();
   if (!host_identity)
     throw std::runtime_error("EMLX host MLX identity is unavailable");
-  if (!descriptor->mlx_runtime_anchor ||
-      descriptor->mlx_runtime_anchor != host_identity->mlx_runtime_anchor)
+  if (!descriptor.mlx_runtime_anchor ||
+      descriptor.mlx_runtime_anchor != host_identity->mlx_runtime_anchor)
     throw std::runtime_error("plugin resolves a different MLX runtime anchor");
 
-  if (descriptor->callback_count > kCallbacksMax ||
-      (descriptor->callback_count > 0 && !descriptor->callbacks))
+  if (descriptor.callback_count > kCallbacksMax ||
+      (descriptor.callback_count > 0 && !descriptor.callbacks))
     throw std::runtime_error("plugin callback table is invalid");
-  if (descriptor->callback_count > 0 &&
-      reinterpret_cast<uintptr_t>(descriptor->callbacks) %
+  if (descriptor.callback_count > 0 &&
+      reinterpret_cast<uintptr_t>(descriptor.callbacks) %
               alignof(EMLXPluginCallbackDescriptor) !=
           0)
     throw std::runtime_error("plugin callback table pointer is not aligned");
   const size_t callback_span =
-      static_cast<size_t>(descriptor->callback_count) *
+      static_cast<size_t>(descriptor.callback_count) *
       sizeof(EMLXPluginCallbackDescriptor);
-  if (descriptor->callback_count > 0 &&
-      callback_span / descriptor->callback_count !=
+  if (descriptor.callback_count > 0 &&
+      callback_span / descriptor.callback_count !=
           sizeof(EMLXPluginCallbackDescriptor))
     throw std::runtime_error("plugin callback table span overflows");
 
@@ -307,16 +375,17 @@ load_generic_candidate(const std::string &requested_name,
   loaded->mlx_runtime_image = host_identity->mlx_runtime_image;
   loaded->shared_object_handle = handle.value;
 
-  for (uint32_t i = 0; i < descriptor->callback_count; ++i) {
-    const auto &source = descriptor->callbacks[i];
+  for (uint32_t i = 0; i < descriptor.callback_count; ++i) {
+    EMLXPluginCallbackDescriptor source{};
+    std::memcpy(&source, descriptor.callbacks + i, sizeof(source));
     auto callback = std::make_shared<EMLXLoadedPluginCallback>();
     callback->name = copy_required_string(source.name, kNameMax, "callback name");
     callback->debug_name =
         copy_optional_string(source.debug_name, kDebugNameMax, "debug_name");
     if (!callback->debug_name.empty() && !valid_utf8(callback->debug_name))
       throw std::runtime_error("plugin callback debug_name is not valid UTF-8");
-    if (!valid_name(callback->name) || source.schema_version == 0 ||
-        source.attr_schema_version == 0 || !source.callback ||
+    if (!valid_name(callback->name) || source.schema_version != 1 ||
+        source.attr_schema_version != 1 || !source.callback ||
         source.operand_count > kOperandsMax || source.output_count > kOutputsMax ||
         source.device_capabilities == 0 ||
         (source.device_capabilities & ~EMLX_PLUGIN_DEVICE_KNOWN_V1) != 0)
@@ -358,6 +427,10 @@ load_generic_candidate(const std::string &requested_name,
 
 EMLXLoadedPlugin::~EMLXLoadedPlugin() = default;
 
+bool emlx_valid_plugin_name(const std::string &value) {
+  return valid_name(value);
+}
+
 EMLXResolvedPluginCallback
 emlx_resolve_plugin_callback(const std::string &plugin,
                              const std::string &callback) {
@@ -372,19 +445,32 @@ emlx_resolve_plugin_callback(const std::string &plugin,
   return {plugin_it->second, callback_it->second};
 }
 
+std::string emlx_plugin_callback_failure_error(
+    const std::string &plugin, const std::string &callback,
+    const std::string &detail, size_t limit) {
+  return callback_failure_error(plugin, callback, detail, limit);
+}
+
+uint32_t emlx_invoke_plugin_count_policy(
+    EMLXOperandCountFn policy, EMLXPluginInt64View attrs,
+    uint32_t fixed_count, const char *kind, const std::string &plugin,
+    const std::string &callback, size_t error_limit) {
+  return invoke_count_policy(policy, attrs, fixed_count, kind, plugin, callback,
+                             error_limit);
+}
+
 std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     const std::string &plugin_name, const std::string &callback_name,
     const std::vector<mlx::core::array> &operands,
     const std::vector<int64_t> &attrs, const mlx::core::Device &device) {
   auto resolved = emlx_resolve_plugin_callback(plugin_name, callback_name);
   const auto &callback = *resolved.callback;
-  uint32_t expected_operands = callback.operand_count;
-  std::string error;
-  if (callback.operand_count_from_attrs &&
-      !callback.operand_count_from_attrs({attrs.data(), attrs.size()},
-                                         expected_operands, error))
-    throw std::runtime_error("plugin callback operand policy failed: " +
-                             bounded_error(error));
+  const EMLXPluginInt64View attr_view{attrs.data(), attrs.size()};
+  constexpr size_t callback_error_max = kErrorMax - kCallPluginNifSuffixSize;
+  const uint32_t expected_operands =
+      emlx_invoke_plugin_count_policy(
+          callback.operand_count_from_attrs, attr_view, callback.operand_count,
+          "operand", plugin_name, callback_name, callback_error_max);
   if (expected_operands > kOperandsMax || operands.size() != expected_operands)
     throw std::runtime_error("plugin callback operand count mismatch");
   if (!emlx::g_current_worker)
@@ -397,8 +483,9 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
   const auto stream = emlx::g_current_worker->stream();
   EMLXPluginExecutionContext execution{&device, &stream};
   EMLXPluginCall call{{operands.data(), operands.size()},
-                      {attrs.data(), attrs.size()}, &execution};
+                      attr_view, &execution};
   std::vector<mlx::core::array> outputs;
+  std::string error;
   bool ok = false;
   try {
     ok = callback.callback(call, outputs, error);
@@ -410,20 +497,19 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     error = "unknown plugin callback exception";
   }
   if (!ok)
-    throw std::runtime_error("plugin callback failed: " +
-                             bounded_error(error.empty() ? "no error detail" : error));
-  uint32_t expected_outputs = callback.output_count;
-  error.clear();
-  if (callback.output_count_from_attrs &&
-      !callback.output_count_from_attrs({attrs.data(), attrs.size()},
-                                        expected_outputs, error))
-    throw std::runtime_error("plugin callback output policy failed: " +
-                             bounded_error(error));
+    throw std::runtime_error(
+        emlx_plugin_callback_failure_error(
+            plugin_name, callback_name, error, callback_error_max));
+  const uint32_t expected_outputs =
+      emlx_invoke_plugin_count_policy(
+          callback.output_count_from_attrs, attr_view, callback.output_count,
+          "output", plugin_name, callback_name, callback_error_max);
   if (expected_outputs > kOutputsMax || outputs.size() != expected_outputs)
     throw std::runtime_error("plugin callback returned the wrong output count");
   return outputs;
 }
 
+#if !defined(EMLX_PLUGIN_REGISTRY_TESTING)
 std::vector<mlx::core::array>
 call_plugin_impl(ErlNifEnv *env, std::string plugin_name,
                  std::string callback_name, std::vector<TensorArg> operands,
@@ -437,6 +523,7 @@ call_plugin_impl(ErlNifEnv *env, std::string plugin_name,
                                      device);
 }
 FINE_ASYNC_NIF(call_plugin)
+#endif
 
 ERL_NIF_TERM load_plugin(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
   (void)argc;
@@ -449,8 +536,10 @@ ERL_NIF_TERM load_plugin(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
       return nx::nif::error(env, "load_plugin expects a path string");
     load_generic_candidate(name, path, "");
     return nx::nif::ok(env);
+  } catch (const std::bad_alloc &) {
+    return nx::nif::error(env, "plugin loader allocation failed");
   } catch (const std::exception &error) {
-    return nx::nif::error(env, error.what());
+    return nx::nif::error(env, bounded_error(error.what()).c_str());
   } catch (...) {
     return nx::nif::error(env, "internal plugin loader error");
   }
@@ -481,7 +570,7 @@ ERL_NIF_TERM load_plugin_with_build_id(ErlNifEnv *env, int argc,
   } catch (const std::bad_alloc &) {
     return nx::nif::error(env, "plugin loader allocation failed");
   } catch (const std::exception &error) {
-    return nx::nif::error(env, error.what());
+    return nx::nif::error(env, bounded_error(error.what()).c_str());
   } catch (...) {
     return nx::nif::error(env, "internal plugin loader error");
   }

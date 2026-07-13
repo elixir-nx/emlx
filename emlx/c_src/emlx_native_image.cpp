@@ -3,6 +3,7 @@
 
 #include "mlx/version.h"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +20,13 @@ namespace {
 
 std::mutex g_host_identity_mutex;
 std::shared_ptr<const EMLXHostRuntimeIdentity> g_host_identity;
+
+#if defined(EMLX_NATIVE_IMAGE_TESTING)
+EMLXNativeImageTestBarrier g_test_barrier = nullptr;
+void *g_test_barrier_context = nullptr;
+std::atomic<uint64_t> g_test_identity_count{0};
+std::atomic<uint64_t> g_test_capture_count{0};
+#endif
 
 void set_error(EMLXNativeImageError &error, EMLXNativeImageErrorCode code,
                const std::string &detail) {
@@ -42,6 +50,22 @@ bool checked_unsigned(Source value, uint64_t &output) {
   return true;
 }
 
+template <typename Source>
+bool checked_signed(Source value, int64_t &output) {
+  if constexpr (std::numeric_limits<Source>::is_signed) {
+    if constexpr (sizeof(Source) > sizeof(int64_t)) {
+      if (value < std::numeric_limits<int64_t>::min() ||
+          value > std::numeric_limits<int64_t>::max())
+        return false;
+    }
+  } else if (value > static_cast<std::make_unsigned_t<int64_t>>(
+                         std::numeric_limits<int64_t>::max())) {
+    return false;
+  }
+  output = static_cast<int64_t>(value);
+  return true;
+}
+
 bool snapshot_from_stat(const struct stat &value,
                         EMLXNativeFileSnapshot &snapshot,
                         EMLXNativeImageError &error) {
@@ -53,10 +77,19 @@ bool snapshot_from_stat(const struct stat &value,
     return false;
   }
 #if defined(__APPLE__)
-  snapshot.modification_seconds = value.st_mtimespec.tv_sec;
+  if (!checked_signed(value.st_mtimespec.tv_sec,
+                      snapshot.modification_seconds)) {
+    set_error(error, EMLXNativeImageErrorCode::stat_failed,
+              "native image timestamp is outside supported ranges");
+    return false;
+  }
   snapshot.modification_nanoseconds = value.st_mtimespec.tv_nsec;
 #elif defined(__linux__)
-  snapshot.modification_seconds = value.st_mtim.tv_sec;
+  if (!checked_signed(value.st_mtim.tv_sec, snapshot.modification_seconds)) {
+    set_error(error, EMLXNativeImageErrorCode::stat_failed,
+              "native image timestamp is outside supported ranges");
+    return false;
+  }
   snapshot.modification_nanoseconds = value.st_mtim.tv_nsec;
 #else
   set_error(error, EMLXNativeImageErrorCode::unsupported_platform,
@@ -86,6 +119,22 @@ private:
 };
 
 } // namespace
+
+#if defined(EMLX_NATIVE_IMAGE_TESTING)
+void emlx_native_image_set_test_barrier(EMLXNativeImageTestBarrier barrier,
+                                        void *context) {
+  g_test_barrier = barrier;
+  g_test_barrier_context = context;
+}
+
+uint64_t emlx_native_image_test_identity_count() {
+  return g_test_identity_count.load();
+}
+
+uint64_t emlx_native_image_test_capture_count() {
+  return g_test_capture_count.load();
+}
+#endif
 
 const char *emlx_native_image_error_name(EMLXNativeImageErrorCode code) {
   switch (code) {
@@ -126,6 +175,9 @@ const char *emlx_native_image_error_name(EMLXNativeImageErrorCode code) {
 bool emlx_native_image_identity(EMLXMLXRuntimeAnchor anchor,
                                 EMLXNativeImageIdentity &identity,
                                 EMLXNativeImageError &error) {
+#if defined(EMLX_NATIVE_IMAGE_TESTING)
+  ++g_test_identity_count;
+#endif
 #if !defined(__APPLE__) && !defined(__linux__)
   set_error(error, EMLXNativeImageErrorCode::unsupported_platform,
             "native image identity is unsupported on this platform");
@@ -184,6 +236,11 @@ bool emlx_native_image_identity(EMLXMLXRuntimeAnchor anchor,
   if (!snapshot_from_stat(before_raw, before, error))
     return false;
 
+#if defined(EMLX_NATIVE_IMAGE_TESTING)
+  if (g_test_barrier)
+    g_test_barrier(path.c_str(), g_test_barrier_context);
+#endif
+
   std::array<uint8_t, 32> digest{};
   std::string hash_error;
   if (!emlx_sha256_file_descriptor(fd.get(), digest, hash_error)) {
@@ -214,6 +271,9 @@ bool emlx_capture_host_runtime_identity(
     const std::array<uint8_t, 32> &expected_mlx_sha256,
     std::shared_ptr<const EMLXHostRuntimeIdentity> &candidate,
     EMLXNativeImageError &error) {
+#if defined(EMLX_NATIVE_IMAGE_TESTING)
+  ++g_test_capture_count;
+#endif
   {
     std::lock_guard lock(g_host_identity_mutex);
     if (g_host_identity) {

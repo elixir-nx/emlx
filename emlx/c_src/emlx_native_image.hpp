@@ -72,3 +72,12 @@ bool emlx_publish_host_runtime_identity(
 std::shared_ptr<const EMLXHostRuntimeIdentity> emlx_host_runtime_identity();
 
 const char *emlx_native_image_error_name(EMLXNativeImageErrorCode code);
+
+#if defined(EMLX_NATIVE_IMAGE_TESTING)
+using EMLXNativeImageTestBarrier = void (*)(const char *path, void *context);
+
+void emlx_native_image_set_test_barrier(EMLXNativeImageTestBarrier barrier,
+                                        void *context);
+uint64_t emlx_native_image_test_identity_count();
+uint64_t emlx_native_image_test_capture_count();
+#endif

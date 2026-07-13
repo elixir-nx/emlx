@@ -308,6 +308,7 @@ std::string plugin_manifest_id(
   const fs::path scan = fs::canonical(scan_header);
   const fs::path actual_headers = fs::canonical(actual_mlx_header);
   const fs::path compat = fs::canonical(compat_header);
+  const fs::path emlx_public_headers = compat.parent_path();
   std::vector<ManifestEntry> entries;
   std::set<std::pair<std::string, std::string>> seen;
   bool saw_scan = false;
@@ -329,6 +330,12 @@ std::string plugin_manifest_id(
         saw_compat = true;
         add_manifest_entry(entries, seen, "FILE", "generated:emlx_compat",
                            read_file(dependency));
+      } else if (within(dependency, emlx_public_headers)) {
+        add_manifest_entry(
+            entries, seen, "FILE",
+            byte_sorted_relative(dependency, emlx_public_headers,
+                                 "emlx-public"),
+            read_file(dependency));
       } else if (within(dependency, mlx)) {
         saw_mlx = true;
         add_manifest_entry(entries, seen, "FILE",

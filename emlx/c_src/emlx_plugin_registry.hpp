@@ -8,6 +8,7 @@
 #include "emlx_native_image.hpp"
 #include "erl_nif.h"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -58,6 +59,17 @@ struct EMLXResolvedPluginCallback {
 EMLXResolvedPluginCallback
 emlx_resolve_plugin_callback(const std::string &plugin,
                              const std::string &callback);
+
+bool emlx_valid_plugin_name(const std::string &value);
+
+std::string emlx_plugin_callback_failure_error(
+    const std::string &plugin, const std::string &callback,
+    const std::string &detail, size_t limit = 4096);
+
+uint32_t emlx_invoke_plugin_count_policy(
+    EMLXOperandCountFn policy, EMLXPluginInt64View attrs,
+    uint32_t fixed_count, const char *kind, const std::string &plugin,
+    const std::string &callback, size_t error_limit = 4096);
 
 std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     const std::string &plugin, const std::string &callback,

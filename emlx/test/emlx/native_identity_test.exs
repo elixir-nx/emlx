@@ -35,8 +35,30 @@ defmodule EMLX.NativeIdentityTest do
 
     if status != 0, do: raise("failed to compile identity tool:\n#{output}")
 
+    abi_tool = Path.join(temporary, "plugin_abi_layout")
+    mlx_include = Application.app_dir(:emlx, "priv/mlx/include")
+
+    {output, status} =
+      System.cmd(
+        compiler,
+        [
+          "-std=c++20",
+          "-O2",
+          "-I",
+          Path.join(root, "c_src"),
+          "-I",
+          mlx_include,
+          Path.join(root, "test/support/plugin_abi_layout.cpp"),
+          "-o",
+          abi_tool
+        ],
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: raise("failed to compile plugin ABI fixture:\n#{output}")
+
     on_exit(fn -> File.rm_rf!(temporary) end)
-    %{tool: tool, temporary: temporary}
+    %{tool: tool, abi_tool: abi_tool, temporary: temporary}
   end
 
   test "shared SHA-256 implementation matches published vectors", context do
@@ -51,6 +73,10 @@ defmodule EMLX.NativeIdentityTest do
       File.write!(path, content)
       assert run!(context.tool, ["sha256", path]) == expected
     end)
+  end
+
+  test "plugin ABI layout serialization matches the independent golden vector", context do
+    assert run!(context.abi_tool, []) == "72ddc26bff8c5c1 2308e9846f0852a"
   end
 
   test "MLX public header identity is path independent and content sensitive", context do
@@ -139,8 +165,12 @@ defmodule EMLX.NativeIdentityTest do
   end
 
   test "plugin build identity is root independent and content sensitive", context do
-    first = plugin_manifest_fixture(context, "manifest-one", "int operation = 1;\n")
-    second = plugin_manifest_fixture(context, "manifest-two", "int operation = 1;\n")
+    first =
+      plugin_manifest_fixture(context, "manifest-one", "int operation = 1;\n", "dev")
+
+    second =
+      plugin_manifest_fixture(context, "manifest-two", "int operation = 1;\n", "test")
+
     changed = plugin_manifest_fixture(context, "manifest-three", "int operation = 2;\n")
 
     assert first == second
@@ -161,7 +191,7 @@ defmodule EMLX.NativeIdentityTest do
     |> String.replace(":", "\\:")
   end
 
-  defp plugin_manifest_fixture(context, name, source_content) do
+  defp plugin_manifest_fixture(context, name, source_content, build_env \\ "dev") do
     root = Path.join(context.temporary, name)
     axon_root = Path.join(root, "emlx_axon")
     emlx_root = Path.join(root, "emlx")
@@ -169,11 +199,14 @@ defmodule EMLX.NativeIdentityTest do
     source = Path.join(axon_root, "c_src/qwen3_plugin.cpp")
     policy = Path.join(axon_root, "c_src/policy.txt")
     makefile = Path.join(axon_root, "Makefile")
-    abi = Path.join(emlx_root, "c_src/emlx_plugin_abi.hpp")
+    emlx_public = Path.join(axon_root, "_build/#{build_env}/lib/emlx/priv/include")
+    abi = Path.join(emlx_public, "emlx_plugin_abi.hpp")
+    packaged_toolchain = Path.join(emlx_public, "emlx_plugin_toolchain.hpp")
     wrapper = Path.join(emlx_root, "c_src/tools/wrapper.cpp")
+    source_toolchain = Path.join(emlx_root, "c_src/emlx_plugin_toolchain.hpp")
     mlx_header = Path.join(mlx_root, "mlx/array.h")
     generated = Path.join(root, "generated")
-    compat = Path.join(generated, "emlx_plugin_build_compat.hpp")
+    compat = Path.join(emlx_public, "emlx_plugin_build_compat.hpp")
     actual_mlx = Path.join(generated, "emlx_qwen3_mlx_headers_build_id.hpp")
     scan_header = Path.join(generated, "scan/emlx_qwen3_plugin_build_id.hpp")
     output_header = Path.join(generated, "final/emlx_qwen3_plugin_build_id.hpp")
@@ -185,7 +218,9 @@ defmodule EMLX.NativeIdentityTest do
       {policy, "policy-v1\n"},
       {makefile, "flags = c++20 O3\n"},
       {abi, "abi-v1\n"},
+      {packaged_toolchain, "toolchain-v1\n"},
       {wrapper, "wrapper-v1\n"},
+      {source_toolchain, "toolchain-v1\n"},
       {mlx_header, "mlx-header-v1\n"}
     ]
 
@@ -212,7 +247,16 @@ defmodule EMLX.NativeIdentityTest do
       String.duplicate("0", 64)
     ])
 
-    dependencies = [source, abi, compat, actual_mlx, scan_header, mlx_header]
+    dependencies = [
+      source,
+      abi,
+      packaged_toolchain,
+      compat,
+      actual_mlx,
+      scan_header,
+      mlx_header
+    ]
+
     File.mkdir_p!(Path.dirname(depfile))
 
     File.write!(
@@ -233,6 +277,8 @@ defmodule EMLX.NativeIdentityTest do
       output_text,
       "--policy",
       wrapper,
+      "--policy",
+      source_toolchain,
       "--policy",
       policy,
       "--policy",
