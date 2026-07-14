@@ -1039,7 +1039,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 }
 
 int upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM load_info) {
-  return emlx_reject_nif_upgrade(env, priv_data, old_priv_data, load_info);
+  return emlx_upgrade_nif_runtime(env, priv_data, old_priv_data, load_info);
 }
 
 UNARY_OP(abs)

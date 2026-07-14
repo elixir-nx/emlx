@@ -15,11 +15,10 @@ defmodule EMLX.NIF do
   @doc """
   Loads the EMLX native image.
 
-  EMLX deliberately rejects NIF hot upgrades because MLX arrays, command
-  queues, compiled programs, and plugin callbacks retain process-lifetime
-  native state. Upgrading EMLX therefore requires restarting the BEAM VM.
-  Stopping and starting applications without replacing the loaded EMLX native
-  image remains supported.
+  Reloading the Elixir module with the same native image preserves MLX arrays,
+  command queues, compiled programs, and plugin callbacks. Replacing the native
+  image still requires restarting the BEAM VM because that state lives for the
+  lifetime of the process.
   """
   def load_nifs do
     path = :filename.join(:code.priv_dir(:emlx), ~c"libemlx")

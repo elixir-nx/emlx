@@ -25,15 +25,12 @@ defmodule EMLX.NativeLifecycleTest do
     assert output =~ "{:status_after, {:ready, 1, 1}}"
   end
 
-  test "NIF upgrade is rejected without invalidating existing native state", context do
-    upgrade_fixture = context.fixture <> "_upgrade"
-    File.cp!(context.fixture <> ".so", upgrade_fixture <> ".so")
-
-    {output, 0} = run_upgrade_subprocess(context.fixture, upgrade_fixture, context.plugin)
+  test "NIF upgrade preserves existing native state", context do
+    {output, 0} = run_upgrade_subprocess(context.fixture, context.fixture, context.plugin)
 
     assert output =~ "{:load, :ok}"
     assert output =~ "{:registration, :ok}"
-    assert output =~ "Library upgrade-call unsuccessful (-1)"
+    refute output =~ "Library upgrade-call unsuccessful"
     assert output =~ "{:upgrade_modules, [EMLX.NativeLifecycleFixture]}"
     assert output =~ "{:status_after, {:ready, 1, 1}}"
     assert output =~ "{:registration_after, :ok}"
