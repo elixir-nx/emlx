@@ -1,8 +1,6 @@
 #include "emlx/compiler.hpp"
 #include "emlx_nif_shared.hpp"
 #include "emlx/plugin/registry.hpp"
-#include "emlx/nif/lifecycle.hpp"
-#include "emlx/plugin/build_compat.hpp"
 
 #include <iostream>
 #include <map>
@@ -1034,12 +1032,15 @@ static int open_resources(ErlNifEnv *env) {
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   (void)priv_data;
   (void)load_info;
-  return emlx_initialize_nif_runtime(env, open_resources,
-                                     EMLX_EXPECTED_MLX_BUILD_ID);
+  return open_resources(env);
 }
 
 int upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM load_info) {
-  return emlx_upgrade_nif_runtime(env, priv_data, old_priv_data, load_info);
+  (void)env;
+  (void)priv_data;
+  (void)old_priv_data;
+  (void)load_info;
+  return 0;
 }
 
 UNARY_OP(abs)
@@ -2044,7 +2045,6 @@ static ErlNifFunc nif_funcs[] = {
     // emlx/plugin/registry.hpp); not worker-routed since it does no MLX
     // graph work.
     {"load_plugin", 2, load_plugin},
-    {"load_plugin", 3, load_plugin_with_build_id},
     {"call_plugin", 6, call_plugin_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

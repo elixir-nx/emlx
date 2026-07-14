@@ -91,19 +91,10 @@ defmodule EMLXAxon.PluginMetadataTest.Proof do
   end
 end
 
-defmodule EMLXAxon.PluginMetadataTest.LoaderEnvFixture do
-  @moduledoc false
-
-  def load(path), do: :erlang.load_nif(String.to_charlist(path), 0)
-  def put(_name, _value), do: :erlang.nif_error(:not_loaded)
-  def delete(_name), do: :erlang.nif_error(:not_loaded)
-end
-
 defmodule EMLXAxon.PluginMetadataTest do
   use ExUnit.Case, async: false
 
   alias EMLX.Native.Expr
-  alias EMLXAxon.PluginMetadataTest.LoaderEnvFixture
   alias EMLXAxon.PluginMetadataTest.Proof
 
   setup_all do
@@ -112,9 +103,7 @@ defmodule EMLXAxon.PluginMetadataTest do
 
     File.mkdir_p!(temporary)
     path = compile_proof_plugin!(temporary)
-    loader_env = compile_loader_env_nif!(temporary)
     assert :ok = EMLX.NIF.load_plugin("proof", path)
-    assert :ok = LoaderEnvFixture.load(loader_env)
     on_exit(fn -> File.rm_rf!(temporary) end)
     :ok
   end
@@ -194,42 +183,46 @@ defmodule EMLXAxon.PluginMetadataTest do
     end)
   end
 
-  test "packaged loader rejects stale build identities and remains idempotent" do
+  test "plugin loading is idempotent and rejects conflicting paths" do
     path = Application.app_dir(:emlx_axon, "priv/libemlx_qwen3.so")
-    build_id = EMLXAxon.Native.Qwen3PluginBuild.build_id()
 
-    assert {:error, _} = EMLX.NIF.load_plugin("qwen3", path, String.duplicate("1", 64))
-    assert :ok = EMLX.NIF.load_plugin("qwen3", path, build_id)
+    temporary =
+      Path.join(System.tmp_dir!(), "emlx-plugin-conflict-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(temporary)
+    on_exit(fn -> File.rm_rf!(temporary) end)
+    conflicting_path = compile_proof_plugin!(temporary, name: "qwen3")
+
+    assert :ok = EMLX.NIF.load_plugin("qwen3", path)
+    assert :ok = EMLX.NIF.load_plugin("qwen3", path)
+    assert {:error, reason} = EMLX.NIF.load_plugin("qwen3", conflicting_path)
+    assert List.to_string(reason) =~ "registration conflicts"
   end
 
-  test "loaders reject malformed identities and descriptors before publication" do
-    path = Application.app_dir(:emlx_axon, "priv/libemlx_qwen3.so")
+  test "plugin loader exposes only the path-based API" do
+    assert function_exported?(EMLX.NIF, :load_plugin, 2)
+    refute function_exported?(EMLX.NIF, :load_plugin, 3)
+  end
 
-    for malformed <- ["", "ABC", String.duplicate("A", 64), String.duplicate("0", 63)] do
-      assert {:error, reason} = EMLX.NIF.load_plugin("qwen3", path, malformed)
-      assert List.to_string(reason) =~ "64 lowercase hexadecimal"
-    end
-
+  test "loader rejects incompatible descriptors before publication" do
     temporary =
       Path.join(System.tmp_dir!(), "emlx-plugin-malformed-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(temporary)
     on_exit(fn -> File.rm_rf!(temporary) end)
 
+    mismatched = compile_proof_plugin!(temporary, name: "descriptor_name")
+    assert {:error, mismatch_reason} = EMLX.NIF.load_plugin("requested_name", mismatched)
+    assert List.to_string(mismatch_reason) =~ "descriptor name does not match"
+
     fixtures = [
       {"bad_magic", :bad_magic, "bootstrap is incompatible"},
       {"bad_bootstrap_size", :bad_bootstrap_size, "bootstrap is incompatible"},
       {"bad_bootstrap_abi", :bad_bootstrap_abi, "bootstrap is incompatible"},
-      {"bad_header_hash", :bad_header_hash, "bootstrap is incompatible"},
-      {"bad_layout", :bad_layout, "bootstrap is incompatible"},
-      {"bad_pointer_width", :bad_pointer_width, "bootstrap is incompatible"},
-      {"bad_endianness", :bad_endianness, "bootstrap is incompatible"},
       {"bad_descriptor_size", :bad_descriptor_size, "bootstrap is incompatible"},
       {"null_descriptor", :null_descriptor, "bootstrap is incompatible"},
       {"misaligned_descriptor", :misaligned_descriptor, "descriptor pointer is not aligned"},
-      {"bad_descriptor_abi", :bad_descriptor_abi, "descriptor is incompatible"},
-      {"bad_descriptor_header_abi", :bad_descriptor_header_abi, "descriptor is incompatible"},
-      {"bad_descriptor_header_hash", :bad_descriptor_header_hash, "descriptor is incompatible"},
+      {"bad_descriptor_inner_size", :bad_descriptor_inner_size, "descriptor is incompatible"},
       {"bad_callback_descriptor_size", :bad_callback_descriptor_size,
        "descriptor is incompatible"},
       {"null_plugin_name", :null_plugin_name, "field name is missing"},
@@ -240,7 +233,6 @@ defmodule EMLXAxon.PluginMetadataTest do
       {"bad_callback_schema", :bad_callback_schema, "callback descriptor is invalid"},
       {"bad_attr_schema", :bad_attr_schema, "callback descriptor is invalid"},
       {"bad_callback_name", :bad_callback_name, "callback descriptor is invalid"},
-      {"bad_debug_utf8", :bad_debug_utf8, "debug_name is not valid UTF-8"},
       {"bad_device", :bad_device, "callback descriptor is invalid"},
       {"bad_operand_policy", :bad_operand_policy, "operand policy is invalid"},
       {"bad_output_policy", :bad_output_policy, "output policy is invalid"},
@@ -252,36 +244,6 @@ defmodule EMLXAxon.PluginMetadataTest do
       assert {:error, reason} = EMLX.NIF.load_plugin(name, fixture)
       assert List.to_string(reason) =~ expected
     end)
-  end
-
-  test "packaged loader rejects every runtime loader override before path lookup" do
-    variables =
-      if match?({:unix, :darwin}, :os.type()) do
-        ~w(DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH DYLD_INSERT_LIBRARIES
-           DYLD_FRAMEWORK_PATH DYLD_FALLBACK_FRAMEWORK_PATH DYLD_ROOT_PATH)
-      else
-        ~w(LD_LIBRARY_PATH LD_PRELOAD LD_AUDIT)
-      end
-
-    for variable <- variables, value <- ["", "/untrusted"] do
-      variable_chars = String.to_charlist(variable)
-      assert :ok = LoaderEnvFixture.put(variable_chars, String.to_charlist(value))
-
-      try do
-        assert {:error, reason} =
-                 EMLX.NIF.load_plugin(
-                   "override_test",
-                   "/path/that/does/not/exist",
-                   String.duplicate("0", 64)
-                 )
-
-        message = List.to_string(reason)
-        assert message =~ "runtime loader override #{variable}"
-        refute message =~ "plugin path does not resolve"
-      after
-        assert :ok = LoaderEnvFixture.delete(variable_chars)
-      end
-    end
   end
 
   test "fallback remains correct under Nx.Defn.Evaluator" do
@@ -535,16 +497,10 @@ defmodule EMLXAxon.PluginMetadataTest do
           :bad_magic -> ["-DEMLX_FIXTURE_BAD_MAGIC"]
           :bad_bootstrap_size -> ["-DEMLX_FIXTURE_BAD_BOOTSTRAP_SIZE"]
           :bad_bootstrap_abi -> ["-DEMLX_FIXTURE_BAD_BOOTSTRAP_ABI"]
-          :bad_header_hash -> ["-DEMLX_FIXTURE_BAD_HEADER_HASH"]
-          :bad_layout -> ["-DEMLX_FIXTURE_BAD_LAYOUT"]
-          :bad_pointer_width -> ["-DEMLX_FIXTURE_BAD_POINTER_WIDTH"]
-          :bad_endianness -> ["-DEMLX_FIXTURE_BAD_ENDIANNESS"]
           :bad_descriptor_size -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_SIZE"]
           :null_descriptor -> ["-DEMLX_FIXTURE_NULL_DESCRIPTOR"]
           :misaligned_descriptor -> ["-DEMLX_FIXTURE_MISALIGNED_DESCRIPTOR"]
-          :bad_descriptor_abi -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_ABI"]
-          :bad_descriptor_header_abi -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_HEADER_ABI"]
-          :bad_descriptor_header_hash -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_HEADER_HASH"]
+          :bad_descriptor_inner_size -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_INNER_SIZE"]
           :bad_callback_descriptor_size -> ["-DEMLX_FIXTURE_BAD_CALLBACK_DESCRIPTOR_SIZE"]
           :null_plugin_name -> ["-DEMLX_FIXTURE_NULL_PLUGIN_NAME"]
           :null_callbacks -> ["-DEMLX_FIXTURE_NULL_CALLBACKS"]
@@ -554,7 +510,6 @@ defmodule EMLXAxon.PluginMetadataTest do
           :bad_callback_schema -> ["-DEMLX_FIXTURE_BAD_CALLBACK_SCHEMA"]
           :bad_attr_schema -> ["-DEMLX_FIXTURE_BAD_ATTR_SCHEMA"]
           :bad_callback_name -> ["-DEMLX_FIXTURE_BAD_CALLBACK_NAME"]
-          :bad_debug_utf8 -> ["-DEMLX_FIXTURE_BAD_DEBUG_UTF8"]
           :bad_device -> ["-DEMLX_FIXTURE_BAD_DEVICE"]
           :bad_operand_policy -> ["-DEMLX_FIXTURE_BAD_OPERAND_POLICY"]
           :bad_output_policy -> ["-DEMLX_FIXTURE_BAD_OUTPUT_POLICY"]
@@ -583,30 +538,6 @@ defmodule EMLXAxon.PluginMetadataTest do
     case System.cmd(compiler, args, stderr_to_stdout: true) do
       {_, 0} -> output
       {message, status} -> raise "proof plugin compile failed (#{status}):\n#{message}"
-    end
-  end
-
-  defp compile_loader_env_nif!(temporary) do
-    source = Path.expand("../support/loader_env_nif.c", __DIR__)
-    load_path = Path.join(temporary, "loader_env_nif")
-    output = load_path <> ".so"
-    compiler = System.find_executable(System.get_env("CC") || "cc") || raise "missing C compiler"
-
-    erts_include =
-      :code.root_dir()
-      |> List.to_string()
-      |> Path.join("erts-#{:erlang.system_info(:version)}/include")
-
-    platform_args =
-      if match?({:unix, :darwin}, :os.type()), do: ["-undefined", "dynamic_lookup"], else: []
-
-    args =
-      ["-fPIC", "-shared", "-I#{erts_include}", source] ++
-        platform_args ++ ["-o", output]
-
-    case System.cmd(compiler, args, stderr_to_stdout: true) do
-      {_, 0} -> load_path
-      {message, status} -> raise "loader environment NIF compile failed (#{status}):\n#{message}"
     end
   end
 end

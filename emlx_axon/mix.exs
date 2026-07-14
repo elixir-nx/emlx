@@ -1,5 +1,3 @@
-Code.require_file("mix_helpers/compiler_probe.exs", __DIR__)
-
 defmodule EMLXAxon.MixProject do
   use Mix.Project
 
@@ -17,31 +15,20 @@ defmodule EMLXAxon.MixProject do
       aliases: aliases(),
       description: "Axon model rewrites to swap supported nodes for EMLX.Fast Metal shaders",
       package: package(),
-      # elixir_make — builds the standalone qwen3 compute plugin
-      # (c_src/qwen3_plugin.cpp), `dlopen`'d at runtime by emlx's
-      # `EMLX.NIF.load_plugin/3` (see lib/emlx_axon/application.ex). A
+      # elixir_make builds the standalone Qwen3 compute plugin
+      # (c_src/qwen3_plugin.cpp), loaded at runtime by EMLX.NIF.load_plugin/2.
+      # A
       # function ref so `Application.app_dir(:emlx, ...)` (needs the
       # :emlx dep already compiled) isn't called while this project/0
       # map is being built — mirrors emlx's own `Fine.include_dir()`
       # deferral in its mix.exs.
       make_env: fn ->
         emlx_priv_dir = Application.app_dir(:emlx, "priv")
-        EMLXAxon.Mix.CompilerProbe.ensure_plugin_build_support!(emlx_priv_dir)
-        emlx_source_dir = Mix.Project.deps_paths()[:emlx]
-        compiler = System.get_env("CXX") || "c++"
-        real_compiler = System.find_executable(compiler) || Mix.raise("cannot find C++ compiler")
-        compiler_family = EMLXAxon.Mix.CompilerProbe.detect!(real_compiler)
 
         %{
           "MLX_INCLUDE_DIR" => Path.join(emlx_priv_dir, "mlx/include"),
           "MLX_LIB_DIR" => Path.join(emlx_priv_dir, "mlx/lib"),
-          "EMLX_PLUGIN_INCLUDE_DIR" => Path.join(emlx_priv_dir, "include"),
-          "EMLX_PLUGIN_TOOL_WRAPPER" =>
-            Path.join(emlx_priv_dir, "build_support/emlx_plugin_tool_wrapper"),
-          "EMLX_BUILD_ID_TOOL" => Path.join(emlx_priv_dir, "build_support/emlx_build_identity"),
-          "EMLX_PLUGIN_REAL_CXX" => real_compiler,
-          "EMLX_PLUGIN_COMPILER_FAMILY" => compiler_family,
-          "EMLX_SOURCE_DIR" => emlx_source_dir
+          "EMLX_PLUGIN_INCLUDE_DIR" => Path.join(emlx_priv_dir, "include")
         }
       end,
       compilers: [:elixir_make] ++ Mix.compilers()
@@ -95,7 +82,7 @@ defmodule EMLXAxon.MixProject do
 
   defp package do
     [
-      files: ~w(lib c_src mix_helpers .formatter.exs mix.exs README.md LICENSE Makefile),
+      files: ~w(lib c_src .formatter.exs mix.exs README.md LICENSE Makefile),
       links: %{"GitHub" => @source_url},
       licenses: ["Apache-2.0"],
       maintainers: ["Paulo Valente"]

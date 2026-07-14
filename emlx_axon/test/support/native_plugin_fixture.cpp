@@ -1,6 +1,4 @@
 #include "emlx/plugin/abi.hpp"
-#include "emlx/plugin/build_compat.hpp"
-#include "emlx/plugin/toolchain.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -12,8 +10,6 @@ namespace {
 #endif
 
 inline constexpr char kPluginName[] = EMLX_FIXTURE_PLUGIN_NAME;
-inline constexpr char kBuildId[] =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 inline constexpr char kScaleAdd[] = "scale_add";
 inline constexpr char kPartialFailure[] = "partial_failure";
 inline constexpr char kWrongShape[] = "wrong_shape";
@@ -42,10 +38,6 @@ inline constexpr char kPartialFailureName[] = "scale_add";
 #else
 inline constexpr char kPartialFailureName[] = "partial_failure";
 #endif
-#if defined(EMLX_FIXTURE_BAD_DEBUG_UTF8)
-inline constexpr char kBadDebugName[] = "\xff";
-#endif
-
 template <size_t N>
 constexpr EMLXPluginStringView string_view(const char (&value)[N]) {
   return {value, N - 1};
@@ -187,8 +179,7 @@ bool callback_must_not_run(const EMLXPluginCall &,
 constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
 #if defined(EMLX_FIXTURE_NULL_CALLBACK)
     {string_view(kPrimaryCallbackName), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, nullptr,
-     {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, nullptr},
 #else
     {string_view(kPrimaryCallbackName),
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_SCHEMA)
@@ -218,66 +209,57 @@ constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
 #else
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
 #endif
-     scale_add,
-#if defined(EMLX_FIXTURE_BAD_DEBUG_UTF8)
-     string_view(kBadDebugName)},
-#else
-     {nullptr, 0}},
-#endif
+     scale_add},
 #endif
     {string_view(kPartialFailureName), 1, 1, 1, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     partial_failure, {nullptr, 0}},
+     partial_failure},
     {string_view(kWrongShape), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, wrong_shape,
-     {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, wrong_shape},
     {string_view(kCpuOnly), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1, scale_add, {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_CPU_V1, scale_add},
     {string_view(kGpuOnly), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add, {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add},
     {string_view(kThrowingOperandPolicy), 1, 1, 0, throwing_operand_policy, 1,
      nullptr, EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     scale_add, {nullptr, 0}},
+     scale_add},
     {string_view(kThrowingOutputPolicy), 1, 1, 1, nullptr, 0,
      throwing_output_policy,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add,
-     {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add},
     {string_view(kOversizedError), 1, 1, 1, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     oversized_error, {nullptr, 0}},
+     oversized_error},
     {string_view(kInvalidUtf8Error), 1, 1, 1, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     invalid_utf8_error, {nullptr, 0}},
+     invalid_utf8_error},
     {string_view(kEmptyError), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, empty_error,
-     {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, empty_error},
     {string_view(kThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     throw_after_output, {nullptr, 0}},
+     throw_after_output},
     {string_view(kUnknownThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     unknown_throw_after_output, {nullptr, 0}},
+     unknown_throw_after_output},
     {string_view(kWrongOutputCount), 1, 1, 1, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     wrong_output_count, {nullptr, 0}},
+     wrong_output_count},
     {string_view(kOversizedOperandPolicy), 1, 1, 0,
      oversized_operand_policy, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     callback_must_not_run, {nullptr, 0}},
+     callback_must_not_run},
     {string_view(kOversizedOutputPolicy), 1, 1, 1, nullptr, 0,
      oversized_output_policy,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     callback_must_not_run, {nullptr, 0}},
+     callback_must_not_run},
     {string_view(kZeroOperandPolicy), 1, 1, 0, zero_count_policy, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     callback_must_not_run, {nullptr, 0}},
+     callback_must_not_run},
     {string_view(kZeroOutputPolicy), 1, 1, 1, nullptr, 0, zero_count_policy,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     callback_must_not_run, {nullptr, 0}},
+     callback_must_not_run},
     {string_view(kDynamicCounts), 1, 1, 0, one_count_policy, 0,
      one_count_policy,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add,
-     {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add},
 };
 
 #if defined(EMLX_FIXTURE_MISALIGNED_CALLBACKS)
@@ -298,43 +280,16 @@ constinit const EMLXPluginDescriptor kDescriptor{
 #else
     string_view(kPluginName),
 #endif
-    {
-#if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_ABI)
-     2,
+#if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_INNER_SIZE)
+    sizeof(EMLXPluginDescriptor) + 1,
 #else
-     EMLX_PLUGIN_ABI_V1,
+    sizeof(EMLXPluginDescriptor),
 #endif
-#if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_HEADER_ABI)
-     2,
-#else
-     EMLX_PLUGIN_HEADER_ABI_V1,
-#endif
-#if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_HEADER_HASH)
-     EMLX_PLUGIN_HEADER_ABI_HASH_V1 + 1,
-#else
-     EMLX_PLUGIN_HEADER_ABI_HASH_V1,
-#endif
-     string_view(EMLX_EXPECTED_MLX_VERSION),
-     string_view(EMLX_EXPECTED_MLX_VARIANT),
-     string_view(EMLX_EXPECTED_MLX_BUILD_ID),
-     string_view(EMLX_EXPECTED_MLX_HEADERS_BUILD_ID),
-     string_view(EMLX_EXPECTED_TARGET_TRIPLE),
-     sizeof(void *) * 8,
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-     EMLX_ENDIAN_BIG,
-#else
-     EMLX_ENDIAN_LITTLE,
-#endif
-     string_view(EMLX_ACTUAL_COMPILER_FAMILY),
-     string_view(EMLX_ACTUAL_CXX_STDLIB_ABI),
-     sizeof(EMLXPluginDescriptor),
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_DESCRIPTOR_SIZE)
-     sizeof(EMLXPluginCallbackDescriptor) + 1,
+    sizeof(EMLXPluginCallbackDescriptor) + 1,
 #else
-     sizeof(EMLXPluginCallbackDescriptor),
+    sizeof(EMLXPluginCallbackDescriptor),
 #endif
-     string_view(kBuildId)},
-    static_cast<EMLXMLXRuntimeAnchor>(&mlx::core::version),
 #if defined(EMLX_FIXTURE_TOO_MANY_CALLBACKS)
     257,
 #else
@@ -365,30 +320,6 @@ constinit const EMLXPluginBootstrapV1 kBootstrap{
     2,
 #else
     EMLX_PLUGIN_ABI_V1,
-#endif
-#if defined(EMLX_FIXTURE_BAD_HEADER_HASH)
-    EMLX_PLUGIN_HEADER_ABI_HASH_V1 + 1,
-#else
-    EMLX_PLUGIN_HEADER_ABI_HASH_V1,
-#endif
-#if defined(EMLX_FIXTURE_BAD_LAYOUT)
-    EMLX_PLUGIN_LAYOUT_ABI_HASH_V1 + 1,
-#else
-    EMLX_PLUGIN_LAYOUT_ABI_HASH_V1,
-#endif
-#if defined(EMLX_FIXTURE_BAD_POINTER_WIDTH)
-    sizeof(void *) * 8 + 1,
-#else
-    sizeof(void *) * 8,
-#endif
-#if defined(EMLX_FIXTURE_BAD_ENDIANNESS)
-    99,
-#else
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    EMLX_ENDIAN_BIG,
-#else
-    EMLX_ENDIAN_LITTLE,
-#endif
 #endif
 #if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_SIZE)
     sizeof(EMLXPluginDescriptor) + 1,

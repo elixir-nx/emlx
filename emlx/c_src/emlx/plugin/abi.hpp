@@ -16,9 +16,6 @@
 
 inline constexpr uint64_t EMLX_PLUGIN_MAGIC_V1 = 0x454D4C58504C4731ULL;
 inline constexpr uint32_t EMLX_PLUGIN_ABI_V1 = 1;
-inline constexpr uint32_t EMLX_PLUGIN_HEADER_ABI_V1 = 1;
-inline constexpr uint32_t EMLX_ENDIAN_LITTLE = 1;
-inline constexpr uint32_t EMLX_ENDIAN_BIG = 2;
 inline constexpr uint32_t EMLX_PLUGIN_DEVICE_CPU_V1 = 1U << 0;
 inline constexpr uint32_t EMLX_PLUGIN_DEVICE_GPU_METAL_V1 = 1U << 1;
 inline constexpr uint32_t EMLX_PLUGIN_DEVICE_KNOWN_V1 =
@@ -26,11 +23,9 @@ inline constexpr uint32_t EMLX_PLUGIN_DEVICE_KNOWN_V1 =
 inline constexpr uint32_t EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 = 8192;
 inline constexpr uint32_t EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1 = 1024;
 
-using EMLXMLXRuntimeAnchor = const char *(*)();
-
-// Views are borrowed from EMLX and remain valid only for the duration of the
-// count-policy or callback invocation that receives them. Plugins must not
-// retain the data pointer or references to its elements after that invocation.
+// Plugin-owned views are borrowed by EMLX only while loading the descriptor.
+// Call-owned views remain valid only for the count-policy or callback
+// invocation that receives them. Neither side may retain borrowed pointers.
 template <typename T> struct EMLXPluginView {
   const T *data;
   uint64_t size;
@@ -45,32 +40,23 @@ using EMLXPluginArrayView = EMLXPluginView<mlx::core::array>;
 using EMLXPluginInt64View = EMLXPluginView<int64_t>;
 
 struct EMLXPluginExecutionContext {
-  // Both pointers are borrowed for one callback invocation. They must not be
-  // retained by the plugin or used after the callback returns.
   const mlx::core::Device *device;
   const mlx::core::Stream *stream;
 };
 
 struct EMLXPluginCall {
-  // The views and execution context are borrowed for one callback invocation.
-  // Plugins must not retain pointers or references into this call.
   EMLXPluginArrayView operands;
   EMLXPluginInt64View attrs;
   const EMLXPluginExecutionContext *execution;
 };
 
-// Count policies and callbacks may run concurrently on EMLX worker threads.
-// Implementations must therefore be reentrant and thread-safe. Expected
-// failures are reported by returning false and assigning error. Exceptions
-// must not cross this ABI boundary; EMLX catches them only as a defensive last
-// resort.
+// Policies and callbacks may run concurrently on EMLX worker threads and must
+// therefore be reentrant. Expected failures return false and populate error;
+// exceptions must not cross the plugin boundary.
 using EMLXOutputCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
                                    std::string &);
 using EMLXOperandCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
                                     std::string &);
-// The operands, attrs, execution context, outputs container, and error string
-// are owned by EMLX and may not be retained. Arrays appended to outputs keep
-// their normal MLX reference ownership after the callback returns.
 using EMLXPluginCallback = bool (*)(const EMLXPluginCall &,
                                     std::vector<mlx::core::array> &,
                                     std::string &);
@@ -85,33 +71,14 @@ struct EMLXPluginCallbackDescriptor {
   EMLXOutputCountFn output_count_from_attrs;
   uint32_t device_capabilities;
   EMLXPluginCallback callback;
-  EMLXPluginStringView debug_name;
-};
-
-struct EMLXPluginCompatibility {
-  uint32_t plugin_abi_version;
-  uint32_t header_abi_version;
-  uint64_t header_abi_hash;
-  EMLXPluginStringView mlx_version;
-  EMLXPluginStringView mlx_variant;
-  EMLXPluginStringView mlx_build_id;
-  EMLXPluginStringView mlx_headers_build_id;
-  EMLXPluginStringView target_triple;
-  uint32_t pointer_width_bits;
-  uint32_t endianness;
-  EMLXPluginStringView compiler_abi_family;
-  EMLXPluginStringView cxx_standard_library_abi;
-  uint64_t plugin_descriptor_size;
-  uint64_t callback_descriptor_size;
-  EMLXPluginStringView plugin_build_id;
 };
 
 struct EMLXPluginDescriptor {
-  // Descriptor strings, the callback table, policy functions, and callback
-  // functions must remain valid for the lifetime of the VM process.
+  // Strings, the callback table, policy functions, and callbacks must remain
+  // valid for the lifetime of the VM process.
   EMLXPluginStringView name;
-  EMLXPluginCompatibility compatibility;
-  EMLXMLXRuntimeAnchor mlx_runtime_anchor;
+  uint64_t descriptor_size;
+  uint64_t callback_descriptor_size;
   uint32_t callback_count;
   const EMLXPluginCallbackDescriptor *callbacks;
 };
@@ -120,278 +87,57 @@ struct EMLXPluginBootstrapV1 {
   uint64_t magic;
   uint32_t bootstrap_size;
   uint32_t plugin_abi_version;
-  uint64_t header_abi_hash;
-  uint64_t layout_abi_hash;
-  uint32_t pointer_width_bits;
-  uint32_t endianness;
   uint64_t descriptor_size;
   const void *descriptor;
 };
 
 using EMLXPluginDiscoveryV1 = const EMLXPluginBootstrapV1 *(*)() noexcept;
 
-constexpr uint64_t emlx_plugin_fnv1a_byte(uint64_t hash, uint8_t value) {
-  return (hash ^ value) * 1099511628211ULL;
-}
-
-constexpr uint64_t emlx_plugin_fnv1a_string(const char *value, size_t size) {
-  uint64_t hash = 14695981039346656037ULL;
-  for (size_t i = 0; i < size; ++i)
-    hash = emlx_plugin_fnv1a_byte(hash, static_cast<uint8_t>(value[i]));
-  return hash;
-}
-
-template <typename UInt>
-constexpr uint64_t emlx_plugin_fnv1a_le(uint64_t hash, UInt value) {
-  for (size_t i = 0; i < sizeof(UInt); ++i) {
-    hash = emlx_plugin_fnv1a_byte(hash, static_cast<uint8_t>(value & 0xffU));
-    value >>= 8U;
-  }
-  return hash;
-}
-
-inline constexpr char EMLX_PLUGIN_ABI_SIGNATURE_V1[] =
-    "EMLXPluginBootstrapV1{u64 magic,u32 bootstrap_size,u32 plugin_abi_version,"
-    "u64 header_abi_hash,u64 layout_abi_hash,u32 pointer_width_bits,u32 "
-    "endianness,u64 descriptor_size,const void* descriptor};"
-    "EMLXPluginStringView{const char* data,u64 size};"
-    "EMLXPluginArrayView{const mlx::core::array* data,u64 size};"
-    "EMLXPluginInt64View{const i64* data,u64 size};"
-    "EMLXPluginExecutionContext{const mlx::core::Device* device,const "
-    "mlx::core::Stream* stream};"
-    "EMLXPluginCall{EMLXPluginArrayView operands,EMLXPluginInt64View attrs,"
-    "const EMLXPluginExecutionContext* execution};"
-    "EMLXPluginCallbackDescriptor{name,schema_version,attr_schema_version,"
-    "operand_count,operand_count_from_attrs,output_count,"
-    "output_count_from_attrs,device_capabilities,callback,debug_name};"
-    "EMLXPluginCompatibility{plugin_abi_version,header_abi_version,"
-    "header_abi_hash,mlx_version,mlx_variant,mlx_build_id,mlx_headers_build_id,"
-    "target_triple,pointer_width_bits,endianness,compiler_abi_family,"
-    "cxx_standard_library_abi,plugin_descriptor_size,callback_descriptor_size,"
-    "plugin_build_id};"
-    "EMLXPluginDescriptor{name,compatibility,mlx_runtime_anchor,callback_count,"
-    "callbacks};"
-    "EMLXPluginDiscoveryV1=const EMLXPluginBootstrapV1*(*)() noexcept";
-
-inline constexpr uint64_t EMLX_PLUGIN_HEADER_ABI_HASH_V1 =
-    emlx_plugin_fnv1a_string(EMLX_PLUGIN_ABI_SIGNATURE_V1,
-                             sizeof(EMLX_PLUGIN_ABI_SIGNATURE_V1) - 1);
-
-constexpr uint64_t emlx_plugin_layout_record(uint64_t hash, uint32_t id,
-                                             uint64_t size, uint64_t alignment,
-                                             const uint64_t *offsets,
-                                             uint32_t count) {
-  hash = emlx_plugin_fnv1a_le(hash, id);
-  hash = emlx_plugin_fnv1a_le(hash, size);
-  hash = emlx_plugin_fnv1a_le(hash, alignment);
-  hash = emlx_plugin_fnv1a_le(hash, count);
-  for (uint32_t i = 0; i < count; ++i)
-    hash = emlx_plugin_fnv1a_le(hash, offsets[i]);
-  return hash;
-}
-
-constexpr uint64_t emlx_plugin_layout_hash_v1() {
-  uint64_t hash = 14695981039346656037ULL;
-  constexpr uint64_t bootstrap[] = {
-      offsetof(EMLXPluginBootstrapV1, magic),
-      offsetof(EMLXPluginBootstrapV1, bootstrap_size),
-      offsetof(EMLXPluginBootstrapV1, plugin_abi_version),
-      offsetof(EMLXPluginBootstrapV1, header_abi_hash),
-      offsetof(EMLXPluginBootstrapV1, layout_abi_hash),
-      offsetof(EMLXPluginBootstrapV1, pointer_width_bits),
-      offsetof(EMLXPluginBootstrapV1, endianness),
-      offsetof(EMLXPluginBootstrapV1, descriptor_size),
-      offsetof(EMLXPluginBootstrapV1, descriptor)};
-  constexpr uint64_t string_view[] = {offsetof(EMLXPluginStringView, data),
-                                      offsetof(EMLXPluginStringView, size)};
-  constexpr uint64_t array_view[] = {offsetof(EMLXPluginArrayView, data),
-                                     offsetof(EMLXPluginArrayView, size)};
-  constexpr uint64_t int64_view[] = {offsetof(EMLXPluginInt64View, data),
-                                     offsetof(EMLXPluginInt64View, size)};
-  constexpr uint64_t execution[] = {
-      offsetof(EMLXPluginExecutionContext, device),
-      offsetof(EMLXPluginExecutionContext, stream)};
-  constexpr uint64_t call[] = {offsetof(EMLXPluginCall, operands),
-                               offsetof(EMLXPluginCall, attrs),
-                               offsetof(EMLXPluginCall, execution)};
-  constexpr uint64_t callback[] = {
-      offsetof(EMLXPluginCallbackDescriptor, name),
-      offsetof(EMLXPluginCallbackDescriptor, schema_version),
-      offsetof(EMLXPluginCallbackDescriptor, attr_schema_version),
-      offsetof(EMLXPluginCallbackDescriptor, operand_count),
-      offsetof(EMLXPluginCallbackDescriptor, operand_count_from_attrs),
-      offsetof(EMLXPluginCallbackDescriptor, output_count),
-      offsetof(EMLXPluginCallbackDescriptor, output_count_from_attrs),
-      offsetof(EMLXPluginCallbackDescriptor, device_capabilities),
-      offsetof(EMLXPluginCallbackDescriptor, callback),
-      offsetof(EMLXPluginCallbackDescriptor, debug_name)};
-  constexpr uint64_t compatibility[] = {
-      offsetof(EMLXPluginCompatibility, plugin_abi_version),
-      offsetof(EMLXPluginCompatibility, header_abi_version),
-      offsetof(EMLXPluginCompatibility, header_abi_hash),
-      offsetof(EMLXPluginCompatibility, mlx_version),
-      offsetof(EMLXPluginCompatibility, mlx_variant),
-      offsetof(EMLXPluginCompatibility, mlx_build_id),
-      offsetof(EMLXPluginCompatibility, mlx_headers_build_id),
-      offsetof(EMLXPluginCompatibility, target_triple),
-      offsetof(EMLXPluginCompatibility, pointer_width_bits),
-      offsetof(EMLXPluginCompatibility, endianness),
-      offsetof(EMLXPluginCompatibility, compiler_abi_family),
-      offsetof(EMLXPluginCompatibility, cxx_standard_library_abi),
-      offsetof(EMLXPluginCompatibility, plugin_descriptor_size),
-      offsetof(EMLXPluginCompatibility, callback_descriptor_size),
-      offsetof(EMLXPluginCompatibility, plugin_build_id)};
-  constexpr uint64_t descriptor[] = {
-      offsetof(EMLXPluginDescriptor, name),
-      offsetof(EMLXPluginDescriptor, compatibility),
-      offsetof(EMLXPluginDescriptor, mlx_runtime_anchor),
-      offsetof(EMLXPluginDescriptor, callback_count),
-      offsetof(EMLXPluginDescriptor, callbacks)};
-
-  hash = emlx_plugin_layout_record(hash, 1, sizeof(EMLXPluginBootstrapV1),
-                                   alignof(EMLXPluginBootstrapV1), bootstrap, 9);
-  hash = emlx_plugin_layout_record(hash, 2, sizeof(EMLXPluginStringView),
-                                   alignof(EMLXPluginStringView), string_view, 2);
-  hash = emlx_plugin_layout_record(hash, 3, sizeof(EMLXPluginArrayView),
-                                   alignof(EMLXPluginArrayView), array_view, 2);
-  hash = emlx_plugin_layout_record(hash, 4, sizeof(EMLXPluginInt64View),
-                                   alignof(EMLXPluginInt64View), int64_view, 2);
-  hash = emlx_plugin_layout_record(hash, 5, sizeof(EMLXPluginExecutionContext),
-                                   alignof(EMLXPluginExecutionContext), execution, 2);
-  hash = emlx_plugin_layout_record(hash, 6, sizeof(EMLXPluginCall),
-                                   alignof(EMLXPluginCall), call, 3);
-  hash = emlx_plugin_layout_record(hash, 7, sizeof(EMLXPluginCallbackDescriptor),
-                                   alignof(EMLXPluginCallbackDescriptor), callback, 10);
-  hash = emlx_plugin_layout_record(hash, 8, sizeof(EMLXPluginCompatibility),
-                                   alignof(EMLXPluginCompatibility), compatibility, 15);
-  return emlx_plugin_layout_record(hash, 9, sizeof(EMLXPluginDescriptor),
-                                   alignof(EMLXPluginDescriptor), descriptor, 5);
-}
-
-inline constexpr uint64_t EMLX_PLUGIN_LAYOUT_ABI_HASH_V1 =
-    emlx_plugin_layout_hash_v1();
-
-constexpr uint64_t emlx_plugin_layout_conformance_vector_v1() {
-  constexpr uint64_t offsets[] = {0, 8, 24};
-  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 8,
-                                   offsets, 3);
-}
-
 static_assert(std::is_standard_layout_v<EMLXPluginBootstrapV1>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginBootstrapV1>);
-static_assert(sizeof(EMLXPluginBootstrapV1) == 56);
+static_assert(sizeof(EMLXPluginBootstrapV1) == 32);
 static_assert(alignof(EMLXPluginBootstrapV1) == 8);
 static_assert(offsetof(EMLXPluginBootstrapV1, magic) == 0);
 static_assert(offsetof(EMLXPluginBootstrapV1, bootstrap_size) == 8);
 static_assert(offsetof(EMLXPluginBootstrapV1, plugin_abi_version) == 12);
-static_assert(offsetof(EMLXPluginBootstrapV1, header_abi_hash) == 16);
-static_assert(offsetof(EMLXPluginBootstrapV1, layout_abi_hash) == 24);
-static_assert(offsetof(EMLXPluginBootstrapV1, pointer_width_bits) == 32);
-static_assert(offsetof(EMLXPluginBootstrapV1, endianness) == 36);
-static_assert(offsetof(EMLXPluginBootstrapV1, descriptor_size) == 40);
-static_assert(offsetof(EMLXPluginBootstrapV1, descriptor) == 48);
+static_assert(offsetof(EMLXPluginBootstrapV1, descriptor_size) == 16);
+static_assert(offsetof(EMLXPluginBootstrapV1, descriptor) == 24);
+
 static_assert(std::is_standard_layout_v<EMLXPluginStringView>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginStringView>);
 static_assert(sizeof(EMLXPluginStringView) == 16);
 static_assert(alignof(EMLXPluginStringView) == 8);
-static_assert(offsetof(EMLXPluginStringView, data) == 0);
-static_assert(offsetof(EMLXPluginStringView, size) == 8);
+
 static_assert(std::is_standard_layout_v<EMLXPluginArrayView>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginArrayView>);
 static_assert(sizeof(EMLXPluginArrayView) == 16);
-static_assert(alignof(EMLXPluginArrayView) == 8);
-static_assert(offsetof(EMLXPluginArrayView, data) == 0);
-static_assert(offsetof(EMLXPluginArrayView, size) == 8);
+
 static_assert(std::is_standard_layout_v<EMLXPluginInt64View>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginInt64View>);
 static_assert(sizeof(EMLXPluginInt64View) == 16);
-static_assert(alignof(EMLXPluginInt64View) == 8);
-static_assert(offsetof(EMLXPluginInt64View, data) == 0);
-static_assert(offsetof(EMLXPluginInt64View, size) == 8);
+
 static_assert(std::is_standard_layout_v<EMLXPluginExecutionContext>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginExecutionContext>);
 static_assert(sizeof(EMLXPluginExecutionContext) == 16);
-static_assert(alignof(EMLXPluginExecutionContext) == 8);
-static_assert(offsetof(EMLXPluginExecutionContext, device) == 0);
-static_assert(offsetof(EMLXPluginExecutionContext, stream) == 8);
+
 static_assert(std::is_standard_layout_v<EMLXPluginCall>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginCall>);
 static_assert(sizeof(EMLXPluginCall) == 40);
-static_assert(alignof(EMLXPluginCall) == 8);
-static_assert(offsetof(EMLXPluginCall, operands) == 0);
-static_assert(offsetof(EMLXPluginCall, attrs) == 16);
-static_assert(offsetof(EMLXPluginCall, execution) == 32);
+
 static_assert(std::is_standard_layout_v<EMLXPluginCallbackDescriptor>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginCallbackDescriptor>);
-static_assert(sizeof(EMLXPluginCallbackDescriptor) == 88);
+static_assert(sizeof(EMLXPluginCallbackDescriptor) == 72);
 static_assert(alignof(EMLXPluginCallbackDescriptor) == 8);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, name) == 0);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, schema_version) == 16);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, attr_schema_version) == 20);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, operand_count) == 24);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, operand_count_from_attrs) ==
-              32);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, output_count) == 40);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, output_count_from_attrs) ==
-              48);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, device_capabilities) == 56);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, callback) == 64);
-static_assert(offsetof(EMLXPluginCallbackDescriptor, debug_name) == 72);
-static_assert(std::is_standard_layout_v<EMLXPluginCompatibility>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginCompatibility>);
-static_assert(sizeof(EMLXPluginCompatibility) == 168);
-static_assert(alignof(EMLXPluginCompatibility) == 8);
-static_assert(offsetof(EMLXPluginCompatibility, plugin_abi_version) == 0);
-static_assert(offsetof(EMLXPluginCompatibility, header_abi_version) == 4);
-static_assert(offsetof(EMLXPluginCompatibility, header_abi_hash) == 8);
-static_assert(offsetof(EMLXPluginCompatibility, mlx_version) == 16);
-static_assert(offsetof(EMLXPluginCompatibility, mlx_variant) == 32);
-static_assert(offsetof(EMLXPluginCompatibility, mlx_build_id) == 48);
-static_assert(offsetof(EMLXPluginCompatibility, mlx_headers_build_id) == 64);
-static_assert(offsetof(EMLXPluginCompatibility, target_triple) == 80);
-static_assert(offsetof(EMLXPluginCompatibility, pointer_width_bits) == 96);
-static_assert(offsetof(EMLXPluginCompatibility, endianness) == 100);
-static_assert(offsetof(EMLXPluginCompatibility, compiler_abi_family) == 104);
-static_assert(offsetof(EMLXPluginCompatibility, cxx_standard_library_abi) == 120);
-static_assert(offsetof(EMLXPluginCompatibility, plugin_descriptor_size) == 136);
-static_assert(offsetof(EMLXPluginCompatibility, callback_descriptor_size) == 144);
-static_assert(offsetof(EMLXPluginCompatibility, plugin_build_id) == 152);
+
 static_assert(std::is_standard_layout_v<EMLXPluginDescriptor>);
 static_assert(std::is_trivially_copyable_v<EMLXPluginDescriptor>);
-static_assert(sizeof(EMLXPluginDescriptor) == 208);
+static_assert(sizeof(EMLXPluginDescriptor) == 48);
 static_assert(alignof(EMLXPluginDescriptor) == 8);
 static_assert(offsetof(EMLXPluginDescriptor, name) == 0);
-static_assert(offsetof(EMLXPluginDescriptor, compatibility) == 16);
-static_assert(offsetof(EMLXPluginDescriptor, mlx_runtime_anchor) == 184);
-static_assert(offsetof(EMLXPluginDescriptor, callback_count) == 192);
-static_assert(offsetof(EMLXPluginDescriptor, callbacks) == 200);
-
-static_assert(emlx_plugin_layout_conformance_vector_v1() ==
-              0x072ddc26bff8c5c1ULL);
-static_assert([] {
-  constexpr uint64_t offsets[] = {0, 8, 24};
-  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 41, 8,
-                                   offsets, 3) !=
-         emlx_plugin_layout_conformance_vector_v1();
-}());
-static_assert([] {
-  constexpr uint64_t offsets[] = {0, 8, 24};
-  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 16,
-                                   offsets, 3) !=
-         emlx_plugin_layout_conformance_vector_v1();
-}());
-static_assert([] {
-  constexpr uint64_t offsets[] = {0, 8, 24, 32};
-  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 8,
-                                   offsets, 4) !=
-         emlx_plugin_layout_conformance_vector_v1();
-}());
-static_assert([] {
-  constexpr uint64_t offsets[] = {0, 8, 25};
-  return emlx_plugin_layout_record(14695981039346656037ULL, 7, 40, 8,
-                                   offsets, 3) !=
-         emlx_plugin_layout_conformance_vector_v1();
-}());
+static_assert(offsetof(EMLXPluginDescriptor, descriptor_size) == 16);
+static_assert(offsetof(EMLXPluginDescriptor, callback_descriptor_size) == 24);
+static_assert(offsetof(EMLXPluginDescriptor, callback_count) == 32);
+static_assert(offsetof(EMLXPluginDescriptor, callbacks) == 40);
 
 extern "C" EMLX_PLUGIN_EXPORT const EMLXPluginBootstrapV1 *
 emlx_plugin_descriptor_v1() noexcept;

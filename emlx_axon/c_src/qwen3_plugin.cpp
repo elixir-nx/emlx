@@ -1,8 +1,4 @@
 #include "emlx/plugin/abi.hpp"
-#include "emlx/plugin/build_compat.hpp"
-#include "emlx/plugin/toolchain.hpp"
-#include "emlx_qwen3_mlx_headers_build_id.hpp"
-#include "emlx_qwen3_plugin_build_id.hpp"
 
 #include <cstring>
 #include <climits>
@@ -1387,24 +1383,6 @@ inline constexpr uint32_t kMaxChunkOutputs =
 static_assert(kMaxDenseChunkOperands <= EMLX_PLUGIN_OPERAND_COUNT_MAX_V1);
 static_assert(kMaxGeneralizedChunkOperands <= EMLX_PLUGIN_OPERAND_COUNT_MAX_V1);
 static_assert(kMaxChunkOutputs <= EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1);
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_COMPILER_FAMILY,
-                                       EMLX_EXPECTED_COMPILER_FAMILY));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_COMPILER_MAJOR,
-                                       EMLX_EXPECTED_COMPILER_MAJOR));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_TARGET_TRIPLE,
-                                       EMLX_EXPECTED_TARGET_TRIPLE));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_ARCHITECTURE_ABI,
-                                       EMLX_EXPECTED_ARCHITECTURE_ABI));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_CXX_LANGUAGE_MODE,
-                                       EMLX_EXPECTED_CXX_LANGUAGE_MODE));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_CXX_STDLIB_FAMILY,
-                                       EMLX_EXPECTED_CXX_STDLIB_FAMILY));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_CXX_STDLIB_ABI,
-                                       EMLX_EXPECTED_CXX_STDLIB_ABI));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_EXCEPTIONS_MODE,
-                                       EMLX_EXPECTED_EXCEPTIONS_MODE));
-static_assert(emlx_plugin_string_equal(EMLX_ACTUAL_RTTI_MODE,
-                                       EMLX_EXPECTED_RTTI_MODE));
 
 template <size_t N>
 constexpr EMLXPluginStringView string_view(const char (&value)[N]) {
@@ -2076,66 +2054,47 @@ bool plugin_chunk_generalized(const EMLXPluginCall &call,
 
 constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
     {string_view(kMLPName), 1, 1, 5, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, plugin_mlp,
-     {nullptr, 0}},
+     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, plugin_mlp},
     {string_view(kKVCacheAttentionName), 1, 1, 5, nullptr, 3, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_kv_cache_attention, {nullptr, 0}},
+     plugin_kv_cache_attention},
     {string_view(kKVCacheAttentionTensorName), 1, 1, 6, nullptr, 3, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_kv_cache_attention_tensor, {nullptr, 0}},
+     plugin_kv_cache_attention_tensor},
     {string_view(kAttentionResidualName), 1, 1, 3, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_attention_residual, {nullptr, 0}},
+     plugin_attention_residual},
     {string_view(kAttentionBlockName), 1, 1, 10, nullptr, 3, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_attention_block, {nullptr, 0}},
+     plugin_attention_block},
     {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_layer_dense, {nullptr, 0}},
+     plugin_layer_dense},
     {string_view(kLayerGeneralizedName), 1, 1, 0,
      generalized_layer_operand_count, 3, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_layer_generalized, {nullptr, 0}},
+     plugin_layer_generalized},
     {string_view(kFinalGreedyName), 1, 1, 3, nullptr, 1, nullptr,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_final_greedy, {nullptr, 0}},
+     plugin_final_greedy},
     {string_view(kForwardDenseName), 1, 1, 0, dense_forward_operand_count, 0,
      dense_forward_output_count,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_forward_dense, {nullptr, 0}},
+     plugin_forward_dense},
     {string_view(kChunkDenseName), 1, 1, 0, dense_chunk_operand_count, 0,
      dense_chunk_output_count,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_chunk_dense, {nullptr, 0}},
+     plugin_chunk_dense},
     {string_view(kChunkGeneralizedName), 1, 1, 0,
      generalized_chunk_operand_count, 0, generalized_chunk_output_count,
      EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
-     plugin_chunk_generalized, {nullptr, 0}},
+     plugin_chunk_generalized},
 };
 
 constinit const EMLXPluginDescriptor kDescriptor{
     string_view(kPluginName),
-    {EMLX_PLUGIN_ABI_V1,
-     EMLX_PLUGIN_HEADER_ABI_V1,
-     EMLX_PLUGIN_HEADER_ABI_HASH_V1,
-     string_view(EMLX_EXPECTED_MLX_VERSION),
-     string_view(EMLX_EXPECTED_MLX_VARIANT),
-     string_view(EMLX_EXPECTED_MLX_BUILD_ID),
-     string_view(EMLX_QWEN3_MLX_HEADERS_BUILD_ID),
-     string_view(EMLX_EXPECTED_TARGET_TRIPLE),
-     sizeof(void *) * 8,
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-     EMLX_ENDIAN_BIG,
-#else
-     EMLX_ENDIAN_LITTLE,
-#endif
-     string_view(EMLX_ACTUAL_COMPILER_FAMILY),
-     string_view(EMLX_ACTUAL_CXX_STDLIB_ABI),
-     sizeof(EMLXPluginDescriptor),
-     sizeof(EMLXPluginCallbackDescriptor),
-     string_view(EMLX_QWEN3_PLUGIN_BUILD_ID)},
-    static_cast<EMLXMLXRuntimeAnchor>(&mlx::core::version),
+    sizeof(EMLXPluginDescriptor),
+    sizeof(EMLXPluginCallbackDescriptor),
     static_cast<uint32_t>(sizeof(kCallbacks) / sizeof(kCallbacks[0])),
     kCallbacks};
 
@@ -2143,14 +2102,6 @@ constinit const EMLXPluginBootstrapV1 kBootstrap{
     EMLX_PLUGIN_MAGIC_V1,
     sizeof(EMLXPluginBootstrapV1),
     EMLX_PLUGIN_ABI_V1,
-    EMLX_PLUGIN_HEADER_ABI_HASH_V1,
-    EMLX_PLUGIN_LAYOUT_ABI_HASH_V1,
-    sizeof(void *) * 8,
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-    EMLX_ENDIAN_BIG,
-#else
-    EMLX_ENDIAN_LITTLE,
-#endif
     sizeof(EMLXPluginDescriptor),
     &kDescriptor};
 

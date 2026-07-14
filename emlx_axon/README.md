@@ -24,14 +24,14 @@ tested against the sibling EMLX source tree. This is required while the generic
 plugin ABI is newer than the latest published EMLX package.
 
 Before publishing the matching EMLXAxon release, EMLX must first release the
-plugin ABI and build support used here. The EMLXAxon dependency lower bound can
-then be updated to that released version. The package already includes its
-plugin C++ source, Makefile, dependency policy, and Mix build helpers.
+plugin ABI used here. The EMLXAxon dependency lower bound can then be updated
+to that released version. The package includes its plugin C++ source and
+Makefile; EMLX packages the shared plugin ABI header.
 
-EMLX native images do not support hot NIF upgrades because native tensors,
-command queues, compiled programs, and plugin callbacks retain VM lifetime
-state. Upgrade EMLX by restarting the BEAM VM. Stopping and starting
-`:emlx_axon` without replacing the EMLX native image is supported.
+The EMLX plugin registry keeps accepted shared objects loaded for the VM
+lifetime. Stopping and starting `:emlx_axon` is supported and loads the same
+Qwen3 plugin idempotently; replacing an accepted plugin under the same name
+requires restarting the BEAM VM.
 
 ## Model download
 

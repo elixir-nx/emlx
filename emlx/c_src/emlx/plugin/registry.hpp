@@ -5,7 +5,6 @@
 // EMLX-owned storage, and keeps the shared object alive for the VM lifetime.
 
 #include "emlx/plugin/abi.hpp"
-#include "emlx/native_image.hpp"
 #include "erl_nif.h"
 
 #include <cstddef>
@@ -13,19 +12,14 @@
 #include <string>
 #include <unordered_map>
 
-// The two-argument loader is the expert path and validates the generic ABI
-// without requiring a caller-provided package build ID. The three-argument
-// loader additionally verifies the packaged build identity and controlled
-// loader environment.
+// Loads and validates the generic plugin descriptor, then keeps the accepted
+// shared object alive for the VM lifetime.
 ERL_NIF_TERM load_plugin(ErlNifEnv *, int, const ERL_NIF_TERM[]);
-ERL_NIF_TERM load_plugin_with_build_id(ErlNifEnv *, int,
-                                       const ERL_NIF_TERM[]);
 ERL_NIF_TERM call_plugin(ErlNifEnv *, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM call_plugin_async(ErlNifEnv *, int, const ERL_NIF_TERM[]);
 
 struct EMLXLoadedPluginCallback {
   std::string name;
-  std::string debug_name;
   uint32_t schema_version;
   uint32_t attr_schema_version;
   uint32_t operand_count;
@@ -39,16 +33,9 @@ struct EMLXLoadedPluginCallback {
 struct EMLXLoadedPlugin {
   std::string name;
   std::string canonical_path;
-  std::string plugin_build_id;
-  std::string mlx_build_id;
-  std::string mlx_headers_build_id;
-  EMLXNativeImageIdentity mlx_runtime_image;
-  void *shared_object_handle;
   std::unordered_map<std::string,
                      std::shared_ptr<const EMLXLoadedPluginCallback>>
       callbacks;
-
-  ~EMLXLoadedPlugin();
 };
 
 struct EMLXResolvedPluginCallback {

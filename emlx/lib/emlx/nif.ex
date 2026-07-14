@@ -147,17 +147,10 @@ defmodule EMLX.NIF do
   # load_plugin — `dlopen`s a standalone, name-keyed native plugin (no
   # erl_nif dependency), validates its generic descriptor, and publishes its
   # callback map in the process-lifetime registry (see
-  # emlx/plugin/registry.hpp). `load_plugin/2` is the compatibility/expert form
-  # without an expected build identity. Packaged plugins use `load_plugin/3` so
-  # stale artifacts are rejected. Native calls fail until their plugin has been
-  # registered — for qwen3, `EMLXAxon.Application` loads it at boot. Loading is
-  # not worker-routed because `dlopen` performs no MLX graph work.
+  # emlx/plugin/registry.hpp). Native calls fail until their plugin has been
+  # registered. Loading is not worker-routed because `dlopen` performs no MLX
+  # graph work.
   def load_plugin(_name, _path) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  @doc false
-  def load_plugin(_name, _path, _expected_plugin_build_id) do
     :erlang.nif_error(:nif_not_loaded)
   end
 
