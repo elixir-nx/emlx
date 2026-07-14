@@ -2100,8 +2100,9 @@ static void resolve_plugin_instruction(Instruction &instr) {
     throw std::runtime_error("emlx::native: malformed plugin callback attributes");
   std::vector<int64_t> callback_attrs;
   callback_attrs.reserve(static_cast<size_t>(callback_attr_count));
-  for (; cursor < attrs.size(); ++cursor)
-    callback_attrs.push_back(plugin_attr_int(attrs[cursor], "callback attribute"));
+  while(cursor < attrs.size()) {
+    callback_attrs.push_back(plugin_attr_int(attrs[cursor++], "callback attribute"));
+  }
 
   uint32_t expected_operands = callback.operand_count;
   if (expected_operands == 0) {
