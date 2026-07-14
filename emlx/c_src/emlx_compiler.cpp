@@ -2118,14 +2118,18 @@ static void resolve_plugin_instruction(Instruction &instr) {
         {callback_attrs.data(), callback_attrs.size()}, expected_outputs,
         "output", plugin_name, callback_name);
   }
-  if (instr.operands.size() != expected_operands)
+  if (instr.operands.size() != expected_operands) {
     throw std::runtime_error("emlx::native: plugin operand count mismatch");
-  if (expected_operands > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1)
+  }
+  if (expected_operands > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1) {
     throw std::runtime_error("emlx::native: plugin operand count exceeds its limit");
-  if (expected_outputs > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1)
+  }
+  if (expected_outputs > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1) {
     throw std::runtime_error("emlx::native: plugin output count exceeds its limit");
-  if (templates.size() != expected_outputs)
+  }
+  if (templates.size() != expected_outputs) {
     throw std::runtime_error("emlx::native: plugin output count mismatch");
+  }
 
   instr.resolved_plugin = std::move(resolved);
   instr.plugin_attrs = std::move(callback_attrs);
