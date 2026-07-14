@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -51,15 +52,16 @@ struct EMLXPluginCall {
 };
 
 // Policies and callbacks may run concurrently on EMLX worker threads and must
-// therefore be reentrant. Expected failures return false and populate error;
-// exceptions must not cross the plugin boundary.
+// therefore be reentrant. Count policies return false and populate their error
+// string on failure. Callback success returns std::nullopt; expected callback
+// failures return an error string. Exceptions must not cross the plugin
+// boundary.
 using EMLXOutputCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
                                    std::string &);
 using EMLXOperandCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
                                     std::string &);
-using EMLXPluginCallback = bool (*)(const EMLXPluginCall &,
-                                    std::vector<mlx::core::array> &,
-                                    std::string &);
+using EMLXPluginCallback = std::optional<std::string> (*)(
+    const EMLXPluginCall &, std::vector<mlx::core::array> &);
 
 struct EMLXPluginCallbackDescriptor {
   EMLXPluginStringView name;

@@ -2155,10 +2155,9 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
                       {instr.plugin_attrs.data(), instr.plugin_attrs.size()},
                       &execution};
   std::vector<mlx::core::array> candidates;
-  std::string error;
-  bool ok = false;
+  std::optional<std::string> error;
   try {
-    ok = callback.callback(call, candidates, error);
+    error = callback.callback(call, candidates);
   } catch (const std::bad_alloc &) {
     error = "plugin callback allocation failed";
   } catch (const std::exception &exception) {
@@ -2166,9 +2165,9 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
   } catch (...) {
     error = "unknown plugin callback exception";
   }
-  if (!ok)
+  if (error)
     throw std::runtime_error(emlx_plugin_callback_failure_error(
-        instr.resolved_plugin.plugin->name, callback.name, error));
+        instr.resolved_plugin.plugin->name, callback.name, *error));
   if (candidates.size() != instr.plugin_outputs.size()) {
     throw std::runtime_error(
         "emlx::native: plugin callback returned " +

@@ -372,10 +372,9 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
   EMLXPluginCall call{{operands.data(), operands.size()},
                       attr_view, &execution};
   std::vector<mlx::core::array> outputs;
-  std::string error;
-  bool ok = false;
+  std::optional<std::string> error;
   try {
-    ok = callback.callback(call, outputs, error);
+    error = callback.callback(call, outputs);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error("plugin callback allocation failed");
   } catch (const std::exception &exception) {
@@ -383,10 +382,10 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
   } catch (...) {
     error = "unknown plugin callback exception";
   }
-  if (!ok)
+  if (error)
     throw std::runtime_error(
         emlx_plugin_callback_failure_error(
-            plugin_name, callback_name, error, callback_error_max));
+            plugin_name, callback_name, *error, callback_error_max));
   if (outputs.size() != expected_outputs)
     throw std::runtime_error("plugin callback returned the wrong output count");
   return outputs;

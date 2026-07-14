@@ -50,14 +50,13 @@ double f64_from_bits(int64_t bits) {
   return value;
 }
 
-bool scale_add(const EMLXPluginCall &call,
-               std::vector<mlx::core::array> &outputs,
-               std::string &error) {
+std::optional<std::string>
+scale_add(const EMLXPluginCall &call,
+          std::vector<mlx::core::array> &outputs) {
   try {
     if (call.operands.size != 1 || call.attrs.size != 2 || !call.execution ||
         !call.execution->stream) {
-      error = "scale_add expects one operand and two attributes";
-      return false;
+      return "scale_add expects one operand and two attributes";
     }
     const auto &input = call.operands.data[0];
     auto scale = mlx::core::array(f64_from_bits(call.attrs.data[0]), input.dtype());
@@ -65,77 +64,74 @@ bool scale_add(const EMLXPluginCall &call,
     outputs.push_back(mlx::core::add(
         mlx::core::multiply(input, scale, *call.execution->stream), bias,
         *call.execution->stream));
-    return true;
+    return std::nullopt;
   } catch (const std::exception &exception) {
-    error = exception.what();
-    return false;
+    return exception.what();
   } catch (...) {
-    error = "unknown proof callback failure";
-    return false;
+    return "unknown proof callback failure";
   }
 }
 
-bool partial_failure(const EMLXPluginCall &call,
-                     std::vector<mlx::core::array> &outputs,
-                     std::string &error) {
+std::optional<std::string>
+partial_failure(const EMLXPluginCall &call,
+                std::vector<mlx::core::array> &outputs) {
   if (call.operands.size == 1)
     outputs.push_back(call.operands.data[0]);
-  error = "intentional partial failure";
-  return false;
+  return "intentional partial failure";
 }
 
-bool wrong_shape(const EMLXPluginCall &call,
-                 std::vector<mlx::core::array> &outputs,
-                 std::string &error) {
+std::optional<std::string>
+wrong_shape(const EMLXPluginCall &call,
+            std::vector<mlx::core::array> &outputs) {
   if (call.operands.size != 1 || !call.execution || !call.execution->stream) {
-    error = "wrong_shape expects one operand";
-    return false;
+    return "wrong_shape expects one operand";
   }
   outputs.push_back(
       mlx::core::sum(call.operands.data[0], false, *call.execution->stream));
-  return true;
+  return std::nullopt;
 }
 
-bool oversized_error(const EMLXPluginCall &,
-                     std::vector<mlx::core::array> &, std::string &error) {
+std::optional<std::string>
+oversized_error(const EMLXPluginCall &,
+                std::vector<mlx::core::array> &) {
+  std::string error;
   error.assign(4080, 'a');
   for (size_t i = 0; i < 32; ++i)
     error.append("\xE2\x82\xAC");
-  return false;
+  return error;
 }
 
-bool invalid_utf8_error(const EMLXPluginCall &,
-                        std::vector<mlx::core::array> &,
-                        std::string &error) {
-  error = std::string("invalid byte: ") + static_cast<char>(0xff);
-  return false;
+std::optional<std::string>
+invalid_utf8_error(const EMLXPluginCall &,
+                   std::vector<mlx::core::array> &) {
+  return std::string("invalid byte: ") + static_cast<char>(0xff);
 }
 
-bool empty_error(const EMLXPluginCall &, std::vector<mlx::core::array> &,
-                 std::string &) {
-  return false;
+std::optional<std::string>
+empty_error(const EMLXPluginCall &, std::vector<mlx::core::array> &) {
+  return std::string{};
 }
 
-bool throw_after_output(const EMLXPluginCall &call,
-                        std::vector<mlx::core::array> &outputs,
-                        std::string &) {
+std::optional<std::string>
+throw_after_output(const EMLXPluginCall &call,
+                   std::vector<mlx::core::array> &outputs) {
   outputs.push_back(call.operands.data[0]);
   throw std::runtime_error("intentional callback exception");
 }
 
-bool unknown_throw_after_output(const EMLXPluginCall &call,
-                                std::vector<mlx::core::array> &outputs,
-                                std::string &) {
+std::optional<std::string>
+unknown_throw_after_output(const EMLXPluginCall &call,
+                           std::vector<mlx::core::array> &outputs) {
   outputs.push_back(call.operands.data[0]);
   throw 42;
 }
 
-bool wrong_output_count(const EMLXPluginCall &call,
-                        std::vector<mlx::core::array> &outputs,
-                        std::string &) {
+std::optional<std::string>
+wrong_output_count(const EMLXPluginCall &call,
+                   std::vector<mlx::core::array> &outputs) {
   outputs.push_back(call.operands.data[0]);
   outputs.push_back(call.operands.data[0]);
-  return true;
+  return std::nullopt;
 }
 
 bool throwing_operand_policy(EMLXPluginInt64View, uint32_t &,
@@ -170,9 +166,9 @@ bool one_count_policy(EMLXPluginInt64View, uint32_t &count, std::string &) {
   return true;
 }
 
-bool callback_must_not_run(const EMLXPluginCall &,
-                           std::vector<mlx::core::array> &,
-                           std::string &) {
+std::optional<std::string>
+callback_must_not_run(const EMLXPluginCall &,
+                      std::vector<mlx::core::array> &) {
   throw std::runtime_error("oversized policy callback ran");
 }
 
