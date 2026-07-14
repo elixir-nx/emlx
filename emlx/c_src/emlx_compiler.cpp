@@ -2323,8 +2323,8 @@ Expr::~Expr() {
 // rather than inside the interpreter at (first) eval time. `:while` itself
 // is valid despite never appearing in op_registry/multi_op_registry — see
 // interpret_instructions.
-static void validate_instructions(std::vector<Instruction> &instructions,
-                                  bool &has_runtime_call) {
+static void validate_and_resolve_instructions(
+    std::vector<Instruction> &instructions, bool &has_runtime_call) {
   for (auto &instr : instructions) {
     const std::string &name = instr.op.to_string();
 
@@ -2334,10 +2334,10 @@ static void validate_instructions(std::vector<Instruction> &instructions,
             "emlx::native: :while instruction must have exactly 2 "
             "subprograms (cond, body), got " +
             std::to_string(instr.subprograms.size()));
-      validate_instructions(instr.subprograms[0].instructions,
-                            has_runtime_call);
-      validate_instructions(instr.subprograms[1].instructions,
-                            has_runtime_call);
+      validate_and_resolve_instructions(instr.subprograms[0].instructions,
+                                        has_runtime_call);
+      validate_and_resolve_instructions(instr.subprograms[1].instructions,
+                                        has_runtime_call);
       continue;
     }
 
@@ -2359,7 +2359,7 @@ static void validate_instructions(std::vector<Instruction> &instructions,
 
 fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   bool has_runtime_call = false;
-  validate_instructions(program.instructions, has_runtime_call);
+  validate_and_resolve_instructions(program.instructions, has_runtime_call);
 
   // Build constant arrays on the current (worker) thread using its default
   // stream.
