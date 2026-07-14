@@ -47,8 +47,7 @@ jobs:
     runs-on: macos-26
     env:
       MIX_ENV: test
-      # This workflow validates EMLX and EMLXAxon changes together. The Hex
-      # release does not contain branch-only native plugin APIs yet.
+      # This workflow validates EMLX and EMLXAxon changes together.
       EMLX_AXON_LOCAL_EMLX: "true"
 
     steps:
