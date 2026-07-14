@@ -50,6 +50,8 @@ defmodule EMLX.NativeBuildCacheTest do
   test "Make clean removes only the selected source cache" do
     root = Path.expand("../..", __DIR__)
     temporary = Path.join(System.tmp_dir!(), "emlx clean #{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(temporary) end)
+
     first_id = EMLX.MixProject.source_cache_id(Path.join(temporary, "worktree one"))
     second_id = EMLX.MixProject.source_cache_id(Path.join(temporary, "worktree two"))
     first = build_dir(root, temporary, first_id)
@@ -66,7 +68,6 @@ defmodule EMLX.NativeBuildCacheTest do
 
     refute File.exists?(first)
     assert File.dir?(second)
-    File.rm_rf!(temporary)
   end
 
   defp build_dir(root, cache, source_id) do

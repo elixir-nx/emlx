@@ -975,7 +975,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert chunk_tokens == manual_tokens
     end
 
-    test "qwen3_forward_greedy_ids_chunk_quantized supports 1023 ordered token outputs" do
+    test "qwen3_forward_greedy_ids_chunk_quantized returns 1023 outputs without truncation" do
       count = 1023
       tokens = qwen3_quantized_chunk_call(qwen3_quantized_chunk_fixtures(count), count)
 

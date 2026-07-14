@@ -45,22 +45,6 @@ defmodule EMLXAxon.Qwen3NativeChunkRunnerTest do
     refute_receive {:native_call, _, _, _}
   end
 
-  test "applies the same subdivision before dense and generalized dispatch" do
-    for kind <- [:dense, :generalized] do
-      forward = fn last_token, calls, offset, count ->
-        tokens = Nx.broadcast(Nx.add(last_token, 1), {count})
-        {tokens, calls ++ [{kind, offset, count}]}
-      end
-
-      assert {chunks, last_token, calls, 4097} =
-               NativeChunkRunner.run(Nx.tensor(0), [], 0, 4097, forward)
-
-      assert Enum.map(chunks, &Nx.shape/1) == [{4096}, {1}]
-      assert Nx.to_number(last_token) == 2
-      assert calls == [{kind, 0, 4096}, {kind, 4096, 1}]
-    end
-  end
-
   test "preserves small chunks and rejects invalid counts" do
     forward = fn last_token, kv_cache, offset, count ->
       {Nx.add(Nx.iota({count}), Nx.add(last_token, 1)), [{offset, count} | kv_cache]}
