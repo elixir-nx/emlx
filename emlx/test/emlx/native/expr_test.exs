@@ -588,7 +588,7 @@ defmodule EMLX.Native.ExprTest do
     end
 
     # Native `:while` lowering (checkpoint c — see EMLX.Native.Expr's
-    # `:while` TODO / EMLXWhile in emlx_compiler.cpp): a hand-built wire
+    # `:while` TODO / EMLXWhile in emlx/compiler.cpp): a hand-built wire
     # `:while` instruction (no Elixir lowering path emits this yet — that's
     # checkpoint d) with `RefKind::Carry` refs inside its cond/body
     # `EMLX.Native.SubProgram`s. Exercises the whole native interpreter loop
@@ -2556,7 +2556,7 @@ defmodule EMLX.Native.ExprTest do
     # Two independent top-level native `:while`s (not nested inside each
     # other) each get their own `EMLXWhile` primitive instance sharing the
     # same read-only captures/constants tables (see `EMLXWhile`'s moduledoc
-    # in emlx_compiler.cpp) -- pins that there's no cross-instance mutable
+    # in emlx/compiler.cpp) -- pins that there's no cross-instance mutable
     # state that could leak between sibling loops.
     defn sibling_whiles(x) do
       {a, _} = while {a = x, i = 0}, Nx.less(i, 3), do: {a + 1.0, i + 1}
@@ -3194,7 +3194,7 @@ defmodule EMLX.Native.ExprTest do
     # (`Nx.runtime_call`'s `:__emlx_native_multi_op__` opt, see
     # `EMLX.Native.Expr`'s `:runtime_call` expand_node clause) lowering
     # straight to `multi_op_registry["kv_cache_sdpa_update"]`
-    # (emlx_compiler.cpp) — unlike every other test in this describe block,
+    # (emlx/compiler.cpp) — unlike every other test in this describe block,
     # this op does NOT go through the single-output `:__EMLX__` metadata
     # mechanism (see `EMLX.Fast.kv_cache_sdpa_update/8`'s moduledoc comment).
     test "kv_cache_sdpa_update: fused native replay matches eager and matches put_slice+sdpa reference" do
@@ -4403,7 +4403,7 @@ defmodule EMLX.Native.ExprTest do
   end
 
   # Pure-Nx primitive reference for prefill RoPE against a precomputed `freqs`
-  # tensor (mirrors emlx_compiler.cpp's fast_rope_with_freqs_positions lambda:
+  # tensor (mirrors emlx/compiler.cpp's fast_rope_with_freqs_positions lambda:
   # inv_freq = reciprocal(freqs), half-rotate cos/sin blend). Kept as an
   # independent oracle for H>1 prefill: the T>1 lowering path never calls
   # mlx::core::fast::rope directly (it always uses the hand cos/sin/rotate

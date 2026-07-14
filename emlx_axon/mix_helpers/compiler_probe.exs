@@ -31,9 +31,9 @@ defmodule EMLXAxon.Mix.CompilerProbe do
 
   def ensure_plugin_build_support!(emlx_priv_dir) do
     required = [
-      "include/emlx_plugin_abi.hpp",
-      "include/emlx_plugin_toolchain.hpp",
-      "include/emlx_plugin_build_compat.hpp",
+      "include/emlx/plugin/abi.hpp",
+      "include/emlx/plugin/toolchain.hpp",
+      "include/emlx/plugin/build_compat.hpp",
       "build_support/emlx_plugin_tool_wrapper",
       "build_support/emlx_build_identity"
     ]

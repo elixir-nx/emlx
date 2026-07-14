@@ -1,6 +1,6 @@
-#include "emlx_plugin_abi.hpp"
-#include "emlx_plugin_build_compat.hpp"
-#include "emlx_plugin_toolchain.hpp"
+#include "emlx/plugin/abi.hpp"
+#include "emlx/plugin/build_compat.hpp"
+#include "emlx/plugin/toolchain.hpp"
 #include "emlx_qwen3_mlx_headers_build_id.hpp"
 #include "emlx_qwen3_plugin_build_id.hpp"
 

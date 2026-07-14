@@ -2,7 +2,7 @@
 
 // emlx_runtime_call_bridge.hpp — blocking bridge between the worker OS
 // thread executing a compiled program's `EMLXRuntimeCall` primitive
-// (emlx_compiler.cpp) and the BEAM process that actually runs the real
+// (emlx/compiler.cpp) and the BEAM process that actually runs the real
 // Elixir callback for `Nx.runtime_call/4` (see EMLX.await_worker/2's
 // `:emlx_runtime_call` receive clause).
 //
@@ -72,7 +72,7 @@ struct PendingRuntimeCall {
 
 // Blocks the calling (worker) thread until the Elixir side invokes
 // `EMLX.NIF.resolve_runtime_call/3` for this call. Called from
-// `EMLXRuntimeCall::eval()` (emlx_compiler.cpp). Throws `std::runtime_error`
+// `EMLXRuntimeCall::eval()` (emlx/compiler.cpp). Throws `std::runtime_error`
 // on any failure (no caller pid in scope, send failure, or a callback that
 // errored) — the caller (`eval_cpu`/`eval_gpu`, reached through
 // `eval_program`'s `CATCH()` macro) turns that into `{:error, _}`.
@@ -80,7 +80,7 @@ inline void invoke_runtime_call(int64_t callback_index,
                                 const std::vector<mlx::core::array> &inputs,
                                 std::vector<mlx::core::array> &outputs) {
   // `EMLXRuntimeCall` is pinned to its own dedicated `k_linalg_cpu` stream
-  // (emlx_compiler.cpp), separate from whichever stream actually computed
+  // (emlx/compiler.cpp), separate from whichever stream actually computed
   // each `inputs[i]` (e.g. the calling worker's own bound stream, for any
   // operand that isn't a bare top-level parameter/capture -- those need no
   // computation at all, so they're trivially visible with no barrier).

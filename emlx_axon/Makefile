@@ -38,7 +38,7 @@ BASE_CFLAGS = -fPIC -isystem $(call esc,$(MLX_INCLUDE_DIR)) -I$(call esc,$(EMLX_
 LDFLAGS = -L$(call esc,$(MLX_LIB_DIR)) -lmlx -shared $(PLATFORM_LDFLAGS)
 
 SOURCES = c_src/qwen3_plugin.cpp
-HEADERS = $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx_plugin_abi.hpp $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx_plugin_toolchain.hpp $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx_plugin_build_compat.hpp
+HEADERS = $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx/plugin/abi.hpp $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx/plugin/toolchain.hpp $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx/plugin/build_compat.hpp
 SCAN_DEPFILES = $(patsubst c_src/%.cpp,$(call esc,$(SCAN_DEP_DIR))/%.d,$(SOURCES))
 FINAL_DEPFILES = $(patsubst c_src/%.cpp,$(call esc,$(FINAL_DEP_DIR))/%.d,$(SOURCES))
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(FINAL_OBJ_DIR))/%.o,$(SOURCES))
@@ -51,7 +51,7 @@ all: $(call esc,$(QWEN3_SO))
 $(call esc,$(PRIV_DIR)):
 	@ mkdir -p "$@"
 
-$(call esc,$(QWEN3_MLX_ID_HEADER)): $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx_plugin_build_compat.hpp
+$(call esc,$(QWEN3_MLX_ID_HEADER)): $(call esc,$(EMLX_PLUGIN_INCLUDE_DIR))/emlx/plugin/build_compat.hpp
 	@ mkdir -p "$(GENERATED_INCLUDE_DIR)"
 	"$(EMLX_BUILD_ID_TOOL)" write-mlx-header-id "$(MLX_INCLUDE_DIR)" "$@" "$<"
 
@@ -66,7 +66,7 @@ $(call esc,$(SCAN_DEP_DIR))/%.d: c_src/%.cpp $(HEADERS) $(PLUGIN_INSPECTOR) $(ca
 	@ "$(PLUGIN_INSPECTOR)" object "$(SCAN_OBJ_DIR)/$*.o" || { rm -f "$@" "$(SCAN_OBJ_DIR)/$*.o"; exit 1; }
 
 $(call esc,$(QWEN3_BUILD_ID_HEADER)): $(SCAN_DEPFILES) $(call esc,$(QWEN3_MLX_ID_HEADER)) $(PLUGIN_DEPENDENCY_POLICY) Makefile
-	"$(EMLX_BUILD_ID_TOOL)" plugin-build-id "$(CURDIR)" "$(EMLX_SOURCE_DIR)" "$(MLX_INCLUDE_DIR)" "$(SCAN_BUILD_ID_HEADER)" "$(QWEN3_MLX_ID_HEADER)" "$(EMLX_PLUGIN_INCLUDE_DIR)/emlx_plugin_build_compat.hpp" "$@" "$(QWEN3_BUILD_ID_FILE)" --policy "$(EMLX_SOURCE_DIR)/c_src/tools/emlx_plugin_tool_wrapper.cpp" --policy "$(EMLX_SOURCE_DIR)/c_src/emlx_plugin_toolchain.hpp" --policy "$(CURDIR)/$(PLUGIN_DEPENDENCY_POLICY)" --policy "$(CURDIR)/$(PLUGIN_INSPECTOR)" --policy "$(CURDIR)/Makefile" --flag "compiler-family=$(EMLX_PLUGIN_COMPILER_FAMILY)" --flag "target=$(TARGET_TRIPLE)" --flag "language=c++20" --flag "optimization=O3" --flag "visibility=hidden" --flag "exceptions=enabled" --flag "rtti=enabled" $(PLUGIN_SCAN_ARGS)
+	"$(EMLX_BUILD_ID_TOOL)" plugin-build-id "$(CURDIR)" "$(EMLX_SOURCE_DIR)" "$(MLX_INCLUDE_DIR)" "$(SCAN_BUILD_ID_HEADER)" "$(QWEN3_MLX_ID_HEADER)" "$(EMLX_PLUGIN_INCLUDE_DIR)/emlx/plugin/build_compat.hpp" "$@" "$(QWEN3_BUILD_ID_FILE)" --policy "$(EMLX_SOURCE_DIR)/c_src/tools/emlx_plugin_tool_wrapper.cpp" --policy "$(EMLX_SOURCE_DIR)/c_src/emlx/plugin/toolchain.hpp" --policy "$(CURDIR)/$(PLUGIN_DEPENDENCY_POLICY)" --policy "$(CURDIR)/$(PLUGIN_INSPECTOR)" --policy "$(CURDIR)/Makefile" --flag "compiler-family=$(EMLX_PLUGIN_COMPILER_FAMILY)" --flag "target=$(TARGET_TRIPLE)" --flag "language=c++20" --flag "optimization=O3" --flag "visibility=hidden" --flag "exceptions=enabled" --flag "rtti=enabled" $(PLUGIN_SCAN_ARGS)
 
 $(call esc,$(QWEN3_BUILD_ID_FILE)): $(call esc,$(QWEN3_BUILD_ID_HEADER))
 	@ test -f "$@"

@@ -1525,7 +1525,7 @@ defmodule EMLX do
   # request in the first place. A request is served here, mid-flight, before
   # the final `{^job_ref, _}` reply for *this* `eval_program` call arrives:
   # the worker thread is blocked inside `EMLXRuntimeCall::eval_cpu`/`eval_gpu`
-  # (emlx_compiler.cpp) waiting on exactly the reply this loop sends back via
+  # (emlx/compiler.cpp) waiting on exactly the reply this loop sends back via
   # `EMLX.NIF.resolve_runtime_call/3`.
   @doc false
   def await_worker(job_ref, runtime_calls \\ [], tensors \\ [], dev \\ nil) do

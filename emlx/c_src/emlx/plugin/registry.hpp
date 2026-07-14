@@ -4,7 +4,7 @@
 // versioned descriptor symbol, copies validated callback records into
 // EMLX-owned storage, and keeps the shared object alive for the VM lifetime.
 
-#include "emlx_plugin_abi.hpp"
+#include "emlx/plugin/abi.hpp"
 #include "emlx_native_image.hpp"
 #include "erl_nif.h"
 

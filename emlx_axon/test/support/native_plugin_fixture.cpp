@@ -1,6 +1,6 @@
-#include "emlx_plugin_abi.hpp"
-#include "emlx_plugin_build_compat.hpp"
-#include "emlx_plugin_toolchain.hpp"
+#include "emlx/plugin/abi.hpp"
+#include "emlx/plugin/build_compat.hpp"
+#include "emlx/plugin/toolchain.hpp"
 
 #include <cstring>
 #include <stdexcept>

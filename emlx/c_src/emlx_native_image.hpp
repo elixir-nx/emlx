@@ -1,6 +1,6 @@
 #pragma once
 
-#include "emlx_plugin_abi.hpp"
+#include "emlx/plugin/abi.hpp"
 
 #include <array>
 #include <cstdint>

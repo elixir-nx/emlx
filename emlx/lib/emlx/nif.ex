@@ -120,7 +120,7 @@ defmodule EMLX.NIF do
   # and a set of captured arrays. Worker-routed (argv[0] = worker).
   # `program` is an `EMLX.Native.Program.t()` (see
   # EMLX.Native.Expr.to_native/1), decoded directly by `fine` on the C++ side
-  # (emlx_compiler.hpp's `Program`/`Instruction` structs) instead of manually
+  # (emlx/compiler.hpp's `Program`/`Instruction` structs) instead of manually
   # parsed positional args.
   # Arity = 1 (worker) + 1 = 2 registered.
   def compile_program(_worker, _program) do
@@ -147,7 +147,7 @@ defmodule EMLX.NIF do
   # load_plugin — `dlopen`s a standalone, name-keyed native plugin (no
   # erl_nif dependency), validates its generic descriptor, and publishes its
   # callback map in the process-lifetime registry (see
-  # emlx_plugin_registry.hpp). `load_plugin/2` is the compatibility/expert form
+  # emlx/plugin/registry.hpp). `load_plugin/2` is the compatibility/expert form
   # without an expected build identity. Packaged plugins use `load_plugin/3` so
   # stale artifacts are rejected. Native calls fail until their plugin has been
   # registered — for qwen3, `EMLXAxon.Application` loads it at boot. Loading is

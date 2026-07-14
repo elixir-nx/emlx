@@ -185,11 +185,11 @@ private:
   }
 
 // Forward declaration — defined in emlx_nif.cpp, used in emlx_fast.cpp and
-// emlx_compiler.cpp.
+// emlx/compiler.cpp.
 ERL_NIF_TERM create_tensor_resource(ErlNifEnv *env, mlx::core::array tensor);
 
 // Dtype name ↔ mlx::core::Dtype mapping — shared across emlx_nif.cpp and
-// emlx_compiler.cpp.
+// emlx/compiler.cpp.
 inline const std::map<std::string, mlx::core::Dtype> &dtype_map() {
   static const std::map<std::string, mlx::core::Dtype> table = {
       {"bool", mlx::core::bool_},         {"uint8", mlx::core::uint8},
@@ -301,7 +301,7 @@ template <> struct Decoder<mlx::core::Device> {
 };
 
 // Dtype atom (`:float32`, `:bool`, …) -> mlx::core::Dtype. Lets NIF argument
-// types (e.g. emlx_compiler.hpp's `Program::constants`) decode dtypes
+// types (e.g. emlx/compiler.hpp's `Program::constants`) decode dtypes
 // directly instead of going through an int<->dtype lookup table shared with
 // Elixir (see EMLX.Native.to_mlx_type/1 on the Elixir side).
 template <> struct Decoder<mlx::core::Dtype> {

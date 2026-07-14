@@ -1,6 +1,6 @@
-#include "emlx_plugin_registry.hpp"
+#include "emlx/plugin/registry.hpp"
 #include "emlx_nif_shared.hpp"
-#include "emlx_plugin_build_compat.hpp"
+#include "emlx/plugin/build_compat.hpp"
 #include "nx_nif_utils.hpp"
 
 #include <algorithm>

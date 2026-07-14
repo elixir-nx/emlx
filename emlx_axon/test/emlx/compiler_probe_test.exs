@@ -54,9 +54,9 @@ defmodule EMLXAxon.CompilerProbeTest do
     on_exit(fn -> File.rm_rf!(priv) end)
 
     files = [
-      "include/emlx_plugin_abi.hpp",
-      "include/emlx_plugin_toolchain.hpp",
-      "include/emlx_plugin_build_compat.hpp",
+      "include/emlx/plugin/abi.hpp",
+      "include/emlx/plugin/toolchain.hpp",
+      "include/emlx/plugin/build_compat.hpp",
       "build_support/emlx_plugin_tool_wrapper",
       "build_support/emlx_build_identity"
     ]
@@ -68,7 +68,7 @@ defmodule EMLXAxon.CompilerProbeTest do
     end)
 
     assert :ok = CompilerProbe.ensure_plugin_build_support!(priv)
-    File.rm!(Path.join(priv, "include/emlx_plugin_abi.hpp"))
+    File.rm!(Path.join(priv, "include/emlx/plugin/abi.hpp"))
 
     assert_raise Mix.Error, ~r/does not provide native plugin build support/, fn ->
       CompilerProbe.ensure_plugin_build_support!(priv)

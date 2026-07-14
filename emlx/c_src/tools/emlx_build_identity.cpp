@@ -18,7 +18,7 @@
 #include <unistd.h>
 #include <vector>
 
-#include "emlx_plugin_toolchain.hpp"
+#include "emlx/plugin/toolchain.hpp"
 
 namespace fs = std::filesystem;
 

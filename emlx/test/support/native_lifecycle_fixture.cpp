@@ -1,7 +1,7 @@
 #include "emlx_native_image.hpp"
 #include "emlx_nif_lifecycle.hpp"
-#include "emlx_plugin_build_compat.hpp"
-#include "emlx_plugin_registry.hpp"
+#include "emlx/plugin/build_compat.hpp"
+#include "emlx/plugin/registry.hpp"
 
 #include "erl_nif.h"
 

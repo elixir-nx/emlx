@@ -1,4 +1,4 @@
-// emlx_compiler.cpp — implements emlx::native compile/eval NIF logic.
+// emlx/compiler.cpp — implements emlx::native compile/eval NIF logic.
 //
 // compile_program bakes the program into a capturing lambda and wraps it with
 // mlx::core::compile(), so MLX traces the computation graph on first eval and
@@ -9,7 +9,7 @@
 // enum. Adding a new op: register it in `op_registry` below.  No enum, no wire
 // integers, no lockstep parity table to maintain.
 
-#include "emlx_compiler.hpp"
+#include "emlx/compiler.hpp"
 #include "emlx_runtime_call_bridge.hpp"
 #include "mlx/allocator.h"
 #include "mlx/compile_impl.h"
@@ -1755,7 +1755,7 @@ static std::vector<mlx::core::array> interpret_instructions(
 //
 // Native lowering of a dynamic-trip-count `Nx.Defn.while` loop (see
 // EMLX.Native.Expr's `:while` moduledoc section). Interprets the `cond`/
-// `body` SubPrograms (emlx_compiler.hpp) directly here in C++, iterating
+// `body` SubPrograms (emlx/compiler.hpp) directly here in C++, iterating
 // until `cond` evaluates false — all inside a single eval_cpu call, so an
 // N-iteration loop costs one eval_program NIF round-trip instead of the old
 // Elixir-driven split-point path's 2N (`run_while_loop` in emlx.ex).
@@ -2032,7 +2032,7 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
 // lambda, with `inputs` set and `carry` null) and, recursively, for a
 // `:while` instruction's `cond`/`body` SubPrograms (called from
 // EMLXWhile::eval, with `carry` set and `inputs` null — SubPrograms never
-// contain `{:input, _}` refs, see emlx_compiler.hpp). `results` is always a
+// contain `{:input, _}` refs, see emlx/compiler.hpp). `results` is always a
 // fresh local accumulator: a SubProgram's `{:result, i}` numbering is local
 // to that interpretation, distinct from the parent program's own.
 static int64_t plugin_attr_int(const Attr &attr, const char *field) {
@@ -2315,7 +2315,7 @@ Expr::~Expr() {
 
 // compile_program — decodes the wire Program (see EMLX.Native.Program /
 // EMLX.Native.Expr.to_native/1, decoded directly by fine::Decoder<Program> in
-// emlx_compiler.hpp), builds a capturing interpreter lambda backed by the op
+// emlx/compiler.hpp), builds a capturing interpreter lambda backed by the op
 // registry, wraps it with mlx::core::compile(), and stores the result as an
 // opaque Expr BEAM resource.
 // Validates op names against the registries up front (recursing into

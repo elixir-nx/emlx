@@ -1,8 +1,8 @@
-#include "emlx_compiler.hpp"
+#include "emlx/compiler.hpp"
 #include "emlx_nif_shared.hpp"
-#include "emlx_plugin_registry.hpp"
+#include "emlx/plugin/registry.hpp"
 #include "emlx_nif_lifecycle.hpp"
-#include "emlx_plugin_build_compat.hpp"
+#include "emlx/plugin/build_compat.hpp"
 
 #include <iostream>
 #include <map>
@@ -327,7 +327,7 @@ NIF(linalg_qr) {
 }
 
 // MLX's `svd`/`eigh` primitives are CPU-only — they throw on a GPU stream
-// (mirroring `emlx_compiler.cpp`'s `k_linalg_cpu`, which pins the same ops
+// (mirroring `emlx/compiler.cpp`'s `k_linalg_cpu`, which pins the same ops
 // for the compiled path). Both NIFs below ignore the caller's `device` and
 // pin to CPU instead: unified memory means the array's data doesn't need to
 // move, only the stream that executes on it, so this is free and lets
@@ -1835,10 +1835,10 @@ ASYNC_NIF(tensordot)
 ASYNC_NIF(window_scatter_max)
 ASYNC_NIF(window_scatter_min)
 
-// ── Native compiler NIFs (logic lives in emlx_compiler.cpp) ──────────────────
+// ── Native compiler NIFs (logic lives in emlx/compiler.cpp) ──────────────────
 //
-// compile_program is defined directly in emlx_compiler.cpp via
-// FINE_ASYNC_NIF(compile_program) (see emlx_compiler.hpp for the
+// compile_program is defined directly in emlx/compiler.cpp via
+// FINE_ASYNC_NIF(compile_program) (see emlx/compiler.hpp for the
 // compile_program/compile_program_async declarations); referenced fully
 // qualified in nif_funcs[] below, same as resolve_runtime_call.
 
@@ -2041,7 +2041,7 @@ static ErlNifFunc nif_funcs[] = {
     {"resolve_runtime_call", 3, emlx::native::resolve_runtime_call},
 
     // load_plugin `dlopen`s a named, standalone native plugin (see
-    // emlx_plugin_registry.hpp); not worker-routed since it does no MLX
+    // emlx/plugin/registry.hpp); not worker-routed since it does no MLX
     // graph work.
     {"load_plugin", 2, load_plugin},
     {"load_plugin", 3, load_plugin_with_build_id},
