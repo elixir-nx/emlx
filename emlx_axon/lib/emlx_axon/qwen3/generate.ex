@@ -365,7 +365,7 @@ defmodule EMLXAxon.Qwen3.Generate do
     {_eos_id, sampler, _temp, _top_p, state, profile_timing?, _token_callback, _chunk_callback,
      native_chunk_runner} = ctx
 
-    if sampler == :greedy and not profile_timing? and fused_end_sync?(state) do
+    if sampler == :greedy and not profile_timing? do
       [last_token | _] = acc_tokens
 
       {next_token_chunks, _last_token, kv_new, next_cur} =
@@ -416,10 +416,6 @@ defmodule EMLXAxon.Qwen3.Generate do
       rng_key,
       ctx
     )
-  end
-
-  defp fused_end_sync?(%Model.State{config: config, lm_head: lm_head}) do
-    config[:dense_layers?] != true or EMLX.Quantization.quantized?(lm_head)
   end
 
   defp decode_tensor_chunks_start(

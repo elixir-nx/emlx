@@ -110,6 +110,42 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     assert end_sync == per_token
   end
 
+  test "dense end host sync batches the remaining tokens in one native chunk" do
+    {:ok, state} =
+      DenseLoader.from_model_info(%{
+        params: %Axon.ModelState{data: params()},
+        spec: spec()
+      })
+
+    state = %{state | config: Map.put(state.config, :eos_token_id, -1)}
+
+    input_ids =
+      Nx.tensor([[1]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    parent = self()
+    runner = fake_native_chunk_runner(parent, :dense)
+
+    {tokens, metadata} =
+      Generate.generate_with_native_chunk_runner(
+        input_ids,
+        state,
+        [
+          max_new_tokens: 4,
+          max_len: 4,
+          sampler: :greedy,
+          host_sync: :end,
+          profile_timing: false
+        ],
+        runner
+      )
+
+    assert length(tokens) == 4
+    assert metadata.finish_reason == :length
+    assert_receive {:native_chunk, :dense, 1, 3}
+    refute_receive {:native_chunk, :dense, _, _}
+  end
+
   test "end host sync subdivides more than 4096 generalized decode tokens" do
     {:ok, state} =
       DenseLoader.from_model_info(%{

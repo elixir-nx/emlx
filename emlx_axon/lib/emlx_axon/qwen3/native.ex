@@ -339,6 +339,9 @@ defmodule EMLXAxon.Qwen3.Native do
     operands = [input_ids, embed_tokens | layer_operands]
     templates = [Nx.template({count}, {:u, 32}) | cache_templates]
 
+    # Bound eager MLX graphs without introducing async evaluation while tracing.
+    submit_each_step = if Plugin.traced?(operands), do: 0, else: 1
+
     outputs =
       flat_multi_operation(
         "forward_greedy_chunk_dense",
@@ -350,7 +353,8 @@ defmodule EMLXAxon.Qwen3.Native do
           Plugin.f64_bits(scale),
           head_dim,
           Plugin.f64_bits(theta),
-          Plugin.f64_bits(eps)
+          Plugin.f64_bits(eps),
+          submit_each_step
         ],
         templates
       )

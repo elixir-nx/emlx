@@ -1119,6 +1119,7 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
                                  std::vector<KVCache> &initial_kv, const mlx::core::array &norm,
                                  const mlx::core::array &lm_head, int offset, int count,
                                  double scale, int head_dim, double theta, double eps,
+                                 bool submit_each_step,
                                  const mlx::core::Device &device,
                                  std::vector<mlx::core::array> &token_out,
                                  std::vector<mlx::core::array> &k_out,
@@ -1212,6 +1213,17 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
       auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, device);
       auto logits = linear_out_in(normed, lm_head, device);
       auto token = mlx::core::argmax(logits, 1, false, device);
+
+      if (submit_each_step) {
+        std::vector<mlx::core::array> eval_arrays;
+        eval_arrays.reserve(1 + (layer_count * 2));
+        eval_arrays.push_back(token);
+        for (size_t layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+          eval_arrays.push_back(next_k_cache[layer_idx]);
+          eval_arrays.push_back(next_v_cache[layer_idx]);
+        }
+        mlx::core::async_eval(eval_arrays);
+      }
 
       token_arrays.push_back(token);
       current_ids = mlx::core::reshape(token, {B_out, 1}, device);
@@ -1850,8 +1862,9 @@ bool dense_forward_output_count(EMLXPluginInt64View attrs, uint32_t &count,
 
 bool dense_chunk_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
                                std::string &error) {
-  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
-    error = "dense chunk attributes have an invalid layer count";
+  if (attrs.size != 8 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
+      (attrs.data[7] != 0 && attrs.data[7] != 1)) {
+    error = "dense chunk attributes have an invalid schema";
     return false;
   }
   count = 4U + static_cast<uint32_t>(attrs.data[0]) * 13U;
@@ -1860,9 +1873,10 @@ bool dense_chunk_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
 
 bool dense_chunk_output_count(EMLXPluginInt64View attrs, uint32_t &count,
                               std::string &error) {
-  if (attrs.size != 7 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
-      attrs.data[2] <= 0 || attrs.data[2] > kMaxChunkTokenCount) {
-    error = "dense chunk attributes have an invalid layer or token count";
+  if (attrs.size != 8 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
+      attrs.data[2] <= 0 || attrs.data[2] > kMaxChunkTokenCount ||
+      (attrs.data[7] != 0 && attrs.data[7] != 1)) {
+    error = "dense chunk attributes have an invalid schema";
     return false;
   }
   count = 1U + static_cast<uint32_t>(attrs.data[0]) * 2U;
@@ -1959,8 +1973,8 @@ bool plugin_chunk_dense(const EMLXPluginCall &call,
           operands[0], operands[1], layers, caches, operands[tail],
           operands[tail + 1], offset, count, f64_from_bits(call.attrs.data[3]),
           head_dim, f64_from_bits(call.attrs.data[5]),
-          f64_from_bits(call.attrs.data[6]), *call.execution->device, tokens,
-          keys, values, error))
+          f64_from_bits(call.attrs.data[6]), call.attrs.data[7] == 1,
+          *call.execution->device, tokens, keys, values, error))
     return false;
   outputs.reserve(expected_outputs);
   outputs.push_back(mlx::core::reshape(
