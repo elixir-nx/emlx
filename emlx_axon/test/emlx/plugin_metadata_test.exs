@@ -441,12 +441,12 @@ defmodule EMLXAxon.PluginMetadataTest do
     assert String.valid?(oversized.message)
     assert oversized.message =~ "... [truncated]"
 
-    for callback <- [
-          "throw_after_output",
-          "unknown_throw_after_output",
-          "wrong_output_count"
+    for {callback, message} <- [
+          {"throw_after_output", ~r/intentional callback exception/},
+          {"unknown_throw_after_output", ~r/unknown plugin callback exception/},
+          {"wrong_output_count", ~r/returned 2 outputs, expected 1/}
         ] do
-      assert_raise EMLX.NIFError, fn ->
+      assert_raise EMLX.NIFError, message, fn ->
         Nx.Defn.jit(fn value -> Proof.operation(value, callback) end, compiler: EMLX).(input)
       end
 

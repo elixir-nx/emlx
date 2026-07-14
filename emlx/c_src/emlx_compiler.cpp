@@ -2168,8 +2168,12 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
   if (!ok)
     throw std::runtime_error(emlx_plugin_callback_failure_error(
         instr.resolved_plugin.plugin->name, callback.name, error));
-  if (candidates.size() != instr.plugin_outputs.size())
-    throw std::runtime_error("emlx::native: plugin callback returned the wrong output count");
+  if (candidates.size() != instr.plugin_outputs.size()) {
+    throw std::runtime_error(
+        "emlx::native: plugin callback returned " +
+        std::to_string(candidates.size()) + " outputs, expected " +
+        std::to_string(instr.plugin_outputs.size()));
+  }
   for (size_t i = 0; i < candidates.size(); ++i) {
     if (candidates[i].shape() != instr.plugin_outputs[i].shape ||
         candidates[i].dtype() != instr.plugin_outputs[i].dtype)
