@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 
@@ -2176,8 +2177,15 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
   }
   for (size_t i = 0; i < candidates.size(); ++i) {
     if (candidates[i].shape() != instr.plugin_outputs[i].shape ||
-        candidates[i].dtype() != instr.plugin_outputs[i].dtype)
-      throw std::runtime_error("emlx::native: plugin callback output template mismatch");
+        candidates[i].dtype() != instr.plugin_outputs[i].dtype) {
+      std::ostringstream message;
+      message << "emlx::native: plugin callback output " << i
+              << " expected shape " << instr.plugin_outputs[i].shape
+              << " and dtype " << instr.plugin_outputs[i].dtype
+              << ", got shape " << candidates[i].shape()
+              << " and dtype " << candidates[i].dtype();
+      throw std::runtime_error(message.str());
+    }
   }
   return candidates;
 }

@@ -458,9 +458,11 @@ defmodule EMLXAxon.PluginMetadataTest do
   test "compiled dispatch rejects an output that violates its traced template" do
     input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
 
-    assert_raise EMLX.NIFError, ~r/output template mismatch/, fn ->
-      Nx.Defn.jit(&Proof.wrong_shape/1, compiler: EMLX).(input)
-    end
+    assert_raise EMLX.NIFError,
+                 ~r/plugin callback output 0 expected shape \(2\) and dtype float32, got shape \(\) and dtype float32/,
+                 fn ->
+                   Nx.Defn.jit(&Proof.wrong_shape/1, compiler: EMLX).(input)
+                 end
   end
 
   test "device capabilities are checked before callback dispatch" do
