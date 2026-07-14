@@ -1,5 +1,5 @@
-#include "emlx_sha256.hpp"
-#include "emlx_depfile.hpp"
+#include "emlx/sha256.hpp"
+#include "emlx/plugin/depfile.hpp"
 
 #include <algorithm>
 #include <array>

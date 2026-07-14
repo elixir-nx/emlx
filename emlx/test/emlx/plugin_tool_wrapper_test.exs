@@ -17,7 +17,7 @@ defmodule EMLX.PluginToolWrapperTest do
         [
           "-std=c++20",
           "-O2",
-          Path.join(root, "c_src/tools/emlx_plugin_tool_wrapper.cpp"),
+          Path.join(root, "c_src/emlx/plugin/tool_wrapper.cpp"),
           "-o",
           wrapper
         ],

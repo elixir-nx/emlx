@@ -5,7 +5,7 @@
 // EMLX-owned storage, and keeps the shared object alive for the VM lifetime.
 
 #include "emlx/plugin/abi.hpp"
-#include "emlx_native_image.hpp"
+#include "emlx/native_image.hpp"
 #include "erl_nif.h"
 
 #include <cstddef>

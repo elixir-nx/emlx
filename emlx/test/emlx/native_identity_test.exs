@@ -24,9 +24,9 @@ defmodule EMLX.NativeIdentityTest do
           "-O2",
           "-I",
           Path.join(root, "c_src"),
-          Path.join(root, "c_src/tools/emlx_build_identity.cpp"),
-          Path.join(root, "c_src/emlx_sha256.cpp"),
-          Path.join(root, "c_src/emlx_depfile.cpp"),
+          Path.join(root, "c_src/emlx/plugin/build_identity.cpp"),
+          Path.join(root, "c_src/emlx/sha256.cpp"),
+          Path.join(root, "c_src/emlx/plugin/depfile.cpp"),
           "-o",
           tool
         ],

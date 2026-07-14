@@ -1,7 +1,7 @@
 #include "emlx/compiler.hpp"
 #include "emlx_nif_shared.hpp"
 #include "emlx/plugin/registry.hpp"
-#include "emlx_nif_lifecycle.hpp"
+#include "emlx/nif/lifecycle.hpp"
 #include "emlx/plugin/build_compat.hpp"
 
 #include <iostream>

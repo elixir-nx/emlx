@@ -80,8 +80,8 @@ defmodule EMLX.NativeImageTest do
       "-isystem",
       Path.join(emlx_priv, "mlx/include"),
       Path.join(root, "test/support/native_image_fixture.cpp"),
-      Path.join(root, "c_src/emlx_native_image.cpp"),
-      Path.join(root, "c_src/emlx_sha256.cpp"),
+      Path.join(root, "c_src/emlx/native_image.cpp"),
+      Path.join(root, "c_src/emlx/sha256.cpp"),
       "-L#{mlx_lib}",
       "-lmlx"
     ]

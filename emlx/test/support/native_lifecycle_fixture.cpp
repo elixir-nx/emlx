@@ -1,5 +1,5 @@
-#include "emlx_native_image.hpp"
-#include "emlx_nif_lifecycle.hpp"
+#include "emlx/native_image.hpp"
+#include "emlx/nif/lifecycle.hpp"
 #include "emlx/plugin/build_compat.hpp"
 #include "emlx/plugin/registry.hpp"
 

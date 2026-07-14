@@ -1,4 +1,4 @@
-#include "emlx_depfile.hpp"
+#include "emlx/plugin/depfile.hpp"
 
 #include <algorithm>
 #include <cctype>

@@ -193,10 +193,10 @@ defmodule EMLX.NativeLifecycleTest do
       "-isystem",
       Path.join(emlx_priv, "mlx/include"),
       Path.join(root, "test/support/native_lifecycle_fixture.cpp"),
-      Path.join(root, "c_src/emlx_nif_lifecycle.cpp"),
-      Path.join(root, "c_src/emlx_native_image.cpp"),
+      Path.join(root, "c_src/emlx/nif/lifecycle.cpp"),
+      Path.join(root, "c_src/emlx/native_image.cpp"),
       Path.join(root, "c_src/emlx/plugin/registry.cpp"),
-      Path.join(root, "c_src/emlx_sha256.cpp"),
+      Path.join(root, "c_src/emlx/sha256.cpp"),
       "-I#{Path.join(root, "deps/fine/c_include")}",
       "-L#{mlx_lib}",
       "-lmlx"

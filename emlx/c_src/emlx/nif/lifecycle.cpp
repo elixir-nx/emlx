@@ -1,7 +1,7 @@
-#include "emlx_nif_lifecycle.hpp"
+#include "emlx/nif/lifecycle.hpp"
 
-#include "emlx_native_image.hpp"
-#include "emlx_sha256.hpp"
+#include "emlx/native_image.hpp"
+#include "emlx/sha256.hpp"
 
 #include <array>
 #include <cstdio>

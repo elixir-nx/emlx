@@ -1,5 +1,5 @@
-#include "emlx_native_image.hpp"
-#include "emlx_sha256.hpp"
+#include "emlx/native_image.hpp"
+#include "emlx/sha256.hpp"
 
 #include "mlx/version.h"
 

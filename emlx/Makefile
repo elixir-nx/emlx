@@ -72,8 +72,8 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx/compiler.cpp c_src/emlx/plugin/registry.cpp c_src/emlx_native_image.cpp c_src/emlx_nif_lifecycle.cpp c_src/emlx_sha256.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx/plugin/abi.hpp c_src/emlx/plugin/toolchain.hpp c_src/emlx/plugin/registry.hpp c_src/emlx_native_image.hpp c_src/emlx_nif_lifecycle.hpp c_src/emlx_sha256.hpp c_src/emlx_depfile.hpp c_src/emlx/compiler.hpp c_src/emlx_runtime_call_bridge.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx/compiler.cpp c_src/emlx/plugin/registry.cpp c_src/emlx/native_image.cpp c_src/emlx/nif/lifecycle.cpp c_src/emlx/sha256.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx/plugin/abi.hpp c_src/emlx/plugin/toolchain.hpp c_src/emlx/plugin/registry.hpp c_src/emlx/native_image.hpp c_src/emlx/nif/lifecycle.hpp c_src/emlx/sha256.hpp c_src/emlx/plugin/depfile.hpp c_src/emlx/compiler.hpp c_src/emlx_runtime_call_bridge.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 DEPFILES = $(patsubst c_src/%.cpp,$(call esc,$(EMLX_DEPFILE_DIR))/%.d,$(SOURCES))
 HOST_DEPFILE_ARGS = $(foreach source,$(SOURCES),"$(source)" "$(EMLX_DEPFILE_DIR)/$(patsubst c_src/%.cpp,%.d,$(source))")
@@ -85,17 +85,17 @@ all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_COMPAT_HEADER)) $(call esc,$(EMLX_P
 $(call esc,$(PRIV_DIR)):
 	@ mkdir -p "$(PRIV_DIR)"
 
-$(call esc,$(EMLX_BUILD_ID_TOOL)): c_src/tools/emlx_build_identity.cpp c_src/emlx_sha256.cpp c_src/emlx_sha256.hpp c_src/emlx_depfile.cpp c_src/emlx_depfile.hpp c_src/emlx/plugin/toolchain.hpp
+$(call esc,$(EMLX_BUILD_ID_TOOL)): c_src/emlx/plugin/build_identity.cpp c_src/emlx/sha256.cpp c_src/emlx/sha256.hpp c_src/emlx/plugin/depfile.cpp c_src/emlx/plugin/depfile.hpp c_src/emlx/plugin/toolchain.hpp
 	@ mkdir -p "$(BUILD_DIR)/tools"
-	$(CXX) -std=c++20 -O2 -I c_src c_src/tools/emlx_build_identity.cpp c_src/emlx_sha256.cpp c_src/emlx_depfile.cpp -o "$@"
+	$(CXX) -std=c++20 -O2 -I c_src c_src/emlx/plugin/build_identity.cpp c_src/emlx/sha256.cpp c_src/emlx/plugin/depfile.cpp -o "$@"
 
 $(call esc,$(EMLX_PACKAGED_BUILD_ID_TOOL)): $(call esc,$(EMLX_BUILD_ID_TOOL))
 	@ mkdir -p "$(PRIV_DIR)/build_support"
 	@ cp "$<" "$@"
 
-$(call esc,$(EMLX_PLUGIN_TOOL_WRAPPER)): c_src/tools/emlx_plugin_tool_wrapper.cpp
+$(call esc,$(EMLX_PLUGIN_TOOL_WRAPPER)): c_src/emlx/plugin/tool_wrapper.cpp
 	@ mkdir -p "$(PRIV_DIR)/build_support"
-	$(CXX) -std=c++20 -O2 c_src/tools/emlx_plugin_tool_wrapper.cpp -o "$@"
+	$(CXX) -std=c++20 -O2 c_src/emlx/plugin/tool_wrapper.cpp -o "$@"
 
 $(call esc,$(EMLX_PLUGIN_ABI_HEADER)): c_src/emlx/plugin/abi.hpp
 	@ mkdir -p "$(dir $(EMLX_PLUGIN_ABI_HEADER))"
