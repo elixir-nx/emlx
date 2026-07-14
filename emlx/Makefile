@@ -37,7 +37,6 @@ MLX_SRC_ARCHIVE = $(EMLX_CACHE_DIR)/mlx/$(MLX_VERSION)$(MLX_VARIANT).tar.gz
 MLX_SRC_DIR = $(EMLX_CACHE_DIR)/mlx/src-$(MLX_VERSION)$(MLX_VARIANT)
 MLX_BUILD_DIR = $(EMLX_CACHE_DIR)/mlx/build-$(MLX_VERSION)$(MLX_VARIANT)
 MLX_INSTALL_DIR = $(MLX_DIR)
-MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
 
 $(info LIBMLX_ENABLE_DEBUG=$(LIBMLX_ENABLE_DEBUG))
 # Build flags
@@ -58,11 +57,13 @@ UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
 ifeq ($(UNAME_S),Darwin)
+    MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
     EMLX_TARGET_TRIPLE = $(UNAME_M)-apple-darwin
     LDFLAGS += -undefined dynamic_lookup -flat_namespace -rpath @loader_path/mlx/lib
     LDFLAGS += -framework Metal -framework Foundation -framework Accelerate
 		MAKE_DEFAULT_JOBS = $(shell sysctl -n hw.ncpu)
 else
+    MLX_SO ?= $(MLX_LIB_DIR)/libmlx.so
     EMLX_TARGET_TRIPLE = $(UNAME_M)-unknown-linux-gnu
     LDFLAGS += -Wl,-rpath,'$$ORIGIN/mlx/lib'
 		MAKE_DEFAULT_JOBS = $(shell nproc)

@@ -27,8 +27,9 @@ inline constexpr char EMLX_ACTUAL_ARCHITECTURE_ABI[] = "aarch64-sysv";
 #error "plugin ABI v1 does not recognize this target ABI"
 #endif
 
-static_assert(__cplusplus >= 202002L,
-              "plugin ABI v1 requires the C++20 language mode");
+#if !defined(__cpp_constinit) || __cpp_constinit < 201907L
+#error "plugin ABI v1 requires C++20 constinit support"
+#endif
 inline constexpr char EMLX_ACTUAL_CXX_LANGUAGE_MODE[] = "c++20";
 
 #if defined(_LIBCPP_VERSION)
