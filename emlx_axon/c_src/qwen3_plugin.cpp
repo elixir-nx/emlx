@@ -1372,6 +1372,12 @@ inline constexpr char kForwardDenseName[] = "forward_greedy_dense";
 inline constexpr char kChunkDenseName[] = "forward_greedy_chunk_dense";
 inline constexpr char kChunkGeneralizedName[] =
     "forward_greedy_chunk_generalized";
+inline constexpr emlx::plugin::device_type_t kSupportedDeviceTypes[] = {
+    mlx::core::Device::DeviceType::cpu,
+    mlx::core::Device::DeviceType::gpu};
+inline constexpr emlx::plugin::device_view_t kSupportedDevices{
+    kSupportedDeviceTypes,
+    sizeof(kSupportedDeviceTypes) / sizeof(kSupportedDeviceTypes[0])};
 inline constexpr int64_t kMaxLayerCount = 256;
 inline constexpr int64_t kMaxChunkTokenCount = 4096;
 inline constexpr uint32_t kMaxDenseChunkOperands =
@@ -2066,42 +2072,31 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
 
 constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
     {string_view(kMLPName), 1, 1, 5, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_mlp},
+     kSupportedDevices, plugin_mlp},
     {string_view(kKVCacheAttentionName), 1, 1, 5, nullptr, 3, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_kv_cache_attention},
+     kSupportedDevices, plugin_kv_cache_attention},
     {string_view(kKVCacheAttentionTensorName), 1, 1, 6, nullptr, 3, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_kv_cache_attention_tensor},
+     kSupportedDevices, plugin_kv_cache_attention_tensor},
     {string_view(kAttentionResidualName), 1, 1, 3, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_attention_residual},
+     kSupportedDevices, plugin_attention_residual},
     {string_view(kAttentionBlockName), 1, 1, 10, nullptr, 3, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_attention_block},
+     kSupportedDevices, plugin_attention_block},
     {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_layer_dense},
+     kSupportedDevices, plugin_layer_dense},
     {string_view(kLayerGeneralizedName), 1, 1, 0,
      generalized_layer_operand_count, 3, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_layer_generalized},
+     kSupportedDevices, plugin_layer_generalized},
     {string_view(kFinalGreedyName), 1, 1, 3, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_final_greedy},
+     kSupportedDevices, plugin_final_greedy},
     {string_view(kForwardDenseName), 1, 1, 0, dense_forward_operand_count, 0,
-     dense_forward_output_count,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     dense_forward_output_count, kSupportedDevices,
      plugin_forward_dense},
     {string_view(kChunkDenseName), 1, 1, 0, dense_chunk_operand_count, 0,
-     dense_chunk_output_count,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     dense_chunk_output_count, kSupportedDevices,
      plugin_chunk_dense},
     {string_view(kChunkGeneralizedName), 1, 1, 0,
      generalized_chunk_operand_count, 0, generalized_chunk_output_count,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     plugin_chunk_generalized},
+     kSupportedDevices, plugin_chunk_generalized},
 };
 
 constinit const emlx::plugin::descriptor_t kDescriptor{

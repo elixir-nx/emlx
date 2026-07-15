@@ -43,6 +43,32 @@ constexpr emlx::plugin::string_view_t string_view(const char (&value)[N]) {
   return {value, N - 1};
 }
 
+template <size_t N>
+constexpr emlx::plugin::device_view_t
+device_view(const emlx::plugin::device_type_t (&values)[N]) {
+  return {values, N};
+}
+
+inline constexpr emlx::plugin::device_type_t kAllDeviceTypes[] = {
+    mlx::core::Device::DeviceType::cpu,
+    mlx::core::Device::DeviceType::gpu};
+inline constexpr emlx::plugin::device_type_t kCpuDeviceTypes[] = {
+    mlx::core::Device::DeviceType::cpu};
+inline constexpr emlx::plugin::device_type_t kGpuDeviceTypes[] = {
+    mlx::core::Device::DeviceType::gpu};
+inline constexpr emlx::plugin::device_type_t kInvalidDeviceTypes[] = {
+    static_cast<emlx::plugin::device_type_t>(12)};
+inline constexpr emlx::plugin::device_type_t kDuplicateDeviceTypes[] = {
+    mlx::core::Device::DeviceType::cpu,
+    mlx::core::Device::DeviceType::cpu};
+
+inline constexpr auto kAllDevices = device_view(kAllDeviceTypes);
+inline constexpr auto kCpuDevices = device_view(kCpuDeviceTypes);
+inline constexpr auto kGpuDevices = device_view(kGpuDeviceTypes);
+inline constexpr auto kInvalidDevices = device_view(kInvalidDeviceTypes);
+inline constexpr auto kDuplicateDevices = device_view(kDuplicateDeviceTypes);
+inline constexpr emlx::plugin::device_view_t kEmptyDevices{nullptr, 0};
+
 double f64_from_bits(int64_t bits) {
   uint64_t raw = static_cast<uint64_t>(bits);
   double value;
@@ -177,7 +203,7 @@ callback_must_not_run(const emlx::plugin::call_t &,
 constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
 #if defined(EMLX_FIXTURE_NULL_CALLBACK)
     {string_view(kPrimaryCallbackName), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, nullptr},
+     kAllDevices, nullptr},
 #else
     {string_view(kPrimaryCallbackName),
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_SCHEMA)
@@ -203,61 +229,54 @@ constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
      nullptr,
 #endif
 #if defined(EMLX_FIXTURE_BAD_DEVICE)
-     1U << 12,
+     kInvalidDevices,
+#elif defined(EMLX_FIXTURE_EMPTY_DEVICES)
+     kEmptyDevices,
+#elif defined(EMLX_FIXTURE_DUPLICATE_DEVICES)
+     kDuplicateDevices,
 #else
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     kAllDevices,
 #endif
      scale_add},
 #endif
     {string_view(kPartialFailureName), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     partial_failure},
+     kAllDevices, partial_failure},
     {string_view(kWrongShape), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, wrong_shape},
+     kAllDevices, wrong_shape},
     {string_view(kCpuOnly), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1, scale_add},
+     kCpuDevices, scale_add},
     {string_view(kGpuOnly), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_gpu_metal_v1, scale_add},
+     kGpuDevices, scale_add},
     {string_view(kThrowingOperandPolicy), 1, 1, 0, throwing_operand_policy, 1,
-     nullptr, emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     scale_add},
+     nullptr, kAllDevices, scale_add},
     {string_view(kThrowingOutputPolicy), 1, 1, 1, nullptr, 0,
      throwing_output_policy,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, scale_add},
-    {string_view(kOversizedError), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     kAllDevices, scale_add},
+    {string_view(kOversizedError), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      oversized_error},
-    {string_view(kInvalidUtf8Error), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+    {string_view(kInvalidUtf8Error), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      invalid_utf8_error},
     {string_view(kEmptyError), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, empty_error},
-    {string_view(kThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     kAllDevices, empty_error},
+    {string_view(kThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      throw_after_output},
     {string_view(kUnknownThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     unknown_throw_after_output},
-    {string_view(kWrongOutputCount), 1, 1, 1, nullptr, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     kAllDevices, unknown_throw_after_output},
+    {string_view(kWrongOutputCount), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      wrong_output_count},
-    {string_view(kOversizedOperandPolicy), 1, 1, 0,
-     oversized_operand_policy, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+    {string_view(kOversizedOperandPolicy), 1, 1, 0, oversized_operand_policy, 1,
+     nullptr, kAllDevices,
      callback_must_not_run},
     {string_view(kOversizedOutputPolicy), 1, 1, 1, nullptr, 0,
-     oversized_output_policy,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     oversized_output_policy, kAllDevices,
      callback_must_not_run},
     {string_view(kZeroOperandPolicy), 1, 1, 0, zero_count_policy, 1, nullptr,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     callback_must_not_run},
+     kAllDevices, callback_must_not_run},
     {string_view(kZeroOutputPolicy), 1, 1, 1, nullptr, 0, zero_count_policy,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
-     callback_must_not_run},
+     kAllDevices, callback_must_not_run},
     {string_view(kDynamicCounts), 1, 1, 0, one_count_policy, 0,
      one_count_policy,
-     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, scale_add},
+     kAllDevices, scale_add},
 };
 
 #if defined(EMLX_FIXTURE_MISALIGNED_CALLBACKS)

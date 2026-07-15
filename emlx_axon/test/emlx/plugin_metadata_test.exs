@@ -234,6 +234,8 @@ defmodule EMLXAxon.PluginMetadataTest do
       {"bad_attr_schema", :bad_attr_schema, "callback descriptor is invalid"},
       {"bad_callback_name", :bad_callback_name, "callback descriptor is invalid"},
       {"bad_device", :bad_device, "callback descriptor is invalid"},
+      {"empty_devices", :empty_devices, "callback descriptor is invalid"},
+      {"duplicate_devices", :duplicate_devices, "callback descriptor is invalid"},
       {"bad_operand_policy", :bad_operand_policy, "operand policy is invalid"},
       {"bad_output_policy", :bad_output_policy, "output policy is invalid"},
       {"duplicate_callback", :duplicate_callback, "callback names must be unique"}
@@ -511,6 +513,8 @@ defmodule EMLXAxon.PluginMetadataTest do
           :bad_attr_schema -> ["-DEMLX_FIXTURE_BAD_ATTR_SCHEMA"]
           :bad_callback_name -> ["-DEMLX_FIXTURE_BAD_CALLBACK_NAME"]
           :bad_device -> ["-DEMLX_FIXTURE_BAD_DEVICE"]
+          :empty_devices -> ["-DEMLX_FIXTURE_EMPTY_DEVICES"]
+          :duplicate_devices -> ["-DEMLX_FIXTURE_DUPLICATE_DEVICES"]
           :bad_operand_policy -> ["-DEMLX_FIXTURE_BAD_OPERAND_POLICY"]
           :bad_output_policy -> ["-DEMLX_FIXTURE_BAD_OUTPUT_POLICY"]
           :duplicate_callback -> ["-DEMLX_FIXTURE_DUPLICATE_CALLBACK"]

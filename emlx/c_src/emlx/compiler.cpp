@@ -2143,10 +2143,7 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
     throw std::runtime_error("emlx::native: plugin execution has no current worker");
   const auto &callback = *instr.resolved_plugin.callback;
   const auto device = emlx::g_current_worker->device();
-  const uint32_t device_bit = device.type == mlx::core::Device::DeviceType::cpu
-                                  ? emlx::plugin::device_cpu_v1
-                                  : emlx::plugin::device_gpu_metal_v1;
-  if ((callback.device_capabilities & device_bit) == 0)
+  if (!emlx_plugin_callback_supports_device(callback, device.type))
     throw std::runtime_error("emlx::native: plugin callback does not support the worker device");
 
   const auto stream = emlx::g_current_worker->stream();

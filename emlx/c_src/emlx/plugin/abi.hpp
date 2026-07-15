@@ -24,9 +24,6 @@ namespace emlx::plugin {
 // expose a versioned discovery symbol rather than changing V1 in place.
 inline constexpr uint64_t magic_v1 = 0x454D4C58504C4731ULL;
 inline constexpr uint32_t abi_v1 = 1;
-inline constexpr uint32_t device_cpu_v1 = 1U << 0;
-inline constexpr uint32_t device_gpu_metal_v1 = 1U << 1;
-inline constexpr uint32_t device_known_v1 = device_cpu_v1 | device_gpu_metal_v1;
 inline constexpr uint32_t operand_count_max_v1 = 8192;
 inline constexpr uint32_t output_count_max_v1 = 1024;
 
@@ -45,6 +42,8 @@ struct string_view_t {
 
 using array_view_t = view_t<mlx::core::array>;
 using int64_view_t = view_t<int64_t>;
+using device_type_t = mlx::core::Device::DeviceType;
+using device_view_t = view_t<device_type_t>;
 
 struct execution_context_t {
   const mlx::core::Device *device;
@@ -75,7 +74,7 @@ struct callback_descriptor_t {
   operand_count_fn_t operand_count_from_attrs;
   uint32_t output_count;
   output_count_fn_t output_count_from_attrs;
-  uint32_t device_capabilities;
+  device_view_t supported_devices;
   callback_fn_t callback;
 };
 
@@ -122,6 +121,11 @@ static_assert(std::is_standard_layout_v<int64_view_t>);
 static_assert(std::is_trivially_copyable_v<int64_view_t>);
 static_assert(sizeof(int64_view_t) == 16);
 
+static_assert(std::is_enum_v<device_type_t>);
+static_assert(std::is_standard_layout_v<device_view_t>);
+static_assert(std::is_trivially_copyable_v<device_view_t>);
+static_assert(sizeof(device_view_t) == 16);
+
 static_assert(std::is_standard_layout_v<execution_context_t>);
 static_assert(std::is_trivially_copyable_v<execution_context_t>);
 static_assert(sizeof(execution_context_t) == 16);
@@ -132,7 +136,7 @@ static_assert(sizeof(call_t) == 40);
 
 static_assert(std::is_standard_layout_v<callback_descriptor_t>);
 static_assert(std::is_trivially_copyable_v<callback_descriptor_t>);
-static_assert(sizeof(callback_descriptor_t) == 72);
+static_assert(sizeof(callback_descriptor_t) == 80);
 static_assert(alignof(callback_descriptor_t) == 8);
 
 static_assert(std::is_standard_layout_v<descriptor_t>);

@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 // Loads and validates the generic plugin descriptor, then keeps the accepted
 // shared object alive for the VM lifetime.
@@ -26,7 +27,7 @@ struct EMLXLoadedPluginCallback {
   emlx::plugin::operand_count_fn_t operand_count_from_attrs;
   uint32_t output_count;
   emlx::plugin::output_count_fn_t output_count_from_attrs;
-  uint32_t device_capabilities;
+  std::vector<emlx::plugin::device_type_t> supported_devices;
   emlx::plugin::callback_fn_t callback;
 };
 
@@ -48,6 +49,10 @@ emlx_resolve_plugin_callback(const std::string &plugin,
                              const std::string &callback);
 
 bool emlx_valid_plugin_name(const std::string &value);
+
+bool emlx_plugin_callback_supports_device(
+    const EMLXLoadedPluginCallback &callback,
+    emlx::plugin::device_type_t device_type);
 
 std::string emlx_plugin_callback_failure_error(
     const std::string &plugin, const std::string &callback,

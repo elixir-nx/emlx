@@ -18,6 +18,7 @@ namespace {
 
 constexpr size_t kNameMax = 128;
 constexpr uint32_t kCallbacksMax = 256;
+constexpr uint64_t kDeviceTypesMax = 2;
 constexpr size_t kErrorMax = 4096;
 constexpr size_t kCallPluginNifSuffixSize =
     sizeof(" in NIF.call_plugin/5") - 1;
@@ -42,6 +43,11 @@ bool valid_name(const std::string &value) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
            (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
   });
+}
+
+bool valid_device_type(emlx::plugin::device_type_t device_type) {
+  return device_type == mlx::core::Device::DeviceType::cpu ||
+         device_type == mlx::core::Device::DeviceType::gpu;
 }
 
 bool valid_utf8(const std::string &value) {
@@ -271,8 +277,11 @@ load_generic_candidate(const std::string &requested_name,
         source.attr_schema_version != 1 || !source.callback ||
         source.operand_count > emlx::plugin::operand_count_max_v1 ||
         source.output_count > emlx::plugin::output_count_max_v1 ||
-        source.device_capabilities == 0 ||
-        (source.device_capabilities & ~emlx::plugin::device_known_v1) != 0)
+        !source.supported_devices.data || source.supported_devices.size == 0 ||
+        source.supported_devices.size > kDeviceTypesMax ||
+        reinterpret_cast<uintptr_t>(source.supported_devices.data) %
+                alignof(emlx::plugin::device_type_t) !=
+            0)
       throw std::runtime_error("plugin callback descriptor is invalid");
     if ((source.operand_count == 0) ==
         (source.operand_count_from_attrs == nullptr))
@@ -286,7 +295,20 @@ load_generic_candidate(const std::string &requested_name,
     callback->operand_count_from_attrs = source.operand_count_from_attrs;
     callback->output_count = source.output_count;
     callback->output_count_from_attrs = source.output_count_from_attrs;
-    callback->device_capabilities = source.device_capabilities;
+    callback->supported_devices.reserve(source.supported_devices.size);
+    for (uint64_t device_index = 0;
+         device_index < source.supported_devices.size; ++device_index) {
+      emlx::plugin::device_type_t device_type{};
+      std::memcpy(&device_type, source.supported_devices.data + device_index,
+                  sizeof(device_type));
+      if (!valid_device_type(device_type) ||
+          std::find(callback->supported_devices.begin(),
+                    callback->supported_devices.end(),
+                    device_type) != callback->supported_devices.end()) {
+        throw std::runtime_error("plugin callback descriptor is invalid");
+      }
+      callback->supported_devices.push_back(device_type);
+    }
     callback->callback = source.callback;
     if (!loaded->callbacks.emplace(callback->name, callback).second)
       throw std::runtime_error("plugin callback names must be unique");
@@ -309,6 +331,14 @@ load_generic_candidate(const std::string &requested_name,
 
 bool emlx_valid_plugin_name(const std::string &value) {
   return valid_name(value);
+}
+
+bool emlx_plugin_callback_supports_device(
+    const EMLXLoadedPluginCallback &callback,
+    emlx::plugin::device_type_t device_type) {
+  return std::find(callback.supported_devices.begin(),
+                   callback.supported_devices.end(),
+                   device_type) != callback.supported_devices.end();
 }
 
 EMLXResolvedPluginCallback
@@ -362,10 +392,7 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     throw std::runtime_error("plugin callback output count exceeds its limit");
   if (!emlx::g_current_worker)
     throw std::runtime_error("plugin execution has no current worker");
-  const uint32_t device_bit = device.type == mlx::core::Device::DeviceType::cpu
-                                  ? emlx::plugin::device_cpu_v1
-                                  : emlx::plugin::device_gpu_metal_v1;
-  if ((callback.device_capabilities & device_bit) == 0)
+  if (!emlx_plugin_callback_supports_device(callback, device.type))
     throw std::runtime_error("plugin callback does not support the worker device");
   const auto stream = emlx::g_current_worker->stream();
   emlx::plugin::execution_context_t execution{&device, &stream};
