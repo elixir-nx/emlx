@@ -1380,12 +1380,13 @@ inline constexpr uint32_t kMaxGeneralizedChunkOperands =
     2U + static_cast<uint32_t>(kMaxLayerCount) * (6U + 7U * 3U) + 1U + 3U;
 inline constexpr uint32_t kMaxChunkOutputs =
     1U + static_cast<uint32_t>(kMaxLayerCount) * 2U;
-static_assert(kMaxDenseChunkOperands <= EMLX_PLUGIN_OPERAND_COUNT_MAX_V1);
-static_assert(kMaxGeneralizedChunkOperands <= EMLX_PLUGIN_OPERAND_COUNT_MAX_V1);
-static_assert(kMaxChunkOutputs <= EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1);
+static_assert(kMaxDenseChunkOperands <= emlx::plugin::operand_count_max_v1);
+static_assert(kMaxGeneralizedChunkOperands <=
+              emlx::plugin::operand_count_max_v1);
+static_assert(kMaxChunkOutputs <= emlx::plugin::output_count_max_v1);
 
 template <size_t N>
-constexpr EMLXPluginStringView string_view(const char (&value)[N]) {
+constexpr emlx::plugin::string_view_t string_view(const char (&value)[N]) {
   return {value, N - 1};
 }
 
@@ -1396,7 +1397,7 @@ double f64_from_bits(int64_t bits) {
   return value;
 }
 
-bool int32_attr(const EMLXPluginCall &call, size_t index, const char *name,
+bool int32_attr(const emlx::plugin::call_t &call, size_t index, const char *name,
                 int &value, std::string &error) {
   if (index >= call.attrs.size || call.attrs.data[index] < INT_MIN ||
       call.attrs.data[index] > INT_MAX) {
@@ -1430,7 +1431,7 @@ bool quantization_mode(int64_t value, std::string &mode,
   }
 }
 
-bool validate_linear_descriptor(EMLXPluginInt64View attrs, size_t &attr_index,
+bool validate_linear_descriptor(emlx::plugin::int64_view_t attrs, size_t &attr_index,
                                 uint32_t &operand_index,
                                 std::string &error) {
   if (attr_index > attrs.size ||
@@ -1478,7 +1479,7 @@ bool validate_linear_descriptor(EMLXPluginInt64View attrs, size_t &attr_index,
   return true;
 }
 
-bool parse_linear_descriptor(const EMLXPluginCall &call, size_t &attr_index,
+bool parse_linear_descriptor(const emlx::plugin::call_t &call, size_t &attr_index,
                              uint32_t &operand_index, LinearWeight &weight,
                              std::string &error) {
   const size_t descriptor_start = attr_index;
@@ -1515,7 +1516,7 @@ bool parse_linear_descriptor(const EMLXPluginCall &call, size_t &attr_index,
   return true;
 }
 
-bool generalized_layer_operand_count(EMLXPluginInt64View attrs,
+bool generalized_layer_operand_count(emlx::plugin::int64_view_t attrs,
                                      uint32_t &count,
                                      std::string &error) {
   if (attrs.size != 7 + 7 * kLinearDescriptorWidth || attrs.data[0] != 1 ||
@@ -1537,7 +1538,7 @@ bool generalized_layer_operand_count(EMLXPluginInt64View attrs,
   return true;
 }
 
-bool generalized_chunk_operand_count(EMLXPluginInt64View attrs,
+bool generalized_chunk_operand_count(emlx::plugin::int64_view_t attrs,
                                      uint32_t &count,
                                      std::string &error) {
   if (attrs.size < 9 || attrs.data[0] != 1 || attrs.data[1] <= 0 ||
@@ -1569,7 +1570,7 @@ bool generalized_chunk_operand_count(EMLXPluginInt64View attrs,
   return true;
 }
 
-bool generalized_chunk_output_count(EMLXPluginInt64View attrs,
+bool generalized_chunk_output_count(emlx::plugin::int64_view_t attrs,
                                     uint32_t &count,
                                     std::string &error) {
   uint32_t ignored_operands = 0;
@@ -1584,7 +1585,7 @@ bool generalized_chunk_output_count(EMLXPluginInt64View attrs,
 }
 
 std::optional<std::string>
-plugin_mlp(const EMLXPluginCall &call,
+plugin_mlp(const emlx::plugin::call_t &call,
            std::vector<mlx::core::array> &outputs) {
   std::string error;
   if (call.operands.size != 5 || call.attrs.size != 1 || !call.execution ||
@@ -1603,7 +1604,7 @@ plugin_mlp(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_kv_cache_attention(const EMLXPluginCall &call,
+plugin_kv_cache_attention(const emlx::plugin::call_t &call,
                           std::vector<mlx::core::array> &outputs) {
   std::string error;
   if (call.operands.size != 5 || call.attrs.size != 4 || !call.execution ||
@@ -1634,7 +1635,7 @@ plugin_kv_cache_attention(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_kv_cache_attention_tensor(const EMLXPluginCall &call,
+plugin_kv_cache_attention_tensor(const emlx::plugin::call_t &call,
                                  std::vector<mlx::core::array> &outputs) {
   std::string error;
   if (call.operands.size != 6 || call.attrs.size != 3 || !call.execution ||
@@ -1662,7 +1663,7 @@ plugin_kv_cache_attention_tensor(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_attention_residual(const EMLXPluginCall &call,
+plugin_attention_residual(const emlx::plugin::call_t &call,
                           std::vector<mlx::core::array> &outputs) {
   std::string error;
   if (call.operands.size != 3 || call.attrs.size != 0 || !call.execution ||
@@ -1680,7 +1681,7 @@ plugin_attention_residual(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_attention_block(const EMLXPluginCall &call,
+plugin_attention_block(const emlx::plugin::call_t &call,
                        std::vector<mlx::core::array> &outputs) {
   std::string error;
   if (call.operands.size != 10 || call.attrs.size != 5 || !call.execution ||
@@ -1714,7 +1715,7 @@ plugin_attention_block(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_layer_dense(const EMLXPluginCall &call,
+plugin_layer_dense(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
   std::string error;
   if (call.operands.size != 14 || call.attrs.size != 5 || !call.execution ||
@@ -1750,7 +1751,7 @@ plugin_layer_dense(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_layer_generalized(const EMLXPluginCall &call,
+plugin_layer_generalized(const emlx::plugin::call_t &call,
                          std::vector<mlx::core::array> &outputs) {
   std::string error;
   uint32_t expected_operands = 0;
@@ -1809,7 +1810,7 @@ plugin_layer_generalized(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_final_greedy(const EMLXPluginCall &call,
+plugin_final_greedy(const emlx::plugin::call_t &call,
                     std::vector<mlx::core::array> &outputs) {
   std::string error;
   if (call.operands.size != 3 || call.attrs.size != 1 || !call.execution ||
@@ -1826,7 +1827,7 @@ plugin_final_greedy(const EMLXPluginCall &call,
   return std::nullopt;
 }
 
-bool dense_forward_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
+bool dense_forward_operand_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
                                  std::string &error) {
   if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
     error = "dense forward attributes have an invalid layer count";
@@ -1836,7 +1837,7 @@ bool dense_forward_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
   return true;
 }
 
-bool dense_forward_output_count(EMLXPluginInt64View attrs, uint32_t &count,
+bool dense_forward_output_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
                                 std::string &error) {
   if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
     error = "dense forward attributes have an invalid layer count";
@@ -1846,7 +1847,7 @@ bool dense_forward_output_count(EMLXPluginInt64View attrs, uint32_t &count,
   return true;
 }
 
-bool dense_chunk_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
+bool dense_chunk_operand_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
                                std::string &error) {
   if (attrs.size != 8 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
       (attrs.data[7] != 0 && attrs.data[7] != 1)) {
@@ -1857,7 +1858,7 @@ bool dense_chunk_operand_count(EMLXPluginInt64View attrs, uint32_t &count,
   return true;
 }
 
-bool dense_chunk_output_count(EMLXPluginInt64View attrs, uint32_t &count,
+bool dense_chunk_output_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
                               std::string &error) {
   if (attrs.size != 8 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
       attrs.data[2] <= 0 || attrs.data[2] > kMaxChunkTokenCount ||
@@ -1887,7 +1888,7 @@ void parse_dense_layers(std::vector<mlx::core::array> &operands, size_t start,
 }
 
 std::optional<std::string>
-plugin_forward_dense(const EMLXPluginCall &call,
+plugin_forward_dense(const emlx::plugin::call_t &call,
                      std::vector<mlx::core::array> &outputs) {
   std::string error;
   uint32_t expected_operands = 0;
@@ -1930,7 +1931,7 @@ plugin_forward_dense(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_chunk_dense(const EMLXPluginCall &call,
+plugin_chunk_dense(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
   std::string error;
   uint32_t expected_operands = 0;
@@ -1976,7 +1977,7 @@ plugin_chunk_dense(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-plugin_chunk_generalized(const EMLXPluginCall &call,
+plugin_chunk_generalized(const emlx::plugin::call_t &call,
                          std::vector<mlx::core::array> &outputs) {
   std::string error;
   uint32_t expected_operands = 0;
@@ -2063,62 +2064,63 @@ plugin_chunk_generalized(const EMLXPluginCall &call,
   return std::nullopt;
 }
 
-constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
+constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
     {string_view(kMLPName), 1, 1, 5, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, plugin_mlp},
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
+     plugin_mlp},
     {string_view(kKVCacheAttentionName), 1, 1, 5, nullptr, 3, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_kv_cache_attention},
     {string_view(kKVCacheAttentionTensorName), 1, 1, 6, nullptr, 3, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_kv_cache_attention_tensor},
     {string_view(kAttentionResidualName), 1, 1, 3, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_attention_residual},
     {string_view(kAttentionBlockName), 1, 1, 10, nullptr, 3, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_attention_block},
     {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_layer_dense},
     {string_view(kLayerGeneralizedName), 1, 1, 0,
      generalized_layer_operand_count, 3, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_layer_generalized},
     {string_view(kFinalGreedyName), 1, 1, 3, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_final_greedy},
     {string_view(kForwardDenseName), 1, 1, 0, dense_forward_operand_count, 0,
      dense_forward_output_count,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_forward_dense},
     {string_view(kChunkDenseName), 1, 1, 0, dense_chunk_operand_count, 0,
      dense_chunk_output_count,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_chunk_dense},
     {string_view(kChunkGeneralizedName), 1, 1, 0,
      generalized_chunk_operand_count, 0, generalized_chunk_output_count,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      plugin_chunk_generalized},
 };
 
-constinit const EMLXPluginDescriptor kDescriptor{
+constinit const emlx::plugin::descriptor_t kDescriptor{
     string_view(kPluginName),
-    sizeof(EMLXPluginDescriptor),
-    sizeof(EMLXPluginCallbackDescriptor),
+    sizeof(emlx::plugin::descriptor_t),
+    sizeof(emlx::plugin::callback_descriptor_t),
     static_cast<uint32_t>(sizeof(kCallbacks) / sizeof(kCallbacks[0])),
     kCallbacks};
 
-constinit const EMLXPluginBootstrapV1 kBootstrap{
-    EMLX_PLUGIN_MAGIC_V1,
-    sizeof(EMLXPluginBootstrapV1),
-    EMLX_PLUGIN_ABI_V1,
-    sizeof(EMLXPluginDescriptor),
+constinit const emlx::plugin::bootstrap_v1_t kBootstrap{
+    emlx::plugin::magic_v1,
+    sizeof(emlx::plugin::bootstrap_v1_t),
+    emlx::plugin::abi_v1,
+    sizeof(emlx::plugin::descriptor_t),
     &kDescriptor};
 
 } // namespace
 
-extern "C" EMLX_PLUGIN_EXPORT const EMLXPluginBootstrapV1 *
+extern "C" EMLX_PLUGIN_EXPORT const emlx::plugin::bootstrap_v1_t *
 emlx_plugin_descriptor_v1() noexcept {
   return &kBootstrap;
 }

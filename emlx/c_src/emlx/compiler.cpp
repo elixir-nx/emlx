@@ -2069,7 +2069,7 @@ static void resolve_plugin_instruction(Instruction &instr) {
       static_cast<uint32_t>(attr_schema) != callback.attr_schema_version)
     throw std::runtime_error("emlx::native: plugin callback schema mismatch");
   if (output_count < 0 ||
-      output_count > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1)
+      output_count > emlx::plugin::output_count_max_v1)
     throw std::runtime_error("emlx::native: plugin output count exceeds its limit");
 
   size_t cursor = 6;
@@ -2122,10 +2122,10 @@ static void resolve_plugin_instruction(Instruction &instr) {
   if (instr.operands.size() != expected_operands) {
     throw std::runtime_error("emlx::native: plugin operand count mismatch");
   }
-  if (expected_operands > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1) {
+  if (expected_operands > emlx::plugin::operand_count_max_v1) {
     throw std::runtime_error("emlx::native: plugin operand count exceeds its limit");
   }
-  if (expected_outputs > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1) {
+  if (expected_outputs > emlx::plugin::output_count_max_v1) {
     throw std::runtime_error("emlx::native: plugin output count exceeds its limit");
   }
   if (templates.size() != expected_outputs) {
@@ -2144,16 +2144,16 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
   const auto &callback = *instr.resolved_plugin.callback;
   const auto device = emlx::g_current_worker->device();
   const uint32_t device_bit = device.type == mlx::core::Device::DeviceType::cpu
-                                  ? EMLX_PLUGIN_DEVICE_CPU_V1
-                                  : EMLX_PLUGIN_DEVICE_GPU_METAL_V1;
+                                  ? emlx::plugin::device_cpu_v1
+                                  : emlx::plugin::device_gpu_metal_v1;
   if ((callback.device_capabilities & device_bit) == 0)
     throw std::runtime_error("emlx::native: plugin callback does not support the worker device");
 
   const auto stream = emlx::g_current_worker->stream();
-  EMLXPluginExecutionContext execution{&device, &stream};
-  EMLXPluginCall call{{operands.data(), operands.size()},
-                      {instr.plugin_attrs.data(), instr.plugin_attrs.size()},
-                      &execution};
+  emlx::plugin::execution_context_t execution{&device, &stream};
+  emlx::plugin::call_t call{
+      {operands.data(), operands.size()},
+      {instr.plugin_attrs.data(), instr.plugin_attrs.size()}, &execution};
   std::vector<mlx::core::array> candidates;
   std::optional<std::string> error;
   try {

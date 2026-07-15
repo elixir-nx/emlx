@@ -23,11 +23,11 @@ struct EMLXLoadedPluginCallback {
   uint32_t schema_version;
   uint32_t attr_schema_version;
   uint32_t operand_count;
-  EMLXOperandCountFn operand_count_from_attrs;
+  emlx::plugin::operand_count_fn_t operand_count_from_attrs;
   uint32_t output_count;
-  EMLXOutputCountFn output_count_from_attrs;
+  emlx::plugin::output_count_fn_t output_count_from_attrs;
   uint32_t device_capabilities;
-  EMLXPluginCallback callback;
+  emlx::plugin::callback_fn_t callback;
 };
 
 struct EMLXLoadedPlugin {
@@ -54,7 +54,7 @@ std::string emlx_plugin_callback_failure_error(
     const std::string &detail, size_t limit = 4096);
 
 uint32_t emlx_invoke_plugin_count_policy(
-    EMLXOperandCountFn policy, EMLXPluginInt64View attrs,
+    emlx::plugin::operand_count_fn_t policy, emlx::plugin::int64_view_t attrs,
     uint32_t fixed_count, const char *kind, const std::string &plugin,
     const std::string &callback, size_t error_limit = 4096);
 

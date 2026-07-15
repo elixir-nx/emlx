@@ -15,40 +15,46 @@
 #define EMLX_PLUGIN_EXPORT
 #endif
 
-inline constexpr uint64_t EMLX_PLUGIN_MAGIC_V1 = 0x454D4C58504C4731ULL;
-inline constexpr uint32_t EMLX_PLUGIN_ABI_V1 = 1;
-inline constexpr uint32_t EMLX_PLUGIN_DEVICE_CPU_V1 = 1U << 0;
-inline constexpr uint32_t EMLX_PLUGIN_DEVICE_GPU_METAL_V1 = 1U << 1;
-inline constexpr uint32_t EMLX_PLUGIN_DEVICE_KNOWN_V1 =
-    EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1;
-inline constexpr uint32_t EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 = 8192;
-inline constexpr uint32_t EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1 = 1024;
+namespace emlx::plugin {
+
+// magic_v1 is the ASCII tag "EMLXPLG1" packed into a uint64_t:
+// 45 4D 4C 58 50 4C 47 31. V1 constants and layouts are immutable. An
+// incompatible ABI revision should add parallel V2 constants and types, use
+// the "EMLXPLG2" tag (0x454D4C58504C4732), set its ABI version to 2, and
+// expose a versioned discovery symbol rather than changing V1 in place.
+inline constexpr uint64_t magic_v1 = 0x454D4C58504C4731ULL;
+inline constexpr uint32_t abi_v1 = 1;
+inline constexpr uint32_t device_cpu_v1 = 1U << 0;
+inline constexpr uint32_t device_gpu_metal_v1 = 1U << 1;
+inline constexpr uint32_t device_known_v1 = device_cpu_v1 | device_gpu_metal_v1;
+inline constexpr uint32_t operand_count_max_v1 = 8192;
+inline constexpr uint32_t output_count_max_v1 = 1024;
 
 // Plugin-owned views are borrowed by EMLX only while loading the descriptor.
 // Call-owned views remain valid only for the count-policy or callback
 // invocation that receives them. Neither side may retain borrowed pointers.
-template <typename T> struct EMLXPluginView {
+template <typename T> struct view_t {
   const T *data;
   uint64_t size;
 };
 
-struct EMLXPluginStringView {
+struct string_view_t {
   const char *data;
   uint64_t size;
 };
 
-using EMLXPluginArrayView = EMLXPluginView<mlx::core::array>;
-using EMLXPluginInt64View = EMLXPluginView<int64_t>;
+using array_view_t = view_t<mlx::core::array>;
+using int64_view_t = view_t<int64_t>;
 
-struct EMLXPluginExecutionContext {
+struct execution_context_t {
   const mlx::core::Device *device;
   const mlx::core::Stream *stream;
 };
 
-struct EMLXPluginCall {
-  EMLXPluginArrayView operands;
-  EMLXPluginInt64View attrs;
-  const EMLXPluginExecutionContext *execution;
+struct call_t {
+  array_view_t operands;
+  int64_view_t attrs;
+  const execution_context_t *execution;
 };
 
 // Policies and callbacks may run concurrently on EMLX worker threads and must
@@ -56,36 +62,34 @@ struct EMLXPluginCall {
 // string on failure. Callback success returns std::nullopt; expected callback
 // failures return an error string. Exceptions must not cross the plugin
 // boundary.
-using EMLXOutputCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
-                                   std::string &);
-using EMLXOperandCountFn = bool (*)(EMLXPluginInt64View, uint32_t &,
-                                    std::string &);
-using EMLXPluginCallback = std::optional<std::string> (*)(
-    const EMLXPluginCall &, std::vector<mlx::core::array> &);
+using output_count_fn_t = bool (*)(int64_view_t, uint32_t &, std::string &);
+using operand_count_fn_t = bool (*)(int64_view_t, uint32_t &, std::string &);
+using callback_fn_t = std::optional<std::string> (*)(
+    const call_t &, std::vector<mlx::core::array> &);
 
-struct EMLXPluginCallbackDescriptor {
-  EMLXPluginStringView name;
+struct callback_descriptor_t {
+  string_view_t name;
   uint32_t schema_version;
   uint32_t attr_schema_version;
   uint32_t operand_count;
-  EMLXOperandCountFn operand_count_from_attrs;
+  operand_count_fn_t operand_count_from_attrs;
   uint32_t output_count;
-  EMLXOutputCountFn output_count_from_attrs;
+  output_count_fn_t output_count_from_attrs;
   uint32_t device_capabilities;
-  EMLXPluginCallback callback;
+  callback_fn_t callback;
 };
 
-struct EMLXPluginDescriptor {
+struct descriptor_t {
   // Strings, the callback table, policy functions, and callbacks must remain
   // valid for the lifetime of the VM process.
-  EMLXPluginStringView name;
+  string_view_t name;
   uint64_t descriptor_size;
   uint64_t callback_descriptor_size;
   uint32_t callback_count;
-  const EMLXPluginCallbackDescriptor *callbacks;
+  const callback_descriptor_t *callbacks;
 };
 
-struct EMLXPluginBootstrapV1 {
+struct bootstrap_v1_t {
   uint64_t magic;
   uint32_t bootstrap_size;
   uint32_t plugin_abi_version;
@@ -93,53 +97,55 @@ struct EMLXPluginBootstrapV1 {
   const void *descriptor;
 };
 
-using EMLXPluginDiscoveryV1 = const EMLXPluginBootstrapV1 *(*)() noexcept;
+using discovery_v1_fn_t = const bootstrap_v1_t *(*)() noexcept;
 
-static_assert(std::is_standard_layout_v<EMLXPluginBootstrapV1>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginBootstrapV1>);
-static_assert(sizeof(EMLXPluginBootstrapV1) == 32);
-static_assert(alignof(EMLXPluginBootstrapV1) == 8);
-static_assert(offsetof(EMLXPluginBootstrapV1, magic) == 0);
-static_assert(offsetof(EMLXPluginBootstrapV1, bootstrap_size) == 8);
-static_assert(offsetof(EMLXPluginBootstrapV1, plugin_abi_version) == 12);
-static_assert(offsetof(EMLXPluginBootstrapV1, descriptor_size) == 16);
-static_assert(offsetof(EMLXPluginBootstrapV1, descriptor) == 24);
+static_assert(std::is_standard_layout_v<bootstrap_v1_t>);
+static_assert(std::is_trivially_copyable_v<bootstrap_v1_t>);
+static_assert(sizeof(bootstrap_v1_t) == 32);
+static_assert(alignof(bootstrap_v1_t) == 8);
+static_assert(offsetof(bootstrap_v1_t, magic) == 0);
+static_assert(offsetof(bootstrap_v1_t, bootstrap_size) == 8);
+static_assert(offsetof(bootstrap_v1_t, plugin_abi_version) == 12);
+static_assert(offsetof(bootstrap_v1_t, descriptor_size) == 16);
+static_assert(offsetof(bootstrap_v1_t, descriptor) == 24);
 
-static_assert(std::is_standard_layout_v<EMLXPluginStringView>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginStringView>);
-static_assert(sizeof(EMLXPluginStringView) == 16);
-static_assert(alignof(EMLXPluginStringView) == 8);
+static_assert(std::is_standard_layout_v<string_view_t>);
+static_assert(std::is_trivially_copyable_v<string_view_t>);
+static_assert(sizeof(string_view_t) == 16);
+static_assert(alignof(string_view_t) == 8);
 
-static_assert(std::is_standard_layout_v<EMLXPluginArrayView>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginArrayView>);
-static_assert(sizeof(EMLXPluginArrayView) == 16);
+static_assert(std::is_standard_layout_v<array_view_t>);
+static_assert(std::is_trivially_copyable_v<array_view_t>);
+static_assert(sizeof(array_view_t) == 16);
 
-static_assert(std::is_standard_layout_v<EMLXPluginInt64View>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginInt64View>);
-static_assert(sizeof(EMLXPluginInt64View) == 16);
+static_assert(std::is_standard_layout_v<int64_view_t>);
+static_assert(std::is_trivially_copyable_v<int64_view_t>);
+static_assert(sizeof(int64_view_t) == 16);
 
-static_assert(std::is_standard_layout_v<EMLXPluginExecutionContext>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginExecutionContext>);
-static_assert(sizeof(EMLXPluginExecutionContext) == 16);
+static_assert(std::is_standard_layout_v<execution_context_t>);
+static_assert(std::is_trivially_copyable_v<execution_context_t>);
+static_assert(sizeof(execution_context_t) == 16);
 
-static_assert(std::is_standard_layout_v<EMLXPluginCall>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginCall>);
-static_assert(sizeof(EMLXPluginCall) == 40);
+static_assert(std::is_standard_layout_v<call_t>);
+static_assert(std::is_trivially_copyable_v<call_t>);
+static_assert(sizeof(call_t) == 40);
 
-static_assert(std::is_standard_layout_v<EMLXPluginCallbackDescriptor>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginCallbackDescriptor>);
-static_assert(sizeof(EMLXPluginCallbackDescriptor) == 72);
-static_assert(alignof(EMLXPluginCallbackDescriptor) == 8);
+static_assert(std::is_standard_layout_v<callback_descriptor_t>);
+static_assert(std::is_trivially_copyable_v<callback_descriptor_t>);
+static_assert(sizeof(callback_descriptor_t) == 72);
+static_assert(alignof(callback_descriptor_t) == 8);
 
-static_assert(std::is_standard_layout_v<EMLXPluginDescriptor>);
-static_assert(std::is_trivially_copyable_v<EMLXPluginDescriptor>);
-static_assert(sizeof(EMLXPluginDescriptor) == 48);
-static_assert(alignof(EMLXPluginDescriptor) == 8);
-static_assert(offsetof(EMLXPluginDescriptor, name) == 0);
-static_assert(offsetof(EMLXPluginDescriptor, descriptor_size) == 16);
-static_assert(offsetof(EMLXPluginDescriptor, callback_descriptor_size) == 24);
-static_assert(offsetof(EMLXPluginDescriptor, callback_count) == 32);
-static_assert(offsetof(EMLXPluginDescriptor, callbacks) == 40);
+static_assert(std::is_standard_layout_v<descriptor_t>);
+static_assert(std::is_trivially_copyable_v<descriptor_t>);
+static_assert(sizeof(descriptor_t) == 48);
+static_assert(alignof(descriptor_t) == 8);
+static_assert(offsetof(descriptor_t, name) == 0);
+static_assert(offsetof(descriptor_t, descriptor_size) == 16);
+static_assert(offsetof(descriptor_t, callback_descriptor_size) == 24);
+static_assert(offsetof(descriptor_t, callback_count) == 32);
+static_assert(offsetof(descriptor_t, callbacks) == 40);
 
-extern "C" EMLX_PLUGIN_EXPORT const EMLXPluginBootstrapV1 *
+} // namespace emlx::plugin
+
+extern "C" EMLX_PLUGIN_EXPORT const emlx::plugin::bootstrap_v1_t *
 emlx_plugin_descriptor_v1() noexcept;

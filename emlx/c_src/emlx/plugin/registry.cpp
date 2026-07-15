@@ -128,8 +128,8 @@ std::string callback_failure_error(const std::string &plugin_name,
   return prefix + separator + bounded_error(detail, detail_limit);
 }
 
-uint32_t invoke_count_policy(EMLXOperandCountFn policy,
-                             EMLXPluginInt64View attrs,
+uint32_t invoke_count_policy(emlx::plugin::operand_count_fn_t policy,
+                             emlx::plugin::int64_view_t attrs,
                              uint32_t fixed_count, const char *kind,
                              const std::string &plugin_name,
                              const std::string &callback_name,
@@ -165,7 +165,7 @@ uint32_t invoke_count_policy(EMLXOperandCountFn policy,
   return count;
 }
 
-std::string copy_required_string(EMLXPluginStringView view, size_t limit,
+std::string copy_required_string(emlx::plugin::string_view_t view, size_t limit,
                                  const char *field) {
   if (!view.data || view.size == 0 || view.size > limit ||
       view.size > std::numeric_limits<size_t>::max())
@@ -206,35 +206,35 @@ load_generic_candidate(const std::string &requested_name,
   }
 
   dlerror();
-  auto discovery = reinterpret_cast<EMLXPluginDiscoveryV1>(
+  auto discovery = reinterpret_cast<emlx::plugin::discovery_v1_fn_t>(
       dlsym(handle.value, "emlx_plugin_descriptor_v1"));
   const char *symbol_error = dlerror();
   if (!discovery || symbol_error)
     throw std::runtime_error("plugin is missing emlx_plugin_descriptor_v1");
 
-  const EMLXPluginBootstrapV1 *plugin_bootstrap = discovery();
+  const emlx::plugin::bootstrap_v1_t *plugin_bootstrap = discovery();
   if (!plugin_bootstrap)
     throw std::runtime_error("plugin returned a null bootstrap");
 
-  EMLXPluginBootstrapV1 bootstrap{};
+  emlx::plugin::bootstrap_v1_t bootstrap{};
   std::memcpy(&bootstrap, plugin_bootstrap, sizeof(bootstrap));
-  if (bootstrap.magic != EMLX_PLUGIN_MAGIC_V1 ||
-      bootstrap.bootstrap_size != sizeof(EMLXPluginBootstrapV1) ||
-      bootstrap.plugin_abi_version != EMLX_PLUGIN_ABI_V1 ||
-      bootstrap.descriptor_size != sizeof(EMLXPluginDescriptor) ||
+  if (bootstrap.magic != emlx::plugin::magic_v1 ||
+      bootstrap.bootstrap_size != sizeof(emlx::plugin::bootstrap_v1_t) ||
+      bootstrap.plugin_abi_version != emlx::plugin::abi_v1 ||
+      bootstrap.descriptor_size != sizeof(emlx::plugin::descriptor_t) ||
       !bootstrap.descriptor)
     throw std::runtime_error("plugin bootstrap is incompatible with EMLX");
 
   if (reinterpret_cast<uintptr_t>(bootstrap.descriptor) %
-          alignof(EMLXPluginDescriptor) !=
+          alignof(emlx::plugin::descriptor_t) !=
       0)
     throw std::runtime_error("plugin descriptor pointer is not aligned");
 
-  EMLXPluginDescriptor descriptor{};
+  emlx::plugin::descriptor_t descriptor{};
   std::memcpy(&descriptor, bootstrap.descriptor, sizeof(descriptor));
-  if (descriptor.descriptor_size != sizeof(EMLXPluginDescriptor) ||
+  if (descriptor.descriptor_size != sizeof(emlx::plugin::descriptor_t) ||
       descriptor.callback_descriptor_size !=
-          sizeof(EMLXPluginCallbackDescriptor))
+          sizeof(emlx::plugin::callback_descriptor_t))
     throw std::runtime_error("plugin descriptor is incompatible with EMLX");
 
   const std::string descriptor_name =
@@ -247,15 +247,15 @@ load_generic_candidate(const std::string &requested_name,
     throw std::runtime_error("plugin callback table is invalid");
   if (descriptor.callback_count > 0 &&
       reinterpret_cast<uintptr_t>(descriptor.callbacks) %
-              alignof(EMLXPluginCallbackDescriptor) !=
+              alignof(emlx::plugin::callback_descriptor_t) !=
           0)
     throw std::runtime_error("plugin callback table pointer is not aligned");
   const size_t callback_span =
       static_cast<size_t>(descriptor.callback_count) *
-      sizeof(EMLXPluginCallbackDescriptor);
+      sizeof(emlx::plugin::callback_descriptor_t);
   if (descriptor.callback_count > 0 &&
       callback_span / descriptor.callback_count !=
-          sizeof(EMLXPluginCallbackDescriptor))
+          sizeof(emlx::plugin::callback_descriptor_t))
     throw std::runtime_error("plugin callback table span overflows");
 
   auto loaded = std::make_shared<EMLXLoadedPlugin>();
@@ -263,16 +263,16 @@ load_generic_candidate(const std::string &requested_name,
   loaded->canonical_path = resolved_path;
 
   for (uint32_t i = 0; i < descriptor.callback_count; ++i) {
-    EMLXPluginCallbackDescriptor source{};
+    emlx::plugin::callback_descriptor_t source{};
     std::memcpy(&source, descriptor.callbacks + i, sizeof(source));
     auto callback = std::make_shared<EMLXLoadedPluginCallback>();
     callback->name = copy_required_string(source.name, kNameMax, "callback name");
     if (!valid_name(callback->name) || source.schema_version != 1 ||
         source.attr_schema_version != 1 || !source.callback ||
-        source.operand_count > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 ||
-        source.output_count > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1 ||
+        source.operand_count > emlx::plugin::operand_count_max_v1 ||
+        source.output_count > emlx::plugin::output_count_max_v1 ||
         source.device_capabilities == 0 ||
-        (source.device_capabilities & ~EMLX_PLUGIN_DEVICE_KNOWN_V1) != 0)
+        (source.device_capabilities & ~emlx::plugin::device_known_v1) != 0)
       throw std::runtime_error("plugin callback descriptor is invalid");
     if ((source.operand_count == 0) ==
         (source.operand_count_from_attrs == nullptr))
@@ -332,7 +332,7 @@ std::string emlx_plugin_callback_failure_error(
 }
 
 uint32_t emlx_invoke_plugin_count_policy(
-    EMLXOperandCountFn policy, EMLXPluginInt64View attrs,
+    emlx::plugin::operand_count_fn_t policy, emlx::plugin::int64_view_t attrs,
     uint32_t fixed_count, const char *kind, const std::string &plugin,
     const std::string &callback, size_t error_limit) {
   return invoke_count_policy(policy, attrs, fixed_count, kind, plugin, callback,
@@ -345,32 +345,32 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     const std::vector<int64_t> &attrs, const mlx::core::Device &device) {
   auto resolved = emlx_resolve_plugin_callback(plugin_name, callback_name);
   const auto &callback = *resolved.callback;
-  const EMLXPluginInt64View attr_view{attrs.data(), attrs.size()};
+  const emlx::plugin::int64_view_t attr_view{attrs.data(), attrs.size()};
   constexpr size_t callback_error_max = kErrorMax - kCallPluginNifSuffixSize;
   const uint32_t expected_operands =
       emlx_invoke_plugin_count_policy(
           callback.operand_count_from_attrs, attr_view, callback.operand_count,
           "operand", plugin_name, callback_name, callback_error_max);
-  if (expected_operands > EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 ||
+  if (expected_operands > emlx::plugin::operand_count_max_v1 ||
       operands.size() != expected_operands)
     throw std::runtime_error("plugin callback operand count mismatch");
   const uint32_t expected_outputs =
       emlx_invoke_plugin_count_policy(
           callback.output_count_from_attrs, attr_view, callback.output_count,
           "output", plugin_name, callback_name, callback_error_max);
-  if (expected_outputs > EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1)
+  if (expected_outputs > emlx::plugin::output_count_max_v1)
     throw std::runtime_error("plugin callback output count exceeds its limit");
   if (!emlx::g_current_worker)
     throw std::runtime_error("plugin execution has no current worker");
   const uint32_t device_bit = device.type == mlx::core::Device::DeviceType::cpu
-                                  ? EMLX_PLUGIN_DEVICE_CPU_V1
-                                  : EMLX_PLUGIN_DEVICE_GPU_METAL_V1;
+                                  ? emlx::plugin::device_cpu_v1
+                                  : emlx::plugin::device_gpu_metal_v1;
   if ((callback.device_capabilities & device_bit) == 0)
     throw std::runtime_error("plugin callback does not support the worker device");
   const auto stream = emlx::g_current_worker->stream();
-  EMLXPluginExecutionContext execution{&device, &stream};
-  EMLXPluginCall call{{operands.data(), operands.size()},
-                      attr_view, &execution};
+  emlx::plugin::execution_context_t execution{&device, &stream};
+  emlx::plugin::call_t call{{operands.data(), operands.size()}, attr_view,
+                            &execution};
   std::vector<mlx::core::array> outputs;
   std::optional<std::string> error;
   try {

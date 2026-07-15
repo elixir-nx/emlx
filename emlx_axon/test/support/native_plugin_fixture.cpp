@@ -39,7 +39,7 @@ inline constexpr char kPartialFailureName[] = "scale_add";
 inline constexpr char kPartialFailureName[] = "partial_failure";
 #endif
 template <size_t N>
-constexpr EMLXPluginStringView string_view(const char (&value)[N]) {
+constexpr emlx::plugin::string_view_t string_view(const char (&value)[N]) {
   return {value, N - 1};
 }
 
@@ -51,7 +51,7 @@ double f64_from_bits(int64_t bits) {
 }
 
 std::optional<std::string>
-scale_add(const EMLXPluginCall &call,
+scale_add(const emlx::plugin::call_t &call,
           std::vector<mlx::core::array> &outputs) {
   try {
     if (call.operands.size != 1 || call.attrs.size != 2 || !call.execution ||
@@ -73,7 +73,7 @@ scale_add(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-partial_failure(const EMLXPluginCall &call,
+partial_failure(const emlx::plugin::call_t &call,
                 std::vector<mlx::core::array> &outputs) {
   if (call.operands.size == 1)
     outputs.push_back(call.operands.data[0]);
@@ -81,7 +81,7 @@ partial_failure(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-wrong_shape(const EMLXPluginCall &call,
+wrong_shape(const emlx::plugin::call_t &call,
             std::vector<mlx::core::array> &outputs) {
   if (call.operands.size != 1 || !call.execution || !call.execution->stream) {
     return "wrong_shape expects one operand";
@@ -92,7 +92,7 @@ wrong_shape(const EMLXPluginCall &call,
 }
 
 std::optional<std::string>
-oversized_error(const EMLXPluginCall &,
+oversized_error(const emlx::plugin::call_t &,
                 std::vector<mlx::core::array> &) {
   std::string error;
   error.assign(4080, 'a');
@@ -102,80 +102,82 @@ oversized_error(const EMLXPluginCall &,
 }
 
 std::optional<std::string>
-invalid_utf8_error(const EMLXPluginCall &,
+invalid_utf8_error(const emlx::plugin::call_t &,
                    std::vector<mlx::core::array> &) {
   return std::string("invalid byte: ") + static_cast<char>(0xff);
 }
 
 std::optional<std::string>
-empty_error(const EMLXPluginCall &, std::vector<mlx::core::array> &) {
+empty_error(const emlx::plugin::call_t &, std::vector<mlx::core::array> &) {
   return std::string{};
 }
 
 std::optional<std::string>
-throw_after_output(const EMLXPluginCall &call,
+throw_after_output(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
   outputs.push_back(call.operands.data[0]);
   throw std::runtime_error("intentional callback exception");
 }
 
 std::optional<std::string>
-unknown_throw_after_output(const EMLXPluginCall &call,
+unknown_throw_after_output(const emlx::plugin::call_t &call,
                            std::vector<mlx::core::array> &outputs) {
   outputs.push_back(call.operands.data[0]);
   throw 42;
 }
 
 std::optional<std::string>
-wrong_output_count(const EMLXPluginCall &call,
+wrong_output_count(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
   outputs.push_back(call.operands.data[0]);
   outputs.push_back(call.operands.data[0]);
   return std::nullopt;
 }
 
-bool throwing_operand_policy(EMLXPluginInt64View, uint32_t &,
+bool throwing_operand_policy(emlx::plugin::int64_view_t, uint32_t &,
                              std::string &) {
   throw std::runtime_error("intentional operand policy exception");
 }
 
-bool throwing_output_policy(EMLXPluginInt64View, uint32_t &,
+bool throwing_output_policy(emlx::plugin::int64_view_t, uint32_t &,
                             std::string &) {
   throw std::runtime_error("intentional output policy exception");
 }
 
-bool oversized_operand_policy(EMLXPluginInt64View, uint32_t &count,
+bool oversized_operand_policy(emlx::plugin::int64_view_t, uint32_t &count,
                                std::string &) {
-  count = EMLX_PLUGIN_OPERAND_COUNT_MAX_V1 + 1;
+  count = emlx::plugin::operand_count_max_v1 + 1;
   return true;
 }
 
-bool oversized_output_policy(EMLXPluginInt64View, uint32_t &count,
+bool oversized_output_policy(emlx::plugin::int64_view_t, uint32_t &count,
                               std::string &) {
-  count = EMLX_PLUGIN_OUTPUT_COUNT_MAX_V1 + 1;
+  count = emlx::plugin::output_count_max_v1 + 1;
   return true;
 }
 
-bool zero_count_policy(EMLXPluginInt64View, uint32_t &count, std::string &) {
+bool zero_count_policy(emlx::plugin::int64_view_t, uint32_t &count,
+                       std::string &) {
   count = 0;
   return true;
 }
 
-bool one_count_policy(EMLXPluginInt64View, uint32_t &count, std::string &) {
+bool one_count_policy(emlx::plugin::int64_view_t, uint32_t &count,
+                      std::string &) {
   count = 1;
   return true;
 }
 
 std::optional<std::string>
-callback_must_not_run(const EMLXPluginCall &,
+callback_must_not_run(const emlx::plugin::call_t &,
                       std::vector<mlx::core::array> &) {
   throw std::runtime_error("oversized policy callback ran");
 }
 
-constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
+constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
 #if defined(EMLX_FIXTURE_NULL_CALLBACK)
     {string_view(kPrimaryCallbackName), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, nullptr},
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, nullptr},
 #else
     {string_view(kPrimaryCallbackName),
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_SCHEMA)
@@ -203,73 +205,73 @@ constinit const EMLXPluginCallbackDescriptor kCallbacks[] = {
 #if defined(EMLX_FIXTURE_BAD_DEVICE)
      1U << 12,
 #else
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
 #endif
      scale_add},
 #endif
     {string_view(kPartialFailureName), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      partial_failure},
     {string_view(kWrongShape), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, wrong_shape},
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, wrong_shape},
     {string_view(kCpuOnly), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1, scale_add},
+     emlx::plugin::device_cpu_v1, scale_add},
     {string_view(kGpuOnly), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add},
+     emlx::plugin::device_gpu_metal_v1, scale_add},
     {string_view(kThrowingOperandPolicy), 1, 1, 0, throwing_operand_policy, 1,
-     nullptr, EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     nullptr, emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      scale_add},
     {string_view(kThrowingOutputPolicy), 1, 1, 1, nullptr, 0,
      throwing_output_policy,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add},
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, scale_add},
     {string_view(kOversizedError), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      oversized_error},
     {string_view(kInvalidUtf8Error), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      invalid_utf8_error},
     {string_view(kEmptyError), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, empty_error},
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, empty_error},
     {string_view(kThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      throw_after_output},
     {string_view(kUnknownThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      unknown_throw_after_output},
     {string_view(kWrongOutputCount), 1, 1, 1, nullptr, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      wrong_output_count},
     {string_view(kOversizedOperandPolicy), 1, 1, 0,
      oversized_operand_policy, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      callback_must_not_run},
     {string_view(kOversizedOutputPolicy), 1, 1, 1, nullptr, 0,
      oversized_output_policy,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      callback_must_not_run},
     {string_view(kZeroOperandPolicy), 1, 1, 0, zero_count_policy, 1, nullptr,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      callback_must_not_run},
     {string_view(kZeroOutputPolicy), 1, 1, 1, nullptr, 0, zero_count_policy,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1,
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1,
      callback_must_not_run},
     {string_view(kDynamicCounts), 1, 1, 0, one_count_policy, 0,
      one_count_policy,
-     EMLX_PLUGIN_DEVICE_CPU_V1 | EMLX_PLUGIN_DEVICE_GPU_METAL_V1, scale_add},
+     emlx::plugin::device_cpu_v1 | emlx::plugin::device_gpu_metal_v1, scale_add},
 };
 
 #if defined(EMLX_FIXTURE_MISALIGNED_CALLBACKS)
 #define EMLX_FIXTURE_CALLBACKS_PTR                                             \
-  reinterpret_cast<const EMLXPluginCallbackDescriptor *>(                    \
+  reinterpret_cast<const emlx::plugin::callback_descriptor_t *>(              \
       reinterpret_cast<const char *>(kCallbacks) + 1)
 #else
 #define EMLX_FIXTURE_CALLBACKS_PTR kCallbacks
 #endif
 
 #if defined(EMLX_FIXTURE_MISALIGNED_CALLBACKS)
-const EMLXPluginDescriptor kDescriptor{
+const emlx::plugin::descriptor_t kDescriptor{
 #else
-constinit const EMLXPluginDescriptor kDescriptor{
+constinit const emlx::plugin::descriptor_t kDescriptor{
 #endif
 #if defined(EMLX_FIXTURE_NULL_PLUGIN_NAME)
     {nullptr, 5},
@@ -277,14 +279,14 @@ constinit const EMLXPluginDescriptor kDescriptor{
     string_view(kPluginName),
 #endif
 #if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_INNER_SIZE)
-    sizeof(EMLXPluginDescriptor) + 1,
+    sizeof(emlx::plugin::descriptor_t) + 1,
 #else
-    sizeof(EMLXPluginDescriptor),
+    sizeof(emlx::plugin::descriptor_t),
 #endif
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_DESCRIPTOR_SIZE)
-    sizeof(EMLXPluginCallbackDescriptor) + 1,
+    sizeof(emlx::plugin::callback_descriptor_t) + 1,
 #else
-    sizeof(EMLXPluginCallbackDescriptor),
+    sizeof(emlx::plugin::callback_descriptor_t),
 #endif
 #if defined(EMLX_FIXTURE_TOO_MANY_CALLBACKS)
     257,
@@ -298,29 +300,29 @@ constinit const EMLXPluginDescriptor kDescriptor{
 #endif
 
 #if defined(EMLX_FIXTURE_MISALIGNED_DESCRIPTOR)
-const EMLXPluginBootstrapV1 kBootstrap{
+const emlx::plugin::bootstrap_v1_t kBootstrap{
 #else
-constinit const EMLXPluginBootstrapV1 kBootstrap{
+constinit const emlx::plugin::bootstrap_v1_t kBootstrap{
 #endif
 #if defined(EMLX_FIXTURE_BAD_MAGIC)
     0,
 #else
-    EMLX_PLUGIN_MAGIC_V1,
+    emlx::plugin::magic_v1,
 #endif
 #if defined(EMLX_FIXTURE_BAD_BOOTSTRAP_SIZE)
-    sizeof(EMLXPluginBootstrapV1) + 1,
+    sizeof(emlx::plugin::bootstrap_v1_t) + 1,
 #else
-    sizeof(EMLXPluginBootstrapV1),
+    sizeof(emlx::plugin::bootstrap_v1_t),
 #endif
 #if defined(EMLX_FIXTURE_BAD_BOOTSTRAP_ABI)
     2,
 #else
-    EMLX_PLUGIN_ABI_V1,
+    emlx::plugin::abi_v1,
 #endif
 #if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_SIZE)
-    sizeof(EMLXPluginDescriptor) + 1,
+    sizeof(emlx::plugin::descriptor_t) + 1,
 #else
-    sizeof(EMLXPluginDescriptor),
+    sizeof(emlx::plugin::descriptor_t),
 #endif
 #if defined(EMLX_FIXTURE_NULL_DESCRIPTOR)
     nullptr};
@@ -332,7 +334,7 @@ constinit const EMLXPluginBootstrapV1 kBootstrap{
 
 } // namespace
 
-extern "C" EMLX_PLUGIN_EXPORT const EMLXPluginBootstrapV1 *
+extern "C" EMLX_PLUGIN_EXPORT const emlx::plugin::bootstrap_v1_t *
 emlx_plugin_descriptor_v1() noexcept {
   return &kBootstrap;
 }
