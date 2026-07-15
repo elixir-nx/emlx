@@ -156,6 +156,7 @@ defmodule EMLXAxon.PluginMetadataTest do
         List.replace_at(instruction.attrs, 4, "1"),
         List.replace_at(instruction.attrs, 5, -1),
         List.replace_at(instruction.attrs, 5, 1025),
+        List.replace_at(instruction.attrs, 5, 9_223_372_036_854_775_807),
         List.replace_at(instruction.attrs, 5, "1"),
         List.replace_at(instruction.attrs, 6, :not_a_dtype),
         List.replace_at(instruction.attrs, 6, "f32"),
@@ -167,6 +168,7 @@ defmodule EMLXAxon.PluginMetadataTest do
         List.replace_at(instruction.attrs, 8, "2"),
         List.replace_at(instruction.attrs, 9, -1),
         List.replace_at(instruction.attrs, 9, 16_385),
+        List.replace_at(instruction.attrs, 9, 9_223_372_036_854_775_807),
         List.replace_at(instruction.attrs, 9, "2"),
         Enum.take(instruction.attrs, 6),
         Enum.take(instruction.attrs, 7),
@@ -275,27 +277,6 @@ defmodule EMLXAxon.PluginMetadataTest do
       Proof.operation(input, "throwing_output_policy")
     end
 
-    assert_all_close(Proof.scale_add(input, 2.0, 1.0), Nx.tensor([3.0, 5.0]))
-  end
-
-  test "eager dispatch rejects oversized dynamic counts before callback execution" do
-    input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
-
-    operand_error =
-      assert_raise EMLX.NIFError, fn ->
-        Proof.operation(input, "oversized_operand_policy")
-      end
-
-    assert operand_error.message =~ "operand count mismatch"
-    refute operand_error.message =~ "callback ran"
-
-    output_error =
-      assert_raise EMLX.NIFError, fn ->
-        Proof.operation(input, "oversized_output_policy")
-      end
-
-    assert output_error.message =~ "output count exceeds its limit"
-    refute output_error.message =~ "callback ran"
     assert_all_close(Proof.scale_add(input, 2.0, 1.0), Nx.tensor([3.0, 5.0]))
   end
 

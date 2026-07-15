@@ -355,7 +355,7 @@ defmodule EMLXAxon.Qwen3GenerateTest do
     assert metadata.finish_reason == :stop
   end
 
-  test "dense native chunk supports token counts across the former plugin output limit" do
+  test "dense native chunk supports large token counts" do
     for count <- [1022, 1023] do
       {:ok, state} =
         DenseLoader.from_model_info(%{

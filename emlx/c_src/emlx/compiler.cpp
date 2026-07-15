@@ -2068,9 +2068,18 @@ static void resolve_plugin_instruction(Instruction &instr) {
       attr_schema <= 0 || attr_schema > UINT32_MAX ||
       static_cast<uint32_t>(attr_schema) != callback.attr_schema_version)
     throw std::runtime_error("emlx::native: plugin callback schema mismatch");
-  if (output_count < 0 ||
-      output_count > emlx::plugin::output_count_max_v1)
-    throw std::runtime_error("emlx::native: plugin output count exceeds its limit");
+  if (output_count < 0) {
+    throw std::runtime_error("emlx::native: plugin output count must be nonnegative");
+  }
+
+  // Every output template needs at least a dtype and rank, and the instruction
+  // must retain one final field for the callback attribute count. Bound the
+  // reservation by the metadata that is already present rather than an
+  // arbitrary global ABI output limit.
+  const size_t output_template_budget = attrs.size() - 7;
+  if (static_cast<uint64_t>(output_count) > output_template_budget / 2) {
+    throw std::runtime_error("emlx::native: malformed plugin output count");
+  }
 
   size_t cursor = 6;
   std::vector<PluginOutputTemplate> templates;
@@ -2096,9 +2105,10 @@ static void resolve_plugin_instruction(Instruction &instr) {
     throw std::runtime_error("emlx::native: missing plugin callback attribute count");
   const int64_t callback_attr_count =
       plugin_attr_int(attrs[cursor++], "callback attribute count");
-  if (callback_attr_count < 0 || callback_attr_count > 16384 ||
-      cursor + static_cast<size_t>(callback_attr_count) != attrs.size())
+  if (callback_attr_count < 0 ||
+      static_cast<uint64_t>(callback_attr_count) != attrs.size() - cursor) {
     throw std::runtime_error("emlx::native: malformed plugin callback attributes");
+  }
   std::vector<int64_t> callback_attrs;
   callback_attrs.reserve(static_cast<size_t>(callback_attr_count));
   while(cursor < attrs.size()) {
@@ -2121,12 +2131,6 @@ static void resolve_plugin_instruction(Instruction &instr) {
   }
   if (instr.operands.size() != expected_operands) {
     throw std::runtime_error("emlx::native: plugin operand count mismatch");
-  }
-  if (expected_operands > emlx::plugin::operand_count_max_v1) {
-    throw std::runtime_error("emlx::native: plugin operand count exceeds its limit");
-  }
-  if (expected_outputs > emlx::plugin::output_count_max_v1) {
-    throw std::runtime_error("emlx::native: plugin output count exceeds its limit");
   }
   if (templates.size() != expected_outputs) {
     throw std::runtime_error("emlx::native: plugin output count mismatch");

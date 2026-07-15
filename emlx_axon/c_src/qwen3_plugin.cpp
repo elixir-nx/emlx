@@ -1380,16 +1380,6 @@ inline constexpr emlx::plugin::device_view_t kSupportedDevices{
     sizeof(kSupportedDeviceTypes) / sizeof(kSupportedDeviceTypes[0])};
 inline constexpr int64_t kMaxLayerCount = 256;
 inline constexpr int64_t kMaxChunkTokenCount = 4096;
-inline constexpr uint32_t kMaxDenseChunkOperands =
-    4U + static_cast<uint32_t>(kMaxLayerCount) * 13U;
-inline constexpr uint32_t kMaxGeneralizedChunkOperands =
-    2U + static_cast<uint32_t>(kMaxLayerCount) * (6U + 7U * 3U) + 1U + 3U;
-inline constexpr uint32_t kMaxChunkOutputs =
-    1U + static_cast<uint32_t>(kMaxLayerCount) * 2U;
-static_assert(kMaxDenseChunkOperands <= emlx::plugin::operand_count_max_v1);
-static_assert(kMaxGeneralizedChunkOperands <=
-              emlx::plugin::operand_count_max_v1);
-static_assert(kMaxChunkOutputs <= emlx::plugin::output_count_max_v1);
 
 template <size_t N>
 constexpr emlx::plugin::string_view_t string_view(const char (&value)[N]) {

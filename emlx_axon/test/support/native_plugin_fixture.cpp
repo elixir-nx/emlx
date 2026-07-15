@@ -23,8 +23,6 @@ inline constexpr char kEmptyError[] = "empty_error";
 inline constexpr char kThrowAfterOutput[] = "throw_after_output";
 inline constexpr char kUnknownThrowAfterOutput[] = "unknown_throw_after_output";
 inline constexpr char kWrongOutputCount[] = "wrong_output_count";
-inline constexpr char kOversizedOperandPolicy[] = "oversized_operand_policy";
-inline constexpr char kOversizedOutputPolicy[] = "oversized_output_policy";
 inline constexpr char kZeroOperandPolicy[] = "zero_operand_policy";
 inline constexpr char kZeroOutputPolicy[] = "zero_output_policy";
 inline constexpr char kDynamicCounts[] = "dynamic_counts";
@@ -170,18 +168,6 @@ bool throwing_output_policy(emlx::plugin::int64_view_t, uint32_t &,
   throw std::runtime_error("intentional output policy exception");
 }
 
-bool oversized_operand_policy(emlx::plugin::int64_view_t, uint32_t &count,
-                               std::string &) {
-  count = emlx::plugin::operand_count_max_v1 + 1;
-  return true;
-}
-
-bool oversized_output_policy(emlx::plugin::int64_view_t, uint32_t &count,
-                              std::string &) {
-  count = emlx::plugin::output_count_max_v1 + 1;
-  return true;
-}
-
 bool zero_count_policy(emlx::plugin::int64_view_t, uint32_t &count,
                        std::string &) {
   count = 0;
@@ -264,12 +250,6 @@ constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
      kAllDevices, unknown_throw_after_output},
     {string_view(kWrongOutputCount), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      wrong_output_count},
-    {string_view(kOversizedOperandPolicy), 1, 1, 0, oversized_operand_policy, 1,
-     nullptr, kAllDevices,
-     callback_must_not_run},
-    {string_view(kOversizedOutputPolicy), 1, 1, 1, nullptr, 0,
-     oversized_output_policy, kAllDevices,
-     callback_must_not_run},
     {string_view(kZeroOperandPolicy), 1, 1, 0, zero_count_policy, 1, nullptr,
      kAllDevices, callback_must_not_run},
     {string_view(kZeroOutputPolicy), 1, 1, 1, nullptr, 0, zero_count_policy,

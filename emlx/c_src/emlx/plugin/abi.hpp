@@ -24,8 +24,6 @@ namespace emlx::plugin {
 // expose a versioned discovery symbol rather than changing V1 in place.
 inline constexpr uint64_t magic_v1 = 0x454D4C58504C4731ULL;
 inline constexpr uint32_t abi_v1 = 1;
-inline constexpr uint32_t operand_count_max_v1 = 8192;
-inline constexpr uint32_t output_count_max_v1 = 1024;
 
 // Plugin-owned views are borrowed by EMLX only while loading the descriptor.
 // Call-owned views remain valid only for the count-policy or callback

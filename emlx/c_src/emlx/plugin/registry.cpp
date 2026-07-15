@@ -275,8 +275,6 @@ load_generic_candidate(const std::string &requested_name,
     callback->name = copy_required_string(source.name, kNameMax, "callback name");
     if (!valid_name(callback->name) || source.schema_version != 1 ||
         source.attr_schema_version != 1 || !source.callback ||
-        source.operand_count > emlx::plugin::operand_count_max_v1 ||
-        source.output_count > emlx::plugin::output_count_max_v1 ||
         !source.supported_devices.data || source.supported_devices.size == 0 ||
         source.supported_devices.size > kDeviceTypesMax ||
         reinterpret_cast<uintptr_t>(source.supported_devices.data) %
@@ -381,15 +379,12 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
       emlx_invoke_plugin_count_policy(
           callback.operand_count_from_attrs, attr_view, callback.operand_count,
           "operand", plugin_name, callback_name, callback_error_max);
-  if (expected_operands > emlx::plugin::operand_count_max_v1 ||
-      operands.size() != expected_operands)
+  if (operands.size() != expected_operands)
     throw std::runtime_error("plugin callback operand count mismatch");
   const uint32_t expected_outputs =
       emlx_invoke_plugin_count_policy(
           callback.output_count_from_attrs, attr_view, callback.output_count,
           "output", plugin_name, callback_name, callback_error_max);
-  if (expected_outputs > emlx::plugin::output_count_max_v1)
-    throw std::runtime_error("plugin callback output count exceeds its limit");
   if (!emlx::g_current_worker)
     throw std::runtime_error("plugin execution has no current worker");
   if (!emlx_plugin_callback_supports_device(callback, device.type))
