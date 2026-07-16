@@ -1032,6 +1032,7 @@ static int open_resources(ErlNifEnv *env) {
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
   (void)priv_data;
   (void)load_info;
+  fine::__private__::init_atoms(env);
   return open_resources(env);
 }
 

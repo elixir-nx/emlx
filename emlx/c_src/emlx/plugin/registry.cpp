@@ -343,6 +343,23 @@ load_generic_candidate(const std::string &requested_name,
   return loaded;
 }
 
+fine::Term load_plugin_impl(ErlNifEnv *env, std::string name,
+                            std::string path) {
+  try {
+    if (!valid_name(name)) {
+      return nx::nif::error(env, "load_plugin expects a valid name");
+    }
+    load_generic_candidate(name, path);
+    return nx::nif::ok(env);
+  } catch (const std::bad_alloc &) {
+    return nx::nif::error(env, "plugin loader allocation failed");
+  } catch (const std::exception &error) {
+    return nx::nif::error(env, bounded_error(error.what()).c_str());
+  } catch (...) {
+    return nx::nif::error(env, "internal plugin loader error");
+  }
+}
+
 } // namespace
 
 EMLXSharedObjectHandle::~EMLXSharedObjectHandle() {
@@ -547,23 +564,5 @@ FINE_ASYNC_NIF(call_plugin)
 #endif
 
 ERL_NIF_TERM load_plugin(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-  (void)argc;
-  try {
-    std::string name;
-    std::string path;
-    if (!nx::nif::get(env, argv[0], name) || !valid_name(name)) {
-      return nx::nif::error(env, "load_plugin expects a valid name");
-    }
-    if (!nx::nif::get(env, argv[1], path)) {
-      return nx::nif::error(env, "load_plugin expects a path string");
-    }
-    load_generic_candidate(name, path);
-    return nx::nif::ok(env);
-  } catch (const std::bad_alloc &) {
-    return nx::nif::error(env, "plugin loader allocation failed");
-  } catch (const std::exception &error) {
-    return nx::nif::error(env, bounded_error(error.what()).c_str());
-  } catch (...) {
-    return nx::nif::error(env, "internal plugin loader error");
-  }
+  return fine::nif(env, argc, argv, load_plugin_impl);
 }

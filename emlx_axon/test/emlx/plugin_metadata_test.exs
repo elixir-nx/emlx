@@ -206,6 +206,11 @@ defmodule EMLXAxon.PluginMetadataTest do
     refute function_exported?(EMLX.NIF, :load_plugin, 3)
   end
 
+  test "plugin loader validates its string arguments through Fine" do
+    assert_raise ArgumentError, fn -> EMLX.NIF.load_plugin(:proof, "/tmp/proof.so") end
+    assert_raise ArgumentError, fn -> EMLX.NIF.load_plugin("proof", :invalid_path) end
+  end
+
   test "loader rejects incompatible descriptors before publication" do
     temporary =
       Path.join(System.tmp_dir!(), "emlx-plugin-malformed-#{System.unique_integer([:positive])}")
