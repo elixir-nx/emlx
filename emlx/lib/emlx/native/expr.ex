@@ -398,9 +398,19 @@ defmodule EMLX.Native.Expr do
     operand_refs = Enum.map(operands, &Map.fetch!(state.node_to_ref, &1.data.id))
 
     refs =
-      case {opcode, Enum.at(attrs, 5)} do
-        {:plugin, count} when is_integer(count) and count > 1 ->
-          for _ <- 1..count, do: make_ref()
+      case {opcode, attrs} do
+        {:plugin,
+         [
+           _wire_version,
+           _plugin_name,
+           _callback_name,
+           _schema_version,
+           _attr_schema_version,
+           output_count
+           | _rest
+         ]}
+        when is_integer(output_count) and output_count > 1 ->
+          for _ <- 1..output_count, do: make_ref()
 
         _ ->
           make_ref()
