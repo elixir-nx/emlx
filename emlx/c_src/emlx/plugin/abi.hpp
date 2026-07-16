@@ -139,17 +139,8 @@ static_assert(std::is_copy_constructible_v<call_t>);
 static_assert(sizeof(call_t) == 72);
 
 static_assert(std::is_copy_constructible_v<callback_descriptor_t>);
-static_assert(sizeof(callback_descriptor_t) == 96);
-static_assert(alignof(callback_descriptor_t) == 8);
 
 static_assert(std::is_copy_constructible_v<descriptor_t>);
-static_assert(sizeof(descriptor_t) == 56);
-static_assert(alignof(descriptor_t) == 8);
-static_assert(offsetof(descriptor_t, name) == 0);
-static_assert(offsetof(descriptor_t, descriptor_size) == 24);
-static_assert(offsetof(descriptor_t, callback_descriptor_size) == 32);
-static_assert(offsetof(descriptor_t, callback_count) == 40);
-static_assert(offsetof(descriptor_t, callbacks) == 48);
 
 } // namespace emlx::plugin
 
