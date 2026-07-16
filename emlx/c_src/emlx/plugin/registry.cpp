@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace {
 
@@ -25,16 +26,6 @@ constexpr size_t kCallPluginNifSuffixSize = sizeof(" in NIF.call_plugin/5") - 1;
 std::unordered_map<std::string, std::shared_ptr<const EMLXLoadedPlugin>>
     g_plugins;
 std::shared_mutex g_plugin_mutex;
-
-struct CandidateHandle {
-  void *value = nullptr;
-  ~CandidateHandle() {
-    if (value) {
-      dlclose(value);
-    }
-  }
-  void release() { value = nullptr; }
-};
 
 bool valid_name(const std::string &value) {
   if (value.empty() || value.size() > kNameMax) {
@@ -232,8 +223,9 @@ load_generic_candidate(const std::string &requested_name,
     }
   }
 
-  CandidateHandle handle{dlopen(resolved_path.c_str(), RTLD_NOW | RTLD_LOCAL)};
-  if (!handle.value) {
+  EMLXSharedObjectHandle handle{
+      dlopen(resolved_path.c_str(), RTLD_NOW | RTLD_LOCAL)};
+  if (!handle) {
     const char *detail = dlerror();
     throw std::runtime_error(std::string("failed to load plugin: ") +
                              (detail ? detail : "unknown loader error"));
@@ -241,7 +233,7 @@ load_generic_candidate(const std::string &requested_name,
 
   dlerror();
   auto discovery = reinterpret_cast<emlx::plugin::discovery_v1_fn_t>(
-      dlsym(handle.value, "emlx_plugin_descriptor_v1"));
+      dlsym(handle.get(), "emlx_plugin_descriptor_v1"));
   const char *symbol_error = dlerror();
   if (symbol_error) {
     throw std::runtime_error(std::string("failed to resolve ") +
@@ -324,6 +316,7 @@ load_generic_candidate(const std::string &requested_name,
   }
 
   auto loaded = std::make_shared<EMLXLoadedPlugin>();
+  loaded->shared_object = std::move(handle);
   loaded->name = descriptor_name;
   loaded->canonical_path = resolved_path;
 
@@ -347,11 +340,31 @@ load_generic_candidate(const std::string &requested_name,
           "plugin registration conflicts with an accepted plugin");
     }
   }
-  handle.release();
   return loaded;
 }
 
 } // namespace
+
+EMLXSharedObjectHandle::~EMLXSharedObjectHandle() {
+  if (value_) {
+    dlclose(value_);
+  }
+}
+
+EMLXSharedObjectHandle::EMLXSharedObjectHandle(
+    EMLXSharedObjectHandle &&other) noexcept
+    : value_(std::exchange(other.value_, nullptr)) {}
+
+EMLXSharedObjectHandle &EMLXSharedObjectHandle::operator=(
+    EMLXSharedObjectHandle &&other) noexcept {
+  if (this != &other) {
+    if (value_) {
+      dlclose(value_);
+    }
+    value_ = std::exchange(other.value_, nullptr);
+  }
+  return *this;
+}
 
 EMLXLoadedPluginCallback::EMLXLoadedPluginCallback(
     const emlx::plugin::callback_descriptor_t &source)

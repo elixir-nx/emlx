@@ -19,6 +19,23 @@ ERL_NIF_TERM load_plugin(ErlNifEnv *, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM call_plugin(ErlNifEnv *, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM call_plugin_async(ErlNifEnv *, int, const ERL_NIF_TERM[]);
 
+class EMLXSharedObjectHandle {
+public:
+  explicit EMLXSharedObjectHandle(void *value = nullptr) : value_(value) {}
+  ~EMLXSharedObjectHandle();
+
+  EMLXSharedObjectHandle(const EMLXSharedObjectHandle &) = delete;
+  EMLXSharedObjectHandle &operator=(const EMLXSharedObjectHandle &) = delete;
+  EMLXSharedObjectHandle(EMLXSharedObjectHandle &&other) noexcept;
+  EMLXSharedObjectHandle &operator=(EMLXSharedObjectHandle &&other) noexcept;
+
+  explicit operator bool() const { return value_ != nullptr; }
+  void *get() const { return value_; }
+
+private:
+  void *value_;
+};
+
 struct EMLXLoadedPluginCallback {
   explicit EMLXLoadedPluginCallback(
       const emlx::plugin::callback_descriptor_t &source);
@@ -35,6 +52,7 @@ struct EMLXLoadedPluginCallback {
 };
 
 struct EMLXLoadedPlugin {
+  EMLXSharedObjectHandle shared_object;
   std::string name;
   std::string canonical_path;
   std::unordered_map<std::string,
