@@ -33,11 +33,7 @@ template <typename T> struct view_t {
   uint64_t size;
 };
 
-struct string_view_t {
-  const char *data;
-  uint64_t size;
-};
-
+using string_view_t = view_t<char>;
 using array_view_t = view_t<mlx::core::array>;
 using int64_view_t = view_t<int64_t>;
 using device_type_t = mlx::core::Device::DeviceType;
