@@ -6,7 +6,7 @@
 #include <optional>
 #include <sstream>
 
-namespace emlx_qwen3_plugin {
+namespace emlx_axon::plugin::qwen3 {
 
 struct LinearWeight {
   bool quantized = false;
