@@ -330,73 +330,7 @@ load_generic_candidate(const std::string &requested_name,
   for (uint32_t i = 0; i < descriptor.callback_count; ++i) {
     emlx::plugin::callback_descriptor_t source{};
     std::memcpy(&source, descriptor.callbacks + i, sizeof(source));
-    auto callback = std::make_shared<EMLXLoadedPluginCallback>();
-    callback->name =
-        copy_required_string(source.name, kNameMax, "callback name");
-    if (!valid_name(callback->name)) {
-      throw std::runtime_error(
-          "plugin callback name contains invalid characters");
-    }
-    if (source.schema_version != 1) {
-      throw std::runtime_error("plugin callback schema version is unsupported");
-    }
-    if (source.attr_schema_version != 1) {
-      throw std::runtime_error(
-          "plugin callback attribute schema version is unsupported");
-    }
-    if (!source.callback) {
-      throw std::runtime_error("plugin callback function pointer is null");
-    }
-    if (!source.supported_devices.data) {
-      throw std::runtime_error(
-          "plugin callback supported device pointer is null");
-    }
-    if (source.supported_devices.size == 0) {
-      throw std::runtime_error("plugin callback supports no devices");
-    }
-    if (source.supported_devices.size > kDeviceTypesMax) {
-      throw std::runtime_error(
-          "plugin callback supported device count exceeds its limit");
-    }
-    if (reinterpret_cast<uintptr_t>(source.supported_devices.data) %
-            alignof(emlx::plugin::device_type_t) !=
-        0) {
-      throw std::runtime_error(
-          "plugin callback supported device pointer is not aligned");
-    }
-    if ((source.operand_count == 0) ==
-        (source.operand_count_from_attrs == nullptr)) {
-      throw std::runtime_error("plugin callback operand policy is invalid");
-    }
-    if ((source.output_count == 0) ==
-        (source.output_count_from_attrs == nullptr)) {
-      throw std::runtime_error("plugin callback output policy is invalid");
-    }
-    callback->schema_version = source.schema_version;
-    callback->attr_schema_version = source.attr_schema_version;
-    callback->operand_count = source.operand_count;
-    callback->operand_count_from_attrs = source.operand_count_from_attrs;
-    callback->output_count = source.output_count;
-    callback->output_count_from_attrs = source.output_count_from_attrs;
-    callback->supported_devices.reserve(source.supported_devices.size);
-    for (uint64_t device_index = 0;
-         device_index < source.supported_devices.size; ++device_index) {
-      emlx::plugin::device_type_t device_type{};
-      std::memcpy(&device_type, source.supported_devices.data + device_index,
-                  sizeof(device_type));
-      if (!valid_device_type(device_type)) {
-        throw std::runtime_error(
-            "plugin callback contains an invalid device type");
-      }
-      if (std::find(callback->supported_devices.begin(),
-                    callback->supported_devices.end(),
-                    device_type) != callback->supported_devices.end()) {
-        throw std::runtime_error(
-            "plugin callback contains a duplicate device type");
-      }
-      callback->supported_devices.push_back(device_type);
-    }
-    callback->callback = source.callback;
+    auto callback = std::make_shared<EMLXLoadedPluginCallback>(source);
     if (!loaded->callbacks.emplace(callback->name, callback).second) {
       throw std::runtime_error("plugin callback names must be unique");
     }
@@ -418,6 +352,73 @@ load_generic_candidate(const std::string &requested_name,
 }
 
 } // namespace
+
+EMLXLoadedPluginCallback::EMLXLoadedPluginCallback(
+    const emlx::plugin::callback_descriptor_t &source)
+    : name(copy_required_string(source.name, kNameMax, "callback name")),
+      schema_version(source.schema_version),
+      attr_schema_version(source.attr_schema_version),
+      operand_count(source.operand_count),
+      operand_count_from_attrs(source.operand_count_from_attrs),
+      output_count(source.output_count),
+      output_count_from_attrs(source.output_count_from_attrs),
+      callback(source.callback) {
+  if (!valid_name(name)) {
+    throw std::runtime_error(
+        "plugin callback name contains invalid characters");
+  }
+  if (schema_version != 1) {
+    throw std::runtime_error("plugin callback schema version is unsupported");
+  }
+  if (attr_schema_version != 1) {
+    throw std::runtime_error(
+        "plugin callback attribute schema version is unsupported");
+  }
+  if (!callback) {
+    throw std::runtime_error("plugin callback function pointer is null");
+  }
+  if (!source.supported_devices.data) {
+    throw std::runtime_error(
+        "plugin callback supported device pointer is null");
+  }
+  if (source.supported_devices.size == 0) {
+    throw std::runtime_error("plugin callback supports no devices");
+  }
+  if (source.supported_devices.size > kDeviceTypesMax) {
+    throw std::runtime_error(
+        "plugin callback supported device count exceeds its limit");
+  }
+  if (reinterpret_cast<uintptr_t>(source.supported_devices.data) %
+          alignof(emlx::plugin::device_type_t) !=
+      0) {
+    throw std::runtime_error(
+        "plugin callback supported device pointer is not aligned");
+  }
+  if ((operand_count == 0) == (operand_count_from_attrs == nullptr)) {
+    throw std::runtime_error("plugin callback operand policy is invalid");
+  }
+  if ((output_count == 0) == (output_count_from_attrs == nullptr)) {
+    throw std::runtime_error("plugin callback output policy is invalid");
+  }
+
+  supported_devices.reserve(source.supported_devices.size);
+  for (uint64_t device_index = 0;
+       device_index < source.supported_devices.size; ++device_index) {
+    emlx::plugin::device_type_t device_type{};
+    std::memcpy(&device_type, source.supported_devices.data + device_index,
+                sizeof(device_type));
+    if (!valid_device_type(device_type)) {
+      throw std::runtime_error(
+          "plugin callback contains an invalid device type");
+    }
+    if (std::find(supported_devices.begin(), supported_devices.end(),
+                  device_type) != supported_devices.end()) {
+      throw std::runtime_error(
+          "plugin callback contains a duplicate device type");
+    }
+    supported_devices.push_back(device_type);
+  }
+}
 
 bool emlx_valid_plugin_name(const std::string &value) {
   return valid_name(value);

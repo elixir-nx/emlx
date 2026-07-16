@@ -20,6 +20,9 @@ ERL_NIF_TERM call_plugin(ErlNifEnv *, int, const ERL_NIF_TERM[]);
 ERL_NIF_TERM call_plugin_async(ErlNifEnv *, int, const ERL_NIF_TERM[]);
 
 struct EMLXLoadedPluginCallback {
+  explicit EMLXLoadedPluginCallback(
+      const emlx::plugin::callback_descriptor_t &source);
+
   std::string name;
   uint32_t schema_version;
   uint32_t attr_schema_version;
