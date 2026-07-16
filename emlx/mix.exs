@@ -39,7 +39,6 @@ defmodule EMLX.MixProject do
             ),
           "MLX_VARIANT" => libmlx_config.variant,
           "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
-          "EMLX_SOURCE_CACHE_ID" => source_cache_id(__DIR__),
           "EMLX_VERSION" => @version,
           "LIBMLX_ENABLE_DEBUG" => to_string(libmlx_config.features.debug?),
           "FINE_INCLUDE_DIR" => Fine.include_dir()
@@ -62,14 +61,6 @@ defmodule EMLX.MixProject do
 
   def cli do
     [preferred_envs: [docs: :docs, "hex.publish": :docs]]
-  end
-
-  @doc false
-  def source_cache_id(source_root) do
-    source_root
-    |> Path.expand()
-    |> then(&:crypto.hash(:sha256, &1))
-    |> Base.encode16(case: :lower)
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]

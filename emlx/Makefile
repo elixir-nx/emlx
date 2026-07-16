@@ -7,10 +7,7 @@ esc = $(subst $(space),\$(space),$(1))
 
 # Private configuration
 PRIV_DIR = $(MIX_APP_PATH)/priv
-ifeq ($(strip $(EMLX_SOURCE_CACHE_ID)),)
-$(error EMLX_SOURCE_CACHE_ID is required)
-endif
-BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)-source-$(EMLX_SOURCE_CACHE_ID)/objs
+BUILD_DIR = $(EMLX_CACHE_DIR)/emlx-$(EMLX_VERSION)-mlx-$(MLX_VERSION)$(MLX_VARIANT)/objs
 EMLX_SO = $(PRIV_DIR)/libemlx.so
 EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
 # Headers are copied alongside the lib (unlike the lib copy, these are not
@@ -126,7 +123,4 @@ clean:
 	rm -rf "$(PRIV_DIR)"
 	rm -rf "$(BUILD_DIR)"
 
-print-build-dir:
-	@ printf '%s\n' "$(BUILD_DIR)"
-
-.PHONY: all clean print-build-dir
+.PHONY: all clean
