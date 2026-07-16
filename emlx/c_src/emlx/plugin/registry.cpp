@@ -143,14 +143,13 @@ std::string copy_required_string(const std::string &value, size_t limit,
 }
 
 std::string canonical_path(const std::string &path) {
-  char *resolved = realpath(path.c_str(), nullptr);
+  auto resolved = std::unique_ptr<char, decltype(&std::free)>(
+      realpath(path.c_str(), nullptr), &std::free);
   if (!resolved) {
     throw std::runtime_error(
         "plugin path does not resolve to an existing file");
   }
-  std::string result(resolved);
-  std::free(resolved);
-  return result;
+  return std::string(resolved.get());
 }
 
 std::shared_ptr<const EMLXLoadedPlugin>
