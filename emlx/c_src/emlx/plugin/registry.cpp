@@ -529,7 +529,7 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
   return outputs;
 }
 
-#if !defined(EMLX_PLUGIN_REGISTRY_TESTING)
+#ifndef EMLX_PLUGIN_REGISTRY_TESTING
 std::vector<mlx::core::array>
 call_plugin_impl(ErlNifEnv *env, std::string plugin_name,
                  std::string callback_name, std::vector<TensorArg> operands,
