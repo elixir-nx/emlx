@@ -347,7 +347,7 @@ defmodule EMLXAxon.PluginMetadataTest do
     assert_all_close(compiled, Nx.tensor([3.0, 5.0]))
   end
 
-  test "callback errors are bounded UTF-8 and identify empty failures" do
+  test "callback errors are bounded and identify empty failures" do
     input = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
 
     oversized =
@@ -358,10 +358,6 @@ defmodule EMLXAxon.PluginMetadataTest do
     assert byte_size(oversized.message) == 4096
     assert String.valid?(oversized.message)
     assert String.ends_with?(oversized.message, "... [truncated] in NIF.call_plugin/5")
-
-    assert_raise EMLX.NIFError, ~r/plugin returned invalid UTF-8 error detail/, fn ->
-      Proof.operation(input, "invalid_utf8_error")
-    end
 
     assert_raise EMLX.NIFError,
                  ~r/plugin callback "proof\/empty_error" failed without error detail/,

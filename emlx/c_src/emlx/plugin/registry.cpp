@@ -41,46 +41,6 @@ bool valid_device_type(emlx::plugin::device_type_t device_type) {
          device_type == mlx::core::Device::DeviceType::gpu;
 }
 
-bool valid_utf8(const std::string &value) {
-  size_t index = 0;
-  while (index < value.size()) {
-    const uint8_t first = static_cast<uint8_t>(value[index++]);
-    if (first <= 0x7f) {
-      continue;
-    }
-    uint32_t codepoint = 0;
-    size_t continuation = 0;
-    if (first >= 0xc2 && first <= 0xdf) {
-      codepoint = first & 0x1f;
-      continuation = 1;
-    } else if (first >= 0xe0 && first <= 0xef) {
-      codepoint = first & 0x0f;
-      continuation = 2;
-    } else if (first >= 0xf0 && first <= 0xf4) {
-      codepoint = first & 0x07;
-      continuation = 3;
-    } else {
-      return false;
-    }
-    if (index + continuation > value.size()) {
-      return false;
-    }
-    for (size_t offset = 0; offset < continuation; ++offset) {
-      const uint8_t next = static_cast<uint8_t>(value[index++]);
-      if ((next & 0xc0) != 0x80) {
-        return false;
-      }
-      codepoint = (codepoint << 6) | (next & 0x3f);
-    }
-    if ((continuation == 2 && codepoint < 0x800) ||
-        (continuation == 3 && codepoint < 0x10000) ||
-        (codepoint >= 0xd800 && codepoint <= 0xdfff) || codepoint > 0x10ffff) {
-      return false;
-    }
-  }
-  return true;
-}
-
 std::string bounded_error(const std::string &value, size_t limit = kErrorMax) {
   static constexpr char kTruncationMarker[] = "... [truncated]";
   constexpr size_t marker_size = sizeof(kTruncationMarker) - 1;
@@ -88,10 +48,6 @@ std::string bounded_error(const std::string &value, size_t limit = kErrorMax) {
   if (limit == 0) {
     return {};
   }
-  if (!valid_utf8(value)) {
-    return "plugin returned invalid UTF-8 error detail";
-  }
-
   const bool truncated = value.size() > limit;
   size_t prefix_size = value.size();
   if (truncated) {

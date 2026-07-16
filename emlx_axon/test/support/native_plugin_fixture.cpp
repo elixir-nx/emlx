@@ -19,7 +19,6 @@ inline constexpr char kGpuOnly[] = "gpu_only_scale_add";
 inline constexpr char kThrowingOperandPolicy[] = "throwing_operand_policy";
 inline constexpr char kThrowingOutputPolicy[] = "throwing_output_policy";
 inline constexpr char kOversizedError[] = "oversized_error";
-inline constexpr char kInvalidUtf8Error[] = "invalid_utf8_error";
 inline constexpr char kEmptyError[] = "empty_error";
 inline constexpr char kThrowAfterOutput[] = "throw_after_output";
 inline constexpr char kUnknownThrowAfterOutput[] = "unknown_throw_after_output";
@@ -118,12 +117,6 @@ oversized_error(const emlx::plugin::call_t &,
   for (size_t i = 0; i < 32; ++i)
     error.append("\xE2\x82\xAC");
   return error;
-}
-
-std::optional<std::string>
-invalid_utf8_error(const emlx::plugin::call_t &,
-                   std::vector<mlx::core::array> &) {
-  return std::string("invalid byte: ") + static_cast<char>(0xff);
 }
 
 std::optional<std::string>
@@ -261,8 +254,6 @@ const emlx::plugin::callback_descriptor_t kCallbacks[] = {
      kAllDevices, scale_add},
     {kOversizedError, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      oversized_error},
-    {kInvalidUtf8Error, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
-     invalid_utf8_error},
     {kEmptyError, 1, 1, 1, nullptr, 1, nullptr,
      kAllDevices, empty_error},
     {kThrowAfterOutput, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
