@@ -337,7 +337,7 @@ load_generic_candidate(const std::string &requested_name,
   }
 
   {
-    std::unique_lock lock(g_plugin_mutex);
+    std::lock_guard lock(g_plugin_mutex);
     auto [it, inserted] = g_plugins.emplace(requested_name, loaded);
     if (!inserted) {
       if (it->second->canonical_path == resolved_path) {
