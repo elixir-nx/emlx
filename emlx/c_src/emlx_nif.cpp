@@ -2045,7 +2045,7 @@ static ErlNifFunc nif_funcs[] = {
     // load_plugin `dlopen`s a named, standalone native plugin (see
     // emlx/plugin/registry.hpp); not worker-routed since it does no MLX
     // graph work.
-    {"load_plugin", 2, load_plugin},
-    {"call_plugin", 6, call_plugin_async}};
+    {"load_plugin", 2, emlx::plugin::load_plugin},
+    {"call_plugin", 6, emlx::plugin::call_plugin_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

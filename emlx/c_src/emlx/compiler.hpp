@@ -95,7 +95,7 @@ struct Instruction {
   // Only non-empty for `op == "while"`: exactly two entries, `[cond, body]`.
   // Empty (the common case) for every other op.
   std::vector<SubProgram> subprograms;
-  EMLXResolvedPluginCallback resolved_plugin;
+  emlx::plugin::resolved_callback_t resolved_plugin;
   std::vector<int64_t> plugin_attrs;
   std::vector<PluginOutputTemplate> plugin_outputs;
 };

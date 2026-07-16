@@ -2053,10 +2053,10 @@ static void resolve_plugin_instruction(Instruction &instr) {
 
   const std::string &plugin_name = attrs[1].as_binary();
   const std::string &callback_name = attrs[2].as_binary();
-  if (!emlx_valid_plugin_name(plugin_name) ||
-      !emlx_valid_plugin_name(callback_name))
+  if (!emlx::plugin::valid_name(plugin_name) ||
+      !emlx::plugin::valid_name(callback_name))
     throw std::runtime_error("emlx::native: plugin names are not canonical");
-  auto resolved = emlx_resolve_plugin_callback(plugin_name, callback_name);
+  auto resolved = emlx::plugin::resolve_callback(plugin_name, callback_name);
   const auto &callback = *resolved.callback;
 
   const int64_t schema = plugin_attr_int(attrs[3], "schema version");
@@ -2118,13 +2118,13 @@ static void resolve_plugin_instruction(Instruction &instr) {
 
   uint32_t expected_operands = callback.operand_count;
   if (expected_operands == 0) {
-    expected_operands = emlx_invoke_plugin_count_policy(
+    expected_operands = emlx::plugin::invoke_count_policy(
         callback.operand_count_from_attrs, callback_attr_view, expected_operands,
         "operand", plugin_name, callback_name);
   }
   uint32_t expected_outputs = callback.output_count;
   if (expected_outputs == 0) {
-    expected_outputs = emlx_invoke_plugin_count_policy(
+    expected_outputs = emlx::plugin::invoke_count_policy(
         callback.output_count_from_attrs, callback_attr_view, expected_outputs,
         "output", plugin_name, callback_name);
   }
@@ -2146,7 +2146,7 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
     throw std::runtime_error("emlx::native: plugin execution has no current worker");
   const auto &callback = *instr.resolved_plugin.callback;
   const auto device = emlx::g_current_worker->device();
-  if (!emlx_plugin_callback_supports_device(callback, device.type))
+  if (!emlx::plugin::callback_supports_device(callback, device.type))
     throw std::runtime_error("emlx::native: plugin callback does not support the worker device");
 
   const auto stream = emlx::g_current_worker->stream();
@@ -2165,7 +2165,7 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
     error = "unknown plugin callback exception";
   }
   if (error)
-    throw std::runtime_error(emlx_plugin_callback_failure_error(
+    throw std::runtime_error(emlx::plugin::callback_failure_error(
         instr.resolved_plugin.plugin->name, callback.name, *error));
   if (candidates.size() != instr.plugin_outputs.size()) {
     throw std::runtime_error(
