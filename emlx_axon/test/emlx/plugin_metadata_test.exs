@@ -118,6 +118,14 @@ defmodule EMLXAxon.PluginMetadataTest do
     assert_all_close(compiled, Nx.tensor([3.0, 5.0]))
   end
 
+  test "plugin views keep their backing storage alive across calls" do
+    first = Nx.tensor([1.0, 2.0], backend: EMLX.Backend)
+    second = Nx.tensor([8.0, 9.0], backend: EMLX.Backend)
+
+    assert_all_close(Proof.operation_callback({first}, callback: "retained_view"), first)
+    assert_all_close(Proof.operation_callback({second}, callback: "retained_view"), first)
+  end
+
   test "proof metadata lowers to one plugin instruction without a runtime call" do
     expr = Nx.Defn.debug_expr_apply(&Proof.compiled/1, [Nx.template({2}, :f32)])
     wire = expr |> Expr.lower() |> Expr.to_native()

@@ -52,7 +52,7 @@ struct KVCache {
   mlx::core::array *v;
 };
 
-} // namespace emlx_qwen3_plugin
+} // namespace emlx_axon::plugin::qwen3
 
 // Qwen3 compute plugin — pure MLX graph-building code, no Erlang/erl_nif
 // dependency whatsoever. Built as its own shared library (libemlx_qwen3.so,
@@ -61,7 +61,7 @@ struct KVCache {
 // `EMLX.NIF.load_plugin("qwen3", path)`. The generic plugin ABI is owned by
 // EMLX; all Qwen3 model schemas remain private to this translation unit.
 
-using namespace emlx_qwen3_plugin;
+using namespace emlx_axon::plugin::qwen3;
 
 namespace {
 
@@ -1375,15 +1375,12 @@ inline constexpr char kChunkGeneralizedName[] =
 inline constexpr emlx::plugin::device_type_t kSupportedDeviceTypes[] = {
     mlx::core::Device::DeviceType::cpu,
     mlx::core::Device::DeviceType::gpu};
-inline constexpr emlx::plugin::device_view_t kSupportedDevices{
-    kSupportedDeviceTypes,
-    sizeof(kSupportedDeviceTypes) / sizeof(kSupportedDeviceTypes[0])};
 inline constexpr int64_t kMaxLayerCount = 256;
 inline constexpr int64_t kMaxChunkTokenCount = 4096;
 
 template <size_t N>
-constexpr emlx::plugin::string_view_t string_view(const char (&value)[N]) {
-  return {value, N - 1};
+emlx::plugin::string_view_t string_view(const char (&value)[N]) {
+  return emlx::plugin::make_view(value, N - 1);
 }
 
 double f64_from_bits(int64_t bits) {
@@ -1713,8 +1710,9 @@ plugin_layer_dense(const emlx::plugin::call_t &call,
     error = "qwen3/layer_dense has an invalid call contract";
     return error;
   }
-  std::vector<mlx::core::array> operands(call.operands.data,
-                                         call.operands.data + call.operands.size);
+  std::vector<mlx::core::array> operands(
+      call.operands.data.get(),
+      call.operands.data.get() + call.operands.size);
   LayerParams layer{&operands[1],  &operands[10], &operands[6],
                     &operands[7],  &operands[2],  &operands[3],
                     &operands[4],  &operands[5],  &operands[11],
@@ -1891,8 +1889,9 @@ plugin_forward_dense(const emlx::plugin::call_t &call,
       !int32_attr(call, 3, "head_dim", head_dim, error))
     return error;
   const size_t layer_count = static_cast<size_t>(call.attrs.data[0]);
-  std::vector<mlx::core::array> operands(call.operands.data,
-                                         call.operands.data + call.operands.size);
+  std::vector<mlx::core::array> operands(
+      call.operands.data.get(),
+      call.operands.data.get() + call.operands.size);
   std::vector<LayerParams> layers;
   std::vector<KVCache> caches;
   parse_dense_layers(operands, 1, layer_count, layers, caches);
@@ -1935,8 +1934,9 @@ plugin_chunk_dense(const emlx::plugin::call_t &call,
       !int32_attr(call, 4, "head_dim", head_dim, error))
     return error;
   const size_t layer_count = static_cast<size_t>(call.attrs.data[0]);
-  std::vector<mlx::core::array> operands(call.operands.data,
-                                         call.operands.data + call.operands.size);
+  std::vector<mlx::core::array> operands(
+      call.operands.data.get(),
+      call.operands.data.get() + call.operands.size);
   std::vector<LayerParams> layers;
   std::vector<KVCache> caches;
   parse_dense_layers(operands, 2, layer_count, layers, caches);
@@ -2047,52 +2047,56 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
   return std::nullopt;
 }
 
-constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
-    {string_view(kMLPName), 1, 1, 5, nullptr, 1, nullptr,
-     kSupportedDevices, plugin_mlp},
-    {string_view(kKVCacheAttentionName), 1, 1, 5, nullptr, 3, nullptr,
-     kSupportedDevices, plugin_kv_cache_attention},
-    {string_view(kKVCacheAttentionTensorName), 1, 1, 6, nullptr, 3, nullptr,
-     kSupportedDevices, plugin_kv_cache_attention_tensor},
-    {string_view(kAttentionResidualName), 1, 1, 3, nullptr, 1, nullptr,
-     kSupportedDevices, plugin_attention_residual},
-    {string_view(kAttentionBlockName), 1, 1, 10, nullptr, 3, nullptr,
-     kSupportedDevices, plugin_attention_block},
-    {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
-     kSupportedDevices, plugin_layer_dense},
-    {string_view(kLayerGeneralizedName), 1, 1, 0,
-     generalized_layer_operand_count, 3, nullptr,
-     kSupportedDevices, plugin_layer_generalized},
-    {string_view(kFinalGreedyName), 1, 1, 3, nullptr, 1, nullptr,
-     kSupportedDevices, plugin_final_greedy},
-    {string_view(kForwardDenseName), 1, 1, 0, dense_forward_operand_count, 0,
-     dense_forward_output_count, kSupportedDevices,
-     plugin_forward_dense},
-    {string_view(kChunkDenseName), 1, 1, 0, dense_chunk_operand_count, 0,
-     dense_chunk_output_count, kSupportedDevices,
-     plugin_chunk_dense},
-    {string_view(kChunkGeneralizedName), 1, 1, 0,
-     generalized_chunk_operand_count, 0, generalized_chunk_output_count,
-     kSupportedDevices, plugin_chunk_generalized},
+struct PluginMetadata {
+  emlx::plugin::device_view_t supported_devices;
+  std::vector<emlx::plugin::callback_descriptor_t> callbacks;
+  emlx::plugin::descriptor_t descriptor;
+  emlx::plugin::bootstrap_v1_t bootstrap;
+
+  PluginMetadata()
+      : supported_devices(emlx::plugin::make_view(kSupportedDeviceTypes)),
+        callbacks{
+            {string_view(kMLPName), 1, 1, 5, nullptr, 1, nullptr,
+             supported_devices, plugin_mlp},
+            {string_view(kKVCacheAttentionName), 1, 1, 5, nullptr, 3, nullptr,
+             supported_devices, plugin_kv_cache_attention},
+            {string_view(kKVCacheAttentionTensorName), 1, 1, 6, nullptr, 3,
+             nullptr, supported_devices, plugin_kv_cache_attention_tensor},
+            {string_view(kAttentionResidualName), 1, 1, 3, nullptr, 1, nullptr,
+             supported_devices, plugin_attention_residual},
+            {string_view(kAttentionBlockName), 1, 1, 10, nullptr, 3, nullptr,
+             supported_devices, plugin_attention_block},
+            {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
+             supported_devices, plugin_layer_dense},
+            {string_view(kLayerGeneralizedName), 1, 1, 0,
+             generalized_layer_operand_count, 3, nullptr, supported_devices,
+             plugin_layer_generalized},
+            {string_view(kFinalGreedyName), 1, 1, 3, nullptr, 1, nullptr,
+             supported_devices, plugin_final_greedy},
+            {string_view(kForwardDenseName), 1, 1, 0,
+             dense_forward_operand_count, 0, dense_forward_output_count,
+             supported_devices, plugin_forward_dense},
+            {string_view(kChunkDenseName), 1, 1, 0, dense_chunk_operand_count,
+             0, dense_chunk_output_count, supported_devices,
+             plugin_chunk_dense},
+            {string_view(kChunkGeneralizedName), 1, 1, 0,
+             generalized_chunk_operand_count, 0,
+             generalized_chunk_output_count, supported_devices,
+             plugin_chunk_generalized}},
+        descriptor{string_view(kPluginName), sizeof(emlx::plugin::descriptor_t),
+                   sizeof(emlx::plugin::callback_descriptor_t),
+                   static_cast<uint32_t>(callbacks.size()), callbacks.data()},
+        bootstrap{emlx::plugin::magic_v1,
+                  sizeof(emlx::plugin::bootstrap_v1_t),
+                  emlx::plugin::abi_v1,
+                  sizeof(emlx::plugin::descriptor_t), &descriptor} {}
 };
-
-constinit const emlx::plugin::descriptor_t kDescriptor{
-    string_view(kPluginName),
-    sizeof(emlx::plugin::descriptor_t),
-    sizeof(emlx::plugin::callback_descriptor_t),
-    static_cast<uint32_t>(sizeof(kCallbacks) / sizeof(kCallbacks[0])),
-    kCallbacks};
-
-constinit const emlx::plugin::bootstrap_v1_t kBootstrap{
-    emlx::plugin::magic_v1,
-    sizeof(emlx::plugin::bootstrap_v1_t),
-    emlx::plugin::abi_v1,
-    sizeof(emlx::plugin::descriptor_t),
-    &kDescriptor};
 
 } // namespace
 
 extern "C" EMLX_PLUGIN_EXPORT const emlx::plugin::bootstrap_v1_t *
 emlx_plugin_descriptor_v1() noexcept {
-  return &kBootstrap;
+  // EMLX keeps accepted plugins loaded for the VM lifetime.
+  static const auto *metadata = new PluginMetadata();
+  return &metadata->bootstrap;
 }

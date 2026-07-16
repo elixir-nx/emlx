@@ -86,5 +86,5 @@ uint32_t emlx_invoke_plugin_count_policy(
 
 std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     const std::string &plugin, const std::string &callback,
-    const std::vector<mlx::core::array> &operands,
-    const std::vector<int64_t> &attrs, const mlx::core::Device &device);
+    std::vector<mlx::core::array> operands, std::vector<int64_t> attrs,
+    const mlx::core::Device &device);

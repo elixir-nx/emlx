@@ -192,7 +192,7 @@ std::string copy_required_string(emlx::plugin::string_view_t view, size_t limit,
     throw std::runtime_error(std::string("plugin field ") + field +
                              " cannot be represented by size_t");
   }
-  return std::string(view.data, static_cast<size_t>(view.size));
+  return std::string(view.data.get(), static_cast<size_t>(view.size));
 }
 
 std::string canonical_path(const std::string &path) {
@@ -273,8 +273,8 @@ load_generic_candidate(const std::string &requested_name,
     throw std::runtime_error("plugin descriptor pointer is not aligned");
   }
 
-  emlx::plugin::descriptor_t descriptor{};
-  std::memcpy(&descriptor, bootstrap.descriptor, sizeof(descriptor));
+  const auto &descriptor =
+      *static_cast<const emlx::plugin::descriptor_t *>(bootstrap.descriptor);
   if (descriptor.descriptor_size != sizeof(emlx::plugin::descriptor_t)) {
     throw std::runtime_error("plugin descriptor size does not match ABI v1");
   }
@@ -321,9 +321,8 @@ load_generic_candidate(const std::string &requested_name,
   loaded->canonical_path = resolved_path;
 
   for (uint32_t i = 0; i < descriptor.callback_count; ++i) {
-    emlx::plugin::callback_descriptor_t source{};
-    std::memcpy(&source, descriptor.callbacks + i, sizeof(source));
-    auto callback = std::make_shared<EMLXLoadedPluginCallback>(source);
+    auto callback =
+        std::make_shared<EMLXLoadedPluginCallback>(descriptor.callbacks[i]);
     if (!loaded->callbacks.emplace(callback->name, callback).second) {
       throw std::runtime_error("plugin callback names must be unique");
     }
@@ -418,7 +417,7 @@ EMLXLoadedPluginCallback::EMLXLoadedPluginCallback(
     throw std::runtime_error(
         "plugin callback supported device count exceeds its limit");
   }
-  if (reinterpret_cast<uintptr_t>(source.supported_devices.data) %
+  if (reinterpret_cast<uintptr_t>(source.supported_devices.data.get()) %
           alignof(emlx::plugin::device_type_t) !=
       0) {
     throw std::runtime_error(
@@ -435,7 +434,8 @@ EMLXLoadedPluginCallback::EMLXLoadedPluginCallback(
   for (uint64_t device_index = 0;
        device_index < source.supported_devices.size; ++device_index) {
     emlx::plugin::device_type_t device_type{};
-    std::memcpy(&device_type, source.supported_devices.data + device_index,
+    std::memcpy(&device_type,
+                source.supported_devices.data.get() + device_index,
                 sizeof(device_type));
     if (!valid_device_type(device_type)) {
       throw std::runtime_error(
@@ -495,18 +495,19 @@ uint32_t emlx_invoke_plugin_count_policy(
 
 std::vector<mlx::core::array> emlx_invoke_plugin_callback(
     const std::string &plugin_name, const std::string &callback_name,
-    const std::vector<mlx::core::array> &operands,
-    const std::vector<int64_t> &attrs, const mlx::core::Device &device) {
+    std::vector<mlx::core::array> operands, std::vector<int64_t> attrs,
+    const mlx::core::Device &device) {
   auto resolved = emlx_resolve_plugin_callback(plugin_name, callback_name);
   const auto &callback = *resolved.callback;
-  const emlx::plugin::int64_view_t attr_view{attrs.data(), attrs.size()};
+  auto operand_view = emlx::plugin::make_view(std::move(operands));
+  auto attr_view = emlx::plugin::make_view(std::move(attrs));
   constexpr size_t callback_error_max = kErrorMax - kCallPluginNifSuffixSize;
   const uint32_t expected_operands = emlx_invoke_plugin_count_policy(
       callback.operand_count_from_attrs, attr_view, callback.operand_count,
       "operand", plugin_name, callback_name, callback_error_max);
-  if (operands.size() != expected_operands) {
+  if (operand_view.size != expected_operands) {
     throw std::runtime_error(
-        "plugin callback received " + std::to_string(operands.size()) +
+        "plugin callback received " + std::to_string(operand_view.size) +
         " operands, expected " + std::to_string(expected_operands));
   }
   const uint32_t expected_outputs = emlx_invoke_plugin_count_policy(
@@ -520,8 +521,8 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
         "plugin callback does not support the worker device");
   }
   const auto stream = emlx::g_current_worker->stream();
-  emlx::plugin::call_t call{
-      {operands.data(), operands.size()}, attr_view, device, stream};
+  emlx::plugin::call_t call{std::move(operand_view), std::move(attr_view),
+                            device, stream};
   std::vector<mlx::core::array> outputs;
   std::optional<std::string> error;
   try {
@@ -557,7 +558,8 @@ call_plugin_impl(ErlNifEnv *env, std::string plugin_name,
   for (const auto &operand : operands) {
     arrays.push_back(*operand);
   }
-  return emlx_invoke_plugin_callback(plugin_name, callback_name, arrays, attrs,
+  return emlx_invoke_plugin_callback(plugin_name, callback_name,
+                                     std::move(arrays), std::move(attrs),
                                      device);
 }
 FINE_ASYNC_NIF(call_plugin)

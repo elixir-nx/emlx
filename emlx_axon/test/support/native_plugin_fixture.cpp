@@ -1,6 +1,7 @@
 #include "emlx/plugin/abi.hpp"
 
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 
 namespace {
@@ -26,6 +27,7 @@ inline constexpr char kWrongOutputCount[] = "wrong_output_count";
 inline constexpr char kZeroOperandPolicy[] = "zero_operand_policy";
 inline constexpr char kZeroOutputPolicy[] = "zero_output_policy";
 inline constexpr char kDynamicCounts[] = "dynamic_counts";
+inline constexpr char kRetainedView[] = "retained_view";
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_NAME)
 inline constexpr char kPrimaryCallbackName[] = "invalid/name";
 #else
@@ -37,14 +39,14 @@ inline constexpr char kPartialFailureName[] = "scale_add";
 inline constexpr char kPartialFailureName[] = "partial_failure";
 #endif
 template <size_t N>
-constexpr emlx::plugin::string_view_t string_view(const char (&value)[N]) {
-  return {value, N - 1};
+emlx::plugin::string_view_t string_view(const char (&value)[N]) {
+  return emlx::plugin::make_view(value, N - 1);
 }
 
 template <size_t N>
-constexpr emlx::plugin::device_view_t
+emlx::plugin::device_view_t
 device_view(const emlx::plugin::device_type_t (&values)[N]) {
-  return {values, N};
+  return emlx::plugin::make_view(values);
 }
 
 inline constexpr emlx::plugin::device_type_t kAllDeviceTypes[] = {
@@ -60,12 +62,12 @@ inline constexpr emlx::plugin::device_type_t kDuplicateDeviceTypes[] = {
     mlx::core::Device::DeviceType::cpu,
     mlx::core::Device::DeviceType::cpu};
 
-inline constexpr auto kAllDevices = device_view(kAllDeviceTypes);
-inline constexpr auto kCpuDevices = device_view(kCpuDeviceTypes);
-inline constexpr auto kGpuDevices = device_view(kGpuDeviceTypes);
-inline constexpr auto kInvalidDevices = device_view(kInvalidDeviceTypes);
-inline constexpr auto kDuplicateDevices = device_view(kDuplicateDeviceTypes);
-inline constexpr emlx::plugin::device_view_t kEmptyDevices{nullptr, 0};
+const auto kAllDevices = device_view(kAllDeviceTypes);
+const auto kCpuDevices = device_view(kCpuDeviceTypes);
+const auto kGpuDevices = device_view(kGpuDeviceTypes);
+const auto kInvalidDevices = device_view(kInvalidDeviceTypes);
+const auto kDuplicateDevices = device_view(kDuplicateDeviceTypes);
+const emlx::plugin::device_view_t kEmptyDevices{};
 
 double f64_from_bits(int64_t bits) {
   uint64_t raw = static_cast<uint64_t>(bits);
@@ -178,13 +180,39 @@ bool one_count_policy(emlx::plugin::int64_view_t, uint32_t &count,
   return true;
 }
 
+struct RetainedViewState {
+  std::mutex mutex;
+  std::optional<emlx::plugin::array_view_t> operands;
+};
+
+RetainedViewState &retained_view_state() {
+  static auto *state = new RetainedViewState();
+  return *state;
+}
+
+std::optional<std::string>
+retained_view(const emlx::plugin::call_t &call,
+              std::vector<mlx::core::array> &outputs) {
+  auto &state = retained_view_state();
+  std::lock_guard lock(state.mutex);
+
+  if (state.operands) {
+    outputs.push_back(state.operands->data[0]);
+    state.operands.reset();
+  } else {
+    state.operands = call.operands;
+    outputs.push_back(call.operands.data[0]);
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string>
 callback_must_not_run(const emlx::plugin::call_t &,
                       std::vector<mlx::core::array> &) {
   throw std::runtime_error("oversized policy callback ran");
 }
 
-constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
+const emlx::plugin::callback_descriptor_t kCallbacks[] = {
 #if defined(EMLX_FIXTURE_NULL_CALLBACK)
     {string_view(kPrimaryCallbackName), 1, 1, 1, nullptr, 1, nullptr,
      kAllDevices, nullptr},
@@ -255,6 +283,8 @@ constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
     {string_view(kDynamicCounts), 1, 1, 0, one_count_policy, 0,
      one_count_policy,
      kAllDevices, scale_add},
+    {string_view(kRetainedView), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
+     retained_view},
 };
 
 #if defined(EMLX_FIXTURE_MISALIGNED_CALLBACKS)
@@ -265,13 +295,9 @@ constinit const emlx::plugin::callback_descriptor_t kCallbacks[] = {
 #define EMLX_FIXTURE_CALLBACKS_PTR kCallbacks
 #endif
 
-#if defined(EMLX_FIXTURE_MISALIGNED_CALLBACKS)
 const emlx::plugin::descriptor_t kDescriptor{
-#else
-constinit const emlx::plugin::descriptor_t kDescriptor{
-#endif
 #if defined(EMLX_FIXTURE_NULL_PLUGIN_NAME)
-    {nullptr, 5},
+    {std::shared_ptr<const char[]>{}, 5},
 #else
     string_view(kPluginName),
 #endif

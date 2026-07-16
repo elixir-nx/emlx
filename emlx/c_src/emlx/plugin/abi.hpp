@@ -4,9 +4,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -25,13 +28,38 @@ namespace emlx::plugin {
 inline constexpr uint64_t magic_v1 = 0x454D4C58504C4731ULL;
 inline constexpr uint32_t abi_v1 = 1;
 
-// Plugin-owned views are borrowed by EMLX only while loading the descriptor.
-// Call-owned views remain valid only for the count-policy or callback
-// invocation that receives them. Neither side may retain borrowed pointers.
+// Views share ownership of their contiguous backing storage. This keeps data
+// valid when a view is copied across the plugin boundary.
 template <typename T> struct view_t {
-  const T *data;
-  uint64_t size;
+  std::shared_ptr<const T[]> data;
+  uint64_t size = 0;
 };
+
+template <typename T> view_t<T> make_view(std::vector<T> values) {
+  if (values.empty()) {
+    return {};
+  }
+
+  auto storage =
+      std::make_shared<const std::vector<T>>(std::move(values));
+  return {std::shared_ptr<const T[]>(storage, storage->data()),
+          static_cast<uint64_t>(storage->size())};
+}
+
+template <typename T> view_t<T> make_view(const T *values, size_t size) {
+  if (size == 0) {
+    return {};
+  }
+  if (!values) {
+    throw std::invalid_argument("plugin view data cannot be null");
+  }
+  return make_view(std::vector<T>(values, values + size));
+}
+
+template <typename T, size_t N>
+view_t<T> make_view(const T (&values)[N]) {
+  return make_view(values, N);
+}
 
 using string_view_t = view_t<char>;
 using array_view_t = view_t<mlx::core::array>;
@@ -98,42 +126,35 @@ static_assert(offsetof(bootstrap_v1_t, plugin_abi_version) == 12);
 static_assert(offsetof(bootstrap_v1_t, descriptor_size) == 16);
 static_assert(offsetof(bootstrap_v1_t, descriptor) == 24);
 
-static_assert(std::is_standard_layout_v<string_view_t>);
-static_assert(std::is_trivially_copyable_v<string_view_t>);
-static_assert(sizeof(string_view_t) == 16);
+static_assert(std::is_copy_constructible_v<string_view_t>);
+static_assert(sizeof(string_view_t) == 24);
 static_assert(alignof(string_view_t) == 8);
 
-static_assert(std::is_standard_layout_v<array_view_t>);
-static_assert(std::is_trivially_copyable_v<array_view_t>);
-static_assert(sizeof(array_view_t) == 16);
+static_assert(std::is_copy_constructible_v<array_view_t>);
+static_assert(sizeof(array_view_t) == 24);
 
-static_assert(std::is_standard_layout_v<int64_view_t>);
-static_assert(std::is_trivially_copyable_v<int64_view_t>);
-static_assert(sizeof(int64_view_t) == 16);
+static_assert(std::is_copy_constructible_v<int64_view_t>);
+static_assert(sizeof(int64_view_t) == 24);
 
 static_assert(std::is_enum_v<device_type_t>);
-static_assert(std::is_standard_layout_v<device_view_t>);
-static_assert(std::is_trivially_copyable_v<device_view_t>);
-static_assert(sizeof(device_view_t) == 16);
+static_assert(std::is_copy_constructible_v<device_view_t>);
+static_assert(sizeof(device_view_t) == 24);
 
-static_assert(std::is_standard_layout_v<call_t>);
-static_assert(std::is_trivially_copyable_v<call_t>);
-static_assert(sizeof(call_t) == 56);
+static_assert(std::is_copy_constructible_v<call_t>);
+static_assert(sizeof(call_t) == 72);
 
-static_assert(std::is_standard_layout_v<callback_descriptor_t>);
-static_assert(std::is_trivially_copyable_v<callback_descriptor_t>);
-static_assert(sizeof(callback_descriptor_t) == 80);
+static_assert(std::is_copy_constructible_v<callback_descriptor_t>);
+static_assert(sizeof(callback_descriptor_t) == 96);
 static_assert(alignof(callback_descriptor_t) == 8);
 
-static_assert(std::is_standard_layout_v<descriptor_t>);
-static_assert(std::is_trivially_copyable_v<descriptor_t>);
-static_assert(sizeof(descriptor_t) == 48);
+static_assert(std::is_copy_constructible_v<descriptor_t>);
+static_assert(sizeof(descriptor_t) == 56);
 static_assert(alignof(descriptor_t) == 8);
 static_assert(offsetof(descriptor_t, name) == 0);
-static_assert(offsetof(descriptor_t, descriptor_size) == 16);
-static_assert(offsetof(descriptor_t, callback_descriptor_size) == 24);
-static_assert(offsetof(descriptor_t, callback_count) == 32);
-static_assert(offsetof(descriptor_t, callbacks) == 40);
+static_assert(offsetof(descriptor_t, descriptor_size) == 24);
+static_assert(offsetof(descriptor_t, callback_descriptor_size) == 32);
+static_assert(offsetof(descriptor_t, callback_count) == 40);
+static_assert(offsetof(descriptor_t, callbacks) == 48);
 
 } // namespace emlx::plugin
 

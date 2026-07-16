@@ -2114,19 +2114,18 @@ static void resolve_plugin_instruction(Instruction &instr) {
   while(cursor < attrs.size()) {
     callback_attrs.push_back(plugin_attr_int(attrs[cursor++], "callback attribute"));
   }
+  auto callback_attr_view = emlx::plugin::make_view(callback_attrs);
 
   uint32_t expected_operands = callback.operand_count;
   if (expected_operands == 0) {
     expected_operands = emlx_invoke_plugin_count_policy(
-        callback.operand_count_from_attrs,
-        {callback_attrs.data(), callback_attrs.size()}, expected_operands,
+        callback.operand_count_from_attrs, callback_attr_view, expected_operands,
         "operand", plugin_name, callback_name);
   }
   uint32_t expected_outputs = callback.output_count;
   if (expected_outputs == 0) {
     expected_outputs = emlx_invoke_plugin_count_policy(
-        callback.output_count_from_attrs,
-        {callback_attrs.data(), callback_attrs.size()}, expected_outputs,
+        callback.output_count_from_attrs, callback_attr_view, expected_outputs,
         "output", plugin_name, callback_name);
   }
   if (instr.operands.size() != expected_operands) {
@@ -2142,7 +2141,7 @@ static void resolve_plugin_instruction(Instruction &instr) {
 }
 
 static std::vector<mlx::core::array> invoke_plugin_instruction(
-    const Instruction &instr, const std::vector<mlx::core::array> &operands) {
+    const Instruction &instr, std::vector<mlx::core::array> operands) {
   if (!instr.resolved_plugin.callback || !emlx::g_current_worker)
     throw std::runtime_error("emlx::native: plugin execution has no current worker");
   const auto &callback = *instr.resolved_plugin.callback;
@@ -2152,8 +2151,8 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
 
   const auto stream = emlx::g_current_worker->stream();
   emlx::plugin::call_t call{
-      {operands.data(), operands.size()},
-      {instr.plugin_attrs.data(), instr.plugin_attrs.size()}, device, stream};
+      emlx::plugin::make_view(std::move(operands)),
+      emlx::plugin::make_view(instr.plugin_attrs), device, stream};
   std::vector<mlx::core::array> candidates;
   std::optional<std::string> error;
   try {
@@ -2257,7 +2256,7 @@ static std::vector<mlx::core::array> interpret_instructions(
     }
 
     if (name == "plugin") {
-      auto outs = invoke_plugin_instruction(instr, op_inputs);
+      auto outs = invoke_plugin_instruction(instr, std::move(op_inputs));
       for (auto &out : outs)
         results.push_back(std::move(out));
       continue;
