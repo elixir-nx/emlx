@@ -6,7 +6,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -174,25 +173,17 @@ uint32_t invoke_count_policy(emlx::plugin::operand_count_fn_t policy,
   return count;
 }
 
-std::string copy_required_string(emlx::plugin::string_view_t view, size_t limit,
+std::string copy_required_string(const std::string &value, size_t limit,
                                  const char *field) {
-  if (!view.data) {
-    throw std::runtime_error(std::string("plugin field ") + field +
-                             " has a null pointer");
-  }
-  if (view.size == 0) {
+  if (value.empty()) {
     throw std::runtime_error(std::string("plugin field ") + field +
                              " is empty");
   }
-  if (view.size > limit) {
+  if (value.size() > limit) {
     throw std::runtime_error(std::string("plugin field ") + field +
                              " exceeds its length limit");
   }
-  if (view.size > std::numeric_limits<size_t>::max()) {
-    throw std::runtime_error(std::string("plugin field ") + field +
-                             " cannot be represented by size_t");
-  }
-  return std::string(view.data.get(), static_cast<size_t>(view.size));
+  return value;
 }
 
 std::string canonical_path(const std::string &path) {

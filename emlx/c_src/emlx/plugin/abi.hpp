@@ -61,7 +61,6 @@ view_t<T> make_view(const T (&values)[N]) {
   return make_view(values, N);
 }
 
-using string_view_t = view_t<char>;
 using array_view_t = view_t<mlx::core::array>;
 using int64_view_t = view_t<int64_t>;
 using device_type_t = mlx::core::Device::DeviceType;
@@ -85,7 +84,7 @@ using callback_fn_t = std::optional<std::string> (*)(
     const call_t &, std::vector<mlx::core::array> &);
 
 struct callback_descriptor_t {
-  string_view_t name;
+  std::string name;
   uint32_t schema_version;
   uint32_t attr_schema_version;
   uint32_t operand_count;
@@ -99,7 +98,7 @@ struct callback_descriptor_t {
 struct descriptor_t {
   // Strings, the callback table, policy functions, and callbacks must remain
   // valid for the lifetime of the VM process.
-  string_view_t name;
+  std::string name;
   uint64_t descriptor_size;
   uint64_t callback_descriptor_size;
   uint32_t callback_count;
@@ -125,10 +124,6 @@ static_assert(offsetof(bootstrap_v1_t, bootstrap_size) == 8);
 static_assert(offsetof(bootstrap_v1_t, plugin_abi_version) == 12);
 static_assert(offsetof(bootstrap_v1_t, descriptor_size) == 16);
 static_assert(offsetof(bootstrap_v1_t, descriptor) == 24);
-
-static_assert(std::is_copy_constructible_v<string_view_t>);
-static_assert(sizeof(string_view_t) == 24);
-static_assert(alignof(string_view_t) == 8);
 
 static_assert(std::is_copy_constructible_v<array_view_t>);
 static_assert(sizeof(array_view_t) == 24);

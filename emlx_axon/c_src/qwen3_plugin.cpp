@@ -1378,11 +1378,6 @@ inline constexpr emlx::plugin::device_type_t kSupportedDeviceTypes[] = {
 inline constexpr int64_t kMaxLayerCount = 256;
 inline constexpr int64_t kMaxChunkTokenCount = 4096;
 
-template <size_t N>
-emlx::plugin::string_view_t string_view(const char (&value)[N]) {
-  return emlx::plugin::make_view(value, N - 1);
-}
-
 double f64_from_bits(int64_t bits) {
   uint64_t raw = static_cast<uint64_t>(bits);
   double value;
@@ -2056,34 +2051,34 @@ struct PluginMetadata {
   PluginMetadata()
       : supported_devices(emlx::plugin::make_view(kSupportedDeviceTypes)),
         callbacks{
-            {string_view(kMLPName), 1, 1, 5, nullptr, 1, nullptr,
+            {kMLPName, 1, 1, 5, nullptr, 1, nullptr,
              supported_devices, plugin_mlp},
-            {string_view(kKVCacheAttentionName), 1, 1, 5, nullptr, 3, nullptr,
+            {kKVCacheAttentionName, 1, 1, 5, nullptr, 3, nullptr,
              supported_devices, plugin_kv_cache_attention},
-            {string_view(kKVCacheAttentionTensorName), 1, 1, 6, nullptr, 3,
+            {kKVCacheAttentionTensorName, 1, 1, 6, nullptr, 3,
              nullptr, supported_devices, plugin_kv_cache_attention_tensor},
-            {string_view(kAttentionResidualName), 1, 1, 3, nullptr, 1, nullptr,
+            {kAttentionResidualName, 1, 1, 3, nullptr, 1, nullptr,
              supported_devices, plugin_attention_residual},
-            {string_view(kAttentionBlockName), 1, 1, 10, nullptr, 3, nullptr,
+            {kAttentionBlockName, 1, 1, 10, nullptr, 3, nullptr,
              supported_devices, plugin_attention_block},
-            {string_view(kLayerDenseName), 1, 1, 14, nullptr, 3, nullptr,
+            {kLayerDenseName, 1, 1, 14, nullptr, 3, nullptr,
              supported_devices, plugin_layer_dense},
-            {string_view(kLayerGeneralizedName), 1, 1, 0,
+            {kLayerGeneralizedName, 1, 1, 0,
              generalized_layer_operand_count, 3, nullptr, supported_devices,
              plugin_layer_generalized},
-            {string_view(kFinalGreedyName), 1, 1, 3, nullptr, 1, nullptr,
+            {kFinalGreedyName, 1, 1, 3, nullptr, 1, nullptr,
              supported_devices, plugin_final_greedy},
-            {string_view(kForwardDenseName), 1, 1, 0,
+            {kForwardDenseName, 1, 1, 0,
              dense_forward_operand_count, 0, dense_forward_output_count,
              supported_devices, plugin_forward_dense},
-            {string_view(kChunkDenseName), 1, 1, 0, dense_chunk_operand_count,
+            {kChunkDenseName, 1, 1, 0, dense_chunk_operand_count,
              0, dense_chunk_output_count, supported_devices,
              plugin_chunk_dense},
-            {string_view(kChunkGeneralizedName), 1, 1, 0,
+            {kChunkGeneralizedName, 1, 1, 0,
              generalized_chunk_operand_count, 0,
              generalized_chunk_output_count, supported_devices,
              plugin_chunk_generalized}},
-        descriptor{string_view(kPluginName), sizeof(emlx::plugin::descriptor_t),
+        descriptor{kPluginName, sizeof(emlx::plugin::descriptor_t),
                    sizeof(emlx::plugin::callback_descriptor_t),
                    static_cast<uint32_t>(callbacks.size()), callbacks.data()},
         bootstrap{emlx::plugin::magic_v1,

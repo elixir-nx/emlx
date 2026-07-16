@@ -39,11 +39,6 @@ inline constexpr char kPartialFailureName[] = "scale_add";
 inline constexpr char kPartialFailureName[] = "partial_failure";
 #endif
 template <size_t N>
-emlx::plugin::string_view_t string_view(const char (&value)[N]) {
-  return emlx::plugin::make_view(value, N - 1);
-}
-
-template <size_t N>
 emlx::plugin::device_view_t
 device_view(const emlx::plugin::device_type_t (&values)[N]) {
   return emlx::plugin::make_view(values);
@@ -214,10 +209,10 @@ callback_must_not_run(const emlx::plugin::call_t &,
 
 const emlx::plugin::callback_descriptor_t kCallbacks[] = {
 #if defined(EMLX_FIXTURE_NULL_CALLBACK)
-    {string_view(kPrimaryCallbackName), 1, 1, 1, nullptr, 1, nullptr,
+    {kPrimaryCallbackName, 1, 1, 1, nullptr, 1, nullptr,
      kAllDevices, nullptr},
 #else
-    {string_view(kPrimaryCallbackName),
+    {kPrimaryCallbackName,
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_SCHEMA)
      2,
 #else
@@ -251,39 +246,39 @@ const emlx::plugin::callback_descriptor_t kCallbacks[] = {
 #endif
      scale_add},
 #endif
-    {string_view(kPartialFailureName), 1, 1, 1, nullptr, 1, nullptr,
+    {kPartialFailureName, 1, 1, 1, nullptr, 1, nullptr,
      kAllDevices, partial_failure},
-    {string_view(kWrongShape), 1, 1, 1, nullptr, 1, nullptr,
+    {kWrongShape, 1, 1, 1, nullptr, 1, nullptr,
      kAllDevices, wrong_shape},
-    {string_view(kCpuOnly), 1, 1, 1, nullptr, 1, nullptr,
+    {kCpuOnly, 1, 1, 1, nullptr, 1, nullptr,
      kCpuDevices, scale_add},
-    {string_view(kGpuOnly), 1, 1, 1, nullptr, 1, nullptr,
+    {kGpuOnly, 1, 1, 1, nullptr, 1, nullptr,
      kGpuDevices, scale_add},
-    {string_view(kThrowingOperandPolicy), 1, 1, 0, throwing_operand_policy, 1,
+    {kThrowingOperandPolicy, 1, 1, 0, throwing_operand_policy, 1,
      nullptr, kAllDevices, scale_add},
-    {string_view(kThrowingOutputPolicy), 1, 1, 1, nullptr, 0,
+    {kThrowingOutputPolicy, 1, 1, 1, nullptr, 0,
      throwing_output_policy,
      kAllDevices, scale_add},
-    {string_view(kOversizedError), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
+    {kOversizedError, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      oversized_error},
-    {string_view(kInvalidUtf8Error), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
+    {kInvalidUtf8Error, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      invalid_utf8_error},
-    {string_view(kEmptyError), 1, 1, 1, nullptr, 1, nullptr,
+    {kEmptyError, 1, 1, 1, nullptr, 1, nullptr,
      kAllDevices, empty_error},
-    {string_view(kThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
+    {kThrowAfterOutput, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      throw_after_output},
-    {string_view(kUnknownThrowAfterOutput), 1, 1, 1, nullptr, 1, nullptr,
+    {kUnknownThrowAfterOutput, 1, 1, 1, nullptr, 1, nullptr,
      kAllDevices, unknown_throw_after_output},
-    {string_view(kWrongOutputCount), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
+    {kWrongOutputCount, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      wrong_output_count},
-    {string_view(kZeroOperandPolicy), 1, 1, 0, zero_count_policy, 1, nullptr,
+    {kZeroOperandPolicy, 1, 1, 0, zero_count_policy, 1, nullptr,
      kAllDevices, callback_must_not_run},
-    {string_view(kZeroOutputPolicy), 1, 1, 1, nullptr, 0, zero_count_policy,
+    {kZeroOutputPolicy, 1, 1, 1, nullptr, 0, zero_count_policy,
      kAllDevices, callback_must_not_run},
-    {string_view(kDynamicCounts), 1, 1, 0, one_count_policy, 0,
+    {kDynamicCounts, 1, 1, 0, one_count_policy, 0,
      one_count_policy,
      kAllDevices, scale_add},
-    {string_view(kRetainedView), 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
+    {kRetainedView, 1, 1, 1, nullptr, 1, nullptr, kAllDevices,
      retained_view},
 };
 
@@ -296,10 +291,10 @@ const emlx::plugin::callback_descriptor_t kCallbacks[] = {
 #endif
 
 const emlx::plugin::descriptor_t kDescriptor{
-#if defined(EMLX_FIXTURE_NULL_PLUGIN_NAME)
-    {std::shared_ptr<const char[]>{}, 5},
+#if defined(EMLX_FIXTURE_EMPTY_PLUGIN_NAME)
+    std::string{},
 #else
-    string_view(kPluginName),
+    kPluginName,
 #endif
 #if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_INNER_SIZE)
     sizeof(emlx::plugin::descriptor_t) + 1,

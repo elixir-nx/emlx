@@ -242,7 +242,7 @@ defmodule EMLXAxon.PluginMetadataTest do
        "plugin descriptor size does not match ABI v1"},
       {"bad_callback_descriptor_size", :bad_callback_descriptor_size,
        "callback descriptor size does not match ABI v1"},
-      {"null_plugin_name", :null_plugin_name, "field name has a null pointer"},
+      {"empty_plugin_name", :empty_plugin_name, "field name is empty"},
       {"null_callbacks", :null_callbacks, "callback table pointer is null"},
       {"too_many_callbacks", :too_many_callbacks, "callback count exceeds its limit"},
       {"misaligned_callbacks", :misaligned_callbacks, "callback table pointer is not aligned"},
@@ -500,7 +500,7 @@ defmodule EMLXAxon.PluginMetadataTest do
           :misaligned_descriptor -> ["-DEMLX_FIXTURE_MISALIGNED_DESCRIPTOR"]
           :bad_descriptor_inner_size -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_INNER_SIZE"]
           :bad_callback_descriptor_size -> ["-DEMLX_FIXTURE_BAD_CALLBACK_DESCRIPTOR_SIZE"]
-          :null_plugin_name -> ["-DEMLX_FIXTURE_NULL_PLUGIN_NAME"]
+          :empty_plugin_name -> ["-DEMLX_FIXTURE_EMPTY_PLUGIN_NAME"]
           :null_callbacks -> ["-DEMLX_FIXTURE_NULL_CALLBACKS"]
           :too_many_callbacks -> ["-DEMLX_FIXTURE_TOO_MANY_CALLBACKS"]
           :misaligned_callbacks -> ["-DEMLX_FIXTURE_MISALIGNED_CALLBACKS"]
