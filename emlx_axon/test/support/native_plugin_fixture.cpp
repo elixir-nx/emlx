@@ -78,16 +78,14 @@ std::optional<std::string>
 scale_add(const emlx::plugin::call_t &call,
           std::vector<mlx::core::array> &outputs) {
   try {
-    if (call.operands.size != 1 || call.attrs.size != 2 || !call.execution ||
-        !call.execution->stream) {
+    if (call.operands.size != 1 || call.attrs.size != 2) {
       return "scale_add expects one operand and two attributes";
     }
     const auto &input = call.operands.data[0];
     auto scale = mlx::core::array(f64_from_bits(call.attrs.data[0]), input.dtype());
     auto bias = mlx::core::array(f64_from_bits(call.attrs.data[1]), input.dtype());
     outputs.push_back(mlx::core::add(
-        mlx::core::multiply(input, scale, *call.execution->stream), bias,
-        *call.execution->stream));
+        mlx::core::multiply(input, scale, call.stream), bias, call.stream));
     return std::nullopt;
   } catch (const std::exception &exception) {
     return exception.what();
@@ -107,11 +105,11 @@ partial_failure(const emlx::plugin::call_t &call,
 std::optional<std::string>
 wrong_shape(const emlx::plugin::call_t &call,
             std::vector<mlx::core::array> &outputs) {
-  if (call.operands.size != 1 || !call.execution || !call.execution->stream) {
+  if (call.operands.size != 1) {
     return "wrong_shape expects one operand";
   }
   outputs.push_back(
-      mlx::core::sum(call.operands.data[0], false, *call.execution->stream));
+      mlx::core::sum(call.operands.data[0], false, call.stream));
   return std::nullopt;
 }
 

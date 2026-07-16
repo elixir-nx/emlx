@@ -2151,10 +2151,9 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
     throw std::runtime_error("emlx::native: plugin callback does not support the worker device");
 
   const auto stream = emlx::g_current_worker->stream();
-  emlx::plugin::execution_context_t execution{&device, &stream};
   emlx::plugin::call_t call{
       {operands.data(), operands.size()},
-      {instr.plugin_attrs.data(), instr.plugin_attrs.size()}, &execution};
+      {instr.plugin_attrs.data(), instr.plugin_attrs.size()}, device, stream};
   std::vector<mlx::core::array> candidates;
   std::optional<std::string> error;
   try {

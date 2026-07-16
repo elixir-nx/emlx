@@ -489,9 +489,8 @@ std::vector<mlx::core::array> emlx_invoke_plugin_callback(
         "plugin callback does not support the worker device");
   }
   const auto stream = emlx::g_current_worker->stream();
-  emlx::plugin::execution_context_t execution{&device, &stream};
   emlx::plugin::call_t call{
-      {operands.data(), operands.size()}, attr_view, &execution};
+      {operands.data(), operands.size()}, attr_view, device, stream};
   std::vector<mlx::core::array> outputs;
   std::optional<std::string> error;
   try {

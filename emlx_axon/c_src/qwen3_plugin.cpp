@@ -1584,8 +1584,7 @@ std::optional<std::string>
 plugin_mlp(const emlx::plugin::call_t &call,
            std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 5 || call.attrs.size != 1 || !call.execution ||
-      !call.execution->device || !call.execution->stream) {
+  if (call.operands.size != 5 || call.attrs.size != 1) {
     error = "qwen3/mlp expects five operands, epsilon, and an execution context";
     return error;
   }
@@ -1593,7 +1592,7 @@ plugin_mlp(const emlx::plugin::call_t &call,
   if (!v_mlp(call.operands.data[0], call.operands.data[1],
              call.operands.data[2], call.operands.data[3],
              call.operands.data[4], f64_from_bits(call.attrs.data[0]),
-             *call.execution->device, output, error))
+             call.device, output, error))
     return error;
   outputs.push_back(std::move(output));
   return std::nullopt;
@@ -1603,8 +1602,7 @@ std::optional<std::string>
 plugin_kv_cache_attention(const emlx::plugin::call_t &call,
                           std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 5 || call.attrs.size != 4 || !call.execution ||
-      !call.execution->device) {
+  if (call.operands.size != 5 || call.attrs.size != 4) {
     error = "qwen3/kv_cache_attention has an invalid call contract";
     return error;
   }
@@ -1621,7 +1619,7 @@ plugin_kv_cache_attention(const emlx::plugin::call_t &call,
   if (!v_kv_cache_attention(
           call.operands.data[0], call.operands.data[1], call.operands.data[2],
           k_cache, v_cache, offset, f64_from_bits(call.attrs.data[1]), head_dim,
-          f64_from_bits(call.attrs.data[3]), *call.execution->device, output,
+          f64_from_bits(call.attrs.data[3]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1634,8 +1632,7 @@ std::optional<std::string>
 plugin_kv_cache_attention_tensor(const emlx::plugin::call_t &call,
                                  std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 6 || call.attrs.size != 3 || !call.execution ||
-      !call.execution->device) {
+  if (call.operands.size != 6 || call.attrs.size != 3) {
     error = "qwen3/kv_cache_attention_tensor_offset has an invalid call contract";
     return error;
   }
@@ -1649,7 +1646,7 @@ plugin_kv_cache_attention_tensor(const emlx::plugin::call_t &call,
           call.operands.data[0], call.operands.data[1], call.operands.data[2],
           call.operands.data[3], call.operands.data[4], call.operands.data[5],
           f64_from_bits(call.attrs.data[0]), head_dim,
-          f64_from_bits(call.attrs.data[2]), *call.execution->device, attention,
+          f64_from_bits(call.attrs.data[2]), call.device, attention,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(attention));
@@ -1662,14 +1659,13 @@ std::optional<std::string>
 plugin_attention_residual(const emlx::plugin::call_t &call,
                           std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 3 || call.attrs.size != 0 || !call.execution ||
-      !call.execution->device) {
+  if (call.operands.size != 3 || call.attrs.size != 0) {
     error = "qwen3/attention_residual has an invalid call contract";
     return error;
   }
   auto output = call.operands.data[0];
   if (!v_attention_residual(call.operands.data[0], call.operands.data[1],
-                            call.operands.data[2], *call.execution->device,
+                            call.operands.data[2], call.device,
                             output, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1680,8 +1676,7 @@ std::optional<std::string>
 plugin_attention_block(const emlx::plugin::call_t &call,
                        std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 10 || call.attrs.size != 5 || !call.execution ||
-      !call.execution->device) {
+  if (call.operands.size != 10 || call.attrs.size != 5) {
     error = "qwen3/attention_block has an invalid call contract";
     return error;
   }
@@ -1701,7 +1696,7 @@ plugin_attention_block(const emlx::plugin::call_t &call,
           call.operands.data[6], call.operands.data[7], k_cache, v_cache,
           offset, f64_from_bits(call.attrs.data[1]), head_dim,
           f64_from_bits(call.attrs.data[3]),
-          f64_from_bits(call.attrs.data[4]), *call.execution->device, output,
+          f64_from_bits(call.attrs.data[4]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1714,8 +1709,7 @@ std::optional<std::string>
 plugin_layer_dense(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 14 || call.attrs.size != 5 || !call.execution ||
-      !call.execution->device) {
+  if (call.operands.size != 14 || call.attrs.size != 5) {
     error = "qwen3/layer_dense has an invalid call contract";
     return error;
   }
@@ -1737,7 +1731,7 @@ plugin_layer_dense(const emlx::plugin::call_t &call,
   if (!v_layer_dense(
           operands[0], layer, cache, offset, f64_from_bits(call.attrs.data[1]),
           head_dim, f64_from_bits(call.attrs.data[3]),
-          f64_from_bits(call.attrs.data[4]), *call.execution->device, output,
+          f64_from_bits(call.attrs.data[4]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1752,8 +1746,7 @@ plugin_layer_generalized(const emlx::plugin::call_t &call,
   std::string error;
   uint32_t expected_operands = 0;
   if (!generalized_layer_operand_count(call.attrs, expected_operands, error) ||
-      call.operands.size != expected_operands || !call.execution ||
-      !call.execution->device) {
+      call.operands.size != expected_operands) {
     if (error.empty())
       error = "qwen3/layer_generalized has an invalid call contract";
     return error;
@@ -1796,7 +1789,7 @@ plugin_layer_generalized(const emlx::plugin::call_t &call,
           call.operands.data[0], layer, cache, offset,
           f64_from_bits(call.attrs.data[2]), head_dim,
           f64_from_bits(call.attrs.data[4]),
-          f64_from_bits(call.attrs.data[5]), *call.execution->device, output,
+          f64_from_bits(call.attrs.data[5]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1809,15 +1802,14 @@ std::optional<std::string>
 plugin_final_greedy(const emlx::plugin::call_t &call,
                     std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 3 || call.attrs.size != 1 || !call.execution ||
-      !call.execution->device) {
+  if (call.operands.size != 3 || call.attrs.size != 1) {
     error = "qwen3/final_greedy has an invalid call contract";
     return error;
   }
   auto output = call.operands.data[0];
   if (!v_final_greedy(call.operands.data[0], call.operands.data[1],
                       call.operands.data[2], f64_from_bits(call.attrs.data[0]),
-                      *call.execution->device, output, error))
+                      call.device, output, error))
     return error;
   outputs.push_back(std::move(output));
   return std::nullopt;
@@ -1891,8 +1883,7 @@ plugin_forward_dense(const emlx::plugin::call_t &call,
   uint32_t expected_outputs = 0;
   if (!dense_forward_operand_count(call.attrs, expected_operands, error) ||
       !dense_forward_output_count(call.attrs, expected_outputs, error) ||
-      call.operands.size != expected_operands || !call.execution ||
-      !call.execution->device)
+      call.operands.size != expected_operands)
     return error;
   int offset = 0;
   int head_dim = 0;
@@ -1914,7 +1905,7 @@ plugin_forward_dense(const emlx::plugin::call_t &call,
           operands[0], layers, caches, operands[tail], operands[tail + 1],
           offset, f64_from_bits(call.attrs.data[2]), head_dim,
           f64_from_bits(call.attrs.data[4]), f64_from_bits(call.attrs.data[5]),
-          false, *call.execution->device, token, ignored_token_id, keys, values,
+          false, call.device, token, ignored_token_id, keys, values,
           error))
     return error;
   outputs.reserve(expected_outputs);
@@ -1934,8 +1925,7 @@ plugin_chunk_dense(const emlx::plugin::call_t &call,
   uint32_t expected_outputs = 0;
   if (!dense_chunk_operand_count(call.attrs, expected_operands, error) ||
       !dense_chunk_output_count(call.attrs, expected_outputs, error) ||
-      call.operands.size != expected_operands || !call.execution ||
-      !call.execution->device)
+      call.operands.size != expected_operands)
     return error;
   int offset = 0;
   int count = 0;
@@ -1959,12 +1949,11 @@ plugin_chunk_dense(const emlx::plugin::call_t &call,
           operands[tail + 1], offset, count, f64_from_bits(call.attrs.data[3]),
           head_dim, f64_from_bits(call.attrs.data[5]),
           f64_from_bits(call.attrs.data[6]), call.attrs.data[7] == 1,
-          *call.execution->device, tokens, keys, values, error))
+          call.device, tokens, keys, values, error))
     return error;
   outputs.reserve(expected_outputs);
   outputs.push_back(mlx::core::reshape(
-      mlx::core::stack(tokens, 0, *call.execution->device), {count},
-      *call.execution->device));
+      mlx::core::stack(tokens, 0, call.device), {count}, call.device));
   for (size_t index = 0; index < keys.size(); ++index) {
     outputs.push_back(std::move(keys[index]));
     outputs.push_back(std::move(values[index]));
@@ -1980,8 +1969,7 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
   uint32_t expected_outputs = 0;
   if (!generalized_chunk_operand_count(call.attrs, expected_operands, error) ||
       !generalized_chunk_output_count(call.attrs, expected_outputs, error) ||
-      call.operands.size != expected_operands || !call.execution ||
-      !call.execution->device) {
+      call.operands.size != expected_operands) {
     if (error.empty())
       error = "qwen3/forward_greedy_chunk_generalized has an invalid call contract";
     return error;
@@ -2046,13 +2034,12 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
           call.operands.data[0], call.operands.data[1], layers, caches, norm,
           lm_head, offset, count, f64_from_bits(call.attrs.data[4]), head_dim,
           f64_from_bits(call.attrs.data[6]),
-          f64_from_bits(call.attrs.data[7]), *call.execution->device, tokens,
+          f64_from_bits(call.attrs.data[7]), call.device, tokens,
           keys, values, error))
     return error;
   outputs.reserve(expected_outputs);
   outputs.push_back(mlx::core::reshape(
-      mlx::core::stack(tokens, 0, *call.execution->device), {count},
-      *call.execution->device));
+      mlx::core::stack(tokens, 0, call.device), {count}, call.device));
   for (size_t index = 0; index < keys.size(); ++index) {
     outputs.push_back(std::move(keys[index]));
     outputs.push_back(std::move(values[index]));

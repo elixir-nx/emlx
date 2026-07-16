@@ -39,15 +39,11 @@ using int64_view_t = view_t<int64_t>;
 using device_type_t = mlx::core::Device::DeviceType;
 using device_view_t = view_t<device_type_t>;
 
-struct execution_context_t {
-  const mlx::core::Device *device;
-  const mlx::core::Stream *stream;
-};
-
 struct call_t {
   array_view_t operands;
   int64_view_t attrs;
-  const execution_context_t *execution;
+  mlx::core::Device device;
+  mlx::core::Stream stream;
 };
 
 // Policies and callbacks may run concurrently on EMLX worker threads and must
@@ -120,13 +116,9 @@ static_assert(std::is_standard_layout_v<device_view_t>);
 static_assert(std::is_trivially_copyable_v<device_view_t>);
 static_assert(sizeof(device_view_t) == 16);
 
-static_assert(std::is_standard_layout_v<execution_context_t>);
-static_assert(std::is_trivially_copyable_v<execution_context_t>);
-static_assert(sizeof(execution_context_t) == 16);
-
 static_assert(std::is_standard_layout_v<call_t>);
 static_assert(std::is_trivially_copyable_v<call_t>);
-static_assert(sizeof(call_t) == 40);
+static_assert(sizeof(call_t) == 56);
 
 static_assert(std::is_standard_layout_v<callback_descriptor_t>);
 static_assert(std::is_trivially_copyable_v<callback_descriptor_t>);
