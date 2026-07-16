@@ -4,12 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <type_traits>
-#include <utility>
 #include <vector>
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -21,54 +18,19 @@
 namespace emlx::plugin {
 
 // magic_v1 is the ASCII tag "EMLXPLG1" packed into a uint64_t:
-// 45 4D 4C 58 50 4C 47 31. V1 constants and layouts are immutable. An
-// incompatible ABI revision should add parallel V2 constants and types, use
-// the "EMLXPLG2" tag (0x454D4C58504C4732), set its ABI version to 2, and
-// expose a versioned discovery symbol rather than changing V1 in place.
+// 45 4D 4C 58 50 4C 47 31. The bootstrap_v1_t POD layout and V1 constants are
+// immutable. C++ call/descriptor types may evolve with host+plugin rebuilds.
+// An incompatible bootstrap revision should add parallel V2 constants and
+// types, use the "EMLXPLG2" tag (0x454D4C58504C4732), set its ABI version to
+// 2, and expose a versioned discovery symbol rather than changing V1 in place.
 inline constexpr uint64_t magic_v1 = 0x454D4C58504C4731ULL;
 inline constexpr uint32_t abi_v1 = 1;
 
-// Views share ownership of their contiguous backing storage. This keeps data
-// valid when a view is copied across the plugin boundary.
-template <typename T> struct view_t {
-  std::shared_ptr<const T[]> data;
-  uint64_t size = 0;
-};
-
-template <typename T> view_t<T> make_view(std::vector<T> values) {
-  if (values.empty()) {
-    return {};
-  }
-
-  auto storage =
-      std::make_shared<const std::vector<T>>(std::move(values));
-  return {std::shared_ptr<const T[]>(storage, storage->data()),
-          static_cast<uint64_t>(storage->size())};
-}
-
-template <typename T> view_t<T> make_view(const T *values, size_t size) {
-  if (size == 0) {
-    return {};
-  }
-  if (!values) {
-    throw std::invalid_argument("plugin view data cannot be null");
-  }
-  return make_view(std::vector<T>(values, values + size));
-}
-
-template <typename T, size_t N>
-view_t<T> make_view(const T (&values)[N]) {
-  return make_view(values, N);
-}
-
-using array_view_t = view_t<mlx::core::array>;
-using int64_view_t = view_t<int64_t>;
 using device_type_t = mlx::core::Device::DeviceType;
-using device_view_t = view_t<device_type_t>;
 
 struct call_t {
-  array_view_t operands;
-  int64_view_t attrs;
+  std::vector<mlx::core::array> operands;
+  std::vector<int64_t> attrs;
   mlx::core::Device device;
   mlx::core::Stream stream;
 };
@@ -78,8 +40,10 @@ struct call_t {
 // string on failure. Callback success returns std::nullopt; expected callback
 // failures return an error string. Exceptions must not cross the plugin
 // boundary.
-using output_count_fn_t = bool (*)(int64_view_t, uint32_t &, std::string &);
-using operand_count_fn_t = bool (*)(int64_view_t, uint32_t &, std::string &);
+using output_count_fn_t =
+    bool (*)(const std::vector<int64_t> &, uint32_t &, std::string &);
+using operand_count_fn_t =
+    bool (*)(const std::vector<int64_t> &, uint32_t &, std::string &);
 using callback_fn_t = std::optional<std::string> (*)(
     const call_t &, std::vector<mlx::core::array> &);
 
@@ -91,7 +55,7 @@ struct callback_descriptor_t {
   operand_count_fn_t operand_count_from_attrs;
   uint32_t output_count;
   output_count_fn_t output_count_from_attrs;
-  device_view_t supported_devices;
+  std::vector<device_type_t> supported_devices;
   callback_fn_t callback;
 };
 
@@ -125,21 +89,9 @@ static_assert(offsetof(bootstrap_v1_t, plugin_abi_version) == 12);
 static_assert(offsetof(bootstrap_v1_t, descriptor_size) == 16);
 static_assert(offsetof(bootstrap_v1_t, descriptor) == 24);
 
-static_assert(std::is_copy_constructible_v<array_view_t>);
-static_assert(sizeof(array_view_t) == 24);
-
-static_assert(std::is_copy_constructible_v<int64_view_t>);
-static_assert(sizeof(int64_view_t) == 24);
-
 static_assert(std::is_enum_v<device_type_t>);
-static_assert(std::is_copy_constructible_v<device_view_t>);
-static_assert(sizeof(device_view_t) == 24);
-
 static_assert(std::is_copy_constructible_v<call_t>);
-static_assert(sizeof(call_t) == 72);
-
 static_assert(std::is_copy_constructible_v<callback_descriptor_t>);
-
 static_assert(std::is_copy_constructible_v<descriptor_t>);
 
 } // namespace emlx::plugin

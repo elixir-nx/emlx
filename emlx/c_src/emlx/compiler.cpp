@@ -2114,18 +2114,16 @@ static void resolve_plugin_instruction(Instruction &instr) {
   while(cursor < attrs.size()) {
     callback_attrs.push_back(plugin_attr_int(attrs[cursor++], "callback attribute"));
   }
-  auto callback_attr_view = emlx::plugin::make_view(callback_attrs);
-
   uint32_t expected_operands = callback.operand_count;
   if (expected_operands == 0) {
     expected_operands = emlx::plugin::invoke_count_policy(
-        callback.operand_count_from_attrs, callback_attr_view, expected_operands,
+        callback.operand_count_from_attrs, callback_attrs, expected_operands,
         "operand", plugin_name, callback_name);
   }
   uint32_t expected_outputs = callback.output_count;
   if (expected_outputs == 0) {
     expected_outputs = emlx::plugin::invoke_count_policy(
-        callback.output_count_from_attrs, callback_attr_view, expected_outputs,
+        callback.output_count_from_attrs, callback_attrs, expected_outputs,
         "output", plugin_name, callback_name);
   }
   if (instr.operands.size() != expected_operands) {
@@ -2150,9 +2148,8 @@ static std::vector<mlx::core::array> invoke_plugin_instruction(
     throw std::runtime_error("emlx::native: plugin callback does not support the worker device");
 
   const auto stream = emlx::g_current_worker->stream();
-  emlx::plugin::call_t call{
-      emlx::plugin::make_view(std::move(operands)),
-      emlx::plugin::make_view(instr.plugin_attrs), device, stream};
+  emlx::plugin::call_t call{std::move(operands), instr.plugin_attrs, device,
+                            stream};
   std::vector<mlx::core::array> candidates;
   std::optional<std::string> error;
   try {

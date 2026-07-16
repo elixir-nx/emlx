@@ -78,13 +78,13 @@ std::string callback_failure_error(
     const std::string &detail, size_t limit = 4096);
 
 uint32_t invoke_count_policy(
-    operand_count_fn_t policy, int64_view_t attrs,
+    operand_count_fn_t policy, const std::vector<int64_t> &attrs,
     uint32_t fixed_count, const char *kind, const std::string &plugin,
     const std::string &callback, size_t error_limit = 4096);
 
 std::vector<mlx::core::array> invoke_callback(
     const std::string &plugin, const std::string &callback,
-    std::vector<mlx::core::array> operands, std::vector<int64_t> attrs,
+    std::vector<mlx::core::array> operands, const std::vector<int64_t> &attrs,
     const mlx::core::Device &device);
 
 } // namespace emlx::plugin

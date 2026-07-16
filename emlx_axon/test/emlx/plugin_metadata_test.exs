@@ -226,41 +226,67 @@ defmodule EMLXAxon.PluginMetadataTest do
     File.mkdir_p!(temporary)
     on_exit(fn -> File.rm_rf!(temporary) end)
 
-    mismatched = compile_proof_plugin!(temporary, name: "descriptor_name")
-    assert {:error, mismatch_reason} = EMLX.NIF.load_plugin("requested_name", mismatched)
-    assert List.to_string(mismatch_reason) =~ "descriptor name does not match"
-
     fixtures = [
-      {"bad_magic", :bad_magic, "bootstrap has an invalid magic value"},
-      {"bad_bootstrap_size", :bad_bootstrap_size, "bootstrap size does not match ABI v1"},
-      {"bad_bootstrap_abi", :bad_bootstrap_abi, "bootstrap ABI version is unsupported"},
-      {"bad_descriptor_size", :bad_descriptor_size,
+      {"descriptor_name", nil, "requested_name", "descriptor name does not match"},
+      {"bad_magic", :bad_magic, "bad_magic", "bootstrap has an invalid magic value"},
+      {"bad_bootstrap_size", :bad_bootstrap_size, "bad_bootstrap_size",
+       "bootstrap size does not match ABI v1"},
+      {"bad_bootstrap_abi", :bad_bootstrap_abi, "bad_bootstrap_abi",
+       "bootstrap ABI version is unsupported"},
+      {"bad_descriptor_size", :bad_descriptor_size, "bad_descriptor_size",
        "bootstrap descriptor size does not match ABI v1"},
-      {"null_descriptor", :null_descriptor, "bootstrap has a null descriptor pointer"},
-      {"misaligned_descriptor", :misaligned_descriptor, "descriptor pointer is not aligned"},
+      {"null_descriptor", :null_descriptor, "null_descriptor",
+       "bootstrap has a null descriptor pointer"},
+      {"misaligned_descriptor", :misaligned_descriptor, "misaligned_descriptor",
+       "descriptor pointer is not aligned"},
       {"bad_descriptor_inner_size", :bad_descriptor_inner_size,
-       "plugin descriptor size does not match ABI v1"},
+       "bad_descriptor_inner_size", "plugin descriptor size does not match ABI v1"},
       {"bad_callback_descriptor_size", :bad_callback_descriptor_size,
-       "callback descriptor size does not match ABI v1"},
-      {"empty_plugin_name", :empty_plugin_name, "field name is empty"},
-      {"null_callbacks", :null_callbacks, "callback table pointer is null"},
-      {"too_many_callbacks", :too_many_callbacks, "callback count exceeds its limit"},
-      {"misaligned_callbacks", :misaligned_callbacks, "callback table pointer is not aligned"},
-      {"null_callback", :null_callback, "callback function pointer is null"},
-      {"bad_callback_schema", :bad_callback_schema, "callback schema version is unsupported"},
-      {"bad_attr_schema", :bad_attr_schema, "callback attribute schema version is unsupported"},
-      {"bad_callback_name", :bad_callback_name, "callback name contains invalid characters"},
-      {"bad_device", :bad_device, "callback contains an invalid device type"},
-      {"empty_devices", :empty_devices, "callback supported device pointer is null"},
-      {"duplicate_devices", :duplicate_devices, "callback contains a duplicate device type"},
-      {"bad_operand_policy", :bad_operand_policy, "operand policy is invalid"},
-      {"bad_output_policy", :bad_output_policy, "output policy is invalid"},
-      {"duplicate_callback", :duplicate_callback, "callback names must be unique"}
+       "bad_callback_descriptor_size", "callback descriptor size does not match ABI v1"},
+      {"empty_plugin_name", :empty_plugin_name, "empty_plugin_name", "field name is empty"},
+      {"null_callbacks", :null_callbacks, "null_callbacks",
+       "callback table pointer is null"},
+      {"too_many_callbacks", :too_many_callbacks, "too_many_callbacks",
+       "callback count exceeds its limit"},
+      {"misaligned_callbacks", :misaligned_callbacks, "misaligned_callbacks",
+       "callback table pointer is not aligned"},
+      {"null_callback", :null_callback, "null_callback",
+       "callback function pointer is null"},
+      {"bad_callback_schema", :bad_callback_schema, "bad_callback_schema",
+       "callback schema version is unsupported"},
+      {"bad_attr_schema", :bad_attr_schema, "bad_attr_schema",
+       "callback attribute schema version is unsupported"},
+      {"bad_callback_name", :bad_callback_name, "bad_callback_name",
+       "callback name contains invalid characters"},
+      {"bad_device", :bad_device, "bad_device", "callback contains an invalid device type"},
+      {"empty_devices", :empty_devices, "empty_devices", "callback supports no devices"},
+      {"duplicate_devices", :duplicate_devices, "duplicate_devices",
+       "callback contains a duplicate device type"},
+      {"bad_operand_policy", :bad_operand_policy, "bad_operand_policy",
+       "operand policy is invalid"},
+      {"bad_output_policy", :bad_output_policy, "bad_output_policy",
+       "output policy is invalid"},
+      {"duplicate_callback", :duplicate_callback, "duplicate_callback",
+       "callback names must be unique"}
     ]
 
-    Enum.each(fixtures, fn {name, fault, expected} ->
-      fixture = compile_proof_plugin!(temporary, name: name, fault: fault)
-      assert {:error, reason} = EMLX.NIF.load_plugin(name, fixture)
+    # Compiling ~23 MLX-linked fixtures serially looks like a hang under
+    # --trace; build them concurrently, then load sequentially.
+    compiled =
+      fixtures
+      |> Task.async_stream(
+        fn {name, fault, _load_name, _expected} ->
+          {name, compile_proof_plugin!(temporary, name: name, fault: fault)}
+        end,
+        timeout: 120_000,
+        ordered: true,
+        max_concurrency: System.schedulers_online()
+      )
+      |> Enum.map(fn {:ok, pair} -> pair end)
+      |> Map.new()
+
+    Enum.each(fixtures, fn {name, _fault, load_name, expected} ->
+      assert {:error, reason} = EMLX.NIF.load_plugin(load_name, Map.fetch!(compiled, name))
       assert List.to_string(reason) =~ expected
     end)
   end
@@ -516,7 +542,7 @@ defmodule EMLXAxon.PluginMetadataTest do
       defines ++
         [
           "-std=c++20",
-          "-O2",
+          "-O0",
           "-fPIC",
           "-fvisibility=hidden",
           "-I#{Path.join(emlx_priv, "include")}",

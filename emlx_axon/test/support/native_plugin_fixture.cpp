@@ -1,8 +1,10 @@
 #include "emlx/plugin/abi.hpp"
 
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -37,31 +39,21 @@ inline constexpr char kPartialFailureName[] = "scale_add";
 #else
 inline constexpr char kPartialFailureName[] = "partial_failure";
 #endif
-template <size_t N>
-emlx::plugin::device_view_t
-device_view(const emlx::plugin::device_type_t (&values)[N]) {
-  return emlx::plugin::make_view(values);
+
+std::vector<emlx::plugin::device_type_t>
+device_list(std::initializer_list<emlx::plugin::device_type_t> values) {
+  return values;
 }
 
-inline constexpr emlx::plugin::device_type_t kAllDeviceTypes[] = {
-    mlx::core::Device::DeviceType::cpu,
-    mlx::core::Device::DeviceType::gpu};
-inline constexpr emlx::plugin::device_type_t kCpuDeviceTypes[] = {
-    mlx::core::Device::DeviceType::cpu};
-inline constexpr emlx::plugin::device_type_t kGpuDeviceTypes[] = {
-    mlx::core::Device::DeviceType::gpu};
-inline constexpr emlx::plugin::device_type_t kInvalidDeviceTypes[] = {
-    static_cast<emlx::plugin::device_type_t>(12)};
-inline constexpr emlx::plugin::device_type_t kDuplicateDeviceTypes[] = {
-    mlx::core::Device::DeviceType::cpu,
-    mlx::core::Device::DeviceType::cpu};
-
-const auto kAllDevices = device_view(kAllDeviceTypes);
-const auto kCpuDevices = device_view(kCpuDeviceTypes);
-const auto kGpuDevices = device_view(kGpuDeviceTypes);
-const auto kInvalidDevices = device_view(kInvalidDeviceTypes);
-const auto kDuplicateDevices = device_view(kDuplicateDeviceTypes);
-const emlx::plugin::device_view_t kEmptyDevices{};
+const auto kAllDevices = device_list({mlx::core::Device::DeviceType::cpu,
+                                      mlx::core::Device::DeviceType::gpu});
+const auto kCpuDevices = device_list({mlx::core::Device::DeviceType::cpu});
+const auto kGpuDevices = device_list({mlx::core::Device::DeviceType::gpu});
+const auto kInvalidDevices =
+    device_list({static_cast<emlx::plugin::device_type_t>(12)});
+const auto kDuplicateDevices = device_list({mlx::core::Device::DeviceType::cpu,
+                                            mlx::core::Device::DeviceType::cpu});
+const std::vector<emlx::plugin::device_type_t> kEmptyDevices{};
 
 double f64_from_bits(int64_t bits) {
   uint64_t raw = static_cast<uint64_t>(bits);
@@ -74,12 +66,12 @@ std::optional<std::string>
 scale_add(const emlx::plugin::call_t &call,
           std::vector<mlx::core::array> &outputs) {
   try {
-    if (call.operands.size != 1 || call.attrs.size != 2) {
+    if (call.operands.size() != 1 || call.attrs.size() != 2) {
       return "scale_add expects one operand and two attributes";
     }
-    const auto &input = call.operands.data[0];
-    auto scale = mlx::core::array(f64_from_bits(call.attrs.data[0]), input.dtype());
-    auto bias = mlx::core::array(f64_from_bits(call.attrs.data[1]), input.dtype());
+    const auto &input = call.operands[0];
+    auto scale = mlx::core::array(f64_from_bits(call.attrs[0]), input.dtype());
+    auto bias = mlx::core::array(f64_from_bits(call.attrs[1]), input.dtype());
     outputs.push_back(mlx::core::add(
         mlx::core::multiply(input, scale, call.stream), bias, call.stream));
     return std::nullopt;
@@ -93,19 +85,19 @@ scale_add(const emlx::plugin::call_t &call,
 std::optional<std::string>
 partial_failure(const emlx::plugin::call_t &call,
                 std::vector<mlx::core::array> &outputs) {
-  if (call.operands.size == 1)
-    outputs.push_back(call.operands.data[0]);
+  if (call.operands.size() == 1)
+    outputs.push_back(call.operands[0]);
   return "intentional partial failure";
 }
 
 std::optional<std::string>
 wrong_shape(const emlx::plugin::call_t &call,
             std::vector<mlx::core::array> &outputs) {
-  if (call.operands.size != 1) {
+  if (call.operands.size() != 1) {
     return "wrong_shape expects one operand";
   }
   outputs.push_back(
-      mlx::core::sum(call.operands.data[0], false, call.stream));
+      mlx::core::sum(call.operands[0], false, call.stream));
   return std::nullopt;
 }
 
@@ -127,42 +119,42 @@ empty_error(const emlx::plugin::call_t &, std::vector<mlx::core::array> &) {
 std::optional<std::string>
 throw_after_output(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
-  outputs.push_back(call.operands.data[0]);
+  outputs.push_back(call.operands[0]);
   throw std::runtime_error("intentional callback exception");
 }
 
 std::optional<std::string>
 unknown_throw_after_output(const emlx::plugin::call_t &call,
                            std::vector<mlx::core::array> &outputs) {
-  outputs.push_back(call.operands.data[0]);
+  outputs.push_back(call.operands[0]);
   throw 42;
 }
 
 std::optional<std::string>
 wrong_output_count(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
-  outputs.push_back(call.operands.data[0]);
-  outputs.push_back(call.operands.data[0]);
+  outputs.push_back(call.operands[0]);
+  outputs.push_back(call.operands[0]);
   return std::nullopt;
 }
 
-bool throwing_operand_policy(emlx::plugin::int64_view_t, uint32_t &,
+bool throwing_operand_policy(const std::vector<int64_t> &, uint32_t &,
                              std::string &) {
   throw std::runtime_error("intentional operand policy exception");
 }
 
-bool throwing_output_policy(emlx::plugin::int64_view_t, uint32_t &,
+bool throwing_output_policy(const std::vector<int64_t> &, uint32_t &,
                             std::string &) {
   throw std::runtime_error("intentional output policy exception");
 }
 
-bool zero_count_policy(emlx::plugin::int64_view_t, uint32_t &count,
+bool zero_count_policy(const std::vector<int64_t> &, uint32_t &count,
                        std::string &) {
   count = 0;
   return true;
 }
 
-bool one_count_policy(emlx::plugin::int64_view_t, uint32_t &count,
+bool one_count_policy(const std::vector<int64_t> &, uint32_t &count,
                       std::string &) {
   count = 1;
   return true;
@@ -170,7 +162,7 @@ bool one_count_policy(emlx::plugin::int64_view_t, uint32_t &count,
 
 struct RetainedViewState {
   std::mutex mutex;
-  std::optional<emlx::plugin::array_view_t> operands;
+  std::optional<std::vector<mlx::core::array>> operands;
 };
 
 RetainedViewState &retained_view_state() {
@@ -185,11 +177,11 @@ retained_view(const emlx::plugin::call_t &call,
   std::lock_guard lock(state.mutex);
 
   if (state.operands) {
-    outputs.push_back(state.operands->data[0]);
+    outputs.push_back((*state.operands)[0]);
     state.operands.reset();
   } else {
     state.operands = call.operands;
-    outputs.push_back(call.operands.data[0]);
+    outputs.push_back(call.operands[0]);
   }
   return std::nullopt;
 }

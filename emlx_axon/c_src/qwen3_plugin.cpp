@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <climits>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -1387,12 +1388,12 @@ double f64_from_bits(int64_t bits) {
 
 bool int32_attr(const emlx::plugin::call_t &call, size_t index, const char *name,
                 int &value, std::string &error) {
-  if (index >= call.attrs.size || call.attrs.data[index] < INT_MIN ||
-      call.attrs.data[index] > INT_MAX) {
+  if (index >= call.attrs.size() || call.attrs[index] < INT_MIN ||
+      call.attrs[index] > INT_MAX) {
     error = std::string(name) + " is outside the int32 range";
     return false;
   }
-  value = static_cast<int>(call.attrs.data[index]);
+  value = static_cast<int>(call.attrs[index]);
   return true;
 }
 
@@ -1419,22 +1420,22 @@ bool quantization_mode(int64_t value, std::string &mode,
   }
 }
 
-bool validate_linear_descriptor(emlx::plugin::int64_view_t attrs, size_t &attr_index,
+bool validate_linear_descriptor(const std::vector<int64_t> &attrs, size_t &attr_index,
                                 uint32_t &operand_index,
                                 std::string &error) {
-  if (attr_index > attrs.size ||
-      attrs.size - attr_index < kLinearDescriptorWidth) {
+  if (attr_index > attrs.size() ||
+      attrs.size() - attr_index < kLinearDescriptorWidth) {
     error = "Qwen3 linear descriptor is truncated";
     return false;
   }
-  const int64_t kind = attrs.data[attr_index];
-  const int64_t weight_index = attrs.data[attr_index + 1];
-  const int64_t scales_index = attrs.data[attr_index + 2];
-  const int64_t biases_index = attrs.data[attr_index + 3];
-  const int64_t group_size = attrs.data[attr_index + 4];
-  const int64_t bits = attrs.data[attr_index + 5];
-  const int64_t mode = attrs.data[attr_index + 6];
-  const int64_t transpose = attrs.data[attr_index + 7];
+  const int64_t kind = attrs[attr_index];
+  const int64_t weight_index = attrs[attr_index + 1];
+  const int64_t scales_index = attrs[attr_index + 2];
+  const int64_t biases_index = attrs[attr_index + 3];
+  const int64_t group_size = attrs[attr_index + 4];
+  const int64_t bits = attrs[attr_index + 5];
+  const int64_t mode = attrs[attr_index + 6];
+  const int64_t transpose = attrs[attr_index + 7];
   attr_index += kLinearDescriptorWidth;
 
   if (weight_index != operand_index || (transpose != 0 && transpose != 1)) {
@@ -1475,40 +1476,40 @@ bool parse_linear_descriptor(const emlx::plugin::call_t &call, size_t &attr_inde
   if (!validate_linear_descriptor(call.attrs, attr_index, next_operand, error))
     return false;
 
-  const int64_t kind = call.attrs.data[descriptor_start];
-  const int64_t weight_index = call.attrs.data[descriptor_start + 1];
-  const int64_t scales_index = call.attrs.data[descriptor_start + 2];
-  const int64_t biases_index = call.attrs.data[descriptor_start + 3];
-  if (next_operand > call.operands.size) {
+  const int64_t kind = call.attrs[descriptor_start];
+  const int64_t weight_index = call.attrs[descriptor_start + 1];
+  const int64_t scales_index = call.attrs[descriptor_start + 2];
+  const int64_t biases_index = call.attrs[descriptor_start + 3];
+  if (next_operand > call.operands.size()) {
     error = "Qwen3 linear descriptor references a missing operand";
     return false;
   }
 
   weight.quantized = kind == 1;
-  weight.weight = const_cast<mlx::core::array *>(&call.operands.data[weight_index]);
+  weight.weight = const_cast<mlx::core::array *>(&call.operands[weight_index]);
   weight.scales = kind == 1
                       ? const_cast<mlx::core::array *>(
-                            &call.operands.data[scales_index])
+                            &call.operands[scales_index])
                       : nullptr;
   weight.biases = biases_index >= 0
                       ? const_cast<mlx::core::array *>(
-                            &call.operands.data[biases_index])
+                            &call.operands[biases_index])
                       : nullptr;
-  weight.group_size = static_cast<int>(call.attrs.data[descriptor_start + 4]);
-  weight.bits = static_cast<int>(call.attrs.data[descriptor_start + 5]);
-  if (!quantization_mode(call.attrs.data[descriptor_start + 6], weight.mode,
+  weight.group_size = static_cast<int>(call.attrs[descriptor_start + 4]);
+  weight.bits = static_cast<int>(call.attrs[descriptor_start + 5]);
+  if (!quantization_mode(call.attrs[descriptor_start + 6], weight.mode,
                          error))
     return false;
-  weight.transpose = call.attrs.data[descriptor_start + 7] == 1;
+  weight.transpose = call.attrs[descriptor_start + 7] == 1;
   operand_index = next_operand;
   return true;
 }
 
-bool generalized_layer_operand_count(emlx::plugin::int64_view_t attrs,
+bool generalized_layer_operand_count(const std::vector<int64_t> &attrs,
                                      uint32_t &count,
                                      std::string &error) {
-  if (attrs.size != 7 + 7 * kLinearDescriptorWidth || attrs.data[0] != 1 ||
-      attrs.data[6] != 7) {
+  if (attrs.size() != 7 + 7 * kLinearDescriptorWidth || attrs[0] != 1 ||
+      attrs[6] != 7) {
     error = "generalized layer attributes have an invalid schema";
     return false;
   }
@@ -1518,7 +1519,7 @@ bool generalized_layer_operand_count(emlx::plugin::int64_view_t attrs,
     if (!validate_linear_descriptor(attrs, attr_index, operand_index, error))
       return false;
   }
-  if (attr_index != attrs.size) {
+  if (attr_index != attrs.size()) {
     error = "generalized layer attributes have trailing fields";
     return false;
   }
@@ -1526,20 +1527,20 @@ bool generalized_layer_operand_count(emlx::plugin::int64_view_t attrs,
   return true;
 }
 
-bool generalized_chunk_operand_count(emlx::plugin::int64_view_t attrs,
+bool generalized_chunk_operand_count(const std::vector<int64_t> &attrs,
                                      uint32_t &count,
                                      std::string &error) {
-  if (attrs.size < 9 || attrs.data[0] != 1 || attrs.data[1] <= 0 ||
-      attrs.data[1] > kMaxLayerCount || attrs.data[8] != attrs.data[1] * 7 + 1 ||
-      attrs.data[8] > 1793 ||
-      attrs.size != 9 + static_cast<uint64_t>(attrs.data[8]) *
+  if (attrs.size() < 9 || attrs[0] != 1 || attrs[1] <= 0 ||
+      attrs[1] > kMaxLayerCount || attrs[8] != attrs[1] * 7 + 1 ||
+      attrs[8] > 1793 ||
+      attrs.size() != 9 + static_cast<uint64_t>(attrs[8]) *
                             kLinearDescriptorWidth) {
     error = "generalized chunk attributes have an invalid schema";
     return false;
   }
   size_t attr_index = 9;
   uint32_t operand_index = 2;
-  for (int64_t layer = 0; layer < attrs.data[1]; ++layer) {
+  for (int64_t layer = 0; layer < attrs[1]; ++layer) {
     if (operand_index > UINT32_MAX - 6) {
       error = "generalized chunk operand count overflows";
       return false;
@@ -1552,23 +1553,23 @@ bool generalized_chunk_operand_count(emlx::plugin::int64_view_t attrs,
   }
   ++operand_index;
   if (!validate_linear_descriptor(attrs, attr_index, operand_index, error) ||
-      attr_index != attrs.size)
+      attr_index != attrs.size())
     return false;
   count = operand_index;
   return true;
 }
 
-bool generalized_chunk_output_count(emlx::plugin::int64_view_t attrs,
+bool generalized_chunk_output_count(const std::vector<int64_t> &attrs,
                                     uint32_t &count,
                                     std::string &error) {
   uint32_t ignored_operands = 0;
   if (!generalized_chunk_operand_count(attrs, ignored_operands, error) ||
-      attrs.data[3] <= 0 || attrs.data[3] > kMaxChunkTokenCount) {
+      attrs[3] <= 0 || attrs[3] > kMaxChunkTokenCount) {
     if (error.empty())
       error = "generalized chunk has an invalid token count";
     return false;
   }
-  count = 1U + static_cast<uint32_t>(attrs.data[1]) * 2U;
+  count = 1U + static_cast<uint32_t>(attrs[1]) * 2U;
   return true;
 }
 
@@ -1576,14 +1577,14 @@ std::optional<std::string>
 plugin_mlp(const emlx::plugin::call_t &call,
            std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 5 || call.attrs.size != 1) {
+  if (call.operands.size() != 5 || call.attrs.size() != 1) {
     error = "qwen3/mlp expects five operands, epsilon, and an execution context";
     return error;
   }
-  mlx::core::array output = call.operands.data[0];
-  if (!v_mlp(call.operands.data[0], call.operands.data[1],
-             call.operands.data[2], call.operands.data[3],
-             call.operands.data[4], f64_from_bits(call.attrs.data[0]),
+  mlx::core::array output = call.operands[0];
+  if (!v_mlp(call.operands[0], call.operands[1],
+             call.operands[2], call.operands[3],
+             call.operands[4], f64_from_bits(call.attrs[0]),
              call.device, output, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1594,13 +1595,13 @@ std::optional<std::string>
 plugin_kv_cache_attention(const emlx::plugin::call_t &call,
                           std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 5 || call.attrs.size != 4) {
+  if (call.operands.size() != 5 || call.attrs.size() != 4) {
     error = "qwen3/kv_cache_attention has an invalid call contract";
     return error;
   }
-  auto k_cache = call.operands.data[3];
-  auto v_cache = call.operands.data[4];
-  auto output = call.operands.data[0];
+  auto k_cache = call.operands[3];
+  auto v_cache = call.operands[4];
+  auto output = call.operands[0];
   auto k_updated = k_cache;
   auto v_updated = v_cache;
   int offset = 0;
@@ -1609,9 +1610,9 @@ plugin_kv_cache_attention(const emlx::plugin::call_t &call,
       !int32_attr(call, 2, "head_dim", head_dim, error))
     return error;
   if (!v_kv_cache_attention(
-          call.operands.data[0], call.operands.data[1], call.operands.data[2],
-          k_cache, v_cache, offset, f64_from_bits(call.attrs.data[1]), head_dim,
-          f64_from_bits(call.attrs.data[3]), call.device, output,
+          call.operands[0], call.operands[1], call.operands[2],
+          k_cache, v_cache, offset, f64_from_bits(call.attrs[1]), head_dim,
+          f64_from_bits(call.attrs[3]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1624,21 +1625,21 @@ std::optional<std::string>
 plugin_kv_cache_attention_tensor(const emlx::plugin::call_t &call,
                                  std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 6 || call.attrs.size != 3) {
+  if (call.operands.size() != 6 || call.attrs.size() != 3) {
     error = "qwen3/kv_cache_attention_tensor_offset has an invalid call contract";
     return error;
   }
   int head_dim = 0;
   if (!int32_attr(call, 1, "head_dim", head_dim, error))
     return error;
-  auto attention = call.operands.data[0];
-  auto k_updated = call.operands.data[3];
-  auto v_updated = call.operands.data[4];
+  auto attention = call.operands[0];
+  auto k_updated = call.operands[3];
+  auto v_updated = call.operands[4];
   if (!tensor_offset_attention(
-          call.operands.data[0], call.operands.data[1], call.operands.data[2],
-          call.operands.data[3], call.operands.data[4], call.operands.data[5],
-          f64_from_bits(call.attrs.data[0]), head_dim,
-          f64_from_bits(call.attrs.data[2]), call.device, attention,
+          call.operands[0], call.operands[1], call.operands[2],
+          call.operands[3], call.operands[4], call.operands[5],
+          f64_from_bits(call.attrs[0]), head_dim,
+          f64_from_bits(call.attrs[2]), call.device, attention,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(attention));
@@ -1651,13 +1652,13 @@ std::optional<std::string>
 plugin_attention_residual(const emlx::plugin::call_t &call,
                           std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 3 || call.attrs.size != 0) {
+  if (call.operands.size() != 3 || call.attrs.size() != 0) {
     error = "qwen3/attention_residual has an invalid call contract";
     return error;
   }
-  auto output = call.operands.data[0];
-  if (!v_attention_residual(call.operands.data[0], call.operands.data[1],
-                            call.operands.data[2], call.device,
+  auto output = call.operands[0];
+  if (!v_attention_residual(call.operands[0], call.operands[1],
+                            call.operands[2], call.device,
                             output, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1668,13 +1669,13 @@ std::optional<std::string>
 plugin_attention_block(const emlx::plugin::call_t &call,
                        std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 10 || call.attrs.size != 5) {
+  if (call.operands.size() != 10 || call.attrs.size() != 5) {
     error = "qwen3/attention_block has an invalid call contract";
     return error;
   }
-  auto k_cache = call.operands.data[8];
-  auto v_cache = call.operands.data[9];
-  auto output = call.operands.data[0];
+  auto k_cache = call.operands[8];
+  auto v_cache = call.operands[9];
+  auto output = call.operands[0];
   auto k_updated = k_cache;
   auto v_updated = v_cache;
   int offset = 0;
@@ -1683,12 +1684,12 @@ plugin_attention_block(const emlx::plugin::call_t &call,
       !int32_attr(call, 2, "head_dim", head_dim, error))
     return error;
   if (!v_attention_block(
-          call.operands.data[0], call.operands.data[1], call.operands.data[2],
-          call.operands.data[3], call.operands.data[4], call.operands.data[5],
-          call.operands.data[6], call.operands.data[7], k_cache, v_cache,
-          offset, f64_from_bits(call.attrs.data[1]), head_dim,
-          f64_from_bits(call.attrs.data[3]),
-          f64_from_bits(call.attrs.data[4]), call.device, output,
+          call.operands[0], call.operands[1], call.operands[2],
+          call.operands[3], call.operands[4], call.operands[5],
+          call.operands[6], call.operands[7], k_cache, v_cache,
+          offset, f64_from_bits(call.attrs[1]), head_dim,
+          f64_from_bits(call.attrs[3]),
+          f64_from_bits(call.attrs[4]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1701,13 +1702,12 @@ std::optional<std::string>
 plugin_layer_dense(const emlx::plugin::call_t &call,
                    std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 14 || call.attrs.size != 5) {
+  if (call.operands.size() != 14 || call.attrs.size() != 5) {
     error = "qwen3/layer_dense has an invalid call contract";
     return error;
   }
   std::vector<mlx::core::array> operands(
-      call.operands.data.get(),
-      call.operands.data.get() + call.operands.size);
+      call.operands.begin(), call.operands.end());
   LayerParams layer{&operands[1],  &operands[10], &operands[6],
                     &operands[7],  &operands[2],  &operands[3],
                     &operands[4],  &operands[5],  &operands[11],
@@ -1722,9 +1722,9 @@ plugin_layer_dense(const emlx::plugin::call_t &call,
       !int32_attr(call, 2, "head_dim", head_dim, error))
     return error;
   if (!v_layer_dense(
-          operands[0], layer, cache, offset, f64_from_bits(call.attrs.data[1]),
-          head_dim, f64_from_bits(call.attrs.data[3]),
-          f64_from_bits(call.attrs.data[4]), call.device, output,
+          operands[0], layer, cache, offset, f64_from_bits(call.attrs[1]),
+          head_dim, f64_from_bits(call.attrs[3]),
+          f64_from_bits(call.attrs[4]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1739,7 +1739,7 @@ plugin_layer_generalized(const emlx::plugin::call_t &call,
   std::string error;
   uint32_t expected_operands = 0;
   if (!generalized_layer_operand_count(call.attrs, expected_operands, error) ||
-      call.operands.size != expected_operands) {
+      call.operands.size() != expected_operands) {
     if (error.empty())
       error = "qwen3/layer_generalized has an invalid call contract";
     return error;
@@ -1751,10 +1751,10 @@ plugin_layer_generalized(const emlx::plugin::call_t &call,
     return error;
 
   LayerParamsQ layer;
-  layer.norm1 = const_cast<mlx::core::array *>(&call.operands.data[1]);
-  layer.q_norm = const_cast<mlx::core::array *>(&call.operands.data[2]);
-  layer.k_norm = const_cast<mlx::core::array *>(&call.operands.data[3]);
-  layer.norm2 = const_cast<mlx::core::array *>(&call.operands.data[6]);
+  layer.norm1 = const_cast<mlx::core::array *>(&call.operands[1]);
+  layer.q_norm = const_cast<mlx::core::array *>(&call.operands[2]);
+  layer.k_norm = const_cast<mlx::core::array *>(&call.operands[3]);
+  layer.norm2 = const_cast<mlx::core::array *>(&call.operands[6]);
   size_t attr_index = 7;
   uint32_t operand_index = 7;
   if (!parse_linear_descriptor(call, attr_index, operand_index, layer.q_proj,
@@ -1773,16 +1773,16 @@ plugin_layer_generalized(const emlx::plugin::call_t &call,
                                layer.down_proj, error))
     return error;
 
-  KVCache cache{const_cast<mlx::core::array *>(&call.operands.data[4]),
-                const_cast<mlx::core::array *>(&call.operands.data[5])};
-  auto output = call.operands.data[0];
-  auto k_updated = call.operands.data[4];
-  auto v_updated = call.operands.data[5];
+  KVCache cache{const_cast<mlx::core::array *>(&call.operands[4]),
+                const_cast<mlx::core::array *>(&call.operands[5])};
+  auto output = call.operands[0];
+  auto k_updated = call.operands[4];
+  auto v_updated = call.operands[5];
   if (!v_layer_quantized(
-          call.operands.data[0], layer, cache, offset,
-          f64_from_bits(call.attrs.data[2]), head_dim,
-          f64_from_bits(call.attrs.data[4]),
-          f64_from_bits(call.attrs.data[5]), call.device, output,
+          call.operands[0], layer, cache, offset,
+          f64_from_bits(call.attrs[2]), head_dim,
+          f64_from_bits(call.attrs[4]),
+          f64_from_bits(call.attrs[5]), call.device, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1795,59 +1795,59 @@ std::optional<std::string>
 plugin_final_greedy(const emlx::plugin::call_t &call,
                     std::vector<mlx::core::array> &outputs) {
   std::string error;
-  if (call.operands.size != 3 || call.attrs.size != 1) {
+  if (call.operands.size() != 3 || call.attrs.size() != 1) {
     error = "qwen3/final_greedy has an invalid call contract";
     return error;
   }
-  auto output = call.operands.data[0];
-  if (!v_final_greedy(call.operands.data[0], call.operands.data[1],
-                      call.operands.data[2], f64_from_bits(call.attrs.data[0]),
+  auto output = call.operands[0];
+  if (!v_final_greedy(call.operands[0], call.operands[1],
+                      call.operands[2], f64_from_bits(call.attrs[0]),
                       call.device, output, error))
     return error;
   outputs.push_back(std::move(output));
   return std::nullopt;
 }
 
-bool dense_forward_operand_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
+bool dense_forward_operand_count(const std::vector<int64_t> &attrs, uint32_t &count,
                                  std::string &error) {
-  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
+  if (attrs.size() != 6 || attrs[0] <= 0 || attrs[0] > kMaxLayerCount) {
     error = "dense forward attributes have an invalid layer count";
     return false;
   }
-  count = 3U + static_cast<uint32_t>(attrs.data[0]) * 13U;
+  count = 3U + static_cast<uint32_t>(attrs[0]) * 13U;
   return true;
 }
 
-bool dense_forward_output_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
+bool dense_forward_output_count(const std::vector<int64_t> &attrs, uint32_t &count,
                                 std::string &error) {
-  if (attrs.size != 6 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount) {
+  if (attrs.size() != 6 || attrs[0] <= 0 || attrs[0] > kMaxLayerCount) {
     error = "dense forward attributes have an invalid layer count";
     return false;
   }
-  count = 1U + static_cast<uint32_t>(attrs.data[0]) * 2U;
+  count = 1U + static_cast<uint32_t>(attrs[0]) * 2U;
   return true;
 }
 
-bool dense_chunk_operand_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
+bool dense_chunk_operand_count(const std::vector<int64_t> &attrs, uint32_t &count,
                                std::string &error) {
-  if (attrs.size != 8 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
-      (attrs.data[7] != 0 && attrs.data[7] != 1)) {
+  if (attrs.size() != 8 || attrs[0] <= 0 || attrs[0] > kMaxLayerCount ||
+      (attrs[7] != 0 && attrs[7] != 1)) {
     error = "dense chunk attributes have an invalid schema";
     return false;
   }
-  count = 4U + static_cast<uint32_t>(attrs.data[0]) * 13U;
+  count = 4U + static_cast<uint32_t>(attrs[0]) * 13U;
   return true;
 }
 
-bool dense_chunk_output_count(emlx::plugin::int64_view_t attrs, uint32_t &count,
+bool dense_chunk_output_count(const std::vector<int64_t> &attrs, uint32_t &count,
                               std::string &error) {
-  if (attrs.size != 8 || attrs.data[0] <= 0 || attrs.data[0] > kMaxLayerCount ||
-      attrs.data[2] <= 0 || attrs.data[2] > kMaxChunkTokenCount ||
-      (attrs.data[7] != 0 && attrs.data[7] != 1)) {
+  if (attrs.size() != 8 || attrs[0] <= 0 || attrs[0] > kMaxLayerCount ||
+      attrs[2] <= 0 || attrs[2] > kMaxChunkTokenCount ||
+      (attrs[7] != 0 && attrs[7] != 1)) {
     error = "dense chunk attributes have an invalid schema";
     return false;
   }
-  count = 1U + static_cast<uint32_t>(attrs.data[0]) * 2U;
+  count = 1U + static_cast<uint32_t>(attrs[0]) * 2U;
   return true;
 }
 
@@ -1876,17 +1876,16 @@ plugin_forward_dense(const emlx::plugin::call_t &call,
   uint32_t expected_outputs = 0;
   if (!dense_forward_operand_count(call.attrs, expected_operands, error) ||
       !dense_forward_output_count(call.attrs, expected_outputs, error) ||
-      call.operands.size != expected_operands)
+      call.operands.size() != expected_operands)
     return error;
   int offset = 0;
   int head_dim = 0;
   if (!int32_attr(call, 1, "offset", offset, error) ||
       !int32_attr(call, 3, "head_dim", head_dim, error))
     return error;
-  const size_t layer_count = static_cast<size_t>(call.attrs.data[0]);
+  const size_t layer_count = static_cast<size_t>(call.attrs[0]);
   std::vector<mlx::core::array> operands(
-      call.operands.data.get(),
-      call.operands.data.get() + call.operands.size);
+      call.operands.begin(), call.operands.end());
   std::vector<LayerParams> layers;
   std::vector<KVCache> caches;
   parse_dense_layers(operands, 1, layer_count, layers, caches);
@@ -1897,8 +1896,8 @@ plugin_forward_dense(const emlx::plugin::call_t &call,
   std::vector<mlx::core::array> values;
   if (!v_forward_greedy_from_hidden(
           operands[0], layers, caches, operands[tail], operands[tail + 1],
-          offset, f64_from_bits(call.attrs.data[2]), head_dim,
-          f64_from_bits(call.attrs.data[4]), f64_from_bits(call.attrs.data[5]),
+          offset, f64_from_bits(call.attrs[2]), head_dim,
+          f64_from_bits(call.attrs[4]), f64_from_bits(call.attrs[5]),
           false, call.device, token, ignored_token_id, keys, values,
           error))
     return error;
@@ -1919,7 +1918,7 @@ plugin_chunk_dense(const emlx::plugin::call_t &call,
   uint32_t expected_outputs = 0;
   if (!dense_chunk_operand_count(call.attrs, expected_operands, error) ||
       !dense_chunk_output_count(call.attrs, expected_outputs, error) ||
-      call.operands.size != expected_operands)
+      call.operands.size() != expected_operands)
     return error;
   int offset = 0;
   int count = 0;
@@ -1928,10 +1927,9 @@ plugin_chunk_dense(const emlx::plugin::call_t &call,
       !int32_attr(call, 2, "count", count, error) ||
       !int32_attr(call, 4, "head_dim", head_dim, error))
     return error;
-  const size_t layer_count = static_cast<size_t>(call.attrs.data[0]);
+  const size_t layer_count = static_cast<size_t>(call.attrs[0]);
   std::vector<mlx::core::array> operands(
-      call.operands.data.get(),
-      call.operands.data.get() + call.operands.size);
+      call.operands.begin(), call.operands.end());
   std::vector<LayerParams> layers;
   std::vector<KVCache> caches;
   parse_dense_layers(operands, 2, layer_count, layers, caches);
@@ -1941,9 +1939,9 @@ plugin_chunk_dense(const emlx::plugin::call_t &call,
   std::vector<mlx::core::array> values;
   if (!v_forward_greedy_ids_chunk(
           operands[0], operands[1], layers, caches, operands[tail],
-          operands[tail + 1], offset, count, f64_from_bits(call.attrs.data[3]),
-          head_dim, f64_from_bits(call.attrs.data[5]),
-          f64_from_bits(call.attrs.data[6]), call.attrs.data[7] == 1,
+          operands[tail + 1], offset, count, f64_from_bits(call.attrs[3]),
+          head_dim, f64_from_bits(call.attrs[5]),
+          f64_from_bits(call.attrs[6]), call.attrs[7] == 1,
           call.device, tokens, keys, values, error))
     return error;
   outputs.reserve(expected_outputs);
@@ -1964,7 +1962,7 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
   uint32_t expected_outputs = 0;
   if (!generalized_chunk_operand_count(call.attrs, expected_operands, error) ||
       !generalized_chunk_output_count(call.attrs, expected_outputs, error) ||
-      call.operands.size != expected_operands) {
+      call.operands.size() != expected_operands) {
     if (error.empty())
       error = "qwen3/forward_greedy_chunk_generalized has an invalid call contract";
     return error;
@@ -1977,7 +1975,7 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
       !int32_attr(call, 5, "head_dim", head_dim, error))
     return error;
 
-  const size_t layer_count = static_cast<size_t>(call.attrs.data[1]);
+  const size_t layer_count = static_cast<size_t>(call.attrs[1]);
   std::vector<LayerParamsQ> layers;
   std::vector<KVCache> caches;
   layers.reserve(layer_count);
@@ -1987,17 +1985,17 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
   for (size_t layer_index = 0; layer_index < layer_count; ++layer_index) {
     LayerParamsQ layer;
     layer.norm1 = const_cast<mlx::core::array *>(
-        &call.operands.data[operand_index++]);
+        &call.operands[operand_index++]);
     layer.norm2 = const_cast<mlx::core::array *>(
-        &call.operands.data[operand_index++]);
+        &call.operands[operand_index++]);
     layer.q_norm = const_cast<mlx::core::array *>(
-        &call.operands.data[operand_index++]);
+        &call.operands[operand_index++]);
     layer.k_norm = const_cast<mlx::core::array *>(
-        &call.operands.data[operand_index++]);
+        &call.operands[operand_index++]);
     auto *k_cache = const_cast<mlx::core::array *>(
-        &call.operands.data[operand_index++]);
+        &call.operands[operand_index++]);
     auto *v_cache = const_cast<mlx::core::array *>(
-        &call.operands.data[operand_index++]);
+        &call.operands[operand_index++]);
     if (!parse_linear_descriptor(call, attr_index, operand_index,
                                  layer.q_proj, error) ||
         !parse_linear_descriptor(call, attr_index, operand_index,
@@ -2016,7 +2014,7 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
     layers.push_back(std::move(layer));
     caches.push_back({k_cache, v_cache});
   }
-  auto &norm = call.operands.data[operand_index++];
+  auto &norm = call.operands[operand_index++];
   LinearWeight lm_head;
   if (!parse_linear_descriptor(call, attr_index, operand_index, lm_head,
                                error))
@@ -2026,10 +2024,10 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
   std::vector<mlx::core::array> keys;
   std::vector<mlx::core::array> values;
   if (!v_forward_greedy_ids_chunk_quantized(
-          call.operands.data[0], call.operands.data[1], layers, caches, norm,
-          lm_head, offset, count, f64_from_bits(call.attrs.data[4]), head_dim,
-          f64_from_bits(call.attrs.data[6]),
-          f64_from_bits(call.attrs.data[7]), call.device, tokens,
+          call.operands[0], call.operands[1], layers, caches, norm,
+          lm_head, offset, count, f64_from_bits(call.attrs[4]), head_dim,
+          f64_from_bits(call.attrs[6]),
+          f64_from_bits(call.attrs[7]), call.device, tokens,
           keys, values, error))
     return error;
   outputs.reserve(expected_outputs);
@@ -2043,13 +2041,13 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
 }
 
 struct PluginMetadata {
-  emlx::plugin::device_view_t supported_devices;
+  std::vector<emlx::plugin::device_type_t> supported_devices;
   std::vector<emlx::plugin::callback_descriptor_t> callbacks;
   emlx::plugin::descriptor_t descriptor;
   emlx::plugin::bootstrap_v1_t bootstrap;
 
   PluginMetadata()
-      : supported_devices(emlx::plugin::make_view(kSupportedDeviceTypes)),
+      : supported_devices(std::begin(kSupportedDeviceTypes), std::end(kSupportedDeviceTypes)),
         callbacks{
             {kMLPName, 1, 1, 5, nullptr, 1, nullptr,
              supported_devices, plugin_mlp},

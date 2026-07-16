@@ -93,7 +93,8 @@ std::string callback_failure_error_impl(const std::string &plugin_name,
   return prefix + separator + bounded_error(detail, detail_limit);
 }
 
-uint32_t invoke_count_policy_impl(operand_count_fn_t policy, int64_view_t attrs,
+uint32_t invoke_count_policy_impl(operand_count_fn_t policy,
+                                  const std::vector<int64_t> &attrs,
                                   uint32_t fixed_count, const char *kind,
                                   const std::string &plugin_name,
                                   const std::string &callback_name,
@@ -352,22 +353,12 @@ loaded_callback_t::loaded_callback_t(const callback_descriptor_t &source)
   if (!callback) {
     throw std::runtime_error("plugin callback function pointer is null");
   }
-  if (!source.supported_devices.data) {
-    throw std::runtime_error(
-        "plugin callback supported device pointer is null");
-  }
-  if (source.supported_devices.size == 0) {
+  if (source.supported_devices.empty()) {
     throw std::runtime_error("plugin callback supports no devices");
   }
-  if (source.supported_devices.size > kDeviceTypesMax) {
+  if (source.supported_devices.size() > kDeviceTypesMax) {
     throw std::runtime_error(
         "plugin callback supported device count exceeds its limit");
-  }
-  if (reinterpret_cast<uintptr_t>(source.supported_devices.data.get()) %
-          alignof(device_type_t) !=
-      0) {
-    throw std::runtime_error(
-        "plugin callback supported device pointer is not aligned");
   }
   if ((operand_count == 0) == (operand_count_from_attrs == nullptr)) {
     throw std::runtime_error("plugin callback operand policy is invalid");
@@ -376,13 +367,8 @@ loaded_callback_t::loaded_callback_t(const callback_descriptor_t &source)
     throw std::runtime_error("plugin callback output policy is invalid");
   }
 
-  supported_devices.reserve(source.supported_devices.size);
-  for (uint64_t device_index = 0;
-       device_index < source.supported_devices.size; ++device_index) {
-    device_type_t device_type{};
-    std::memcpy(&device_type,
-                source.supported_devices.data.get() + device_index,
-                sizeof(device_type));
+  supported_devices.reserve(source.supported_devices.size());
+  for (device_type_t device_type : source.supported_devices) {
     if (!valid_device_type(device_type)) {
       throw std::runtime_error(
           "plugin callback contains an invalid device type");
@@ -428,7 +414,8 @@ std::string callback_failure_error(const std::string &plugin,
   return callback_failure_error_impl(plugin, callback, detail, limit);
 }
 
-uint32_t invoke_count_policy(operand_count_fn_t policy, int64_view_t attrs,
+uint32_t invoke_count_policy(operand_count_fn_t policy,
+                             const std::vector<int64_t> &attrs,
                              uint32_t fixed_count, const char *kind,
                              const std::string &plugin,
                              const std::string &callback, size_t error_limit) {
@@ -438,23 +425,21 @@ uint32_t invoke_count_policy(operand_count_fn_t policy, int64_view_t attrs,
 
 std::vector<mlx::core::array> invoke_callback(
     const std::string &plugin_name, const std::string &callback_name,
-    std::vector<mlx::core::array> operands, std::vector<int64_t> attrs,
+    std::vector<mlx::core::array> operands, const std::vector<int64_t> &attrs,
     const mlx::core::Device &device) {
   auto resolved = resolve_callback(plugin_name, callback_name);
   const auto &callback = *resolved.callback;
-  auto operand_view = make_view(std::move(operands));
-  auto attr_view = make_view(std::move(attrs));
   constexpr size_t callback_error_max = kErrorMax - kCallPluginNifSuffixSize;
   const uint32_t expected_operands = invoke_count_policy(
-      callback.operand_count_from_attrs, attr_view, callback.operand_count,
+      callback.operand_count_from_attrs, attrs, callback.operand_count,
       "operand", plugin_name, callback_name, callback_error_max);
-  if (operand_view.size != expected_operands) {
+  if (operands.size() != expected_operands) {
     throw std::runtime_error(
-        "plugin callback received " + std::to_string(operand_view.size) +
+        "plugin callback received " + std::to_string(operands.size()) +
         " operands, expected " + std::to_string(expected_operands));
   }
   const uint32_t expected_outputs = invoke_count_policy(
-      callback.output_count_from_attrs, attr_view, callback.output_count,
+      callback.output_count_from_attrs, attrs, callback.output_count,
       "output", plugin_name, callback_name, callback_error_max);
   if (!emlx::g_current_worker) {
     throw std::runtime_error("plugin execution has no current worker");
@@ -464,7 +449,7 @@ std::vector<mlx::core::array> invoke_callback(
         "plugin callback does not support the worker device");
   }
   const auto stream = emlx::g_current_worker->stream();
-  call_t call{std::move(operand_view), std::move(attr_view), device, stream};
+  call_t call{std::move(operands), attrs, device, stream};
   std::vector<mlx::core::array> outputs;
   std::optional<std::string> error;
   try {

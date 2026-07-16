@@ -50,15 +50,30 @@ defmodule EMLXAxon.MixProject do
   end
 
   defp emlx_dep do
-    if System.get_env("EMLX_AXON_LOCAL_EMLX") == "true" do
-      {:emlx, path: "../emlx", override: true}
-    else
-      # Release sequencing: this source tree needs the generic plugin ABI added
-      # after v0.4.0. Keep the Hex requirement publishable until the maintainer
-      # assigns and releases that EMLX version, then raise this lower bound before
-      # publishing the matching EMLXAxon release.
-      {:emlx, "~> 0.4.0"}
+    cond do
+      System.get_env("EMLX_AXON_LOCAL_EMLX") == "true" ->
+        {:emlx, path: "../emlx", override: true}
+
+      System.get_env("EMLX_AXON_LOCAL_EMLX") == "false" ->
+        hex_emlx_dep()
+
+      # Monorepo checkout: prefer the sibling package so plugin builds see the
+      # in-tree ABI header under priv/include. Hex remains the default when
+      # ../emlx is absent (Hex installs) or when EMLX_AXON_LOCAL_EMLX=false.
+      File.dir?(Path.expand("../emlx", __DIR__)) ->
+        {:emlx, path: "../emlx", override: true}
+
+      true ->
+        hex_emlx_dep()
     end
+  end
+
+  defp hex_emlx_dep do
+    # Release sequencing: this source tree needs the generic plugin ABI added
+    # after v0.4.0. Keep the Hex requirement publishable until the maintainer
+    # assigns and releases that EMLX version, then raise this lower bound before
+    # publishing the matching EMLXAxon release.
+    {:emlx, "~> 0.4.0"}
   end
 
   def cli do

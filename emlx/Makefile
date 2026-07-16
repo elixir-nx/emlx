@@ -110,7 +110,7 @@ $(call esc,$(MLX_SO)): $(call esc,$(MLX_SRC_DIR))
 		fi ; \
 	fi
 
-$(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(OBJECTS)
+$(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(call esc,$(EMLX_PLUGIN_ABI_HEADER)) $(OBJECTS)
 	@ echo "Copying MLX library to $(EMLX_LIB_DIR)"
 	@ mkdir -p "$(EMLX_LIB_DIR)"
 	@ cp -a "$(MLX_LIB_DIR)"/* "$(EMLX_LIB_DIR)"
