@@ -8,6 +8,7 @@
 #include <dlfcn.h>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -184,10 +185,15 @@ load_generic_candidate(const std::string &requested_name,
   dlerror();
   auto discovery = reinterpret_cast<discovery_v1_fn_t>(
       dlsym(handle.get(), "emlx_plugin_descriptor_v1"));
-  const char *symbol_error = dlerror();
+
+  std::optional<std::string> symbol_error;
+  if (const char *error = dlerror()) {
+    symbol_error.emplace(error);
+  }
+
   if (symbol_error) {
     throw std::runtime_error(std::string("failed to resolve ") +
-                             "emlx_plugin_descriptor_v1: " + symbol_error);
+                             "emlx_plugin_descriptor_v1: " + *symbol_error);
   }
   if (!discovery) {
     throw std::runtime_error("emlx_plugin_descriptor_v1 resolved to null");
