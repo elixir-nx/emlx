@@ -15,10 +15,9 @@ defmodule EMLXAxon.MixProject do
       aliases: aliases(),
       description: "Axon model rewrites to swap supported nodes for EMLX.Fast Metal shaders",
       package: package(),
-      # elixir_make builds the standalone Qwen3 compute plugin
-      # (c_src/qwen3_plugin.cpp), loaded at runtime by EMLX.NIF.load_plugin/2.
-      # A
-      # function ref so `Application.app_dir(:emlx, ...)` (needs the
+      # elixir_make builds the standalone model compute plugins, loaded at
+      # runtime by EMLX.NIF.load_plugin/2.
+      # A function ref ensures `Application.app_dir(:emlx, ...)` (which needs the
       # :emlx dep already compiled) isn't called while this project/0
       # map is being built — mirrors emlx's own `Fine.include_dir()`
       # deferral in its mix.exs.
