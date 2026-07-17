@@ -279,11 +279,6 @@ const emlx::plugin::descriptor_t kDescriptor{
 #else
     kPluginName,
 #endif
-#if defined(EMLX_FIXTURE_BAD_DESCRIPTOR_INNER_SIZE)
-    sizeof(emlx::plugin::descriptor_t) + 1,
-#else
-    sizeof(emlx::plugin::descriptor_t),
-#endif
 #if defined(EMLX_FIXTURE_BAD_CALLBACK_DESCRIPTOR_SIZE)
     sizeof(emlx::plugin::callback_descriptor_t) + 1,
 #else

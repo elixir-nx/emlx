@@ -225,9 +225,6 @@ load_generic_candidate(const std::string &requested_name,
 
   const auto &descriptor =
       *static_cast<const descriptor_t *>(bootstrap.descriptor);
-  if (descriptor.descriptor_size != sizeof(descriptor_t)) {
-    throw std::runtime_error("plugin descriptor size does not match ABI v1");
-  }
   if (descriptor.callback_descriptor_size !=
       sizeof(callback_descriptor_t)) {
     throw std::runtime_error(

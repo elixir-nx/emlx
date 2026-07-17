@@ -239,8 +239,6 @@ defmodule EMLXAxon.PluginMetadataTest do
        "bootstrap has a null descriptor pointer"},
       {"misaligned_descriptor", :misaligned_descriptor, "misaligned_descriptor",
        "descriptor pointer is not aligned"},
-      {"bad_descriptor_inner_size", :bad_descriptor_inner_size, "bad_descriptor_inner_size",
-       "plugin descriptor size does not match ABI v1"},
       {"bad_callback_descriptor_size", :bad_callback_descriptor_size,
        "bad_callback_descriptor_size", "callback descriptor size does not match ABI v1"},
       {"empty_plugin_name", :empty_plugin_name, "empty_plugin_name", "field name is empty"},
@@ -517,7 +515,6 @@ defmodule EMLXAxon.PluginMetadataTest do
           :bad_descriptor_size -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_SIZE"]
           :null_descriptor -> ["-DEMLX_FIXTURE_NULL_DESCRIPTOR"]
           :misaligned_descriptor -> ["-DEMLX_FIXTURE_MISALIGNED_DESCRIPTOR"]
-          :bad_descriptor_inner_size -> ["-DEMLX_FIXTURE_BAD_DESCRIPTOR_INNER_SIZE"]
           :bad_callback_descriptor_size -> ["-DEMLX_FIXTURE_BAD_CALLBACK_DESCRIPTOR_SIZE"]
           :empty_plugin_name -> ["-DEMLX_FIXTURE_EMPTY_PLUGIN_NAME"]
           :null_callbacks -> ["-DEMLX_FIXTURE_NULL_CALLBACKS"]

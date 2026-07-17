@@ -63,7 +63,6 @@ struct descriptor_t {
   // Strings, the callback table, policy functions, and callbacks must remain
   // valid for the lifetime of the VM process.
   std::string name;
-  uint64_t descriptor_size;
   uint64_t callback_descriptor_size;
   uint32_t callback_count;
   const callback_descriptor_t *callbacks;
