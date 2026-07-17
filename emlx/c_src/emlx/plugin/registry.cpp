@@ -174,9 +174,11 @@ load_generic_candidate(const std::string &requested_name,
   shared_object_handle_t handle{
       dlopen(resolved_path.c_str(), RTLD_NOW | RTLD_LOCAL)};
   if (!handle) {
-    const char *detail = dlerror();
-    throw std::runtime_error(std::string("failed to load plugin: ") +
-                             (detail ? detail : "unknown loader error"));
+    std::string detail = "unknown loader error";
+    if (const char *error = dlerror()) {
+      detail = error;
+    }
+    throw std::runtime_error("failed to load plugin: " + detail);
   }
 
   dlerror();
