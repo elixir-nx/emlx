@@ -2,7 +2,7 @@ defmodule EMLX.Native.Instruction do
   @moduledoc false
 
   # One compiled-program instruction, as passed to the `compile_program` NIF.
-  # Decoded directly on the C++ side by Fine (see emlx_compiler.hpp's
+  # Decoded directly on the C++ side by Fine (see emlx/compiler.hpp's
   # `Instruction` struct + `fine::Decoder<Instruction>`), replacing the old
   # to_native/1 format's parallel `op_names`/`operands`/`attrs` lists.
 
@@ -22,9 +22,9 @@ defmodule EMLX.Native.Instruction do
 
   # Most attrs are plain integers (shapes, axes, flags, f64_bits-encoded
   # floats); a few are MLX dtype atoms or quantized_matmul mode atoms (see
-  # emlx_compiler.hpp's `Attr` type) — no int<->meaning lookup table needs to
+  # emlx/compiler.hpp's `Attr` type) — no int<->meaning lookup table needs to
   # be kept in sync between Elixir and C++ for those.
-  @type attr :: integer() | atom()
+  @type attr :: integer() | atom() | binary()
 
   @type t :: %__MODULE__{
           op: atom(),

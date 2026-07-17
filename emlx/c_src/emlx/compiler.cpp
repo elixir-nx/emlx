@@ -1,4 +1,4 @@
-// emlx_compiler.cpp — implements emlx::native compile/eval NIF logic.
+// emlx/compiler.cpp — implements emlx::native compile/eval NIF logic.
 //
 // compile_program bakes the program into a capturing lambda and wraps it with
 // mlx::core::compile(), so MLX traces the computation graph on first eval and
@@ -9,7 +9,7 @@
 // enum. Adding a new op: register it in `op_registry` below.  No enum, no wire
 // integers, no lockstep parity table to maintain.
 
-#include "emlx_compiler.hpp"
+#include "emlx/compiler.hpp"
 #include "emlx_runtime_call_bridge.hpp"
 #include "mlx/allocator.h"
 #include "mlx/compile_impl.h"
@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <thread>
 #include <unordered_map>
 
@@ -1754,7 +1755,7 @@ static std::vector<mlx::core::array> interpret_instructions(
 //
 // Native lowering of a dynamic-trip-count `Nx.Defn.while` loop (see
 // EMLX.Native.Expr's `:while` moduledoc section). Interprets the `cond`/
-// `body` SubPrograms (emlx_compiler.hpp) directly here in C++, iterating
+// `body` SubPrograms (emlx/compiler.hpp) directly here in C++, iterating
 // until `cond` evaluates false — all inside a single eval_cpu call, so an
 // N-iteration loop costs one eval_program NIF round-trip instead of the old
 // Elixir-driven split-point path's 2N (`run_while_loop` in emlx.ex).
@@ -2031,9 +2032,159 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
 // lambda, with `inputs` set and `carry` null) and, recursively, for a
 // `:while` instruction's `cond`/`body` SubPrograms (called from
 // EMLXWhile::eval, with `carry` set and `inputs` null — SubPrograms never
-// contain `{:input, _}` refs, see emlx_compiler.hpp). `results` is always a
+// contain `{:input, _}` refs, see emlx/compiler.hpp). `results` is always a
 // fresh local accumulator: a SubProgram's `{:result, i}` numbering is local
 // to that interpretation, distinct from the parent program's own.
+static int64_t plugin_attr_int(const Attr &attr, const char *field) {
+  if (!attr.is_int())
+    throw std::runtime_error(std::string("emlx::native: plugin ") + field +
+                             " must be an integer");
+  return static_cast<int64_t>(attr);
+}
+
+static void resolve_plugin_instruction(Instruction &instr) {
+  const auto &attrs = instr.attrs;
+  if (attrs.size() < 7)
+    throw std::runtime_error("emlx::native: truncated plugin instruction");
+  if (plugin_attr_int(attrs[0], "wire version") != 1)
+    throw std::runtime_error("emlx::native: unsupported plugin wire version");
+  if (!attrs[1].is_binary() || !attrs[2].is_binary())
+    throw std::runtime_error("emlx::native: plugin names must be binaries");
+
+  const std::string &plugin_name = attrs[1].as_binary();
+  const std::string &callback_name = attrs[2].as_binary();
+  if (!emlx::plugin::valid_name(plugin_name) ||
+      !emlx::plugin::valid_name(callback_name))
+    throw std::runtime_error("emlx::native: plugin names are not canonical");
+  auto resolved = emlx::plugin::resolve_callback(plugin_name, callback_name);
+  const auto &callback = *resolved.callback;
+
+  const int64_t schema = plugin_attr_int(attrs[3], "schema version");
+  const int64_t attr_schema =
+      plugin_attr_int(attrs[4], "attribute schema version");
+  const int64_t output_count = plugin_attr_int(attrs[5], "output count");
+  if (schema <= 0 || schema > UINT32_MAX ||
+      static_cast<uint32_t>(schema) != callback.schema_version ||
+      attr_schema <= 0 || attr_schema > UINT32_MAX ||
+      static_cast<uint32_t>(attr_schema) != callback.attr_schema_version)
+    throw std::runtime_error("emlx::native: plugin callback schema mismatch");
+  if (output_count < 0) {
+    throw std::runtime_error("emlx::native: plugin output count must be nonnegative");
+  }
+
+  // Every output template needs at least a dtype and rank, and the instruction
+  // must retain one final field for the callback attribute count. Bound the
+  // reservation by the metadata that is already present rather than an
+  // arbitrary global ABI output limit.
+  const size_t output_template_budget = attrs.size() - 7;
+  if (static_cast<uint64_t>(output_count) > output_template_budget / 2) {
+    throw std::runtime_error("emlx::native: malformed plugin output count");
+  }
+
+  size_t cursor = 6;
+  std::vector<PluginOutputTemplate> templates;
+  templates.reserve(static_cast<size_t>(output_count));
+  for (int64_t output = 0; output < output_count; ++output) {
+    if (cursor + 2 > attrs.size() || !attrs[cursor].is_atom())
+      throw std::runtime_error("emlx::native: malformed plugin output template");
+    auto dtype = attrs[cursor++].as_dtype();
+    const int64_t rank = plugin_attr_int(attrs[cursor++], "output rank");
+    if (rank < 0 || rank > 16 || cursor + static_cast<size_t>(rank) > attrs.size())
+      throw std::runtime_error("emlx::native: malformed plugin output rank");
+    mlx::core::Shape shape;
+    shape.reserve(static_cast<size_t>(rank));
+    for (int64_t axis = 0; axis < rank; ++axis) {
+      const int64_t dim = plugin_attr_int(attrs[cursor++], "output dimension");
+      if (dim < 0 || dim > INT32_MAX)
+        throw std::runtime_error("emlx::native: plugin output dimension is out of range");
+      shape.push_back(static_cast<int>(dim));
+    }
+    templates.push_back({dtype, std::move(shape)});
+  }
+  if (cursor >= attrs.size())
+    throw std::runtime_error("emlx::native: missing plugin callback attribute count");
+  const int64_t callback_attr_count =
+      plugin_attr_int(attrs[cursor++], "callback attribute count");
+  if (callback_attr_count < 0 ||
+      static_cast<uint64_t>(callback_attr_count) != attrs.size() - cursor) {
+    throw std::runtime_error("emlx::native: malformed plugin callback attributes");
+  }
+  std::vector<int64_t> callback_attrs;
+  callback_attrs.reserve(static_cast<size_t>(callback_attr_count));
+  while(cursor < attrs.size()) {
+    callback_attrs.push_back(plugin_attr_int(attrs[cursor++], "callback attribute"));
+  }
+  uint32_t expected_operands = callback.operand_count;
+  if (expected_operands == 0) {
+    expected_operands = emlx::plugin::invoke_count_policy(
+        callback.operand_count_from_attrs, callback_attrs, expected_operands,
+        "operand", plugin_name, callback_name);
+  }
+  uint32_t expected_outputs = callback.output_count;
+  if (expected_outputs == 0) {
+    expected_outputs = emlx::plugin::invoke_count_policy(
+        callback.output_count_from_attrs, callback_attrs, expected_outputs,
+        "output", plugin_name, callback_name);
+  }
+  if (instr.operands.size() != expected_operands) {
+    throw std::runtime_error("emlx::native: plugin operand count mismatch");
+  }
+  if (templates.size() != expected_outputs) {
+    throw std::runtime_error("emlx::native: plugin output count mismatch");
+  }
+
+  instr.resolved_plugin = std::move(resolved);
+  instr.plugin_attrs = std::move(callback_attrs);
+  instr.plugin_outputs = std::move(templates);
+}
+
+static std::vector<mlx::core::array> invoke_plugin_instruction(
+    const Instruction &instr, std::vector<mlx::core::array> operands) {
+  if (!instr.resolved_plugin.callback || !emlx::g_current_worker)
+    throw std::runtime_error("emlx::native: plugin execution has no current worker");
+  const auto &callback = *instr.resolved_plugin.callback;
+  const auto device = emlx::g_current_worker->device();
+  if (!emlx::plugin::callback_supports_device(callback, device.type))
+    throw std::runtime_error("emlx::native: plugin callback does not support the worker device");
+
+  const auto stream = emlx::g_current_worker->stream();
+  emlx::plugin::call_t call{std::move(operands), instr.plugin_attrs, device,
+                            stream};
+  std::vector<mlx::core::array> candidates;
+  std::optional<std::string> error;
+  try {
+    error = callback.callback(call, candidates);
+  } catch (const std::bad_alloc &) {
+    error = "plugin callback allocation failed";
+  } catch (const std::exception &exception) {
+    error = exception.what();
+  } catch (...) {
+    error = "unknown plugin callback exception";
+  }
+  if (error)
+    throw std::runtime_error(emlx::plugin::callback_failure_error(
+        instr.resolved_plugin.plugin->name, callback.name, *error));
+  if (candidates.size() != instr.plugin_outputs.size()) {
+    throw std::runtime_error(
+        "emlx::native: plugin callback returned " +
+        std::to_string(candidates.size()) + " outputs, expected " +
+        std::to_string(instr.plugin_outputs.size()));
+  }
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    if (candidates[i].shape() != instr.plugin_outputs[i].shape ||
+        candidates[i].dtype() != instr.plugin_outputs[i].dtype) {
+      std::ostringstream message;
+      message << "emlx::native: plugin callback output " << i
+              << " expected shape " << instr.plugin_outputs[i].shape
+              << " and dtype " << instr.plugin_outputs[i].dtype
+              << ", got shape " << candidates[i].shape()
+              << " and dtype " << candidates[i].dtype();
+      throw std::runtime_error(message.str());
+    }
+  }
+  return candidates;
+}
+
 static std::vector<mlx::core::array> interpret_instructions(
     const std::vector<Instruction> &instructions,
     const std::vector<Ref> &output_refs,
@@ -2101,6 +2252,13 @@ static std::vector<mlx::core::array> interpret_instructions(
       continue;
     }
 
+    if (name == "plugin") {
+      auto outs = invoke_plugin_instruction(instr, std::move(op_inputs));
+      for (auto &out : outs)
+        results.push_back(std::move(out));
+      continue;
+    }
+
     auto multi_it = multi_op_registry.find(name);
     if (multi_it != multi_op_registry.end()) {
       // Multi-output op: append each result in order to the flat accumulator.
@@ -2152,7 +2310,7 @@ Expr::~Expr() {
 
 // compile_program — decodes the wire Program (see EMLX.Native.Program /
 // EMLX.Native.Expr.to_native/1, decoded directly by fine::Decoder<Program> in
-// emlx_compiler.hpp), builds a capturing interpreter lambda backed by the op
+// emlx/compiler.hpp), builds a capturing interpreter lambda backed by the op
 // registry, wraps it with mlx::core::compile(), and stores the result as an
 // opaque Expr BEAM resource.
 // Validates op names against the registries up front (recursing into
@@ -2160,9 +2318,9 @@ Expr::~Expr() {
 // rather than inside the interpreter at (first) eval time. `:while` itself
 // is valid despite never appearing in op_registry/multi_op_registry — see
 // interpret_instructions.
-static void validate_instructions(const std::vector<Instruction> &instructions,
-                                  bool &has_runtime_call) {
-  for (const auto &instr : instructions) {
+static void validate_and_resolve_instructions(
+    std::vector<Instruction> &instructions, bool &has_runtime_call) {
+  for (auto &instr : instructions) {
     const std::string &name = instr.op.to_string();
 
     if (name == "while") {
@@ -2171,10 +2329,18 @@ static void validate_instructions(const std::vector<Instruction> &instructions,
             "emlx::native: :while instruction must have exactly 2 "
             "subprograms (cond, body), got " +
             std::to_string(instr.subprograms.size()));
-      validate_instructions(instr.subprograms[0].instructions,
-                            has_runtime_call);
-      validate_instructions(instr.subprograms[1].instructions,
-                            has_runtime_call);
+      validate_and_resolve_instructions(instr.subprograms[0].instructions,
+                                        has_runtime_call);
+      validate_and_resolve_instructions(instr.subprograms[1].instructions,
+                                        has_runtime_call);
+      continue;
+    }
+
+    if (name == "plugin") {
+      if (!instr.subprograms.empty())
+        throw std::runtime_error(
+            "emlx::native: :plugin instruction cannot contain subprograms");
+      resolve_plugin_instruction(instr);
       continue;
     }
 
@@ -2188,7 +2354,7 @@ static void validate_instructions(const std::vector<Instruction> &instructions,
 
 fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   bool has_runtime_call = false;
-  validate_instructions(program.instructions, has_runtime_call);
+  validate_and_resolve_instructions(program.instructions, has_runtime_call);
 
   // Build constant arrays on the current (worker) thread using its default
   // stream.

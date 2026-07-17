@@ -18,17 +18,17 @@ EMLX_LIB_DIR = $(PRIV_DIR)/mlx/lib
 # emlx_axon's Makefile/mix.exs, which locate these via
 # `Application.app_dir(:emlx, "priv/mlx/...")`.
 EMLX_INCLUDE_DIR = $(PRIV_DIR)/mlx/include
+EMLX_PLUGIN_ABI_HEADER = $(PRIV_DIR)/include/emlx/plugin/abi.hpp
 
 # Only used if MLX_BUILD is true
 MLX_SRC_ARCHIVE = $(EMLX_CACHE_DIR)/mlx/$(MLX_VERSION)$(MLX_VARIANT).tar.gz
 MLX_SRC_DIR = $(EMLX_CACHE_DIR)/mlx/src-$(MLX_VERSION)$(MLX_VARIANT)
 MLX_BUILD_DIR = $(EMLX_CACHE_DIR)/mlx/build-$(MLX_VERSION)$(MLX_VARIANT)
 MLX_INSTALL_DIR = $(MLX_DIR)
-MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
 
 $(info LIBMLX_ENABLE_DEBUG=$(LIBMLX_ENABLE_DEBUG))
 # Build flags
-CFLAGS = -fPIC -I$(call esc,$(ERTS_INCLUDE_DIR)) -I$(call esc,$(MLX_INCLUDE_DIR)) \
+CFLAGS = -fPIC -I c_src -I$(call esc,$(ERTS_INCLUDE_DIR)) -I$(call esc,$(MLX_INCLUDE_DIR)) \
          -I$(call esc,$(FINE_INCLUDE_DIR)) -Wall -std=c++20
 ifeq ($(LIBMLX_ENABLE_DEBUG),true)
 		CFLAGS += -g
@@ -44,10 +44,12 @@ LDFLAGS = -L$(call esc,$(MLX_LIB_DIR)) -lmlx -shared
 UNAME_S := $(shell uname -s)
 
 ifeq ($(UNAME_S),Darwin)
+    MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
     LDFLAGS += -undefined dynamic_lookup -flat_namespace -rpath @loader_path/mlx/lib
     LDFLAGS += -framework Metal -framework Foundation -framework Accelerate
 		MAKE_DEFAULT_JOBS = $(shell sysctl -n hw.ncpu)
 else
+    MLX_SO ?= $(MLX_LIB_DIR)/libmlx.so
     LDFLAGS += -Wl,-rpath,'$$ORIGIN/mlx/lib'
 		MAKE_DEFAULT_JOBS = $(shell nproc)
 endif
@@ -55,16 +57,20 @@ endif
 MAKE_JOBS ?= $(MAKE_DEFAULT_JOBS)
 
 # Source files
-SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx_fast/qwen3.cpp c_src/emlx_compiler.cpp c_src/emlx_plugin_registry.cpp
-HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx_plugin_registry.hpp c_src/emlx_fast/qwen3.hpp c_src/emlx_fast/qwen3_plugin_abi.hpp c_src/emlx_compiler.hpp c_src/emlx_runtime_call_bridge.hpp
+SOURCES = c_src/emlx_nif.cpp c_src/emlx_fast.cpp c_src/emlx/compiler.cpp c_src/emlx/plugin/registry.cpp
+HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_src/emlx_nif_shared.hpp c_src/emlx/plugin/abi.hpp c_src/emlx/plugin/registry.hpp c_src/emlx/compiler.hpp c_src/emlx_runtime_call_bridge.hpp
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 
 # Main targets
-all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_SO))
+all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_PLUGIN_ABI_HEADER)) $(call esc,$(EMLX_SO))
 	@ echo > /dev/null
 
 $(call esc,$(PRIV_DIR)):
 	@ mkdir -p "$(PRIV_DIR)"
+
+$(call esc,$(EMLX_PLUGIN_ABI_HEADER)): c_src/emlx/plugin/abi.hpp
+	@ mkdir -p "$(dir $(EMLX_PLUGIN_ABI_HEADER))"
+	@ cp "$<" "$@"
 
 $(call esc,$(BUILD_DIR))/%.o: c_src/%.cpp $(HEADERS)
 	@ mkdir -p "$(dir $@)"
@@ -104,7 +110,7 @@ $(call esc,$(MLX_SO)): $(call esc,$(MLX_SRC_DIR))
 		fi ; \
 	fi
 
-$(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(OBJECTS)
+$(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(call esc,$(EMLX_PLUGIN_ABI_HEADER)) $(OBJECTS)
 	@ echo "Copying MLX library to $(EMLX_LIB_DIR)"
 	@ mkdir -p "$(EMLX_LIB_DIR)"
 	@ cp -a "$(MLX_LIB_DIR)"/* "$(EMLX_LIB_DIR)"

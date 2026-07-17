@@ -15,9 +15,9 @@ defmodule EMLXAxon.MixProject do
       aliases: aliases(),
       description: "Axon model rewrites to swap supported nodes for EMLX.Fast Metal shaders",
       package: package(),
-      # elixir_make — builds the standalone qwen3 compute plugin
-      # (c_src/qwen3_plugin.cpp), `dlopen`'d at runtime by emlx's
-      # `EMLX.NIF.load_plugin/2` (see lib/emlx_axon/application.ex). A
+      # elixir_make builds the standalone Qwen3 compute plugin
+      # (c_src/qwen3_plugin.cpp), loaded at runtime by EMLX.NIF.load_plugin/2.
+      # A
       # function ref so `Application.app_dir(:emlx, ...)` (needs the
       # :emlx dep already compiled) isn't called while this project/0
       # map is being built — mirrors emlx's own `Fine.include_dir()`
@@ -28,7 +28,7 @@ defmodule EMLXAxon.MixProject do
         %{
           "MLX_INCLUDE_DIR" => Path.join(emlx_priv_dir, "mlx/include"),
           "MLX_LIB_DIR" => Path.join(emlx_priv_dir, "mlx/lib"),
-          "QWEN3_ABI_INCLUDE_DIR" => Path.join(Mix.Project.deps_paths()[:emlx], "c_src/emlx_fast")
+          "EMLX_PLUGIN_INCLUDE_DIR" => Path.join(emlx_priv_dir, "include")
         }
       end,
       compilers: [:elixir_make] ++ Mix.compilers()
@@ -42,12 +42,38 @@ defmodule EMLXAxon.MixProject do
   defp deps do
     [
       {:elixir_make, "~> 0.6"},
-      {:emlx, "~> 0.4.0"},
-      # {:emlx, path: "../emlx"},
+      emlx_dep(),
       {:axon, "~> 0.7"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
+  end
+
+  defp emlx_dep do
+    cond do
+      System.get_env("EMLX_AXON_LOCAL_EMLX") == "true" ->
+        {:emlx, path: "../emlx", override: true}
+
+      System.get_env("EMLX_AXON_LOCAL_EMLX") == "false" ->
+        hex_emlx_dep()
+
+      # Monorepo checkout: prefer the sibling package so plugin builds see the
+      # in-tree ABI header under priv/include. Hex remains the default when
+      # ../emlx is absent (Hex installs) or when EMLX_AXON_LOCAL_EMLX=false.
+      File.dir?(Path.expand("../emlx", __DIR__)) ->
+        {:emlx, path: "../emlx", override: true}
+
+      true ->
+        hex_emlx_dep()
+    end
+  end
+
+  defp hex_emlx_dep do
+    # Release sequencing: this source tree needs the generic plugin ABI added
+    # after v0.4.0. Keep the Hex requirement publishable until the maintainer
+    # assigns and releases that EMLX version, then raise this lower bound before
+    # publishing the matching EMLXAxon release.
+    {:emlx, "~> 0.4.0"}
   end
 
   def cli do
@@ -71,6 +97,7 @@ defmodule EMLXAxon.MixProject do
 
   defp package do
     [
+      files: ~w(lib c_src .formatter.exs mix.exs README.md LICENSE Makefile),
       links: %{"GitHub" => @source_url},
       licenses: ["Apache-2.0"],
       maintainers: ["Paulo Valente"]

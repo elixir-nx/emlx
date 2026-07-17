@@ -395,13 +395,31 @@ defmodule EMLX.Native.Expr do
   end
 
   defp emit_metadata_instr(id, opcode, operands, attrs, state) do
-    ref = make_ref()
     operand_refs = Enum.map(operands, &Map.fetch!(state.node_to_ref, &1.data.id))
+
+    refs =
+      case {opcode, attrs} do
+        {:plugin,
+         [
+           _wire_version,
+           _plugin_name,
+           _callback_name,
+           _schema_version,
+           _attr_schema_version,
+           output_count
+           | _rest
+         ]}
+        when is_integer(output_count) and output_count > 1 ->
+          for _ <- 1..output_count, do: make_ref()
+
+        _ ->
+          make_ref()
+      end
 
     %{
       state
-      | instructions: [{ref, opcode, operand_refs, attrs} | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, ref)
+      | instructions: [{refs, opcode, operand_refs, attrs} | state.instructions],
+        node_to_ref: Map.put(state.node_to_ref, id, refs)
     }
   end
 
@@ -493,7 +511,7 @@ defmodule EMLX.Native.Expr do
   # any mismatch silently falls through to the generic lowering below, never
   # an error), rewrite `put_slice(K)` + `put_slice(V)` + `transpose` ×3 (Q,
   # post-write K, post-write V) + this SDPA node — 6 native-IR instructions —
-  # into one `multi_op_registry["kv_cache_sdpa_update"]` (`emlx_compiler.cpp`)
+  # into one `multi_op_registry["kv_cache_sdpa_update"]` (`emlx/compiler.cpp`)
   # instruction.
   defp expand_node(
          %T{
@@ -1982,7 +2000,7 @@ defmodule EMLX.Native.Expr do
   # `native_eligible_node?/1` used to reject `:token` outright. Firing inline
   # gets per-iteration semantics for free (same mechanism validated for
   # `:runtime_call` generally -- see `EMLXRuntimeCall`'s moduledoc in
-  # emlx_compiler.cpp), and each hook's runtime call also threads a
+  # emlx/compiler.cpp), and each hook's runtime call also threads a
   # `hook_chain_ref` scalar through `state`: this is what still makes a hook
   # fire even when *this specific token's* hook value has no other consumer
   # (matching Evaluator's "the token, not the individual hook expr, is what
@@ -2192,7 +2210,7 @@ defmodule EMLX.Native.Expr do
   # Sibling of `emit_runtime_call_refs/7` for the `:__emlx_native_multi_op__`
   # escape hatch (see the `:runtime_call` `expand_node/2` clause above):
   # emits one plain multi-output instruction dispatched to `opcode`
-  # (expected to resolve via `emlx_compiler.cpp`'s `multi_op_registry`, the
+  # (expected to resolve via `emlx/compiler.cpp`'s `multi_op_registry`, the
   # same mechanism already backing `qr`/`svd`/`lu` -- pure native C++, no
   # `EMLXRuntimeCall`/BEAM round-trip, unlike `emit_runtime_call_refs/7`).
   # `attrs` are static (baked in at trace time, like every other op's attrs);
@@ -2611,7 +2629,7 @@ defmodule EMLX.Native.Expr do
 
   # ── while (native lowering for dynamic-trip-count loops) ───────────────────
   #
-  # See emlx_compiler.cpp's EMLXWhile primitive and emlx_compiler.hpp's
+  # See emlx/compiler.cpp's EMLXWhile primitive and emlx/compiler.hpp's
   # SubProgram/RefKind::Carry. Instead of unrolling (impossible: the trip
   # count is data-dependent) or splitting the graph and driving the loop
   # from Elixir (the old `emlx.ex` `build_while_base_eval_fn`/`run_while_loop`
@@ -2654,13 +2672,13 @@ defmodule EMLX.Native.Expr do
   end
 
   # Every node is native-eligible: `:runtime_call` is backed by a genuine
-  # `mx::core::Primitive` (`EMLXRuntimeCall`, emlx_compiler.cpp) that re-fires
+  # `mx::core::Primitive` (`EMLXRuntimeCall`, emlx/compiler.cpp) that re-fires
   # on every replay of the compiled tape, including replays driven by
   # `EMLXWhile`'s own per-iteration `mlx::core::eval()` calls (validated safe:
   # both are CPU-pinned primitives triggering nested `eval()` from inside a
   # primitive's own `eval()`, the same pattern already validated for
   # while-inside-while nesting -- see `EMLXWhile`'s moduledoc comment in
-  # emlx_compiler.cpp). See `propagate_stable_carry_positions/4` for how a
+  # emlx/compiler.cpp). See `propagate_stable_carry_positions/4` for how a
   # `:runtime_call` operand recovers its true top-level position when it's a
   # `while`-carried value instead of a direct top-level parameter. `:token`
   # (hooks) lowers to an inline `:runtime_call` too (see
@@ -2745,7 +2763,7 @@ defmodule EMLX.Native.Expr do
             "cannot lower a hook inside a :while condition unless its value is exactly the " <>
               "condition's own boolean result -- EMLXWhile's condition sub-program is fixed " <>
               "at exactly one output (see EMLXWhile::evaluate_predicate in " <>
-              "emlx_compiler.cpp), so there is no way to force evaluation of a hook whose " <>
+              "emlx/compiler.cpp), so there is no way to force evaluation of a hook whose " <>
               "value the returned boolean doesn't already depend on. Move the hook into the " <>
               "while's body instead."
     end
@@ -3405,7 +3423,7 @@ defmodule EMLX.Native.Expr do
   # `instructions`, see to_native_subprogram/3) into wire
   # `EMLX.Native.Instruction`s, threading a `ref_to_wire` map + flat
   # `{:result, i}` counter that starts wherever `seed_ref_to_wire` leaves off
-  # (0 for a fresh sub-program interpretation, matching emlx_compiler.hpp's
+  # (0 for a fresh sub-program interpretation, matching emlx/compiler.hpp's
   # SubProgram semantics). `capture_map`/`constant_map` are always the
   # *outer* Program's tables, threaded down unchanged: a `:while`
   # sub-program's `{:capture, i}`/`{:const, i}` refs resolve against the same
@@ -3491,7 +3509,7 @@ defmodule EMLX.Native.Expr do
   # Converts a `:while` instruction's internal cond/body sub-scope (built by
   # lower_while_subprogram/3) into a wire `EMLX.Native.SubProgram`. Its own
   # `{:result, i}` numbering starts fresh at 0 (local to this sub-program,
-  # matching emlx_compiler.hpp's SubProgram semantics) -- the seed map only
+  # matching emlx/compiler.hpp's SubProgram semantics) -- the seed map only
   # ever contains `{:carry, i}` (the sub-scope's own carry parameters) plus
   # the outer program's shared `{:capture, i}`/`{:const, i}` entries, never
   # the outer `{:input, i}`/`{:result, i}` entries: `Nx.Defn.while`'s closure

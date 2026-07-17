@@ -1,13 +1,14 @@
 #pragma once
 
-// emlx_compiler.hpp — emlx::native namespace: Op enum, Expr program struct,
+// emlx/compiler.hpp — emlx::native namespace: Op enum, Expr program struct,
 // and NIF implementation declarations for compile_program / eval_program /
 // native_expr_opcode_table.
 //
-// The three *_impl functions are implemented in emlx_compiler.cpp and called
+// The three *_impl functions are implemented in emlx/compiler.cpp and called
 // from thin NIF wrappers in emlx_nif.cpp.
 
 #include "emlx_nif_shared.hpp"
+#include "emlx/plugin/registry.hpp"
 #include <variant>
 
 namespace emlx {
@@ -27,7 +28,7 @@ namespace native {
 // loop-carry slot, respectively. `Carry` only ever appears inside a
 // `SubProgram` (a `:while` instruction's `cond`/`body`) — never in the
 // top-level program's own instruction list, and vice versa for `Input`
-// (see EMLXWhile's doc comment in emlx_compiler.cpp).
+// (see EMLXWhile's doc comment in emlx/compiler.cpp).
 enum class RefKind { Input, Capture, Const, Result, Carry };
 
 struct Ref {
@@ -40,12 +41,13 @@ struct Ref {
 // mode strings, sent as atoms so no int<->meaning lookup table needs to be
 // kept in sync with Elixir (see string2dtype/dtype_map in
 // emlx_nif_shared.hpp). The implicit int64_t conversion below keeps every
-// existing `attrs[i]`-as-int64_t use site in emlx_compiler.cpp's op registry
+// existing `attrs[i]`-as-int64_t use site in emlx/compiler.cpp's op registry
 // compiling unchanged.
 class Attr {
 public:
   Attr(int64_t v) : value_(v) {}
   Attr(fine::Atom a) : value_(std::move(a)) {}
+  Attr(std::string binary) : value_(std::move(binary)) {}
 
   operator int64_t() const { return std::get<int64_t>(value_); }
 
@@ -54,9 +56,18 @@ public:
   }
 
   std::string as_mode() const { return std::get<fine::Atom>(value_).to_string(); }
+  const std::string &as_binary() const { return std::get<std::string>(value_); }
+  bool is_int() const { return std::holds_alternative<int64_t>(value_); }
+  bool is_atom() const { return std::holds_alternative<fine::Atom>(value_); }
+  bool is_binary() const { return std::holds_alternative<std::string>(value_); }
 
 private:
-  std::variant<int64_t, fine::Atom> value_;
+  std::variant<int64_t, fine::Atom, std::string> value_;
+};
+
+struct PluginOutputTemplate {
+  mlx::core::Dtype dtype;
+  mlx::core::Shape shape;
 };
 
 struct Instruction;
@@ -64,7 +75,7 @@ struct Instruction;
 // A `:while` instruction's condition or body, lowered as its own
 // self-contained flat instruction list (not inlined into the parent
 // program) — see EMLX.Native.Expr's `:while` moduledoc section and
-// EMLXWhile (emlx_compiler.cpp). `instructions`' own `Ref::Result` entries
+// EMLXWhile (emlx/compiler.cpp). `instructions`' own `Ref::Result` entries
 // are local to this sub-program (a fresh flat accumulator per interpretation
 // — see `interpret_instructions`), distinct from the parent program's own
 // `{:result, i}` numbering. `Ref::Carry` entries resolve against whatever
@@ -84,6 +95,9 @@ struct Instruction {
   // Only non-empty for `op == "while"`: exactly two entries, `[cond, body]`.
   // Empty (the common case) for every other op.
   std::vector<SubProgram> subprograms;
+  emlx::plugin::resolved_callback_t resolved_plugin;
+  std::vector<int64_t> plugin_attrs;
+  std::vector<PluginOutputTemplate> plugin_outputs;
 };
 
 struct Program {
@@ -125,7 +139,7 @@ struct Expr {
 };
 
 // compile_program is defined via FINE_ASYNC_NIF(compile_program) in
-// emlx_compiler.cpp (declares `compile_program`/`compile_program_async`
+// emlx/compiler.cpp (declares `compile_program`/`compile_program_async`
 // here); eval_program is a plain hand-written NIF, called from a thin
 // wrapper in emlx_nif.cpp.
 ERL_NIF_TERM compile_program(ErlNifEnv *env, int argc,
@@ -166,6 +180,11 @@ template <> struct Decoder<emlx::native::Attr> {
     ErlNifSInt64 v;
     if (enif_get_int64(env, term, &v)) {
       return emlx::native::Attr(static_cast<int64_t>(v));
+    }
+    ErlNifBinary binary;
+    if (enif_inspect_binary(env, term, &binary)) {
+      return emlx::native::Attr(
+          std::string(reinterpret_cast<const char *>(binary.data), binary.size));
     }
     return emlx::native::Attr(fine::decode<fine::Atom>(env, term));
   }

@@ -520,7 +520,7 @@ defmodule EMLX.Fast do
   Elixir/Nx and once in C++).
 
   Traced: lowers to one `multi_op_registry["kv_cache_sdpa_update"]`
-  (`emlx_compiler.cpp`) native IR instruction.
+  (`emlx/compiler.cpp`) native IR instruction.
   """
   deftransform kv_cache_sdpa_update(q, new_k, new_v, k_cache, v_cache, offset, key_mask, scale) do
     t_q = elem(Nx.shape(q), 1)

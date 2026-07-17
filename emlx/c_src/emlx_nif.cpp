@@ -1,7 +1,6 @@
-#include "emlx_compiler.hpp"
+#include "emlx/compiler.hpp"
 #include "emlx_nif_shared.hpp"
-#include "emlx_fast/qwen3.hpp"
-#include "emlx_plugin_registry.hpp"
+#include "emlx/plugin/registry.hpp"
 
 #include <iostream>
 #include <map>
@@ -326,7 +325,7 @@ NIF(linalg_qr) {
 }
 
 // MLX's `svd`/`eigh` primitives are CPU-only — they throw on a GPU stream
-// (mirroring `emlx_compiler.cpp`'s `k_linalg_cpu`, which pins the same ops
+// (mirroring `emlx/compiler.cpp`'s `k_linalg_cpu`, which pins the same ops
 // for the compiled path). Both NIFs below ignore the caller's `device` and
 // pin to CPU instead: unified memory means the array's data doesn't need to
 // move, only the stream that executes on it, so this is free and lets
@@ -1031,20 +1030,17 @@ static int open_resources(ErlNifEnv *env) {
 }
 
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
-  if (open_resources(env) != 0) {
-    return -1;
-  }
-
-  return 0;
+  (void)priv_data;
+  (void)load_info;
+  fine::__private__::init_atoms(env);
+  return open_resources(env);
 }
 
 int upgrade(ErlNifEnv *env, void **priv_data, void **old_priv_data, ERL_NIF_TERM load_info) {
-  // Silence "unused var" warnings.
-  (void)(env);
-  (void)(priv_data);
-  (void)(old_priv_data);
-  (void)(load_info);
-
+  (void)env;
+  (void)priv_data;
+  (void)old_priv_data;
+  (void)load_info;
   return 0;
 }
 
@@ -1466,9 +1462,6 @@ ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
 
 // fast_* and kv_cache_* NIFs are defined in emlx_fast.cpp.
-// Qwen3 model accelerators are defined in emlx_fast/qwen3.cpp. They are still
-// registered by emlx for now, but kept isolated because the user facing
-// loading and generation path lives in emlx_axon.
 
 // Forward declarations for the async wrappers defined in emlx_fast.cpp.
 ERL_NIF_TERM fast_rms_norm_async(ErlNifEnv *, int, const ERL_NIF_TERM []);
@@ -1844,10 +1837,10 @@ ASYNC_NIF(tensordot)
 ASYNC_NIF(window_scatter_max)
 ASYNC_NIF(window_scatter_min)
 
-// ── Native compiler NIFs (logic lives in emlx_compiler.cpp) ──────────────────
+// ── Native compiler NIFs (logic lives in emlx/compiler.cpp) ──────────────────
 //
-// compile_program is defined directly in emlx_compiler.cpp via
-// FINE_ASYNC_NIF(compile_program) (see emlx_compiler.hpp for the
+// compile_program is defined directly in emlx/compiler.cpp via
+// FINE_ASYNC_NIF(compile_program) (see emlx/compiler.hpp for the
 // compile_program/compile_program_async declarations); referenced fully
 // qualified in nif_funcs[] below, same as resolve_runtime_call.
 
@@ -2049,23 +2042,10 @@ static ErlNifFunc nif_funcs[] = {
     // graph work, so it can run directly on the calling BEAM scheduler.
     {"resolve_runtime_call", 3, emlx::native::resolve_runtime_call},
 
-    // ── Qwen3 model accelerators (emlx_fast/qwen3.cpp).
-    {"qwen3_kv_cache_attention", 11, qwen3_kv_cache_attention_async},
-    {"qwen3_mlp", 8, qwen3_mlp_async},
-    {"qwen3_layer", 21, qwen3_layer_async},
-    {"qwen3_layer_quantized", 21, qwen3_layer_quantized_async},
-    {"qwen3_forward_greedy_ids", 13, qwen3_forward_greedy_ids_async},
-    {"qwen3_forward_greedy_ids_chunk", 14, qwen3_forward_greedy_ids_chunk_async},
-    {"qwen3_forward_greedy_ids_chunk_quantized", 14,
-     qwen3_forward_greedy_ids_chunk_quantized_async},
-    {"qwen3_forward_greedy_ids_token_id", 13, qwen3_forward_greedy_ids_token_id_async},
-    {"qwen3_forward_greedy_token_id", 13, qwen3_forward_greedy_token_id_async},
-    {"qwen3_final_greedy", 6, qwen3_final_greedy_async},
-    {"qwen3_attention_residual", 5, qwen3_attention_residual_async},
-    {"qwen3_attention_block", 17, qwen3_attention_block_async},
     // load_plugin `dlopen`s a named, standalone native plugin (see
-    // emlx_plugin_registry.hpp); not worker-routed since it does no MLX
+    // emlx/plugin/registry.hpp); not worker-routed since it does no MLX
     // graph work.
-    {"load_plugin", 2, load_plugin}};
+    {"load_plugin", 2, emlx::plugin::load_plugin},
+    {"call_plugin", 6, emlx::plugin::call_plugin_async}};
 
 ERL_NIF_INIT(Elixir.EMLX.NIF, nif_funcs, load, NULL, upgrade, NULL)

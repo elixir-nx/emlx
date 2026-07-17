@@ -1,11 +1,390 @@
+defmodule EMLXAxon.Qwen3PluginTestAdapter do
+  @moduledoc false
+
+  alias EMLXAxon.Qwen3.Native
+
+  def kv_cache_attention(q, k, v, k_cache, v_cache, offset, scale, head_dim, theta) do
+    Native.kv_cache_attention(
+      tensor(q),
+      tensor(k),
+      tensor(v),
+      tensor(k_cache),
+      tensor(v_cache),
+      offset,
+      scale,
+      head_dim,
+      theta
+    )
+    |> raw_tuple()
+  end
+
+  def mlp(hidden, norm, gate, up, down, eps) do
+    Native.mlp(tensor(hidden), tensor(norm), tensor(gate), tensor(up), tensor(down), eps)
+    |> raw()
+  end
+
+  def attention_residual(hidden, attention, projection) do
+    Native.attention_residual(tensor(hidden), tensor(attention), tensor(projection)) |> raw()
+  end
+
+  def attention_block(
+        hidden,
+        norm,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        k_cache,
+        v_cache,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    Native.attention_block(
+      tensor(hidden),
+      tensor(norm),
+      tensor(q_proj),
+      tensor(k_proj),
+      tensor(v_proj),
+      tensor(o_proj),
+      tensor(q_norm),
+      tensor(k_norm),
+      tensor(k_cache),
+      tensor(v_cache),
+      offset,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
+    |> raw_tuple()
+  end
+
+  def layer(
+        hidden,
+        norm1,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        k_cache,
+        v_cache,
+        norm2,
+        gate_proj,
+        up_proj,
+        down_proj,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    Native.layer_dense(
+      tensor(hidden),
+      tensor(norm1),
+      tensor(q_proj),
+      tensor(k_proj),
+      tensor(v_proj),
+      tensor(o_proj),
+      tensor(q_norm),
+      tensor(k_norm),
+      tensor(k_cache),
+      tensor(v_cache),
+      tensor(norm2),
+      tensor(gate_proj),
+      tensor(up_proj),
+      tensor(down_proj),
+      offset,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
+    |> raw_tuple()
+  end
+
+  def layer_quantized(
+        hidden,
+        norm1,
+        q_proj,
+        k_proj,
+        v_proj,
+        o_proj,
+        q_norm,
+        k_norm,
+        k_cache,
+        v_cache,
+        norm2,
+        gate_proj,
+        up_proj,
+        down_proj,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    Native.layer_generalized(
+      tensor(hidden),
+      tensor(norm1),
+      tensor(q_proj),
+      tensor(k_proj),
+      tensor(v_proj),
+      tensor(o_proj),
+      tensor(q_norm),
+      tensor(k_norm),
+      tensor(k_cache),
+      tensor(v_cache),
+      tensor(norm2),
+      tensor(gate_proj),
+      tensor(up_proj),
+      tensor(down_proj),
+      offset,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
+    |> raw_tuple()
+  end
+
+  def final_greedy(hidden, norm, lm_head, eps) do
+    Native.final_greedy(tensor(hidden), tensor(norm), tensor(lm_head), eps) |> raw()
+  end
+
+  def forward_greedy_ids(
+        input_ids,
+        embed_tokens,
+        layers,
+        kv_cache,
+        norm,
+        lm_head,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    validate_single_batch!(tensor(input_ids), "forward_greedy_ids_token_id")
+    embed_tokens = tensor(embed_tokens)
+    hidden = embed(tensor(input_ids), embed_tokens)
+
+    Native.forward_greedy_dense(
+      hidden,
+      tensor_layers(layers),
+      tensor_cache(kv_cache),
+      tensor(norm),
+      tensor(lm_head),
+      offset,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
+    |> raw_forward()
+  end
+
+  def forward_greedy_ids_token_id(
+        input_ids,
+        embed_tokens,
+        layers,
+        kv_cache,
+        norm,
+        lm_head,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    {token, cache} =
+      forward_greedy_ids(
+        input_ids,
+        embed_tokens,
+        layers,
+        kv_cache,
+        norm,
+        lm_head,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      )
+
+    {token |> tensor() |> Nx.squeeze() |> Nx.to_number(), cache}
+  end
+
+  def forward_greedy_token_id(
+        token_id,
+        embed_tokens,
+        layers,
+        kv_cache,
+        norm,
+        lm_head,
+        offset,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    embed = tensor(embed_tokens)
+    ids = Nx.tensor([[token_id]], type: :s64, backend: backend(embed))
+
+    forward_greedy_ids_token_id(
+      ids,
+      embed,
+      layers,
+      kv_cache,
+      norm,
+      lm_head,
+      offset,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
+  end
+
+  def forward_greedy_ids_chunk(
+        input_ids,
+        embed_tokens,
+        layers,
+        kv_cache,
+        norm,
+        lm_head,
+        offset,
+        count,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    validate_decode_input!(tensor(input_ids), "forward_greedy_ids_chunk")
+
+    Native.forward_greedy_chunk_dense(
+      tensor(input_ids),
+      tensor(embed_tokens),
+      tensor_layers(layers),
+      tensor_cache(kv_cache),
+      tensor(norm),
+      tensor(lm_head),
+      offset,
+      count,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
+    |> raw_chunk()
+  end
+
+  def forward_greedy_ids_chunk_quantized(
+        input_ids,
+        embed_tokens,
+        layers,
+        kv_cache,
+        norm,
+        lm_head,
+        offset,
+        count,
+        scale,
+        head_dim,
+        theta,
+        eps
+      ) do
+    validate_decode_input!(tensor(input_ids), "forward_greedy_ids_chunk_quantized")
+
+    Native.forward_greedy_chunk_generalized(
+      tensor(input_ids),
+      tensor(embed_tokens),
+      tensor_layers(layers),
+      tensor_cache(kv_cache),
+      tensor(norm),
+      tensor(lm_head),
+      offset,
+      count,
+      scale,
+      head_dim,
+      theta,
+      eps
+    )
+    |> raw_chunk()
+  end
+
+  defp tensor(%Nx.Tensor{} = tensor), do: tensor
+  defp tensor(ref), do: EMLX.Backend.to_nx(ref)
+
+  defp tensor_layers(layers),
+    do:
+      Enum.map(
+        layers,
+        &(&1 |> Tuple.to_list() |> Enum.map(fn value -> tensor(value) end) |> List.to_tuple())
+      )
+
+  defp tensor_cache(cache), do: Enum.map(cache, fn {k, v} -> {tensor(k), tensor(v)} end)
+
+  defp embed(input_ids, embed_tokens) do
+    ids = Nx.squeeze(input_ids, axes: [0])
+    embed_tokens |> Nx.take(ids, axis: 0) |> Nx.new_axis(0)
+  end
+
+  defp backend(%Nx.Tensor{data: %EMLX.Backend{ref: {device, _ref}}}),
+    do: {EMLX.Backend, device: device}
+
+  defp raw(%Nx.Tensor{} = tensor), do: EMLX.Backend.from_nx(tensor)
+  defp raw_tuple(tuple), do: tuple |> Tuple.to_list() |> Enum.map(&raw/1) |> List.to_tuple()
+
+  defp raw_forward({token, cache}) do
+    {raw(token), cache |> Tuple.to_list() |> Enum.map(fn {k, v} -> {raw(k), raw(v)} end)}
+  end
+
+  defp raw_chunk({tokens, cache}) do
+    token_refs = tokens |> Nx.to_batched(1) |> Enum.map(&raw/1)
+
+    {token_refs, cache |> Tuple.to_list() |> Enum.map(fn {k, v} -> {raw(k), raw(v)} end)}
+  end
+
+  defp validate_single_batch!(input_ids, name) do
+    case Nx.shape(input_ids) do
+      {1, _sequence} ->
+        :ok
+
+      {batch, _sequence} ->
+        raise ArgumentError, "#{name} requires batch size 1, got batch size #{batch}"
+
+      shape ->
+        raise ArgumentError, "#{name} expects rank 2 input_ids, got: #{inspect(shape)}"
+    end
+  end
+
+  defp validate_decode_input!(input_ids, name) do
+    validate_single_batch!(input_ids, name)
+
+    case Nx.shape(input_ids) do
+      {1, 1} ->
+        :ok
+
+      {1, sequence} ->
+        raise ArgumentError, "#{name} requires sequence length 1, got sequence length #{sequence}"
+    end
+  end
+end
+
 defmodule EMLXAxon.Qwen3NativeTest do
   @moduledoc """
-  Unit tests for the qwen3 native accelerators — `EMLX.Native.Qwen3.*` NIFs,
-  backed by the standalone qwen3 compute plugin loaded from this project
+  Unit tests for the Qwen3 operations backed by the standalone compute plugin
+  loaded from this project
   (see `c_src/qwen3_plugin.cpp` and `EMLXAxon.Application`).
 
   Each test verifies:
-  1. The NIF returns a tensor with the correct shape and dtype.
+  1. The plugin operation returns a tensor with the correct shape and dtype.
   2. Numerical output is close to the equivalent pure-Nx reference.
 
   All tests require Metal (tagged :metal).
@@ -13,11 +392,13 @@ defmodule EMLXAxon.Qwen3NativeTest do
   use ExUnit.Case, async: false
   import Nx.Testing
 
+  alias EMLXAxon.Qwen3PluginTestAdapter, as: Qwen3Plugin
+
   @moduletag :metal
 
   defp gpu(tensor), do: Nx.backend_transfer(tensor, {EMLX.Backend, device: :gpu})
 
-  describe "EMLX.Native.Qwen3.kv_cache_attention/9 validation" do
+  describe "Qwen3Plugin.kv_cache_attention/9 validation" do
     test "rejects malformed Q rank before reading shapes" do
       q = Nx.broadcast(0.0, {1, 1, 4}) |> Nx.as_type(:f16) |> gpu()
       k = Nx.broadcast(0.0, {1, 1, 1, 4}) |> Nx.as_type(:f16) |> gpu()
@@ -25,8 +406,8 @@ defmodule EMLXAxon.Qwen3NativeTest do
       k_cache = Nx.broadcast(0.0, {1, 1, 4, 4}) |> Nx.as_type(:f16) |> gpu()
       v_cache = Nx.broadcast(0.0, {1, 1, 4, 4}) |> Nx.as_type(:f16) |> gpu()
 
-      assert_raise EMLX.NIFError, ~r/q expects rank 4/, fn ->
-        EMLX.Native.Qwen3.kv_cache_attention(
+      assert_raise ArgumentError, ~r/query expects rank 4/, fn ->
+        Qwen3Plugin.kv_cache_attention(
           EMLX.Backend.from_nx(q),
           EMLX.Backend.from_nx(k),
           EMLX.Backend.from_nx(v),
@@ -48,7 +429,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       v_cache = Nx.broadcast(0.0, {1, 1, 4, 4}) |> Nx.as_type(:f16) |> gpu()
 
       assert_raise EMLX.NIFError, ~r/offset must be non-negative/, fn ->
-        EMLX.Native.Qwen3.kv_cache_attention(
+        Qwen3Plugin.kv_cache_attention(
           EMLX.Backend.from_nx(q),
           EMLX.Backend.from_nx(k),
           EMLX.Backend.from_nx(v),
@@ -70,7 +451,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       v_cache = Nx.broadcast(0.0, {1, 1, 4, 4}) |> Nx.as_type(:f16) |> gpu()
 
       assert_raise EMLX.NIFError, ~r/KV cache capacity 4 is smaller than required length 5/, fn ->
-        EMLX.Native.Qwen3.kv_cache_attention(
+        Qwen3Plugin.kv_cache_attention(
           EMLX.Backend.from_nx(q),
           EMLX.Backend.from_nx(k),
           EMLX.Backend.from_nx(v),
@@ -102,7 +483,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       scale = 1.0 / :math.sqrt(head_dim)
 
       {attn_ref, k_ref, v_ref} =
-        EMLX.Native.Qwen3.kv_cache_attention(
+        Qwen3Plugin.kv_cache_attention(
           EMLX.Backend.from_nx(gpu(q_cpu)),
           EMLX.Backend.from_nx(gpu(k_cpu)),
           EMLX.Backend.from_nx(gpu(v_cpu)),
@@ -167,7 +548,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       scale = 1.0 / :math.sqrt(head_dim)
 
       {attn_ref, k_ref, v_ref} =
-        EMLX.Native.Qwen3.kv_cache_attention(
+        Qwen3Plugin.kv_cache_attention(
           EMLX.Backend.from_nx(gpu(q_cpu)),
           EMLX.Backend.from_nx(gpu(k_cpu)),
           EMLX.Backend.from_nx(gpu(v_cpu)),
@@ -233,7 +614,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       eps = 1.0e-6
 
       out_ref =
-        EMLX.Native.Qwen3.mlp(
+        Qwen3Plugin.mlp(
           EMLX.Backend.from_nx(gpu(hidden_cpu)),
           EMLX.Backend.from_nx(gpu(norm_cpu)),
           EMLX.Backend.from_nx(gpu(gate_cpu)),
@@ -257,7 +638,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.Native.Qwen3.attention_block(
+        Qwen3Plugin.attention_block(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -304,7 +685,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.Native.Qwen3.attention_block(
+        Qwen3Plugin.attention_block(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -353,7 +734,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.Native.Qwen3.layer(
+        Qwen3Plugin.layer(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -414,7 +795,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
       {out_ref, k_ref, v_ref} =
-        EMLX.Native.Qwen3.layer(
+        Qwen3Plugin.layer(
           EMLX.Backend.from_nx(gpu(fixtures.hidden)),
           EMLX.Backend.from_nx(gpu(fixtures.norm1)),
           EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -581,7 +962,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
 
     test "qwen3_forward_greedy_ids_chunk_quantized produces identical token ids to " <>
            "running the quantized single-layer NIF + manual final step N times" do
-      # Each fused NIF call `std::move`s the k/v caches it receives (mirroring
+      # Each fused plugin call `std::move`s the k/v caches it receives (mirroring
       # `qwen3_layer`'s existing move-and-return-updated-cache contract), so
       # the two independent call paths below must not share the same
       # underlying cache resource — build separate fixture instances rather
@@ -592,6 +973,18 @@ defmodule EMLXAxon.Qwen3NativeTest do
       manual_tokens = qwen3_quantized_chunk_manual_tokens(qwen3_quantized_chunk_fixtures(), count)
 
       assert chunk_tokens == manual_tokens
+    end
+
+    test "qwen3_forward_greedy_ids_chunk_quantized returns 1023 outputs without truncation" do
+      count = 1023
+      tokens = qwen3_quantized_chunk_call(qwen3_quantized_chunk_fixtures(count), count)
+
+      expected_prefix =
+        qwen3_quantized_chunk_manual_tokens(qwen3_quantized_chunk_fixtures(), 3)
+
+      assert length(tokens) == count
+      assert Enum.all?(tokens, &(length(&1) == 1))
+      assert Enum.take(tokens, 3) == expected_prefix
     end
 
     test "qwen3_attention_residual matches pure Nx reference" do
@@ -605,7 +998,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
         end)
 
       out_ref =
-        EMLX.Native.Qwen3.attention_residual(
+        Qwen3Plugin.attention_residual(
           EMLX.Backend.from_nx(gpu(hidden)),
           EMLX.Backend.from_nx(gpu(attn_out)),
           EMLX.Backend.from_nx(gpu(o_proj))
@@ -644,7 +1037,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       eps = 1.0e-6
 
       token_ref =
-        EMLX.Native.Qwen3.final_greedy(
+        Qwen3Plugin.final_greedy(
           EMLX.Backend.from_nx(gpu(hidden)),
           EMLX.Backend.from_nx(gpu(norm)),
           EMLX.Backend.from_nx(gpu(lm_head)),
@@ -701,7 +1094,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert {:cpu, _ref} = EMLX.Backend.from_nx(embed_tokens)
 
       {_token_id, [{{k_device, _k_ref}, {v_device, _v_ref}}]} =
-        EMLX.Native.Qwen3.forward_greedy_token_id(
+        Qwen3Plugin.forward_greedy_token_id(
           0,
           EMLX.Backend.from_nx(embed_tokens),
           [layer],
@@ -748,7 +1141,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       }
 
       {token_ref, _kv_cache} =
-        EMLX.Native.Qwen3.forward_greedy_ids(
+        Qwen3Plugin.forward_greedy_ids(
           EMLX.Backend.from_nx(input_ids),
           EMLX.Backend.from_nx(embed_tokens),
           [layer],
@@ -763,7 +1156,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
         )
 
       {token_id, _kv_cache} =
-        EMLX.Native.Qwen3.forward_greedy_token_id(
+        Qwen3Plugin.forward_greedy_token_id(
           0,
           EMLX.Backend.from_nx(embed_tokens),
           [layer],
@@ -788,7 +1181,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
     end
   end
 
-  describe "EMLX.Native.Qwen3.attention_block/15 validation" do
+  describe "Qwen3Plugin.attention_block/15 validation" do
     test "qwen3_kv_cache_attention rejects required cache length overflow before graph construction" do
       q = Nx.broadcast(0.0, {1, 1, 2, 2}) |> Nx.as_type(:f32) |> gpu()
       k = Nx.broadcast(0.0, {1, 1, 1, 2}) |> Nx.as_type(:f32) |> gpu()
@@ -799,7 +1192,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert_raise EMLX.NIFError,
                    ~r/KV cache capacity 4 is smaller than required length 2147483648/,
                    fn ->
-                     EMLX.Native.Qwen3.kv_cache_attention(
+                     Qwen3Plugin.kv_cache_attention(
                        EMLX.Backend.from_nx(q),
                        EMLX.Backend.from_nx(k),
                        EMLX.Backend.from_nx(v),
@@ -819,7 +1212,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert_raise EMLX.NIFError,
                    ~r/KV cache capacity 4 is smaller than required length 2147483649/,
                    fn ->
-                     EMLX.Native.Qwen3.layer(
+                     Qwen3Plugin.layer(
                        EMLX.Backend.from_nx(gpu(fixtures.hidden)),
                        EMLX.Backend.from_nx(gpu(fixtures.norm1)),
                        EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -849,7 +1242,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert_raise EMLX.NIFError,
                    ~r/KV cache capacity 4 is smaller than required length 2147483649/,
                    fn ->
-                     EMLX.Native.Qwen3.attention_block(
+                     Qwen3Plugin.attention_block(
                        EMLX.Backend.from_nx(gpu(fixtures.hidden)),
                        EMLX.Backend.from_nx(gpu(fixtures.norm1)),
                        EMLX.Backend.from_nx(gpu(fixtures.q_proj)),
@@ -878,7 +1271,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert_raise ArgumentError,
                    ~r/forward_greedy_ids_token_id requires batch size 1, got batch size 2/,
                    fn ->
-                     EMLX.Native.Qwen3.forward_greedy_ids_token_id(
+                     Qwen3Plugin.forward_greedy_ids_token_id(
                        EMLX.Backend.from_nx(input_ids),
                        EMLX.Backend.from_nx(embed_tokens),
                        [:invalid_layer],
@@ -903,7 +1296,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert_raise ArgumentError,
                    ~r/forward_greedy_ids_chunk requires sequence length 1, got sequence length 2/,
                    fn ->
-                     EMLX.Native.Qwen3.forward_greedy_ids_chunk(
+                     Qwen3Plugin.forward_greedy_ids_chunk(
                        EMLX.Backend.from_nx(input_ids),
                        EMLX.Backend.from_nx(embed_tokens),
                        [:invalid_layer],
@@ -935,7 +1328,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
       assert_raise EMLX.NIFError,
                    ~r/projection output widths must be divisible by head_dim/,
                    fn ->
-                     EMLX.Native.Qwen3.attention_block(
+                     Qwen3Plugin.attention_block(
                        EMLX.Backend.from_nx(hidden),
                        EMLX.Backend.from_nx(norm),
                        EMLX.Backend.from_nx(q_proj),
@@ -1078,7 +1471,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
   defp qwen3_layer_quantized_call(fixtures) do
     scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
-    EMLX.Native.Qwen3.layer_quantized(
+    Qwen3Plugin.layer_quantized(
       EMLX.Backend.from_nx(gpu(fixtures.hidden)),
       ensure_gpu(fixtures.norm1),
       ensure_gpu(fixtures.q_proj),
@@ -1134,7 +1527,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
   # `qwen3_quantized_attention_fixtures/2`, plus a small embedding table and a
   # quantized `lm_head` (`{vocab, H}`, already in the `{out, in}` convention
   # `EMLX.quantize/2` expects — no transpose needed, unlike the projections).
-  defp qwen3_quantized_chunk_fixtures do
+  defp qwen3_quantized_chunk_fixtures(cache_capacity \\ 8) do
     base =
       qwen3_quantized_attention_fixtures([
         :q_proj,
@@ -1158,10 +1551,15 @@ defmodule EMLXAxon.Qwen3NativeTest do
 
     norm = Nx.iota({32}, type: :f32) |> Nx.add(50) |> Nx.divide(10) |> gpu()
 
-    # Enough KV cache capacity for `offset + count` across the test's decode
-    # steps (capacity 8 comfortably covers `count = 3`).
-    k_cache = Nx.broadcast(0.0, {1, 1, 8, 16}) |> Nx.as_type(:f32) |> gpu()
-    v_cache = Nx.broadcast(0.0, {1, 1, 8, 16}) |> Nx.as_type(:f32) |> gpu()
+    k_cache =
+      Nx.broadcast(0.0, {1, 1, cache_capacity, 16})
+      |> Nx.as_type(:f32)
+      |> gpu()
+
+    v_cache =
+      Nx.broadcast(0.0, {1, 1, cache_capacity, 16})
+      |> Nx.as_type(:f32)
+      |> gpu()
 
     %{
       base
@@ -1193,7 +1591,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
     }
 
     {token_refs, _kv_cache} =
-      EMLX.Native.Qwen3.forward_greedy_ids_chunk_quantized(
+      Qwen3Plugin.forward_greedy_ids_chunk_quantized(
         EMLX.Backend.from_nx(input_ids),
         EMLX.Backend.from_nx(fixtures.embed_tokens),
         [layer],
@@ -1212,10 +1610,10 @@ defmodule EMLXAxon.Qwen3NativeTest do
   end
 
   # Manually replays the same `count` decode steps by calling the
-  # already-verified single-layer `qwen3_layer_quantized` NIF plus a manual
+  # already-verified single-layer `qwen3_layer_quantized` plugin operation plus a manual
   # final RMSNorm + `EMLX.quantized_matmul` lm_head + argmax step, once per
   # step. Both paths run the exact same MLX ops (just organized as 1 fused
-  # NIF call vs `count` separate calls), so token ids should be bit-identical.
+  # plugin call vs `count` separate calls), so token ids should be bit-identical.
   defp qwen3_quantized_chunk_manual_tokens(fixtures, count) do
     scale = 1.0 / :math.sqrt(fixtures.head_dim)
 
@@ -1230,7 +1628,7 @@ defmodule EMLXAxon.Qwen3NativeTest do
             |> Nx.new_axis(0)
 
           {hidden_ref, k_ref, v_ref} =
-            EMLX.Native.Qwen3.layer_quantized(
+            Qwen3Plugin.layer_quantized(
               EMLX.Backend.from_nx(hidden),
               ensure_gpu(fixtures.norm1),
               ensure_gpu(fixtures.q_proj),

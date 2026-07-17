@@ -12,10 +12,26 @@ Add `emlx_axon` as a dependency in your `mix.exs`:
 def deps do
   [
     {:emlx_axon, github: "elixir-nx/emlx", sparse: "emlx_axon", branch: "main"},
-    {:emlx, github: "elixir-nx/emlx", branch: "main"}
+    {:emlx, github: "elixir-nx/emlx", branch: "main", override: true}
   ]
 end
 ```
+
+## Development and release sequencing
+
+The monorepo CI sets `EMLX_AXON_LOCAL_EMLX=true` so EMLXAxon is compiled and
+tested against the sibling EMLX source tree. This is required while the generic
+plugin ABI is newer than the latest published EMLX package.
+
+Before publishing the matching EMLXAxon release, EMLX must first release the
+plugin ABI used here. The EMLXAxon dependency lower bound can then be updated
+to that released version. The package includes its plugin C++ source and
+Makefile; EMLX packages the shared plugin ABI header.
+
+The EMLX plugin registry keeps accepted shared objects loaded for the VM
+lifetime. Stopping and starting `:emlx_axon` is supported and loads the same
+Qwen3 plugin idempotently; replacing an accepted plugin under the same name
+requires restarting the BEAM VM.
 
 ## Model download
 

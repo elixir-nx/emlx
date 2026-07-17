@@ -12,6 +12,14 @@ defmodule EMLX.NIF do
   end
 
   @on_load :load_nifs
+  @doc """
+  Loads the EMLX native image.
+
+  Reloading the Elixir module with the same native image preserves MLX arrays,
+  command queues, compiled programs, and plugin callbacks. Replacing the native
+  image still requires restarting the BEAM VM because that state lives for the
+  lifetime of the process.
+  """
   def load_nifs do
     path = :filename.join(:code.priv_dir(:emlx), ~c"libemlx")
     :erlang.load_nif(path, 0)
@@ -112,7 +120,7 @@ defmodule EMLX.NIF do
   # and a set of captured arrays. Worker-routed (argv[0] = worker).
   # `program` is an `EMLX.Native.Program.t()` (see
   # EMLX.Native.Expr.to_native/1), decoded directly by `fine` on the C++ side
-  # (emlx_compiler.hpp's `Program`/`Instruction` structs) instead of manually
+  # (emlx/compiler.hpp's `Program`/`Instruction` structs) instead of manually
   # parsed positional args.
   # Arity = 1 (worker) + 1 = 2 registered.
   def compile_program(_worker, _program) do
@@ -136,215 +144,18 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
-  # ── Qwen3 fused native NIFs ────────────────────────────────────────────────
-  # Elixir wrappers live in `EMLX.Native.Qwen3` (without the `qwen3_` prefix);
-  # the NIF/C++ names below keep it (`emlx/c_src/emlx_fast/qwen3.cpp`).
-  # Worker-routed (argv[0] = worker), same pattern as the `@mlx_function`
-  # macro-generated stubs above.
-
-  def qwen3_kv_cache_attention(
-        _worker,
-        _q,
-        _k,
-        _v,
-        _k_cache,
-        _v_cache,
-        _offset,
-        _scale,
-        _head_dim,
-        _theta,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_mlp(_worker, _hidden, _norm, _gate, _up, _down, _eps, _device) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_attention_residual(_worker, _hidden, _attn, _o_proj, _device) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_layer(
-        _worker,
-        _hidden,
-        _norm1,
-        _q,
-        _k,
-        _v,
-        _o,
-        _q_norm,
-        _k_norm,
-        _k_cache,
-        _v_cache,
-        _norm2,
-        _gate,
-        _up,
-        _down,
-        _offset,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_layer_quantized(
-        _worker,
-        _hidden,
-        _norm1,
-        _q,
-        _k,
-        _v,
-        _o,
-        _q_norm,
-        _k_norm,
-        _k_cache,
-        _v_cache,
-        _norm2,
-        _gate,
-        _up,
-        _down,
-        _offset,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_forward_greedy_ids(
-        _worker,
-        _ids,
-        _embed,
-        _layers,
-        _kv_cache,
-        _norm,
-        _lm_head,
-        _offset,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_forward_greedy_ids_chunk(
-        _worker,
-        _ids,
-        _embed,
-        _layers,
-        _kv_cache,
-        _norm,
-        _lm_head,
-        _offset,
-        _count,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_forward_greedy_ids_chunk_quantized(
-        _worker,
-        _ids,
-        _embed,
-        _layers,
-        _kv_cache,
-        _norm,
-        _lm_head,
-        _offset,
-        _count,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_forward_greedy_ids_token_id(
-        _worker,
-        _ids,
-        _embed,
-        _layers,
-        _kv_cache,
-        _norm,
-        _lm_head,
-        _offset,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_forward_greedy_token_id(
-        _worker,
-        _token_id,
-        _embed,
-        _layers,
-        _kv_cache,
-        _norm,
-        _lm_head,
-        _offset,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_final_greedy(_worker, _hidden, _norm, _lm_head, _eps, _device) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
-  def qwen3_attention_block(
-        _worker,
-        _hidden,
-        _norm,
-        _q,
-        _k,
-        _v,
-        _o,
-        _q_norm,
-        _k_norm,
-        _k_cache,
-        _v_cache,
-        _offset,
-        _scale,
-        _head_dim,
-        _theta,
-        _eps,
-        _device
-      ) do
-    :erlang.nif_error(:nif_not_loaded)
-  end
-
   # load_plugin — `dlopen`s a standalone, name-keyed native plugin (no
-  # erl_nif dependency) and caches its vtable under `name` (see
-  # emlx_plugin_registry.hpp). Callers that decode/dispatch into a
-  # specific plugin's ABI (e.g. `qwen3_*` NIFs above, which fetch the
-  # "qwen3" plugin) error with `{:error, _}` until this has been called
-  # successfully for that name — for qwen3, see `EMLXAxon.Application`,
-  # which calls it eagerly at boot. Not worker-routed (no argv[0] worker
-  # ref): `dlopen` does no MLX graph work.
+  # erl_nif dependency), validates its generic descriptor, and publishes its
+  # callback map in the process-lifetime registry (see
+  # emlx/plugin/registry.hpp). Native calls fail until their plugin has been
+  # registered. Loading is not worker-routed because `dlopen` performs no MLX
+  # graph work.
   def load_plugin(_name, _path) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
+  @doc false
+  def call_plugin(_worker, _plugin, _callback, _operands, _attrs, _device) do
     :erlang.nif_error(:nif_not_loaded)
   end
 end

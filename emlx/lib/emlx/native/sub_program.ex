@@ -5,7 +5,7 @@ defmodule EMLX.Native.SubProgram do
   # self-contained flat instruction list instead of being inlined into the
   # parent program's own `instructions` — see `EMLX.Native.Expr`'s `:while`
   # moduledoc section. Decoded directly on the C++ side by Fine (see
-  # emlx_compiler.hpp's `SubProgram` struct + `fine::Decoder<SubProgram>`).
+  # emlx/compiler.hpp's `SubProgram` struct + `fine::Decoder<SubProgram>`).
   #
   # `instructions`' own `{:result, i}` refs are local to this sub-program (a
   # fresh flat accumulator per interpretation, distinct from the parent

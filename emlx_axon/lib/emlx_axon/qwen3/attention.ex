@@ -7,11 +7,11 @@ defmodule EMLXAxon.Qwen3.Attention do
   the cache without an extra transpose, and feeds directly into
   `EMLX.Fast.scaled_dot_product_attention` which expects `{B, N, T, D}`.
 
-  `forward/12` delegates to the native `EMLX.Native.Qwen3.kv_cache_attention`/
-  `attention_block` NIFs (`qwen3_plugin.cpp`), which transpose Q/K to
-  `{B, N, T, D}` and apply RoPE internally via `mlx::core::fast::rope`
-  (single Metal shader, no precomputed cos/sin needed) before the fused
-  cache-update + SDPA. The `offset` is the current cache fill length.
+  `forward/12` delegates to `EMLXAxon.Qwen3.Native` operations backed by the
+  Qwen3 plugin callbacks in `qwen3_plugin.cpp`. They transpose Q/K to
+  `{B, N, T, D}` and apply RoPE internally via `mlx::core::fast::rope` before
+  the fused cache update and SDPA. The `offset` is the current cache fill
+  length.
   """
 
   alias EMLXAxon.Qwen3.Layers
@@ -120,27 +120,25 @@ defmodule EMLXAxon.Qwen3.Attention do
 
     # Fused Q/K transpose + RoPE + cache update + SDPA.
     #
-    # The NIF move-extracts k_cache / v_cache from their ENIF resources before
+    # The plugin callback updates k_cache / v_cache before
     # slice_update, enabling MLX's donation optimisation at eval time: the
     # existing 4 MB Metal buffer is reused in-place — no new allocation needed.
     # The slice and SDPA are fused in the same lazy graph, so they land in one
     # Metal command buffer submission.
-    {attn_ref, k_cache_ref, v_cache_ref} =
-      EMLX.Native.Qwen3.kv_cache_attention(
-        EMLX.Backend.from_nx(q),
-        EMLX.Backend.from_nx(k),
-        EMLX.Backend.from_nx(v),
-        EMLX.Backend.from_nx(k_cache),
-        EMLX.Backend.from_nx(v_cache),
+    {attn_out, k_cache, v_cache} =
+      EMLXAxon.Qwen3.Native.kv_cache_attention(
+        q,
+        k,
+        v,
+        k_cache,
+        v_cache,
         current_len,
         scale,
         head_dim,
         theta
       )
 
-    attn_out = attention_residual(hidden, attn_ref, o_proj)
-    k_cache = EMLX.Backend.to_nx(k_cache_ref)
-    v_cache = EMLX.Backend.to_nx(v_cache_ref)
+    attn_out = attention_residual(hidden, attn_out, o_proj)
 
     {attn_out, k_cache, v_cache}
   end
@@ -163,41 +161,30 @@ defmodule EMLXAxon.Qwen3.Attention do
     scale = 1.0 / :math.sqrt(head_dim)
     theta = cfg.rope_theta
 
-    {out_ref, k_cache_ref, v_cache_ref} =
-      EMLX.Native.Qwen3.attention_block(
-        EMLX.Backend.from_nx(hidden),
-        EMLX.Backend.from_nx(norm),
-        EMLX.Backend.from_nx(q_proj),
-        EMLX.Backend.from_nx(k_proj),
-        EMLX.Backend.from_nx(v_proj),
-        EMLX.Backend.from_nx(o_proj),
-        EMLX.Backend.from_nx(q_norm),
-        EMLX.Backend.from_nx(k_norm),
-        EMLX.Backend.from_nx(k_cache),
-        EMLX.Backend.from_nx(v_cache),
-        current_len,
-        scale,
-        head_dim,
-        theta,
-        cfg.rms_norm_eps
-      )
-
-    {
-      EMLX.Backend.to_nx(out_ref),
-      EMLX.Backend.to_nx(k_cache_ref),
-      EMLX.Backend.to_nx(v_cache_ref)
-    }
+    EMLXAxon.Qwen3.Native.attention_block(
+      hidden,
+      norm,
+      q_proj,
+      k_proj,
+      v_proj,
+      o_proj,
+      q_norm,
+      k_norm,
+      k_cache,
+      v_cache,
+      current_len,
+      scale,
+      head_dim,
+      theta,
+      cfg.rms_norm_eps
+    )
   end
 
-  defp attention_residual(residual_hidden, attn_ref, o_proj) do
+  defp attention_residual(residual_hidden, attn_out, o_proj) do
     if EMLX.Quantization.quantized?(o_proj) do
-      attn_out = EMLX.Backend.to_nx(attn_ref)
       Nx.add(residual_hidden, Nx.dot(attn_out, [2], o_proj, [1]))
     else
-      residual_hidden
-      |> EMLX.Backend.from_nx()
-      |> EMLX.Native.Qwen3.attention_residual(attn_ref, EMLX.Backend.from_nx(o_proj))
-      |> EMLX.Backend.to_nx()
+      EMLXAxon.Qwen3.Native.attention_residual(residual_hidden, attn_out, o_proj)
     end
   end
 end

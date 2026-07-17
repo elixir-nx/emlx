@@ -75,6 +75,20 @@ defmodule EMLXAxon.TextGenerationTest do
   end
 
   describe "serving/3" do
+    test "prepares generalized state when the serving is built" do
+      assert {:ok, state} = dense_state()
+
+      state = %{
+        state
+        | layers: [:invalid_layer],
+          config: %{state.config | dense_layers?: false}
+      }
+
+      assert_raise ArgumentError, ~r/expected a Qwen3 layer tuple/, fn ->
+        EMLXAxon.TextGeneration.serving(__MODULE__.FakeTokenizer.new(), state)
+      end
+    end
+
     test "rejects list inputs during client preprocessing" do
       assert {:ok, state} = dense_state()
       serving = EMLXAxon.TextGeneration.serving(:tokenizer, state)

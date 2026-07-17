@@ -4,10 +4,10 @@ defmodule EMLXAxon.Application do
 
   Eagerly loads the standalone qwen3 compute plugin (`c_src/qwen3_plugin.cpp`,
   built as `priv/libemlx_qwen3.so`) into emlx's generic native plugin
-  registry via `EMLX.NIF.load_plugin/2`. Every `EMLX.Native.Qwen3.*` NIF
-  errors with `{:error, _}` until this has run — since `:emlx` is a
-  dependency of `:emlx_axon`, OTP starts it first, so `EMLX.NIF.load_plugin/2`
-  is always available by the time this runs.
+  registry via `EMLX.NIF.load_plugin/2`. The operations in
+  `EMLXAxon.Qwen3.Native` cannot dispatch until this has run. Since `:emlx` is
+  a dependency of `:emlx_axon`, OTP starts it first, so
+  `EMLX.NIF.load_plugin/2` is available by the time this runs.
   """
 
   use Application
@@ -27,8 +27,12 @@ defmodule EMLXAxon.Application do
         :ok
 
       {:error, reason} ->
-        raise EMLX.NIFError,
-              "EMLXAxon.Application could not load the qwen3 plugin: " <> List.to_string(reason)
+        raise_plugin_load!(reason)
     end
+  end
+
+  defp raise_plugin_load!(reason) do
+    raise EMLX.NIFError,
+          "EMLXAxon.Application could not load the qwen3 plugin: " <> List.to_string(reason)
   end
 end

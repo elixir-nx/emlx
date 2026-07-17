@@ -20,7 +20,7 @@ defmodule EMLXAxon.Qwen3.Generate do
       )
   """
 
-  alias EMLXAxon.Qwen3.{Model, Sampler}
+  alias EMLXAxon.Qwen3.{Model, NativeChunkRunner, Sampler}
 
   @cpu_backend Nx.BinaryBackend
 
@@ -77,7 +77,24 @@ defmodule EMLXAxon.Qwen3.Generate do
   - `:total_ms`       — wall time for the whole call, with microsecond resolution
   """
   def generate(input_ids, %Model.State{} = state, opts \\ []) do
+    generate_with_native_chunk_runner(
+      input_ids,
+      state,
+      opts,
+      &Model.forward_greedy_chunk/5
+    )
+  end
+
+  @doc false
+  def generate_with_native_chunk_runner(
+        input_ids,
+        %Model.State{} = state,
+        opts,
+        native_chunk_runner
+      )
+      when is_function(native_chunk_runner, 5) do
     ensure_single_batch!(input_ids)
+    state = Model.prepare_native(state)
 
     requested_max_new =
       opts
@@ -131,7 +148,8 @@ defmodule EMLXAxon.Qwen3.Generate do
     eos_id = eos_token_id(state)
 
     decode_ctx =
-      {eos_id, sampler, temp, top_p, state, profile_timing?, token_callback, chunk_callback}
+      {eos_id, sampler, temp, top_p, state, profile_timing?, token_callback, chunk_callback,
+       native_chunk_runner}
 
     # Tail-recursive decode: max_new - 1 steps after prefill (no Enum range / closure).
     remaining_decode = max(max_new - 1, 0)
@@ -287,7 +305,7 @@ defmodule EMLXAxon.Qwen3.Generate do
 
   defp decode_tokens(n, acc_tokens, acc_times, kv, cur, rng_key, ctx)
        when is_integer(n) and n > 0 do
-    {eos_id, _, _, _, _, _, _, _} = ctx
+    {eos_id, _, _, _, _, _, _, _, _} = ctx
     [last_id | _] = acc_tokens
 
     if eos_token?(last_id, eos_id) do
@@ -298,8 +316,8 @@ defmodule EMLXAxon.Qwen3.Generate do
   end
 
   defp decode_step_timed(n, acc_tokens, acc_times, kv, cur, rng_key, ctx, last_id) do
-    {_eos_id, sampler, temp, top_p, state, profile_timing?, token_callback, _chunk_callback} =
-      ctx
+    {_eos_id, sampler, temp, top_p, state, profile_timing?, token_callback, _chunk_callback,
+     _native_chunk_runner} = ctx
 
     ts = if profile_timing?, do: timing_now_us()
 
@@ -330,8 +348,8 @@ defmodule EMLXAxon.Qwen3.Generate do
   end
 
   defp decode_tensors(0, acc_tokens, acc_times, kv, cur, rng_key, ctx) do
-    {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback, _chunk_callback} =
-      ctx
+    {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback, _chunk_callback,
+     _native_chunk_runner} = ctx
 
     tokens =
       acc_tokens
@@ -344,8 +362,32 @@ defmodule EMLXAxon.Qwen3.Generate do
 
   defp decode_tensors(n, acc_tokens, acc_times, kv, cur, rng_key, ctx)
        when is_integer(n) and n > 0 do
-    {_eos_id, sampler, temp, top_p, state, profile_timing?, _token_callback, _chunk_callback} =
-      ctx
+    {_eos_id, sampler, _temp, _top_p, state, profile_timing?, _token_callback, _chunk_callback,
+     native_chunk_runner} = ctx
+
+    if sampler == :greedy and not profile_timing? do
+      [last_token | _] = acc_tokens
+
+      {next_token_chunks, _last_token, kv_new, next_cur} =
+        run_native_chunks(last_token, kv, cur, n, state, native_chunk_runner)
+
+      decode_tensors(
+        0,
+        Enum.reduce(next_token_chunks, acc_tokens, fn tokens, acc -> [tokens | acc] end),
+        acc_times,
+        kv_new,
+        next_cur,
+        rng_key,
+        ctx
+      )
+    else
+      decode_tensors_per_token(n, acc_tokens, acc_times, kv, cur, rng_key, ctx)
+    end
+  end
+
+  defp decode_tensors_per_token(n, acc_tokens, acc_times, kv, cur, rng_key, ctx) do
+    {_eos_id, sampler, temp, top_p, state, profile_timing?, _token_callback, _chunk_callback,
+     _native_chunk_runner} = ctx
 
     [last_token | _] = acc_tokens
 
@@ -408,7 +450,7 @@ defmodule EMLXAxon.Qwen3.Generate do
          current_len,
          rng_key,
          {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback,
-          chunk_callback} = ctx,
+          chunk_callback, _native_chunk_runner} = ctx,
          chunk_size,
          true
        )
@@ -448,8 +490,8 @@ defmodule EMLXAxon.Qwen3.Generate do
          ctx,
          _chunk_size
        ) do
-    {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback, chunk_callback} =
-      ctx
+    {eos_id, _sampler, _temp, _top_p, _state, _profile_timing?, _token_callback, chunk_callback,
+     _native_chunk_runner} = ctx
 
     tokens = flush_chunk(host_tokens, pending_tokens, eos_id, chunk_callback)
     {:lists.reverse(tokens), :lists.reverse(acc_times), kv, cur, rng_key}
@@ -469,8 +511,8 @@ defmodule EMLXAxon.Qwen3.Generate do
          chunk_size
        )
        when is_integer(n) and n > 0 do
-    {eos_id, sampler, _temp, _top_p, state, profile_timing?, _token_callback, chunk_callback} =
-      ctx
+    {eos_id, sampler, _temp, _top_p, state, profile_timing?, _token_callback, chunk_callback,
+     native_chunk_runner} = ctx
 
     case maybe_flush_chunk(
            host_tokens,
@@ -485,47 +527,39 @@ defmodule EMLXAxon.Qwen3.Generate do
 
       {:cont, host_tokens, pending_tokens, pending_count} ->
         ts = if profile_timing?, do: timing_now_us()
-        decode_input = Nx.reshape(last_token, {1, 1})
 
         if sampler == :greedy and not profile_timing? do
           chunk_count = min(n, chunk_size - pending_count)
 
-          case Model.forward_greedy_chunk(decode_input, kv, cur, chunk_count, state) do
-            {next_tokens, kv_new} ->
-              {last_token, pending_tokens} =
-                append_reversed_with_last(next_tokens, pending_tokens)
+          {next_token_chunks, last_token, kv_new, next_cur} =
+            run_native_chunks(
+              last_token,
+              kv,
+              cur,
+              chunk_count,
+              state,
+              native_chunk_runner
+            )
 
-              decode_tensor_chunks(
-                n - chunk_count,
-                last_token,
-                pending_tokens,
-                pending_count + chunk_count,
-                host_tokens,
-                acc_times,
-                kv_new,
-                cur + chunk_count,
-                rng_key,
-                ctx,
-                chunk_size
-              )
+          pending_tokens =
+            Enum.reduce(next_token_chunks, pending_tokens, fn tokens, acc -> [tokens | acc] end)
 
-            :fallback ->
-              decode_tensor_chunk_step(
-                n,
-                decode_input,
-                pending_tokens,
-                pending_count,
-                host_tokens,
-                acc_times,
-                kv,
-                cur,
-                rng_key,
-                ctx,
-                ts,
-                chunk_size
-              )
-          end
+          decode_tensor_chunks(
+            n - chunk_count,
+            last_token,
+            pending_tokens,
+            pending_count + chunk_count,
+            host_tokens,
+            acc_times,
+            kv_new,
+            next_cur,
+            rng_key,
+            ctx,
+            chunk_size
+          )
         else
+          decode_input = Nx.reshape(last_token, {1, 1})
+
           decode_tensor_chunk_step(
             n,
             decode_input,
@@ -544,20 +578,6 @@ defmodule EMLXAxon.Qwen3.Generate do
     end
   end
 
-  defp append_reversed_with_last([token | rest], pending_tokens) do
-    append_reversed_with_last(rest, token, [token | pending_tokens])
-  end
-
-  defp append_reversed_with_last([], _pending_tokens) do
-    raise ArgumentError, "expected at least one generated token in a greedy chunk"
-  end
-
-  defp append_reversed_with_last([token | rest], _last_token, pending_tokens) do
-    append_reversed_with_last(rest, token, [token | pending_tokens])
-  end
-
-  defp append_reversed_with_last([], last_token, pending_tokens), do: {last_token, pending_tokens}
-
   defp decode_tensor_chunk_step(
          n,
          decode_input,
@@ -572,8 +592,8 @@ defmodule EMLXAxon.Qwen3.Generate do
          ts,
          chunk_size
        ) do
-    {_eos_id, sampler, temp, top_p, state, profile_timing?, _token_callback, _chunk_callback} =
-      ctx
+    {_eos_id, sampler, temp, top_p, state, profile_timing?, _token_callback, _chunk_callback,
+     _native_chunk_runner} = ctx
 
     {rng_key, gpu_key} = advance_rng_for_gpu(sampler, rng_key)
 
@@ -622,6 +642,19 @@ defmodule EMLXAxon.Qwen3.Generate do
     input_ids = Nx.tensor([[token_id]], type: :s64, backend: @cpu_backend)
     {next_token, kv_new} = forward_sample(input_ids, kv, cur, sampler, temp, top_p, key, state)
     {Nx.to_number(next_token), kv_new}
+  end
+
+  defp run_native_chunks(last_token, kv_cache, current_len, count, state, native_chunk_runner) do
+    NativeChunkRunner.run(
+      last_token,
+      kv_cache,
+      current_len,
+      count,
+      fn token, kv_cache, offset, chunk_count ->
+        input_ids = Nx.reshape(token, {1, 1})
+        native_chunk_runner.(input_ids, kv_cache, offset, chunk_count, state)
+      end
+    )
   end
 
   defp sample(logits, :top_p_cpu, temp, top_p, _key),
