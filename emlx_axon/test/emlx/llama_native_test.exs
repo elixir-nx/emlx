@@ -350,7 +350,8 @@ defmodule EMLXAxon.LlamaNativeTest do
 
   test "llama_layer matches Nx reference for GQA prefill with nonzero offset" do
     {hidden, norm1, norm2, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, k_cache,
-     v_cache, rope_freqs} =
+     v_cache,
+     rope_freqs} =
       Nx.with_default_backend(Nx.BinaryBackend, fn ->
         {
           Nx.iota({1, 2, 4}, type: :f32) |> Nx.add(1) |> Nx.divide(10),
