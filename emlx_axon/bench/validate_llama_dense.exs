@@ -123,6 +123,7 @@ defmodule LlamaDenseBenchmark do
     print_summary(report)
     maybe_write_json(config.json_path, report)
     enforce_strict_length!(report, config)
+    enforce_text_equality!(report)
   end
 
   defp config do
@@ -250,7 +251,12 @@ defmodule LlamaDenseBenchmark do
     warmups =
       for i <- run_indices(config.warmup_runs) do
         result = run_once(serving, config.prompt, config.max_new_tokens)
-        IO.puts("  warmup #{i}: #{result.tokens} tokens / #{format_ms(result.ms)} ms")
+
+        IO.puts(
+          "  warmup #{i}: #{result.tokens} tokens / #{format_ms(result.ms)} ms\n" <>
+            "    text: #{inspect(result.text)}"
+        )
+
         result
       end
 
@@ -262,11 +268,14 @@ defmodule LlamaDenseBenchmark do
 
         IO.puts(
           "  run #{i}: #{result.tokens} tokens / #{format_ms(result.ms)} ms = " <>
-            "#{format_rate(result.tok_s)} tok/s finish=#{result.finish_reason}"
+            "#{format_rate(result.tok_s)} tok/s finish=#{result.finish_reason}\n" <>
+            "    text: #{inspect(result.text)}"
         )
 
         result
       end
+
+    assert_equal_texts!(label, Enum.map(warmups ++ runs, & &1.text))
 
     path_report(warmups, runs)
     |> Map.put(:ttft_ms, benchmark_ttft(label, ttft_serving, config))
@@ -325,15 +334,23 @@ defmodule LlamaDenseBenchmark do
   end
 
   defp benchmark_ttft(label, serving, config) do
-    _warmup = run_once(serving, config.prompt, 1)
+    warmup = run_once(serving, config.prompt, 1)
+    IO.puts("  #{label} TTFT warmup: #{format_ms(warmup.ms)} ms\n    text: #{inspect(warmup.text)}")
 
-    values =
-      for i <- run_indices(config.runs) do
+    {values, texts} =
+      Enum.map(run_indices(config.runs), fn i ->
         result = run_once(serving, config.prompt, 1)
-        IO.puts("  #{label} TTFT #{i}: #{format_ms(result.ms)} ms")
-        result.ms
-      end
 
+        IO.puts(
+          "  #{label} TTFT #{i}: #{format_ms(result.ms)} ms\n" <>
+            "    text: #{inspect(result.text)}"
+        )
+
+        {result.ms, result.text}
+      end)
+      |> Enum.unzip()
+
+    assert_equal_texts!("#{label} TTFT", [warmup.text | texts])
     stats(values)
   end
 
@@ -370,6 +387,7 @@ defmodule LlamaDenseBenchmark do
       tokens: tokens,
       tok_s: rate(tokens, ms),
       finish_reason: finish_reason,
+      text: text,
       preview: text |> String.replace("\n", " ") |> String.slice(0, 80)
     }
   end
@@ -443,6 +461,11 @@ defmodule LlamaDenseBenchmark do
         {path, Enum.map(path_report[:runs] || [], & &1.tokens)}
       end)
 
+    measured_texts =
+      Map.new(paths, fn {path, path_report} ->
+        {path, Enum.map(path_report[:runs] || [], & &1.text)}
+      end)
+
     finish_reasons =
       Map.new(paths, fn {path, path_report} ->
         {path, get_in(path_report, [:measured, :finish_reasons]) || %{}}
@@ -455,9 +478,49 @@ defmodule LlamaDenseBenchmark do
       expected_tokens_per_run: config.max_new_tokens,
       measured_token_counts: measured_token_counts,
       equal_measured_token_count?: equal_measured_token_count?(measured_token_counts, config),
+      measured_texts: measured_texts,
+      equal_measured_text?: equal_measured_text?(measured_texts),
       finish_reasons: finish_reasons,
       comparable_finish_reasons?: comparable_finish_reasons?(finish_reasons, config)
     }
+  end
+
+  defp equal_measured_text?(measured_texts) do
+    texts =
+      measured_texts
+      |> Enum.reject(fn {_path, texts} -> texts == [] end)
+      |> Enum.flat_map(fn {_path, texts} -> texts end)
+
+    case texts do
+      [] -> true
+      _ -> MapSet.size(MapSet.new(texts)) == 1
+    end
+  end
+
+  defp assert_equal_texts!(_label, []), do: :ok
+
+  defp assert_equal_texts!(label, texts) do
+    unique = Enum.uniq(texts)
+
+    unless length(unique) == 1 do
+      raise """
+      #{label} generated unequal texts across calls:
+      #{Enum.map_join(Enum.with_index(texts, 1), "\n", fn {text, i} -> "  #{i}: #{inspect(text)}" end)}
+      """
+    end
+  end
+
+  defp enforce_text_equality!(report) do
+    verification = report.verification
+
+    unless verification.equal_measured_text? do
+      raise """
+      Llama dense benchmark generated unequal measured texts across paths:
+      #{Enum.map_join(verification.measured_texts, "\n", fn {path, texts} ->
+        "  #{path}: #{inspect(texts)}"
+      end)}
+      """
+    end
   end
 
   defp equal_measured_token_count?(measured_token_counts, config) do
@@ -627,6 +690,7 @@ defmodule LlamaDenseBenchmark do
       tokens: run.tokens,
       tokens_per_sec: round_float(run.tok_s),
       finish_reason: to_string(run.finish_reason),
+      text: run.text,
       preview: run.preview
     }
   end
