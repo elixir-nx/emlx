@@ -6,7 +6,7 @@ defmodule EMLXAxon.PluginMetadataTest.Proof do
   alias EMLXAxon.Native.Plugin
 
   deftransform scale_add(x, scale, bias) do
-    attrs = [Plugin.f64_bits(scale), Plugin.f64_bits(bias)]
+    attrs = [scale, bias]
 
     if Plugin.traced?(x) do
       template = Nx.to_template(x)
@@ -42,7 +42,7 @@ defmodule EMLXAxon.PluginMetadataTest.Proof do
         "proof",
         "scale_add",
         [x],
-        [Plugin.f64_bits(opts[:scale]), Plugin.f64_bits(opts[:bias])],
+        [opts[:scale], opts[:bias]],
         Nx.to_template(x)
       )
 
@@ -54,7 +54,7 @@ defmodule EMLXAxon.PluginMetadataTest.Proof do
   defn differentiated(x), do: Nx.Defn.grad(x, &scale_add(&1, 2.0, 1.0))
 
   deftransform operation(x, callback) do
-    attrs = [Plugin.f64_bits(2.0), Plugin.f64_bits(1.0)]
+    attrs = [2.0, 1.0]
     template = Nx.to_template(x)
 
     if Plugin.traced?(x) do
@@ -83,7 +83,7 @@ defmodule EMLXAxon.PluginMetadataTest.Proof do
         "proof",
         opts[:callback],
         [x],
-        [Plugin.f64_bits(2.0), Plugin.f64_bits(1.0)],
+        [2.0, 1.0],
         Nx.to_template(x)
       )
 
@@ -133,7 +133,15 @@ defmodule EMLXAxon.PluginMetadataTest do
     assert [%EMLX.Native.Instruction{op: :plugin, attrs: attrs}] = wire.instructions
     assert Enum.at(attrs, 1) == "proof"
     assert Enum.at(attrs, 2) == "scale_add"
+    # Float callback attrs are auto-encoded onto the int64 channel.
+    assert Enum.take(attrs, -3) == [2, Expr.f64_bits(2.0), Expr.f64_bits(1.0)]
     refute Enum.any?(wire.instructions, &(&1.op == :runtime_call))
+  end
+
+  test "plugin encode_attrs keeps integers raw and encodes only floats" do
+    alias EMLXAxon.Native.Plugin
+
+    assert Plugin.encode_attrs([1, 1.0, 2]) == [1, Expr.f64_bits(1.0), 2]
   end
 
   test "plugin wire rejects malformed and noncanonical fields" do

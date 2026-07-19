@@ -1,13 +1,16 @@
-# Builds the standalone Qwen3 compute plugin.
+# Builds the standalone model compute plugins.
 empty :=
 space := $(empty) $(empty)
 esc = $(subst $(space),\$(space),$(1))
 
 PRIV_DIR = $(MIX_APP_PATH)/priv
 QWEN3_SO = $(PRIV_DIR)/libemlx_qwen3.so
+LLAMA_SO = $(PRIV_DIR)/libemlx_llama.so
 OBJ_DIR = $(PRIV_DIR)/objs
 QWEN3_OBJECT = $(OBJ_DIR)/qwen3_plugin.o
+LLAMA_OBJECT = $(OBJ_DIR)/llama_plugin.o
 QWEN3_SOURCE = c_src/qwen3_plugin.cpp
+LLAMA_SOURCE = c_src/llama_plugin.cpp
 PLUGIN_ABI = $(EMLX_PLUGIN_INCLUDE_DIR)/emlx/plugin/abi.hpp
 
 UNAME_S := $(shell uname -s)
@@ -22,14 +25,23 @@ endif
 CFLAGS = -fPIC -isystem $(call esc,$(MLX_INCLUDE_DIR)) -I$(call esc,$(EMLX_PLUGIN_INCLUDE_DIR)) -Wall -std=c++20 -O3 -fvisibility=hidden $(PLATFORM_CFLAGS)
 LDFLAGS = -L$(call esc,$(MLX_LIB_DIR)) -lmlx -shared $(PLATFORM_LDFLAGS)
 
-all: $(call esc,$(QWEN3_SO))
+all: $(call esc,$(QWEN3_SO)) $(call esc,$(LLAMA_SO))
 	@ echo > /dev/null
 
 $(call esc,$(QWEN3_OBJECT)): $(QWEN3_SOURCE) $(call esc,$(PLUGIN_ABI))
 	@ mkdir -p "$(OBJ_DIR)"
 	$(CXX) $(CFLAGS) -c "$<" -o "$@"
 
+$(call esc,$(LLAMA_OBJECT)): $(LLAMA_SOURCE) $(call esc,$(PLUGIN_ABI))
+	@ mkdir -p "$(OBJ_DIR)"
+	$(CXX) $(CFLAGS) -c "$<" -o "$@"
+
 $(call esc,$(QWEN3_SO)): $(call esc,$(QWEN3_OBJECT))
+	@ mkdir -p "$(PRIV_DIR)/mlx/lib"
+	@ cp -a "$(MLX_LIB_DIR)"/* "$(PRIV_DIR)/mlx/lib"
+	$(CXX) "$<" -o "$@" $(LDFLAGS)
+
+$(call esc,$(LLAMA_SO)): $(call esc,$(LLAMA_OBJECT))
 	@ mkdir -p "$(PRIV_DIR)/mlx/lib"
 	@ cp -a "$(MLX_LIB_DIR)"/* "$(PRIV_DIR)/mlx/lib"
 	$(CXX) "$<" -o "$@" $(LDFLAGS)

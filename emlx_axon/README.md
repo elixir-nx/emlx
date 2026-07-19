@@ -1,6 +1,7 @@
 # EMLXAxon
 
-`emlx_axon` provides [Axon](https://github.com/elixir-nx/axon) model rewrites that swap supported nodes for `EMLX.Fast` Metal shader implementations, accelerating inference on Apple Silicon.
+`emlx_axon` provides [Axon](https://github.com/elixir-nx/axon) model rewrites
+and native model plugins that accelerate inference on Apple Silicon.
 
 It builds on top of [`emlx`](https://github.com/elixir-nx/emlx) and is intended to be used alongside [Bumblebee](https://github.com/elixir-nx/bumblebee) for running LLM serving workloads on MLX.
 
@@ -30,8 +31,38 @@ Makefile; EMLX packages the shared plugin ABI header.
 
 The EMLX plugin registry keeps accepted shared objects loaded for the VM
 lifetime. Stopping and starting `:emlx_axon` is supported and loads the same
-Qwen3 plugin idempotently; replacing an accepted plugin under the same name
-requires restarting the BEAM VM.
+Qwen3 and Llama plugins idempotently; replacing an accepted plugin under the
+same name requires restarting the BEAM VM.
+
+## Native dense Llama
+
+Standard Hugging Face Llama checkpoints can be loaded from safetensors and run
+through the native Llama plugin:
+
+```elixir
+{:ok, tokenizer} =
+  Bumblebee.load_tokenizer({:hf, "meta-llama/Llama-3.2-1B"})
+
+{:ok, state} =
+  EMLXAxon.Llama.DenseLoader.from_safetensors_dir(
+    "~/.cache/huggingface/hub/models--meta-llama--Llama-3.2-1B/snapshots/<revision>",
+    type: :f16
+  )
+
+result =
+  EMLXAxon.TextGeneration.run(
+    tokenizer,
+    state,
+    "The capital of France is",
+    max_new_tokens: 32,
+    sampler: :greedy
+  )
+
+IO.inspect(result)
+```
+
+`EMLXAxon.TextGeneration.run/4`, `stream/5`, and `serving/3` dispatch from the
+loaded state, so the same APIs support native Qwen3 and dense Llama models.
 
 ## Model download
 
@@ -46,6 +77,10 @@ pipx install huggingface_hub[cli]
 Download the model checkpoints:
 
 ```bash
+# Dense Llama 3.2 1B. This repository is gated and requires access approval.
+huggingface-cli download meta-llama/Llama-3.2-1B \
+  --local-dir ~/models/Llama-3.2-1B
+
 # 0.6B — small, fast to iterate (~400 MB)
 huggingface-cli download lmstudio-community/Qwen3-0.6B-MLX-4bit \
   --local-dir ~/models/Qwen3-0.6B-MLX-4bit
@@ -60,6 +95,20 @@ Export the path before running tests or benchmarks:
 ```bash
 export EMLX_QWEN3_MODEL_PATH=~/models/Qwen3-0.6B-MLX-4bit
 ```
+
+Run the dense Llama comparison from `emlx_axon`:
+
+```bash
+EMLX_DENSE_LLAMA_MODEL=~/models/Llama-3.2-1B \
+EMLX_DENSE_LLAMA_DEVICE=gpu \
+EMLX_DENSE_LLAMA_TYPE=f16 \
+EMLX_DENSE_LLAMA_STRICT_LENGTH=true \
+mix run bench/validate_llama_dense.exs
+```
+
+The report compares stock Bumblebee, the EMLXAxon rewrite path, and the native
+Llama plugin with equal token counts. It includes load time, warmed one-token
+latency, request duration, throughput, token counts, and finish reasons.
 
 ### Pinning a model revision
 

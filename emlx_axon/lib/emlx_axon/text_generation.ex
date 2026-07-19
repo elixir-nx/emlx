@@ -1,11 +1,10 @@
 defmodule EMLXAxon.TextGeneration do
   @moduledoc """
-  A `Nx.Serving`-compatible wrapper around native Qwen3 generation.
+  A `Nx.Serving`-compatible wrapper around native EMLXAxon text generation.
 
-  Bypasses the Axon graph entirely — the 28-layer forward pass runs as a single
-  `mlx::eval` per token (via `EMLXAxon.Qwen3.Generate`), avoiding
-  the 28 separate Metal command buffer submissions that the Bumblebee + Axon path
-  incurs.
+  Bypasses the Axon graph and dispatches to the native generator for the loaded
+  model family. Supported states currently come from `EMLXAxon.Qwen3` and
+  `EMLXAxon.Llama`.
 
   Only Bumblebee tokenization is used from upstream Bumblebee. No Bumblebee model
   function or Axon graph is involved in the decode forward pass.
@@ -39,9 +38,13 @@ defmodule EMLXAxon.TextGeneration do
 
       result = Nx.Serving.run(serving, "Write a short story about a robot who learns to love.")
       IO.puts(result.results |> hd() |> Map.fetch!(:generated_text))
+
+  Llama dense states use the same `serving/3` API and can be loaded with
+  `EMLXAxon.Llama.DenseLoader.from_safetensors_dir/2`.
   """
 
-  alias EMLXAxon.Qwen3.{Model, Generate, Loader}
+  alias EMLXAxon.{Llama, Qwen3}
+  alias EMLXAxon.Qwen3.Loader
 
   @cpu_backend Nx.BinaryBackend
   @decode_cache_table __MODULE__.DecodeCache
@@ -49,16 +52,18 @@ defmodule EMLXAxon.TextGeneration do
   @default_stream_host_sync {:chunk, 5}
 
   @doc """
-  Runs native Qwen3 text generation directly, without wrapping the call in
+  Runs native text generation directly, without wrapping the call in
   `Nx.Serving`.
 
   This is useful for host applications that already own a loaded
-  `EMLXAxon.Qwen3.Model.State` and want to avoid serving preprocessing
-  overhead. The return shape matches `serving/3` for the same `:output_format`.
+  `EMLXAxon.Qwen3.Model.State` or `EMLXAxon.Llama.Model.State` and want to
+  avoid serving preprocessing overhead.
   """
-  def run(tokenizer, %Model.State{} = state, input, opts \\ []) do
+  def run(tokenizer, state, input, opts \\ []) do
+    ensure_supported_state!(state)
+
     max_new = max_new_tokens!(opts, 100)
-    configured_max_len = Keyword.get(opts, :max_len, 2048)
+    configured_max_len = max_len!(opts, 2048)
     sampler = Keyword.get(opts, :sampler, :greedy)
     profile_timing = Keyword.get(opts, :profile_timing, false)
     output_format = Keyword.get(opts, :output_format, :native)
@@ -83,7 +88,7 @@ defmodule EMLXAxon.TextGeneration do
       kv_cache_for_request(opts, state, configured_max_len, input_length, max_new, sampler)
 
     {tokens, metadata} =
-      Generate.generate(input_ids, state,
+      generate_module(state).generate(input_ids, state,
         kv_cache: kv_cache,
         max_new_tokens: max_new,
         max_len: max_len,
@@ -143,10 +148,24 @@ defmodule EMLXAxon.TextGeneration do
   end
 
   defp init_kv_cache_for_sampler(state, max_len, :greedy),
-    do: Model.init_native_kv_cache(state, max_len)
+    do: model_module(state).init_native_kv_cache(state, max_len)
 
   defp init_kv_cache_for_sampler(state, max_len, _sampler),
-    do: Model.init_kv_cache(state, max_len)
+    do: model_module(state).init_kv_cache(state, max_len)
+
+  defp ensure_supported_state!(%Qwen3.Model.State{}), do: :ok
+  defp ensure_supported_state!(%Llama.Model.State{}), do: :ok
+
+  defp ensure_supported_state!(state) do
+    raise ArgumentError,
+          "expected a Qwen3 or Llama native model state, got: #{inspect(state)}"
+  end
+
+  defp model_module(%Qwen3.Model.State{}), do: Qwen3.Model
+  defp model_module(%Llama.Model.State{}), do: Llama.Model
+
+  defp generate_module(%Qwen3.Model.State{}), do: Qwen3.Generate
+  defp generate_module(%Llama.Model.State{}), do: Llama.Generate
 
   defp adaptive_max_len(configured_max_len, input_length, max_new) do
     min(configured_max_len, input_length + max(max_new, 1) - 1)
@@ -181,7 +200,7 @@ defmodule EMLXAxon.TextGeneration do
   defp stream_host_sync_mode(other, _sampler), do: other
 
   @doc """
-  Streams native Qwen3 text generation through `emit_fun`.
+  Streams native text generation through `emit_fun`.
 
   `emit_fun` is called with decoded text chunks as they become available. The
   function returns a map with `:token_summary`, matching the shape used by
@@ -204,10 +223,12 @@ defmodule EMLXAxon.TextGeneration do
     the response. Samplers that cannot use deferred host sync fall back to
     emitting each token.
   """
-  def stream(tokenizer, %Model.State{} = state, input, emit_fun, opts \\ [])
+  def stream(tokenizer, state, input, emit_fun, opts \\ [])
       when is_function(emit_fun, 1) do
+    ensure_supported_state!(state)
+
     max_new = max_new_tokens!(opts, 100)
-    configured_max_len = Keyword.get(opts, :max_len, 2048)
+    configured_max_len = max_len!(opts, 2048)
     sampler = Keyword.get(opts, :sampler, :greedy)
     profile_timing = Keyword.get(opts, :profile_timing, false)
     temperature = Keyword.get(opts, :temperature, 0.95)
@@ -278,15 +299,16 @@ defmodule EMLXAxon.TextGeneration do
   end
 
   @doc """
-  Builds an `Nx.Serving` wrapping a native Qwen3 model state.
+  Builds an `Nx.Serving` wrapping a native model state.
 
   The state may come from the MLX-4bit loader or from
-  `EMLXAxon.Qwen3.DenseLoader` for standard dense Hugging Face safetensors.
+  `EMLXAxon.Qwen3.DenseLoader` or `EMLXAxon.Llama.DenseLoader` for standard
+  dense Hugging Face safetensors.
 
   Accepts the same text-string input format as `Bumblebee.Text.generation/4`:
   a plain binary or `%{text: binary()}`. Returns `%{results: [%{generated_text: binary(),
-  num_tokens: pos_integer()}]}`. Native Qwen3 generation currently supports
-  one input at a time; list/batch inputs raise `ArgumentError`.
+  num_tokens: pos_integer()}], finish_reason: :stop | :length}`. Native
+  generation currently supports one input at a time.
 
   ## Options
 
@@ -310,9 +332,10 @@ defmodule EMLXAxon.TextGeneration do
                         compatible with `Bumblebee.Text.generation/4` (default `:native`)
   """
   def serving(tokenizer, state, opts \\ []) do
-    state = Model.prepare_native(state)
+    ensure_supported_state!(state)
+    state = model_module(state).prepare_native(state)
     max_new = max_new_tokens!(opts, 100)
-    configured_max_len = Keyword.get(opts, :max_len, 2048)
+    configured_max_len = max_len!(opts, 2048)
     sampler = Keyword.get(opts, :sampler, :greedy)
     temperature = Keyword.get(opts, :temperature, 0.95)
     top_p = Keyword.get(opts, :top_p, 0.9)
@@ -336,8 +359,8 @@ defmodule EMLXAxon.TextGeneration do
         max_len = adaptive_max_len(configured_max_len, input_length, max_new)
         kv_cache = init_kv_cache_for_sampler(state, max_len, sampler)
 
-        {tokens, _timing} =
-          Generate.generate(input_ids, state,
+        {tokens, generation_metadata} =
+          generate_module(state).generate(input_ids, state,
             kv_cache: kv_cache,
             max_new_tokens: max_new,
             max_len: max_len,
@@ -350,7 +373,7 @@ defmodule EMLXAxon.TextGeneration do
 
         # Return as 2-D tensor {1, num_tokens} matching the shape that
         # Bumblebee.Tokenizer.decode/2 expects for batch input.
-        tokens_to_batch_tensor(tokens)
+        serving_output(tokens, generation_metadata)
       end
     end)
     |> Nx.Serving.client_preprocessing(fn input ->
@@ -371,14 +394,52 @@ defmodule EMLXAxon.TextGeneration do
 
       {Nx.Batch.concatenate([%{"input_ids" => input_ids}]), input_length}
     end)
-    |> Nx.Serving.client_postprocessing(fn {token_ids, _metadata}, input_length ->
+    |> Nx.Serving.client_postprocessing(fn {%{token_ids: token_ids} = generation_output,
+                                            _metadata},
+                                           input_length ->
       # token_ids: {1, num_generated_tokens} on Nx.BinaryBackend
       num_tokens = elem(Nx.shape(token_ids), 1)
       decoded = Bumblebee.Tokenizer.decode(tokenizer, token_ids)
 
       %{results: [result(decoded_text(decoded), input_length, num_tokens, output_format)]}
+      |> maybe_put_serving_finish_reason(generation_output)
     end)
   end
+
+  defp serving_output(tokens, generation_metadata) do
+    %{
+      token_ids: tokens_to_batch_tensor(tokens),
+      finish_reason: serving_finish_reason(generation_metadata)
+    }
+  end
+
+  defp serving_finish_reason(%{finish_reason: finish_reason}) do
+    Nx.tensor([finish_reason_code(finish_reason)], type: :s64)
+  end
+
+  defp serving_finish_reason(_metadata) do
+    Nx.tensor([finish_reason_code(:length)], type: :s64)
+  end
+
+  defp maybe_put_serving_finish_reason(output, %{finish_reason: finish_reason_code}) do
+    maybe_put_finish_reason(output, %{finish_reason: finish_reason_from_code(finish_reason_code)})
+  end
+
+  defp maybe_put_serving_finish_reason(output, _generation_output), do: output
+
+  defp finish_reason_code(:stop), do: 0
+  defp finish_reason_code(:length), do: 1
+  defp finish_reason_code(_other), do: 1
+
+  defp finish_reason_from_code(%Nx.Tensor{} = code) do
+    code
+    |> Nx.to_flat_list()
+    |> hd()
+    |> finish_reason_from_code()
+  end
+
+  defp finish_reason_from_code(0), do: :stop
+  defp finish_reason_from_code(_code), do: :length
 
   @doc """
   Convenience: load `%State{}` from an MLX-4bit checkpoint directory and build a serving.
@@ -398,7 +459,7 @@ defmodule EMLXAxon.TextGeneration do
 
   defp normalize_input(inputs) when is_list(inputs) do
     raise ArgumentError,
-          "native Qwen3 text generation currently supports one input at a time, got a list"
+          "native text generation currently supports one input at a time, got a list"
   end
 
   defp normalize_input(input) do
@@ -420,6 +481,20 @@ defmodule EMLXAxon.TextGeneration do
           "expected :max_new_tokens to be a positive integer, got: #{inspect(max_new)}"
   end
 
+  defp max_len!(opts, default) do
+    opts
+    |> Keyword.get(:max_len, default)
+    |> validate_max_len!()
+  end
+
+  defp validate_max_len!(max_len) when is_integer(max_len) and max_len > 0,
+    do: max_len
+
+  defp validate_max_len!(max_len) do
+    raise ArgumentError,
+          "expected :max_len to be a positive integer, got: #{inspect(max_len)}"
+  end
+
   defp ensure_single_batch!(input_ids) do
     case Nx.shape(input_ids) do
       {1, _seq_len} ->
@@ -427,7 +502,7 @@ defmodule EMLXAxon.TextGeneration do
 
       {batch_size, _seq_len} ->
         raise ArgumentError,
-              "native Qwen3 text generation currently supports batch size 1, got batch size #{batch_size}"
+              "native text generation currently supports batch size 1, got batch size #{batch_size}"
 
       shape ->
         raise ArgumentError,
@@ -465,7 +540,7 @@ defmodule EMLXAxon.TextGeneration do
          :per_token,
          opts
        ) do
-    Generate.generate(input_ids, state,
+    generate_module(state).generate(input_ids, state,
       kv_cache: kv_cache,
       max_new_tokens: Keyword.fetch!(opts, :max_new),
       max_len: Keyword.fetch!(opts, :max_len),
@@ -493,7 +568,7 @@ defmodule EMLXAxon.TextGeneration do
          opts
        )
        when is_integer(chunk_size) and chunk_size > 0 do
-    Generate.generate(input_ids, state,
+    generate_module(state).generate(input_ids, state,
       kv_cache: kv_cache,
       max_new_tokens: Keyword.fetch!(opts, :max_new),
       max_len: Keyword.fetch!(opts, :max_len),

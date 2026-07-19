@@ -3264,13 +3264,13 @@ defmodule EMLX.Native.Expr do
 
   @doc false
   def f64_bits(v) when is_number(v) do
-    <<bits::signed-64>> = <<v * 1.0::float-64>>
+    <<bits::signed-native-64>> = <<v * 1.0::float-native-64>>
     bits
   end
 
   @doc false
   def bits_to_f64(bits) when is_integer(bits) do
-    <<v::float-64>> = <<bits::signed-64>>
+    <<v::float-native-64>> = <<bits::signed-native-64>>
     v
   end
 

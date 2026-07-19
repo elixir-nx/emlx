@@ -1,9 +1,9 @@
-defmodule EMLXAxon.Qwen3DenseLoaderTest do
+defmodule EMLXAxon.LlamaDenseLoaderTest do
   use ExUnit.Case, async: true
 
-  alias EMLXAxon.Qwen3.{DenseLoader, Generate}
+  alias EMLXAxon.Llama.{DenseLoader, Generate, Model, Rope}
 
-  test "builds native state from Bumblebee dense Qwen3 params" do
+  test "builds native state from Bumblebee dense Llama params" do
     params = %Axon.ModelState{data: params()}
 
     assert {:ok, state} = DenseLoader.from_model_info(%{params: params, spec: spec()})
@@ -16,8 +16,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
 
     [layer] = state.layers
 
-    {_norm1, _norm2, _q_norm, _k_norm, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
-     down_proj} = layer
+    {_norm1, _norm2, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj} = layer
 
     assert Nx.shape(q_proj) == {4, 4}
     assert Nx.shape(k_proj) == {4, 2}
@@ -26,6 +25,65 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     assert Nx.shape(gate_proj) == {4, 8}
     assert Nx.shape(up_proj) == {4, 8}
     assert Nx.shape(down_proj) == {8, 4}
+  end
+
+  test "rejects unsupported Bumblebee Llama activation" do
+    params = %Axon.ModelState{data: params()}
+    spec = spec(activation: :gelu)
+
+    assert {:error, message} = DenseLoader.from_model_info(%{params: params, spec: spec})
+    assert message =~ "supports activation :silu only"
+    assert message =~ ":gelu"
+  end
+
+  test "rejects non-keyword model_info options with a clear error" do
+    model_info = %{params: %Axon.ModelState{data: params()}, spec: spec()}
+
+    assert {:error, message} = DenseLoader.from_model_info(model_info, :bad_opts)
+    assert message =~ "expected opts to be a keyword list"
+    assert message =~ ":bad_opts"
+  end
+
+  test "uses token ids from Bumblebee generation config" do
+    model_info = %{params: %Axon.ModelState{data: params()}, spec: spec()}
+
+    assert {:ok, probe_state} = DenseLoader.from_model_info(model_info)
+
+    input_ids =
+      Nx.tensor([[1, 2]], type: :s64)
+      |> Nx.backend_transfer({EMLX.Backend, device: :gpu})
+
+    {[first_token], _metadata} =
+      Generate.generate(input_ids, probe_state,
+        max_new_tokens: 1,
+        max_len: 8,
+        sampler: :greedy,
+        host_sync: :per_token,
+        profile_timing: false
+      )
+
+    generation_config = %Bumblebee.Text.GenerationConfig{
+      eos_token_id: [first_token, 128_009],
+      bos_token_id: 128_000
+    }
+
+    assert {:ok, state} =
+             DenseLoader.from_model_info(model_info, generation_config: generation_config)
+
+    assert state.config.eos_token_id == [first_token, 128_009]
+    assert state.config.bos_token_id == 128_000
+
+    {tokens, metadata} =
+      Generate.generate(input_ids, state,
+        max_new_tokens: 5,
+        max_len: 8,
+        sampler: :greedy,
+        host_sync: :per_token,
+        profile_timing: false
+      )
+
+    assert tokens == [first_token]
+    assert metadata.finish_reason == :stop
   end
 
   test "keeps params already loaded on EMLX GPU" do
@@ -39,7 +97,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
   end
 
   test "builds native state directly from dense safetensors directory" do
-    dir = Path.join(System.tmp_dir!(), "qwen3_dense_loader_#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -58,7 +116,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     assert Nx.shape(state.lm_head) == {16, 4}
     assert emlx_ref(state.lm_head) == emlx_ref(state.embed_tokens)
     assert Nx.shape(file_state.embed_tokens) == {16, 4}
-    assert state.config.eos_token_id == 151_645
+    assert state.config.eos_token_id == 2
     # config.json uses integer rope_theta; loaders must coerce to float for plugin attrs.
     assert state.config.rope_theta == 10_000.0
     assert is_float(state.config.rope_theta)
@@ -66,8 +124,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
 
     [layer] = state.layers
 
-    {_norm1, _norm2, _q_norm, _k_norm, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj,
-     down_proj} = layer
+    {_norm1, _norm2, q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj} = layer
 
     assert Nx.shape(q_proj) == {4, 4}
     assert Nx.shape(k_proj) == {4, 2}
@@ -101,7 +158,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
   end
 
   test "dense state loaded from safetensors can run native generation" do
-    dir = Path.join(System.tmp_dir!(), "qwen3_dense_loader_#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -131,8 +188,32 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     assert metadata.finish_reason in [:length, :stop]
   end
 
+  test "KV cache dtype follows bf16 safetensors state dtype" do
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    config_path = Path.join(dir, "config.json")
+    safetensors_path = Path.join(dir, "model.safetensors")
+
+    File.write!(config_path, Jason.encode!(config_json()))
+    Safetensors.write!(safetensors_path, safetensors_params())
+
+    assert {:ok, state} =
+             DenseLoader.from_safetensors_files(config_path, [safetensors_path], type: :bf16)
+
+    [{k_cache, v_cache}] = Model.init_kv_cache(state, 8)
+    [{native_k_cache, native_v_cache}] = Model.init_native_kv_cache(state, 8)
+
+    assert Nx.type(state.embed_tokens) == {:bf, 16}
+    assert Nx.type(k_cache) == {:bf, 16}
+    assert Nx.type(v_cache) == {:bf, 16}
+    assert Nx.type(native_k_cache) == {:bf, 16}
+    assert Nx.type(native_v_cache) == {:bf, 16}
+  end
+
   test "rejects unsupported safetensors cast type" do
-    dir = Path.join(System.tmp_dir!(), "qwen3_dense_loader_#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -149,7 +230,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
   end
 
   test "rejects CPU safetensors device for native dense generation" do
-    dir = Path.join(System.tmp_dir!(), "qwen3_dense_loader_#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -165,6 +246,114 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     assert message =~ "supports device: :gpu only"
   end
 
+  test "rejects unsupported safetensors RoPE scaling config" do
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    config_path = Path.join(dir, "config.json")
+    safetensors_path = Path.join(dir, "model.safetensors")
+
+    config =
+      Map.put(config_json(), "rope_scaling", %{
+        "rope_type" => "linear",
+        "factor" => 2.0
+      })
+
+    File.write!(config_path, Jason.encode!(config))
+    Safetensors.write!(safetensors_path, safetensors_params())
+
+    assert {:error, message} = DenseLoader.from_safetensors_files(config_path, [safetensors_path])
+    assert message =~ "supports nil or llama3 rope scaling"
+  end
+
+  test "rejects unsupported safetensors config features" do
+    for {field, value, expected} <- [
+          {"attention_bias", true, "attention_bias=true"},
+          {"mlp_bias", true, "mlp_bias=true"},
+          {"hidden_act", "gelu", ~s(hidden_act "silu")}
+        ] do
+      dir =
+        Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      config_path = Path.join(dir, "config.json")
+      safetensors_path = Path.join(dir, "model.safetensors")
+
+      config = Map.put(config_json(), field, value)
+
+      File.write!(config_path, Jason.encode!(config))
+      Safetensors.write!(safetensors_path, safetensors_params())
+
+      assert {:error, message} =
+               DenseLoader.from_safetensors_files(config_path, [safetensors_path])
+
+      assert message =~ expected
+    end
+  end
+
+  test "rejects safetensors checkpoints with missing or unsupported model type" do
+    for {config, expected} <- [
+          {Map.delete(config_json(), "model_type"), "got: nil"},
+          {Map.put(config_json(), "model_type", "mistral"), ~s(got: "mistral")}
+        ] do
+      dir =
+        Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
+
+      File.mkdir_p!(dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      config_path = Path.join(dir, "config.json")
+      safetensors_path = Path.join(dir, "model.safetensors")
+
+      File.write!(config_path, Jason.encode!(config))
+      Safetensors.write!(safetensors_path, safetensors_params())
+
+      assert {:error, message} =
+               DenseLoader.from_safetensors_files(config_path, [safetensors_path])
+
+      assert message =~ ~s(expected model_type "llama")
+      assert message =~ expected
+    end
+  end
+
+  test "rejects safetensors checkpoints configured for sliding-window attention" do
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    config_path = Path.join(dir, "config.json")
+    safetensors_path = Path.join(dir, "model.safetensors")
+    config = Map.put(config_json(), "sliding_window", 4_096)
+
+    File.write!(config_path, Jason.encode!(config))
+    Safetensors.write!(safetensors_path, safetensors_params())
+
+    assert {:error, message} =
+             DenseLoader.from_safetensors_files(config_path, [safetensors_path])
+
+    assert message =~ "does not support sliding_window"
+    assert message =~ "4096"
+  end
+
+  test "accepts a null safetensors sliding-window setting" do
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    config_path = Path.join(dir, "config.json")
+    safetensors_path = Path.join(dir, "model.safetensors")
+    config = Map.put(config_json(), "sliding_window", nil)
+
+    File.write!(config_path, Jason.encode!(config))
+    Safetensors.write!(safetensors_path, safetensors_params())
+
+    assert {:ok, %Model.State{}} =
+             DenseLoader.from_safetensors_files(config_path, [safetensors_path])
+  end
+
   test "rejects invalid safetensors device for native dense generation" do
     assert {:error, message} =
              DenseLoader.from_safetensors_files("missing-config.json", [], device: :tpu)
@@ -174,7 +363,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
   end
 
   test "returns an error when a safetensors checkpoint is missing a required key" do
-    dir = Path.join(System.tmp_dir!(), "qwen3_dense_loader_#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -191,7 +380,7 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
   end
 
   test "requires lm_head weight when safetensors embeddings are not tied" do
-    dir = Path.join(System.tmp_dir!(), "qwen3_dense_loader_#{System.unique_integer([:positive])}")
+    dir = Path.join(System.tmp_dir!(), "llama_dense_loader_#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf!(dir) end)
 
@@ -207,8 +396,44 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     assert message =~ "lm_head.weight"
   end
 
-  defp spec do
-    %Bumblebee.Text.Qwen3{
+  test "precomputes RoPE frequencies in MLX fast rope convention" do
+    freqs =
+      %{
+        head_dim: 8,
+        rope_theta: 10_000.0,
+        rope_scaling: nil
+      }
+      |> Rope.freqs_from_config!()
+      |> tensor_values()
+
+    assert_all_close(freqs, [1.0, 10.0, 100.0, 1000.0], atol: 1.0e-4)
+
+    inverse_freqs = Enum.map(freqs, &Kernel./(1.0, &1))
+    assert_all_close(inverse_freqs, [1.0, 0.1, 0.01, 0.001], atol: 1.0e-6)
+  end
+
+  test "precomputes Llama 3 RoPE scaling frequencies in MLX fast rope convention" do
+    freqs =
+      %{
+        head_dim: 8,
+        rope_theta: 10_000.0,
+        rope_scaling: %{
+          type: :llama3,
+          factor: 8.0,
+          low_frequency_factor: 1.0,
+          high_frequency_factor: 4.0,
+          original_max_positions: 8192
+        }
+      }
+      |> Rope.freqs_from_config!()
+      |> tensor_values()
+
+    inverse_freqs = Enum.map(freqs, &Kernel./(1.0, &1))
+    assert_all_close(inverse_freqs, [1.0, 0.1, 0.01, 0.000213761], atol: 1.0e-6)
+  end
+
+  defp spec(opts \\ []) do
+    defaults = [
       architecture: :for_causal_language_modeling,
       vocab_size: 16,
       hidden_size: 4,
@@ -220,11 +445,14 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
       rotary_embedding_base: 10_000,
       layer_norm_epsilon: 1.0e-6,
       tie_word_embeddings: true
-    }
+    ]
+
+    struct!(Bumblebee.Text.Llama, Keyword.merge(defaults, opts))
   end
 
   defp config_json do
     %{
+      "model_type" => "llama",
       "hidden_size" => 4,
       "intermediate_size" => 8,
       "num_attention_heads" => 2,
@@ -235,8 +463,8 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
       "rms_norm_eps" => 1.0e-6,
       "rope_theta" => 10_000,
       "tie_word_embeddings" => true,
-      "eos_token_id" => 151_645,
-      "bos_token_id" => 151_643
+      "eos_token_id" => 2,
+      "bos_token_id" => 1
     }
   end
 
@@ -246,8 +474,6 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
       "model.norm.weight" => f16_ones({4}),
       "model.layers.0.input_layernorm.weight" => f16_ones({4}),
       "model.layers.0.post_attention_layernorm.weight" => f16_ones({4}),
-      "model.layers.0.self_attn.q_norm.weight" => f16_ones({2}),
-      "model.layers.0.self_attn.k_norm.weight" => f16_ones({2}),
       "model.layers.0.self_attn.q_proj.weight" => Nx.iota({4, 4}, type: :f16),
       "model.layers.0.self_attn.k_proj.weight" => Nx.iota({2, 4}, type: :f16),
       "model.layers.0.self_attn.v_proj.weight" => Nx.iota({2, 4}, type: :f16),
@@ -267,8 +493,6 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     |> put("output_norm", "weight", Nx.broadcast(1.0, {4}))
     |> put("decoder.blocks.0.self_attention_norm", "weight", Nx.broadcast(1.0, {4}))
     |> put("decoder.blocks.0.output_norm", "weight", Nx.broadcast(1.0, {4}))
-    |> put("decoder.blocks.0.self_attention.query_norm", "weight", Nx.broadcast(1.0, {2}))
-    |> put("decoder.blocks.0.self_attention.key_norm", "weight", Nx.broadcast(1.0, {2}))
     |> put("decoder.blocks.0.self_attention.query", "kernel", Nx.iota({4, 4}, type: :f32))
     |> put("decoder.blocks.0.self_attention.key", "kernel", Nx.iota({4, 2}, type: :f32))
     |> put("decoder.blocks.0.self_attention.value", "kernel", Nx.iota({4, 2}, type: :f32))
@@ -299,5 +523,12 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     tensor
     |> Nx.backend_transfer(Nx.BinaryBackend)
     |> Nx.to_flat_list()
+  end
+
+  defp assert_all_close(left, right, opts) do
+    atol = Keyword.fetch!(opts, :atol)
+
+    assert Enum.zip(left, right)
+           |> Enum.all?(fn {left, right} -> abs(left - right) <= atol end)
   end
 end

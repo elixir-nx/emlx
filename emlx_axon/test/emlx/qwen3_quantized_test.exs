@@ -46,38 +46,38 @@ defmodule EMLXAxon.Qwen3QuantizedTest do
     # Greedy must be deterministic across runs
     assert tokens1 == tokens2
 
-    # Reference tokens from the upstream EMLX 0.4 forward pass.
-    # Captured on M4 Max with MLX 0.31.2.
+    # Reference from mlx_lm greedy decode on the same local MLX-4bit checkpoint:
+    #   prompt = "Write one sentence about Elixir."  (raw encode, no chat template)
+    #   max_tokens = 20, temp = 0
+    # Decodes to:
+    #   " - How does Elixir handle the case when there is no data in the database? - What is"
     #
-    # Note: tokens differ from `mlx_lm` because embed_tokens is dequantised to
-    # f16 at load time (vs bf16 in mlx_lm), and fast-ops (rms_norm, rope, sdpa)
-    # may accumulate in f32 then cast back. Tokens are internally consistent
-    # and deterministic on this hardware + software stack.
-    #
-    # To regenerate, compare the same checkpoint and prompt on upstream main
-    # before updating this branch's expected values.
-    assert tokens1 == [
-             481,
-             2585,
-             1558,
-             468,
-             97772,
-             3705,
-             1465,
-             11589,
-             304,
-             264,
-             7299,
-             60804,
-             291,
-             4573,
-             30,
-             481,
-             3555,
-             374,
-             279,
-             6672
-           ]
+    # Regenerate with:
+    #   python -c 'from mlx_lm import load; from mlx_lm.generate import generate_step; ...'
+    expected = [
+      481,
+      2585,
+      1558,
+      468,
+      97772,
+      3705,
+      279,
+      1142,
+      979,
+      1052,
+      374,
+      902,
+      821,
+      304,
+      279,
+      4625,
+      30,
+      481,
+      3555,
+      374
+    ]
+
+    assert tokens1 == expected
   end
 
   test "greedy decode is faster than top_p_cpu", %{state: state, tokenizer: tok} do
