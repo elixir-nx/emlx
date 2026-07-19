@@ -65,8 +65,9 @@ defmodule EMLXAxon.Qwen3.Loader do
         head_dim: raw["head_dim"] || div(raw["hidden_size"], raw["num_attention_heads"]),
         num_hidden_layers: raw["num_hidden_layers"],
         vocab_size: raw["vocab_size"],
-        rms_norm_eps: raw["rms_norm_eps"] || 1.0e-6,
-        rope_theta: raw["rope_theta"] || 10_000.0,
+        # Force floats: Jason keeps whole JSON numbers as integers.
+        rms_norm_eps: (raw["rms_norm_eps"] || 1.0e-6) * 1.0,
+        rope_theta: (raw["rope_theta"] || 10_000.0) * 1.0,
         tie_word_embeddings: raw["tie_word_embeddings"] || false,
         eos_token_id: raw["eos_token_id"] || 2,
         bos_token_id: raw["bos_token_id"] || 1
@@ -105,27 +106,27 @@ defmodule EMLXAxon.Qwen3.Loader do
 
     to_gpu = fn t -> Nx.backend_transfer(t, gpu) end
 
-    # Embedding: quantized in MLX 4-bit format; dequantize to dense f16 once
-    # at load time so Nx.take works for embedding lookup and lm_head projection.
-    embed_tokens =
+    # Embedding: MLX 4-bit checkpoints store QuantizedEmbedding. Dequantize to
+    # dense for Nx.take (no quantized gather yet). Keep the original quantized
+    # tensor for tied lm_head — re-quantizing the dense embed mismatches mlx_lm.
+    {embed_tokens, quantized_embed} =
       if Map.has_key?(tensors, "model.embed_tokens.scales") do
         qw = quantized_linear(tensors, "model.embed_tokens", config)
-        EMLX.Quantization.dequantize(qw)
+        {EMLX.Quantization.dequantize(qw), qw}
       else
-        tensors["model.embed_tokens.weight"] |> to_gpu.()
+        {tensors["model.embed_tokens.weight"] |> to_gpu.(), nil}
       end
 
     # Norm weights are dense f16/bf16
     final_norm = tensors["model.norm.weight"] |> to_gpu.()
 
-    # lm_head: quantize for 4× bandwidth reduction on the {vocab_size, hidden} matmul.
-    # embed_tokens stays dense f16 because token lookups use Nx.take (gather), not dot.
+    # lm_head: prefer checkpoint quantized weights; fall back to quantizing dense.
     lm_head =
       cond do
+        config.tie_word_embeddings and quantized_embed != nil ->
+          quantized_embed
+
         config.tie_word_embeddings ->
-          # embed_tokens weight was already moved to GPU (and the checkpoint tensors consumed
-          # by backend_transfer). Re-quantize from the dequantized f16 tensor — precision
-          # loss is acceptable for a timing benchmark; the dispatched op is identical.
           EMLX.quantize(embed_tokens, type: {:s, 4}, group_size: 64)
 
         Map.has_key?(tensors, "lm_head.scales") ->

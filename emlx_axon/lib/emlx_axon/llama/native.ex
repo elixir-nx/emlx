@@ -46,7 +46,7 @@ defmodule EMLXAxon.Llama.Native do
         down_proj,
         rope_freqs
       ],
-      [offset, Plugin.f64_bits(scale), head_dim, Plugin.f64_bits(eps)],
+      [offset, scale, head_dim, eps],
       {Nx.to_template(hidden), Nx.to_template(k_cache), Nx.to_template(v_cache)}
     )
   end
@@ -77,9 +77,9 @@ defmodule EMLXAxon.Llama.Native do
         [
           layer_count,
           offset,
-          Plugin.f64_bits(scale),
+          scale,
           head_dim,
-          Plugin.f64_bits(eps)
+          eps
         ],
         templates
       )
@@ -119,9 +119,9 @@ defmodule EMLXAxon.Llama.Native do
           layer_count,
           offset,
           count,
-          Plugin.f64_bits(scale),
+          scale,
           head_dim,
-          Plugin.f64_bits(eps),
+          eps,
           submit_each_step
         ],
         templates

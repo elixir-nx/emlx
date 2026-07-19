@@ -13,7 +13,7 @@ defmodule EMLXAxon.Qwen3.Native do
 
   deftransform mlp(hidden, norm, gate_proj, up_proj, down_proj, eps) do
     tensors = [hidden, norm, gate_proj, up_proj, down_proj]
-    attrs = [Plugin.f64_bits(eps)]
+    attrs = [eps]
 
     if Plugin.traced?(tensors) do
       template = Nx.to_template(hidden)
@@ -59,7 +59,7 @@ defmodule EMLXAxon.Qwen3.Native do
     multi_operation(
       "kv_cache_attention",
       [query, key, value, k_cache, v_cache],
-      [offset, Plugin.f64_bits(scale), head_dim, Plugin.f64_bits(theta)],
+      [offset, scale, head_dim, theta],
       {output, Nx.to_template(k_cache), Nx.to_template(v_cache)}
     )
   end
@@ -83,7 +83,7 @@ defmodule EMLXAxon.Qwen3.Native do
     multi_operation(
       "kv_cache_attention_tensor_offset",
       [query, key, value, k_cache, v_cache, offset],
-      [Plugin.f64_bits(scale), head_dim, Plugin.f64_bits(theta)],
+      [scale, head_dim, theta],
       {output, Nx.to_template(k_cache), Nx.to_template(v_cache)}
     )
   end
@@ -130,10 +130,10 @@ defmodule EMLXAxon.Qwen3.Native do
       ],
       [
         offset,
-        Plugin.f64_bits(scale),
+        scale,
         head_dim,
-        Plugin.f64_bits(theta),
-        Plugin.f64_bits(eps)
+        theta,
+        eps
       ],
       {Nx.to_template(hidden), Nx.to_template(k_cache), Nx.to_template(v_cache)}
     )
@@ -180,10 +180,10 @@ defmodule EMLXAxon.Qwen3.Native do
       ],
       [
         offset,
-        Plugin.f64_bits(scale),
+        scale,
         head_dim,
-        Plugin.f64_bits(theta),
-        Plugin.f64_bits(eps)
+        theta,
+        eps
       ],
       {Nx.to_template(hidden), Nx.to_template(k_cache), Nx.to_template(v_cache)}
     )
@@ -256,10 +256,10 @@ defmodule EMLXAxon.Qwen3.Native do
       [
         1,
         offset,
-        Plugin.f64_bits(scale),
+        scale,
         head_dim,
-        Plugin.f64_bits(theta),
-        Plugin.f64_bits(eps),
+        theta,
+        eps,
         7
         | descriptors
       ],
@@ -273,7 +273,7 @@ defmodule EMLXAxon.Qwen3.Native do
     single_operation(
       "final_greedy",
       [hidden, norm, lm_head],
-      [Plugin.f64_bits(eps)],
+      [eps],
       Nx.template({batch}, {:u, 32})
     )
   end
@@ -305,10 +305,10 @@ defmodule EMLXAxon.Qwen3.Native do
         [
           layer_count,
           offset,
-          Plugin.f64_bits(scale),
+          scale,
           head_dim,
-          Plugin.f64_bits(theta),
-          Plugin.f64_bits(eps)
+          theta,
+          eps
         ],
         templates
       )
@@ -350,10 +350,10 @@ defmodule EMLXAxon.Qwen3.Native do
           layer_count,
           offset,
           count,
-          Plugin.f64_bits(scale),
+          scale,
           head_dim,
-          Plugin.f64_bits(theta),
-          Plugin.f64_bits(eps),
+          theta,
+          eps,
           submit_each_step
         ],
         templates
@@ -420,10 +420,10 @@ defmodule EMLXAxon.Qwen3.Native do
           layer_count,
           offset,
           count,
-          Plugin.f64_bits(scale),
+          scale,
           head_dim,
-          Plugin.f64_bits(theta),
-          Plugin.f64_bits(eps),
+          theta,
+          eps,
           layer_count * 7 + 1
           | descriptors
         ],
@@ -440,7 +440,7 @@ defmodule EMLXAxon.Qwen3.Native do
         "qwen3",
         "mlp",
         [hidden, norm, gate_proj, up_proj, down_proj],
-        [Plugin.f64_bits(opts[:eps])],
+        [opts[:eps]],
         Nx.to_template(hidden)
       )
 

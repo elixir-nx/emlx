@@ -59,6 +59,10 @@ defmodule EMLXAxon.Qwen3DenseLoaderTest do
     assert emlx_ref(state.lm_head) == emlx_ref(state.embed_tokens)
     assert Nx.shape(file_state.embed_tokens) == {16, 4}
     assert state.config.eos_token_id == 151_645
+    # config.json uses integer rope_theta; loaders must coerce to float for plugin attrs.
+    assert state.config.rope_theta == 10_000.0
+    assert is_float(state.config.rope_theta)
+    assert is_float(state.config.rms_norm_eps)
 
     [layer] = state.layers
 

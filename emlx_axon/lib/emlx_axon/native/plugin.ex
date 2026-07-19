@@ -1,8 +1,6 @@
 defmodule EMLXAxon.Native.Plugin do
   @moduledoc false
 
-  alias EMLX.Native.Expr, as: NativeExpr
-
   @wire_version 1
 
   @doc false
@@ -21,6 +19,8 @@ defmodule EMLXAxon.Native.Plugin do
         [EMLX.Native.to_mlx_type(type), tuple_size(shape) | Tuple.to_list(shape)]
       end)
 
+    encoded_attrs = encode_attrs(callback_attrs)
+
     attrs =
       [
         @wire_version,
@@ -29,7 +29,7 @@ defmodule EMLXAxon.Native.Plugin do
         schema_version,
         attr_schema_version,
         length(templates)
-      ] ++ encoded_templates ++ [length(callback_attrs) | callback_attrs]
+      ] ++ encoded_templates ++ [length(encoded_attrs) | encoded_attrs]
 
     Nx.Defn.Expr.metadata(fallback, %{
       __EMLX__: %{op: :plugin, operands: operands, attrs: attrs}
@@ -52,7 +52,7 @@ defmodule EMLXAxon.Native.Plugin do
         plugin,
         callback,
         Enum.map(backend_refs, &elem(&1, 1)),
-        callback_attrs,
+        encode_attrs(callback_attrs),
         effective_device
       )
       |> EMLX.unwrap!()
@@ -76,6 +76,15 @@ defmodule EMLXAxon.Native.Plugin do
     end)
   end
 
+  # Floats ride the int64 attr channel as IEEE-754 bit patterns. Integers are
+  # left alone so dims/offsets stay raw (1 vs 1.0 is intentional).
   @doc false
-  def f64_bits(value), do: NativeExpr.f64_bits(value)
+  def encode_attrs(attrs), do: Enum.map(attrs, &encode_attr/1)
+
+  defp encode_attr(value) when is_float(value) do
+    <<bits::signed-native-64>> = <<value::float-native-64>>
+    bits
+  end
+
+  defp encode_attr(value), do: value
 end
