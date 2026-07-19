@@ -51,8 +51,8 @@ jobs:
         job:
           # Compatibility / full suite
           - { otp: "25.3.2.15", elixir: "1.17.0" }
-          # Format only — pin to Elixir 1.20 so CI matches local formatter output
-          - { otp: "25.3.2.15", elixir: "1.20.1", lint: true }
+          # Format only — pin to Elixir 1.20 / OTP 28 so CI matches local formatter output
+          - { otp: "28.5.0.1", elixir: "1.20.1", lint: true }
     env:
       MIX_ENV: test
       # This workflow validates EMLX and EMLXAxon changes together.
