@@ -43,11 +43,7 @@ constexpr emlx::plugin::device_type_t kSupportedDeviceTypes[] = {
     mlx::core::Device::DeviceType::cpu,
     mlx::core::Device::DeviceType::gpu};
 
-double f64_from_bits(int64_t bits) {
-  double value = 0.0;
-  std::memcpy(&value, &bits, sizeof(value));
-  return value;
-}
+#define f64_from_bits(bits) (*reinterpret_cast<const double *>(&bits))
 
 bool int32_attr(const emlx::plugin::call_t &call, size_t index,
                 const char *name, int &value, std::string &error) {

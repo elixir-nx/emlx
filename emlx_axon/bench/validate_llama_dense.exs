@@ -660,10 +660,9 @@ defmodule LlamaDenseBenchmark do
     gb =
       bytes
       |> String.to_integer()
-      |> Kernel./(1024 * 1024 * 1024)
-      |> Float.round(1)
+      |> Kernel./(1024 ** 3)
 
-    "#{gb} GB RAM"
+    "#{:erlang.float_to_binary(gb, decimals: 1)} GiB RAM"
   rescue
     _ -> nil
   end

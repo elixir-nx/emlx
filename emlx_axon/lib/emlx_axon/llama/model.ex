@@ -81,15 +81,14 @@ defmodule EMLXAxon.Llama.Model do
     # Cache layout: {B, N_kv, max_len, D} — heads-before-sequence so that
     # tensors transposed to {B, N, T, D} for RoPE/SDPA slot in without copies.
     for _layer <- layers do
+      backend = {EMLX.Backend, device: :gpu}
+
       k =
         0.0
-        |> EMLX.full({1, num_kv_heads, max_len, head_dim}, cache_type, :gpu)
-        |> EMLX.Backend.to_nx()
+        |> Nx.tensor(type: cache_type, backend: backend)
+        |> Nx.broadcast({1, num_kv_heads, max_len, head_dim})
 
-      v =
-        0.0
-        |> EMLX.full({1, num_kv_heads, max_len, head_dim}, cache_type, :gpu)
-        |> EMLX.Backend.to_nx()
+      v = Nx.backend_copy(k, backend)
 
       {k, v}
     end
@@ -215,9 +214,7 @@ defmodule EMLXAxon.Llama.Model do
 
   defp cache_type!(%State{embed_tokens: embed_tokens}) do
     case Nx.type(embed_tokens) do
-      {:f, 16} -> :float16
-      {:bf, 16} -> :bfloat16
-      {:f, 32} -> :float32
+      t when t in [{:f, 16}, {:bf, 16}, {:f, 32}] -> t
       type -> raise ArgumentError, "unsupported Llama KV cache tensor type: #{inspect(type)}"
     end
   end
