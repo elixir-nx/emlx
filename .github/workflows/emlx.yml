@@ -86,7 +86,8 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { otp: "25.3.2.15", elixir: "1.17.0", lint: true }
+          # Format only on Elixir 1.20 so CI matches local formatter output
+          - { otp: "25.3.2.15", elixir: "1.20.1", lint: true }
           - { otp: "25.3.2.15", elixir: "1.17.0", build: true }
           - { otp: "25.3.2.15", elixir: "1.17.0", gpu: true }
           - { otp: "25.3.2.15", elixir: "1.17.0", gpu: true, build: true }

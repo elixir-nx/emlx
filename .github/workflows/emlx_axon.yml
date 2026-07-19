@@ -43,8 +43,16 @@ concurrency:
 
 jobs:
   emlx_axon:
-    name: EMLXAxon suite (macOS arm64)
+    name: EMLXAxon suite (macOS arm64) (${{ matrix.job.elixir }}${{ matrix.job.lint && ', format' || '' }})
     runs-on: macos-26
+    strategy:
+      fail-fast: false
+      matrix:
+        job:
+          # Compatibility / full suite
+          - { otp: "25.3.2.15", elixir: "1.17.0" }
+          # Format only — pin to Elixir 1.20 so CI matches local formatter output
+          - { otp: "25.3.2.15", elixir: "1.20.1", lint: true }
     env:
       MIX_ENV: test
       # This workflow validates EMLX and EMLXAxon changes together.
@@ -57,11 +65,12 @@ jobs:
         id: setup
         run: |
           curl -fsSO https://elixir-lang.org/install.sh
-          sh install.sh elixir@1.17.0 otp@25.3.2.15
+          sh install.sh elixir@${{ matrix.job.elixir }} otp@${{ matrix.job.otp }}
 
-          OTP_MAJOR="25"
-          export OTP_PATH=$HOME/.elixir-install/installs/otp/25.3.2.15/bin
-          export ELIXIR_PATH=$HOME/.elixir-install/installs/elixir/1.17.0-otp-${OTP_MAJOR}/bin
+          OTP_VERSION="${{ matrix.job.otp }}"
+          OTP_MAJOR="${OTP_VERSION%%.*}"
+          export OTP_PATH=$HOME/.elixir-install/installs/otp/${OTP_VERSION}/bin
+          export ELIXIR_PATH=$HOME/.elixir-install/installs/elixir/${{ matrix.job.elixir }}-otp-${OTP_MAJOR}/bin
           echo "path=${OTP_PATH}:${ELIXIR_PATH}" >> $GITHUB_OUTPUT
           echo "${OTP_PATH}" >> $GITHUB_PATH
           echo "${ELIXIR_PATH}" >> $GITHUB_PATH
@@ -73,22 +82,25 @@ jobs:
           mix local.rebar --force
 
       - name: Cache emlx deps and build
+        if: ${{ !matrix.job.lint }}
         uses: actions/cache@v4
         with:
           path: |
             ${{ github.workspace }}/emlx/deps
             ${{ github.workspace }}/emlx/_build
-          key: ${{ runner.os }}-emlx-axon-emlx-${{ hashFiles('emlx/mix.lock', 'emlx/mix.exs', 'emlx/Makefile', 'emlx/c_src/**', 'emlx/mix_helpers/**') }}-v2
+          key: ${{ runner.os }}-emlx-axon-emlx-${{ matrix.job.elixir }}-${{ hashFiles('emlx/mix.lock', 'emlx/mix.exs', 'emlx/Makefile', 'emlx/c_src/**', 'emlx/mix_helpers/**') }}-v2
 
       - name: Cache emlx_axon deps and build
+        if: ${{ !matrix.job.lint }}
         uses: actions/cache@v4
         with:
           path: |
             ${{ github.workspace }}/emlx_axon/deps
             ${{ github.workspace }}/emlx_axon/_build
-          key: ${{ runner.os }}-emlx-axon-${{ hashFiles('emlx_axon/mix.lock', 'emlx_axon/mix.exs', 'emlx_axon/Makefile', 'emlx_axon/c_src/**', 'emlx_axon/mix_helpers/**') }}-v2
+          key: ${{ runner.os }}-emlx-axon-${{ matrix.job.elixir }}-${{ hashFiles('emlx_axon/mix.lock', 'emlx_axon/mix.exs', 'emlx_axon/Makefile', 'emlx_axon/c_src/**', 'emlx_axon/mix_helpers/**') }}-v2
 
       - name: Build EMLX
+        if: ${{ !matrix.job.lint }}
         working-directory: emlx
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
@@ -102,12 +114,14 @@ jobs:
           mix deps.get
 
       - name: Check formatting
+        if: ${{ matrix.job.lint }}
         working-directory: emlx_axon
         run: |
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           mix format --check-formatted
 
       - name: Run emlx_axon tests
+        if: ${{ !matrix.job.lint }}
         working-directory: emlx_axon
         env:
           EMLX_TEST_DEFAULT_GPU: "true"
