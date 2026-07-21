@@ -2011,7 +2011,8 @@ defmodule EMLX.Native.Expr do
   # `EMLX.Native.Expr.t/0`'s `keepalive_refs` doc for where the final tip of
   # this chain ends up.
   defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}},
+         %T{data: %Nx.Defn.Expr{id: id, op: :io_call,
+              args: [tensor_expr, callback_spec, _template, _ref]}},
          state
        ) do
     unless MapSet.member?(state.top_scope_ids, id) do
@@ -2023,34 +2024,19 @@ defmodule EMLX.Native.Expr do
               "branch's hook). Move the hook outside the cond."
     end
 
-    # `token.hooks` stores the most-recently-declared hook at the head (see
-    # Nx.Defn.Token's moduledoc) -- reverse to chain them in true declaration
-    # order.
-    Enum.reduce(Enum.reverse(hooks), state, fn
-      %{callback: nil}, state ->
-        state
+    case callback_spec do
+      {:fn, fun} ->
+        state = emit_hook_runtime_call(tensor_expr, fun, state)
+        set_io_call_ref(id, tensor_expr, state)
 
-      %{callback: callback, expr: expr}, state ->
-        emit_hook_runtime_call(expr, callback, state)
-    end)
-  end
+      {:named, _name, nil} ->
+        ref = Map.fetch!(state.node_to_ref, tensor_expr.data.id)
+        %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
 
-  # Resolves to the hooked (post-side-effect) value when `expr` is one of
-  # *this* token's own hooked expressions -- see `emit_hook_runtime_call/3`'s
-  # `hooked_value_refs` doc -- falling back to the plain ref otherwise (a
-  # name-only hook with no callback, or `attach_token` wrapping something
-  # that isn't itself hooked).
-  defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :attach_token, args: [_token, expr]}},
-         state
-       ) do
-    ref =
-      case Map.fetch(state.hooked_value_refs, expr.data.id) do
-        {:ok, hooked_ref} -> hooked_ref
-        :error -> Map.fetch!(state.node_to_ref, expr.data.id)
-      end
-
-    %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
+      {:named, _name, callback} when is_function(callback, 1) ->
+        state = emit_hook_runtime_call(tensor_expr, callback, state)
+        set_io_call_ref(id, tensor_expr, state)
+    end
   end
 
   defp expand_node(
@@ -2156,6 +2142,19 @@ defmodule EMLX.Native.Expr do
 
   defp expand_node(%T{data: %Nx.Defn.Expr{op: op}}, _state) do
     raise ArgumentError, "does not yet lower op #{inspect(op)}"
+  end
+
+  defp set_io_call_ref(id, tensor_expr, state) do
+    leaves = Composite.flatten_list([tensor_expr])
+    leaf_refs =
+      Enum.map(leaves, fn leaf ->
+        Map.fetch!(state.hooked_value_refs, leaf.data.id)
+      end)
+
+    case leaf_refs do
+      [single_ref] -> %{state | node_to_ref: Map.put(state.node_to_ref, id, single_ref)}
+      refs -> %{state | node_to_ref: Map.put(state.node_to_ref, id, refs)}
+    end
   end
 
   # Emits one `:runtime_call` instruction from already-resolved operand refs
@@ -2818,8 +2817,12 @@ defmodule EMLX.Native.Expr do
     container
     |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
     |> Enum.any?(fn
-      %T{data: %Nx.Defn.Expr{op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}} ->
-        Enum.any?(hooks, &(&1.callback != nil))
+      %T{data: %Nx.Defn.Expr{op: :io_call, args: [_, callback_spec, _, _]}} ->
+        case callback_spec do
+          {:fn, _} -> true
+          {:named, _, callback} when is_function(callback, 1) -> true
+          _ -> false
+        end
 
       _ ->
         false
