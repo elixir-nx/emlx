@@ -96,6 +96,10 @@ jobs:
           - { os: macos-15, otp: "28.5.0.1", elixir: "1.20.1", compat: true, gpu: true }
     env:
       MIX_ENV: test
+      # Job-level: mix.exs resolves libmlx while loading project/0 (including
+      # `mix local.hex` in Setup Mix). Per-step exports below are too late for
+      # macos-15 hosts that must use the 14.0 archive (#127).
+      LIBMLX_MACOS_COMPAT: ${{ matrix.job.compat && 'true' || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
