@@ -234,31 +234,31 @@ bool validate_qkv_cache_attention(const mlx::core::array &q,
 // ── Dense/quantized linear projection helpers ────────────────────────────
 
 mlx::core::array linear_in_out(const mlx::core::array &x, const mlx::core::array &weight,
-                                const mlx::core::Device &device) {
+                                mlx::core::StreamOrDevice stream) {
   if (x.ndim() == 3 && x.shape(1) == 1) {
-    auto x_2d = mlx::core::reshape(x, {x.shape(0), x.shape(2)}, device);
-    auto out = mlx::core::matmul(x_2d, weight, device);
-    return mlx::core::reshape(out, {x.shape(0), 1, weight.shape(1)}, device);
+    auto x_2d = mlx::core::reshape(x, {x.shape(0), x.shape(2)}, stream);
+    auto out = mlx::core::matmul(x_2d, weight, stream);
+    return mlx::core::reshape(out, {x.shape(0), 1, weight.shape(1)}, stream);
   }
-  return mlx::core::matmul(x, weight, device);
+  return mlx::core::matmul(x, weight, stream);
 }
 
 mlx::core::array linear_out_in(const mlx::core::array &x, const mlx::core::array &weight,
-                                const mlx::core::Device &device) {
+                                mlx::core::StreamOrDevice stream) {
   return mlx::core::tensordot(x, weight, std::vector<int>{static_cast<int>(x.ndim()) - 1},
-                               std::vector<int>{1}, device);
+                               std::vector<int>{1}, stream);
 }
 
 mlx::core::array apply_linear(const mlx::core::array &x, const LinearWeight &w,
-                               const mlx::core::Device &device) {
+                               mlx::core::StreamOrDevice stream) {
   if (w.quantized) {
     std::optional<mlx::core::array> biases_opt =
         w.biases != nullptr ? std::make_optional(*w.biases) : std::nullopt;
     return mlx::core::quantized_matmul(x, *w.weight, *w.scales, biases_opt, w.transpose,
-                                        w.group_size, w.bits, w.mode, device);
+                                        w.group_size, w.bits, w.mode, stream);
   }
-  return w.transpose ? linear_out_in(x, *w.weight, device)
-                      : linear_in_out(x, *w.weight, device);
+  return w.transpose ? linear_out_in(x, *w.weight, stream)
+                      : linear_in_out(x, *w.weight, stream);
 }
 
 int linear_weight_out_features(const LinearWeight &w) {
@@ -443,19 +443,19 @@ bool validate_dense_layer(const mlx::core::array &hidden, const LayerParams &lay
 
 // Shared causal/prefill mask builder used by every attention path below.
 mlx::core::array build_prefill_mask(const mlx::core::array &q, int T_new, int valid_len,
-                                     const mlx::core::Device &device) {
+                                     mlx::core::StreamOrDevice stream) {
   auto mask_dtype = q.dtype();
-  auto zero_val = mlx::core::zeros({}, mask_dtype, device);
+  auto zero_val = mlx::core::zeros({}, mask_dtype, stream);
   auto neginf_val =
-      mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, device);
+      mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, stream);
   int kv_offset = valid_len - T_new;
-  auto row = mlx::core::reshape(mlx::core::arange(T_new, mlx::core::int32, device),
-                                 {1, 1, T_new, 1}, device);
-  auto col = mlx::core::reshape(mlx::core::arange(valid_len, mlx::core::int32, device),
-                                 {1, 1, 1, valid_len}, device);
+  auto row = mlx::core::reshape(mlx::core::arange(T_new, mlx::core::int32, stream),
+                                 {1, 1, T_new, 1}, stream);
+  auto col = mlx::core::reshape(mlx::core::arange(valid_len, mlx::core::int32, stream),
+                                 {1, 1, 1, valid_len}, stream);
   auto causal_bool = mlx::core::less_equal(
-      col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), device), device);
-  return mlx::core::where(causal_bool, zero_val, neginf_val, device);
+      col, mlx::core::add(row, mlx::core::full({}, kv_offset, mlx::core::int32, stream), stream), stream);
+  return mlx::core::where(causal_bool, zero_val, neginf_val, stream);
 }
 
 bool validate_tensor_offset(const mlx::core::array &offset, int capacity,
@@ -473,68 +473,68 @@ bool validate_tensor_offset(const mlx::core::array &offset, int capacity,
 }
 
 mlx::core::array clamp_offset(const mlx::core::array &offset, int maximum,
-                              const mlx::core::Device &device) {
-  auto offset_i32 = mlx::core::astype(offset, mlx::core::int32, device);
-  auto zero = mlx::core::array(0, mlx::core::int32);
-  auto upper = mlx::core::array(maximum, mlx::core::int32);
-  return mlx::core::minimum(mlx::core::maximum(offset_i32, zero, device), upper,
-                            device);
+                              mlx::core::StreamOrDevice stream) {
+  auto offset_i32 = mlx::core::astype(offset, mlx::core::int32, stream);
+  auto zero = mlx::core::full({}, 0, mlx::core::int32, stream);
+  auto upper = mlx::core::full({}, maximum, mlx::core::int32, stream);
+  return mlx::core::minimum(mlx::core::maximum(offset_i32, zero, stream), upper,
+                            stream);
 }
 
 mlx::core::array rope_with_positions(const mlx::core::array &input,
                                      const mlx::core::array &offset,
                                      int dims, float theta,
-                                     const mlx::core::Device &device) {
+                                     mlx::core::StreamOrDevice stream) {
   const int batch = input.shape(0);
   const int tokens = input.shape(1);
   const int heads = input.shape(2);
   const int half = dims / 2;
   auto positions = mlx::core::add(
-      mlx::core::arange(tokens, mlx::core::int32, device), offset, device);
-  positions = mlx::core::reshape(positions, {1, tokens, 1}, device);
+      mlx::core::arange(tokens, mlx::core::int32, stream), offset, stream);
+  positions = mlx::core::reshape(positions, {1, tokens, 1}, stream);
   if (batch != 1)
-    positions = mlx::core::broadcast_to(positions, {batch, tokens, 1}, device);
-  auto frequency_index = mlx::core::arange(0, dims, 2, mlx::core::float32, device);
+    positions = mlx::core::broadcast_to(positions, {batch, tokens, 1}, stream);
+  auto frequency_index = mlx::core::arange(0, dims, 2, mlx::core::float32, stream);
   auto exponent = mlx::core::divide(
-      frequency_index, mlx::core::array(static_cast<float>(dims)), device);
+      frequency_index, mlx::core::full({}, static_cast<float>(dims), mlx::core::float32, stream), stream);
   auto inverse_frequency = mlx::core::exp(
       mlx::core::multiply(
-          exponent, mlx::core::array(-std::log(theta), mlx::core::float32),
-          device),
-      device);
+          exponent, mlx::core::full({}, static_cast<float>(-std::log(theta)), mlx::core::float32, stream),
+          stream),
+      stream);
   auto angles = mlx::core::multiply(
-      mlx::core::astype(positions, mlx::core::float32, device),
-      mlx::core::reshape(inverse_frequency, {1, 1, half}, device), device);
+      mlx::core::astype(positions, mlx::core::float32, stream),
+      mlx::core::reshape(inverse_frequency, {1, 1, half}, stream), stream);
   auto cosine = mlx::core::astype(
-      mlx::core::reshape(mlx::core::cos(angles, device), {batch, tokens, 1, half},
-                         device),
-      input.dtype(), device);
+      mlx::core::reshape(mlx::core::cos(angles, stream), {batch, tokens, 1, half},
+                         stream),
+      input.dtype(), stream);
   auto sine = mlx::core::astype(
-      mlx::core::reshape(mlx::core::sin(angles, device), {batch, tokens, 1, half},
-                         device),
-      input.dtype(), device);
+      mlx::core::reshape(mlx::core::sin(angles, stream), {batch, tokens, 1, half},
+                         stream),
+      input.dtype(), stream);
   auto cosine_full =
       mlx::core::concatenate(std::vector<mlx::core::array>{cosine, cosine}, 3,
-                             device);
+                             stream);
   auto sine_full =
       mlx::core::concatenate(std::vector<mlx::core::array>{sine, sine}, 3,
-                             device);
+                             stream);
   auto first = mlx::core::slice(input, {0, 0, 0, 0},
-                                {batch, tokens, heads, half}, device);
+                                {batch, tokens, heads, half}, stream);
   auto second = mlx::core::slice(input, {0, 0, 0, half},
-                                 {batch, tokens, heads, dims}, device);
+                                 {batch, tokens, heads, dims}, stream);
   auto rotated = mlx::core::concatenate(
-      std::vector<mlx::core::array>{mlx::core::negative(second, device), first},
-      3, device);
-  return mlx::core::add(mlx::core::multiply(input, cosine_full, device),
-                        mlx::core::multiply(rotated, sine_full, device), device);
+      std::vector<mlx::core::array>{mlx::core::negative(second, stream), first},
+      3, stream);
+  return mlx::core::add(mlx::core::multiply(input, cosine_full, stream),
+                        mlx::core::multiply(rotated, sine_full, stream), stream);
 }
 
 bool tensor_offset_attention(
     const mlx::core::array &query, const mlx::core::array &key,
     const mlx::core::array &value, const mlx::core::array &k_cache,
     const mlx::core::array &v_cache, const mlx::core::array &offset,
-    float scale, int head_dim, float theta, const mlx::core::Device &device,
+    float scale, int head_dim, float theta, mlx::core::StreamOrDevice stream,
     mlx::core::array &attention, mlx::core::array &k_updated,
     mlx::core::array &v_updated, std::string &error) {
   if (!validate_qkv_cache_attention(query, key, value, k_cache, v_cache, 0,
@@ -549,48 +549,48 @@ bool tensor_offset_attention(
   if (!validate_tensor_offset(offset, capacity, tokens, error))
     return false;
 
-  auto safe_offset = clamp_offset(offset, capacity - tokens, device);
-  auto query_rope = rope_with_positions(query, safe_offset, head_dim, theta, device);
-  auto key_rope = rope_with_positions(key, safe_offset, head_dim, theta, device);
-  auto query_bn = mlx::core::transpose(query_rope, {0, 2, 1, 3}, device);
-  auto key_bn = mlx::core::transpose(key_rope, {0, 2, 1, 3}, device);
-  auto value_bn = mlx::core::transpose(value, {0, 2, 1, 3}, device);
-  auto start = mlx::core::reshape(safe_offset, {1}, device);
-  k_updated = mlx::core::slice_update(k_cache, key_bn, start, {2}, device);
-  v_updated = mlx::core::slice_update(v_cache, value_bn, start, {2}, device);
+  auto safe_offset = clamp_offset(offset, capacity - tokens, stream);
+  auto query_rope = rope_with_positions(query, safe_offset, head_dim, theta, stream);
+  auto key_rope = rope_with_positions(key, safe_offset, head_dim, theta, stream);
+  auto query_bn = mlx::core::transpose(query_rope, {0, 2, 1, 3}, stream);
+  auto key_bn = mlx::core::transpose(key_rope, {0, 2, 1, 3}, stream);
+  auto value_bn = mlx::core::transpose(value, {0, 2, 1, 3}, stream);
+  auto start = mlx::core::reshape(safe_offset, {1}, stream);
+  k_updated = mlx::core::slice_update(k_cache, key_bn, start, {2}, stream);
+  v_updated = mlx::core::slice_update(v_cache, value_bn, start, {2}, stream);
 
   auto row = mlx::core::reshape(
-      mlx::core::add(mlx::core::arange(tokens, mlx::core::int32, device),
-                     safe_offset, device),
-      {1, 1, tokens, 1}, device);
+      mlx::core::add(mlx::core::arange(tokens, mlx::core::int32, stream),
+                     safe_offset, stream),
+      {1, 1, tokens, 1}, stream);
   auto column = mlx::core::reshape(
-      mlx::core::arange(capacity, mlx::core::int32, device),
-      {1, 1, 1, capacity}, device);
-  auto visible = mlx::core::less_equal(column, row, device);
+      mlx::core::arange(capacity, mlx::core::int32, stream),
+      {1, 1, 1, capacity}, stream);
+  auto visible = mlx::core::less_equal(column, row, stream);
   auto mask = mlx::core::where(
-      visible, mlx::core::zeros({}, query.dtype(), device),
+      visible, mlx::core::zeros({}, query.dtype(), stream),
       mlx::core::full({}, -std::numeric_limits<float>::infinity(), query.dtype(),
-                      device),
-      device);
+                      stream),
+      stream);
   auto attended = mlx::core::fast::scaled_dot_product_attention(
       query_bn, k_updated, v_updated, scale, "array", mask, std::nullopt,
-      device);
+      stream);
   attention = mlx::core::reshape(
-      mlx::core::transpose(attended, {0, 2, 1, 3}, device),
-      {batch, tokens, query_heads * width}, device);
+      mlx::core::transpose(attended, {0, 2, 1, 3}, stream),
+      {batch, tokens, query_heads * width}, stream);
   (void)kv_heads;
   return true;
 }
 
 mlx::core::array sdpa(const mlx::core::array &q_rope, const mlx::core::array &k_valid,
                        const mlx::core::array &v_valid, float scale, int T_new,
-                       int valid_len, const mlx::core::Device &device) {
+                       int valid_len, mlx::core::StreamOrDevice stream) {
   return (T_new == 1)
              ? mlx::core::fast::scaled_dot_product_attention(
-                   q_rope, k_valid, v_valid, scale, "", std::nullopt, std::nullopt, device)
+                   q_rope, k_valid, v_valid, scale, "", std::nullopt, std::nullopt, stream)
              : mlx::core::fast::scaled_dot_product_attention(
                    q_rope, k_valid, v_valid, scale, "array",
-                   build_prefill_mask(q_rope, T_new, valid_len, device), std::nullopt, device);
+                   build_prefill_mask(q_rope, T_new, valid_len, stream), std::nullopt, stream);
 }
 
 // ── Generalized (dense-or-quantized) per-layer compute ───────────────────
@@ -599,7 +599,7 @@ mlx::core::array sdpa(const mlx::core::array &q_rope, const mlx::core::array &k_
 mlx::core::array layer_core_generalized(const mlx::core::array &hidden,
                                          const LayerParamsQ &layer, KVCache &kv, int offset,
                                          float scale, int head_dim, float theta, float eps,
-                                         const mlx::core::Device &device,
+                                         mlx::core::StreamOrDevice stream,
                                          mlx::core::array *k_out, mlx::core::array *v_out) {
   int B = hidden.shape(0);
   int T_new = hidden.shape(1);
@@ -609,61 +609,61 @@ mlx::core::array layer_core_generalized(const mlx::core::array &hidden,
   int attn_width = N_q * D;
   int valid_len = offset + T_new;
 
-  auto xn = mlx::core::fast::rms_norm(hidden, *layer.norm1, eps, device);
-  auto q_flat = apply_linear(xn, layer.q_proj, device);
-  auto k_flat = apply_linear(xn, layer.k_proj, device);
-  auto v_flat = apply_linear(xn, layer.v_proj, device);
+  auto xn = mlx::core::fast::rms_norm(hidden, *layer.norm1, eps, stream);
+  auto q_flat = apply_linear(xn, layer.q_proj, stream);
+  auto k_flat = apply_linear(xn, layer.k_proj, stream);
+  auto v_flat = apply_linear(xn, layer.v_proj, stream);
 
-  auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, device);
-  auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, device);
-  auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, device);
+  auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, stream);
+  auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, stream);
+  auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, stream);
 
-  q = mlx::core::fast::rms_norm(q, *layer.q_norm, eps, device);
-  k = mlx::core::fast::rms_norm(k, *layer.k_norm, eps, device);
+  q = mlx::core::fast::rms_norm(q, *layer.q_norm, eps, stream);
+  k = mlx::core::fast::rms_norm(k, *layer.k_norm, eps, stream);
 
-  auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, device);
-  auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, device);
-  auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, device);
+  auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, stream);
+  auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, stream);
+  auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, stream);
 
-  auto q_rope = mlx::core::fast::rope(q_bn, D, false, theta, 1.0f, offset, std::nullopt, device);
-  auto k_rope = mlx::core::fast::rope(k_bn, D, false, theta, 1.0f, offset, std::nullopt, device);
+  auto q_rope = mlx::core::fast::rope(q_bn, D, false, theta, 1.0f, offset, std::nullopt, stream);
+  auto k_rope = mlx::core::fast::rope(k_bn, D, false, theta, 1.0f, offset, std::nullopt, stream);
 
   auto k_cache_owned = std::move(*kv.k);
   auto v_cache_owned = std::move(*kv.v);
 
   auto k_upd = mlx::core::slice_update(k_cache_owned, k_rope, to_shape({0, 0, offset, 0}),
-                                        to_shape({B, N_kv, valid_len, D}), device);
+                                        to_shape({B, N_kv, valid_len, D}), stream);
   auto v_upd = mlx::core::slice_update(v_cache_owned, v_bn, to_shape({0, 0, offset, 0}),
-                                        to_shape({B, N_kv, valid_len, D}), device);
+                                        to_shape({B, N_kv, valid_len, D}), stream);
 
   auto k_valid = mlx::core::slice(k_upd, to_shape({0, 0, 0, 0}),
-                                   to_shape({B, N_kv, valid_len, D}), device);
+                                   to_shape({B, N_kv, valid_len, D}), stream);
   auto v_valid = mlx::core::slice(v_upd, to_shape({0, 0, 0, 0}),
-                                   to_shape({B, N_kv, valid_len, D}), device);
+                                   to_shape({B, N_kv, valid_len, D}), stream);
 
-  auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, scale, T_new, valid_len, device);
-  auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
-  auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, device);
-  auto attn_projected = apply_linear(attn_out, layer.o_proj, device);
-  auto attn_hidden = mlx::core::add(hidden, attn_projected, device);
+  auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, scale, T_new, valid_len, stream);
+  auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, stream);
+  auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, stream);
+  auto attn_projected = apply_linear(attn_out, layer.o_proj, stream);
+  auto attn_hidden = mlx::core::add(hidden, attn_projected, stream);
 
-  auto xn2 = mlx::core::fast::rms_norm(attn_hidden, *layer.norm2, eps, device);
-  auto gate = apply_linear(xn2, layer.gate_proj, device);
-  auto up = apply_linear(xn2, layer.up_proj, device);
-  auto mlp = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device),
-                                  up, device);
-  auto mlp_out = apply_linear(mlp, layer.down_proj, device);
+  auto xn2 = mlx::core::fast::rms_norm(attn_hidden, *layer.norm2, eps, stream);
+  auto gate = apply_linear(xn2, layer.gate_proj, stream);
+  auto up = apply_linear(xn2, layer.up_proj, stream);
+  auto mlp = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, stream), stream),
+                                  up, stream);
+  auto mlp_out = apply_linear(mlp, layer.down_proj, stream);
 
   if (k_out != nullptr) *k_out = k_upd;
   if (v_out != nullptr) *v_out = v_upd;
 
-  return mlx::core::add(attn_hidden, mlp_out, device);
+  return mlx::core::add(attn_hidden, mlp_out, stream);
 }
 
 // ── Dense per-layer compute ───────────────────────────────────────────────
 mlx::core::array layer_dense_impl(const mlx::core::array &hidden, const LayerParams &layer,
                                    KVCache &kv, int offset, float scale, int head_dim,
-                                   float theta, float eps, const mlx::core::Device &device,
+                                   float theta, float eps, mlx::core::StreamOrDevice stream,
                                    mlx::core::array *k_out, mlx::core::array *v_out) {
   int B = hidden.shape(0);
   int T_new = hidden.shape(1);
@@ -673,55 +673,55 @@ mlx::core::array layer_dense_impl(const mlx::core::array &hidden, const LayerPar
   int attn_width = N_q * D;
   int valid_len = offset + T_new;
 
-  auto xn = mlx::core::fast::rms_norm(hidden, *layer.norm1, eps, device);
-  auto q_flat = linear_in_out(xn, *layer.q_proj, device);
-  auto k_flat = linear_in_out(xn, *layer.k_proj, device);
-  auto v_flat = linear_in_out(xn, *layer.v_proj, device);
+  auto xn = mlx::core::fast::rms_norm(hidden, *layer.norm1, eps, stream);
+  auto q_flat = linear_in_out(xn, *layer.q_proj, stream);
+  auto k_flat = linear_in_out(xn, *layer.k_proj, stream);
+  auto v_flat = linear_in_out(xn, *layer.v_proj, stream);
 
-  auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, device);
-  auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, device);
-  auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, device);
+  auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, stream);
+  auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, stream);
+  auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, stream);
 
-  q = mlx::core::fast::rms_norm(q, *layer.q_norm, eps, device);
-  k = mlx::core::fast::rms_norm(k, *layer.k_norm, eps, device);
+  q = mlx::core::fast::rms_norm(q, *layer.q_norm, eps, stream);
+  k = mlx::core::fast::rms_norm(k, *layer.k_norm, eps, stream);
 
-  auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, device);
-  auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, device);
-  auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, device);
+  auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, stream);
+  auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, stream);
+  auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, stream);
 
-  auto q_rope = mlx::core::fast::rope(q_bn, D, false, theta, 1.0f, offset, std::nullopt, device);
-  auto k_rope = mlx::core::fast::rope(k_bn, D, false, theta, 1.0f, offset, std::nullopt, device);
+  auto q_rope = mlx::core::fast::rope(q_bn, D, false, theta, 1.0f, offset, std::nullopt, stream);
+  auto k_rope = mlx::core::fast::rope(k_bn, D, false, theta, 1.0f, offset, std::nullopt, stream);
 
   auto k_cache_owned = std::move(*kv.k);
   auto v_cache_owned = std::move(*kv.v);
 
   auto k_upd = mlx::core::slice_update(k_cache_owned, k_rope, to_shape({0, 0, offset, 0}),
-                                        to_shape({B, N_kv, valid_len, D}), device);
+                                        to_shape({B, N_kv, valid_len, D}), stream);
   auto v_upd = mlx::core::slice_update(v_cache_owned, v_bn, to_shape({0, 0, offset, 0}),
-                                        to_shape({B, N_kv, valid_len, D}), device);
+                                        to_shape({B, N_kv, valid_len, D}), stream);
 
   auto k_valid = mlx::core::slice(k_upd, to_shape({0, 0, 0, 0}),
-                                   to_shape({B, N_kv, valid_len, D}), device);
+                                   to_shape({B, N_kv, valid_len, D}), stream);
   auto v_valid = mlx::core::slice(v_upd, to_shape({0, 0, 0, 0}),
-                                   to_shape({B, N_kv, valid_len, D}), device);
+                                   to_shape({B, N_kv, valid_len, D}), stream);
 
-  auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, scale, T_new, valid_len, device);
-  auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
-  auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, device);
-  auto attn_projected = linear_in_out(attn_out, *layer.o_proj, device);
-  auto attn_hidden = mlx::core::add(hidden, attn_projected, device);
+  auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, scale, T_new, valid_len, stream);
+  auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, stream);
+  auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, stream);
+  auto attn_projected = linear_in_out(attn_out, *layer.o_proj, stream);
+  auto attn_hidden = mlx::core::add(hidden, attn_projected, stream);
 
-  auto xn2 = mlx::core::fast::rms_norm(attn_hidden, *layer.norm2, eps, device);
-  auto gate = linear_in_out(xn2, *layer.gate_proj, device);
-  auto up = linear_in_out(xn2, *layer.up_proj, device);
-  auto mlp = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device),
-                                  up, device);
-  auto mlp_out = linear_in_out(mlp, *layer.down_proj, device);
+  auto xn2 = mlx::core::fast::rms_norm(attn_hidden, *layer.norm2, eps, stream);
+  auto gate = linear_in_out(xn2, *layer.gate_proj, stream);
+  auto up = linear_in_out(xn2, *layer.up_proj, stream);
+  auto mlp = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, stream), stream),
+                                  up, stream);
+  auto mlp_out = linear_in_out(mlp, *layer.down_proj, stream);
 
   if (k_out != nullptr) *k_out = k_upd;
   if (v_out != nullptr) *v_out = v_upd;
 
-  return mlx::core::add(attn_hidden, mlp_out, device);
+  return mlx::core::add(attn_hidden, mlp_out, stream);
 }
 
 // ── VTable entrypoints ────────────────────────────────────────────────────
@@ -729,7 +729,7 @@ mlx::core::array layer_dense_impl(const mlx::core::array &hidden, const LayerPar
 bool v_kv_cache_attention(const mlx::core::array &q, const mlx::core::array &new_k,
                            const mlx::core::array &new_v, mlx::core::array &k_cache,
                            mlx::core::array &v_cache, int offset, double scale, int head_dim,
-                           double theta, const mlx::core::Device &device, mlx::core::array &out,
+                           double theta, mlx::core::StreamOrDevice stream, mlx::core::array &out,
                            mlx::core::array &k_upd, mlx::core::array &v_upd,
                            std::string &error) {
   try {
@@ -745,31 +745,31 @@ bool v_kv_cache_attention(const mlx::core::array &q, const mlx::core::array &new
     int N_kv = new_k.shape(2);
     int valid_len = offset + T_new;
 
-    auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, device);
-    auto k_bn = mlx::core::transpose(new_k, {0, 2, 1, 3}, device);
-    auto v_bn = mlx::core::transpose(new_v, {0, 2, 1, 3}, device);
+    auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, stream);
+    auto k_bn = mlx::core::transpose(new_k, {0, 2, 1, 3}, stream);
+    auto v_bn = mlx::core::transpose(new_v, {0, 2, 1, 3}, stream);
 
     auto q_rope =
-        mlx::core::fast::rope(q_bn, head_dim, false, (float)theta, 1.0f, offset, std::nullopt, device);
+        mlx::core::fast::rope(q_bn, head_dim, false, (float)theta, 1.0f, offset, std::nullopt, stream);
     auto k_rope =
-        mlx::core::fast::rope(k_bn, head_dim, false, (float)theta, 1.0f, offset, std::nullopt, device);
+        mlx::core::fast::rope(k_bn, head_dim, false, (float)theta, 1.0f, offset, std::nullopt, stream);
 
     auto k_cache_owned = std::move(k_cache);
     auto v_cache_owned = std::move(v_cache);
 
     k_upd = mlx::core::slice_update(k_cache_owned, k_rope, to_shape({0, 0, offset, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
     v_upd = mlx::core::slice_update(v_cache_owned, v_bn, to_shape({0, 0, offset, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
 
     auto k_valid = mlx::core::slice(k_upd, to_shape({0, 0, 0, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
     auto v_valid = mlx::core::slice(v_upd, to_shape({0, 0, 0, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
 
-    auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, (float)scale, T_new, valid_len, device);
-    auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
-    out = mlx::core::reshape(attn_out_bthd, {B, T_new, N_q * D}, device);
+    auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, (float)scale, T_new, valid_len, stream);
+    auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, stream);
+    out = mlx::core::reshape(attn_out_bthd, {B, T_new, N_q * D}, stream);
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -782,7 +782,7 @@ bool v_kv_cache_attention(const mlx::core::array &q, const mlx::core::array &new
 
 bool v_mlp(const mlx::core::array &hidden, const mlx::core::array &norm,
            const mlx::core::array &gate_proj, const mlx::core::array &up_proj,
-           const mlx::core::array &down_proj, double eps, const mlx::core::Device &device,
+           const mlx::core::array &down_proj, double eps, mlx::core::StreamOrDevice stream,
            mlx::core::array &out, std::string &error) {
   try {
     if (!check_rank3_positive(hidden, "hidden", error)) {
@@ -801,13 +801,13 @@ bool v_mlp(const mlx::core::array &hidden, const mlx::core::array &norm,
       return false;
     }
 
-    auto xn = mlx::core::fast::rms_norm(hidden, norm, (float)eps, device);
-    auto gate = linear_in_out(xn, gate_proj, device);
-    auto up = linear_in_out(xn, up_proj, device);
-    auto mlp = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, device), device),
-                                    up, device);
-    auto proj = linear_in_out(mlp, down_proj, device);
-    out = mlx::core::add(hidden, proj, device);
+    auto xn = mlx::core::fast::rms_norm(hidden, norm, (float)eps, stream);
+    auto gate = linear_in_out(xn, gate_proj, stream);
+    auto up = linear_in_out(xn, up_proj, stream);
+    auto mlp = mlx::core::multiply(mlx::core::multiply(gate, mlx::core::sigmoid(gate, stream), stream),
+                                    up, stream);
+    auto proj = linear_in_out(mlp, down_proj, stream);
+    out = mlx::core::add(hidden, proj, stream);
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -819,7 +819,7 @@ bool v_mlp(const mlx::core::array &hidden, const mlx::core::array &norm,
 }
 
 bool v_attention_residual(const mlx::core::array &hidden, const mlx::core::array &attn_out,
-                           const mlx::core::array &o_proj, const mlx::core::Device &device,
+                           const mlx::core::array &o_proj, mlx::core::StreamOrDevice stream,
                            mlx::core::array &out, std::string &error) {
   try {
     if (!check_rank3_positive(hidden, "hidden", error) ||
@@ -836,8 +836,8 @@ bool v_attention_residual(const mlx::core::array &hidden, const mlx::core::array
         !check_dim(o_proj, 1, H, "o_proj", "output width", error)) {
       return false;
     }
-    auto projected = linear_in_out(attn_out, o_proj, device);
-    out = mlx::core::add(hidden, projected, device);
+    auto projected = linear_in_out(attn_out, o_proj, stream);
+    out = mlx::core::add(hidden, projected, stream);
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -854,7 +854,7 @@ bool v_attention_block(const mlx::core::array &hidden, const mlx::core::array &n
                         const mlx::core::array &q_norm, const mlx::core::array &k_norm,
                         mlx::core::array &k_cache, mlx::core::array &v_cache, int offset,
                         double scale, int head_dim, double theta, double eps,
-                        const mlx::core::Device &device, mlx::core::array &out,
+                        mlx::core::StreamOrDevice stream, mlx::core::array &out,
                         mlx::core::array &k_upd, mlx::core::array &v_upd, std::string &error) {
   try {
     if (!check_rank3_positive(hidden, "hidden", error) ||
@@ -903,45 +903,45 @@ bool v_attention_block(const mlx::core::array &hidden, const mlx::core::array &n
     }
     int valid_len = offset + T_new;
 
-    auto xn = mlx::core::fast::rms_norm(hidden, norm, (float)eps, device);
-    auto q_flat = linear_in_out(xn, q_proj, device);
-    auto k_flat = linear_in_out(xn, k_proj, device);
-    auto v_flat = linear_in_out(xn, v_proj, device);
+    auto xn = mlx::core::fast::rms_norm(hidden, norm, (float)eps, stream);
+    auto q_flat = linear_in_out(xn, q_proj, stream);
+    auto k_flat = linear_in_out(xn, k_proj, stream);
+    auto v_flat = linear_in_out(xn, v_proj, stream);
 
-    auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, device);
-    auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, device);
-    auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, device);
+    auto q = mlx::core::reshape(q_flat, {B, T_new, N_q, D}, stream);
+    auto k = mlx::core::reshape(k_flat, {B, T_new, N_kv, D}, stream);
+    auto v = mlx::core::reshape(v_flat, {B, T_new, N_kv, D}, stream);
 
-    q = mlx::core::fast::rms_norm(q, q_norm, (float)eps, device);
-    k = mlx::core::fast::rms_norm(k, k_norm, (float)eps, device);
+    q = mlx::core::fast::rms_norm(q, q_norm, (float)eps, stream);
+    k = mlx::core::fast::rms_norm(k, k_norm, (float)eps, stream);
 
-    auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, device);
-    auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, device);
-    auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, device);
+    auto q_bn = mlx::core::transpose(q, {0, 2, 1, 3}, stream);
+    auto k_bn = mlx::core::transpose(k, {0, 2, 1, 3}, stream);
+    auto v_bn = mlx::core::transpose(v, {0, 2, 1, 3}, stream);
 
     auto q_rope =
-        mlx::core::fast::rope(q_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, device);
+        mlx::core::fast::rope(q_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, stream);
     auto k_rope =
-        mlx::core::fast::rope(k_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, device);
+        mlx::core::fast::rope(k_bn, D, false, (float)theta, 1.0f, offset, std::nullopt, stream);
 
     auto k_cache_owned = std::move(k_cache);
     auto v_cache_owned = std::move(v_cache);
 
     k_upd = mlx::core::slice_update(k_cache_owned, k_rope, to_shape({0, 0, offset, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
     v_upd = mlx::core::slice_update(v_cache_owned, v_bn, to_shape({0, 0, offset, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
 
     auto k_valid = mlx::core::slice(k_upd, to_shape({0, 0, 0, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
     auto v_valid = mlx::core::slice(v_upd, to_shape({0, 0, 0, 0}),
-                                     to_shape({B, N_kv, valid_len, D}), device);
+                                     to_shape({B, N_kv, valid_len, D}), stream);
 
-    auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, (float)scale, T_new, valid_len, device);
-    auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, device);
-    auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, device);
-    auto projected = linear_in_out(attn_out, o_proj, device);
-    out = mlx::core::add(hidden, projected, device);
+    auto attn_out_bn = sdpa(q_rope, k_valid, v_valid, (float)scale, T_new, valid_len, stream);
+    auto attn_out_bthd = mlx::core::transpose(attn_out_bn, {0, 2, 1, 3}, stream);
+    auto attn_out = mlx::core::reshape(attn_out_bthd, {B, T_new, attn_width}, stream);
+    auto projected = linear_in_out(attn_out, o_proj, stream);
+    out = mlx::core::add(hidden, projected, stream);
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -954,14 +954,14 @@ bool v_attention_block(const mlx::core::array &hidden, const mlx::core::array &n
 
 bool v_layer_dense(const mlx::core::array &hidden, const LayerParams &layer, KVCache &kv,
                     int offset, double scale, int head_dim, double theta, double eps,
-                    const mlx::core::Device &device, mlx::core::array &out,
+                    mlx::core::StreamOrDevice stream, mlx::core::array &out,
                     mlx::core::array &k_upd, mlx::core::array &v_upd, std::string &error) {
   try {
     if (!validate_dense_layer(hidden, layer, kv, offset, head_dim, error)) {
       return false;
     }
     out = layer_dense_impl(hidden, layer, kv, offset, (float)scale, head_dim, (float)theta,
-                            (float)eps, device, &k_upd, &v_upd);
+                            (float)eps, stream, &k_upd, &v_upd);
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -974,14 +974,14 @@ bool v_layer_dense(const mlx::core::array &hidden, const LayerParams &layer, KVC
 
 bool v_layer_quantized(const mlx::core::array &hidden, const LayerParamsQ &layer, KVCache &kv,
                         int offset, double scale, int head_dim, double theta, double eps,
-                        const mlx::core::Device &device, mlx::core::array &out,
+                        mlx::core::StreamOrDevice stream, mlx::core::array &out,
                         mlx::core::array &k_upd, mlx::core::array &v_upd, std::string &error) {
   try {
     if (!validate_generalized_layer(hidden, layer, kv, offset, head_dim, error)) {
       return false;
     }
     out = layer_core_generalized(hidden, layer, kv, offset, (float)scale, head_dim, (float)theta,
-                                  (float)eps, device, &k_upd, &v_upd);
+                                  (float)eps, stream, &k_upd, &v_upd);
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -993,7 +993,7 @@ bool v_layer_quantized(const mlx::core::array &hidden, const LayerParamsQ &layer
 }
 
 bool v_final_greedy(const mlx::core::array &hidden, const mlx::core::array &norm,
-                     const mlx::core::array &lm_head, double eps, const mlx::core::Device &device,
+                     const mlx::core::array &lm_head, double eps, mlx::core::StreamOrDevice stream,
                      mlx::core::array &out, std::string &error) {
   try {
     if (!check_rank3_positive(hidden, "hidden", error)) {
@@ -1008,15 +1008,15 @@ bool v_final_greedy(const mlx::core::array &hidden, const mlx::core::array &norm
       return false;
     }
 
-    auto last = (T == 1) ? mlx::core::reshape(hidden, {B, H}, device)
+    auto last = (T == 1) ? mlx::core::reshape(hidden, {B, H}, stream)
                           : mlx::core::reshape(mlx::core::slice(hidden, to_shape({0, T - 1, 0}),
-                                                                 to_shape({B, T, H}), device),
-                                                {B, H}, device);
+                                                                 to_shape({B, T, H}), stream),
+                                                {B, H}, stream);
 
-    auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, device);
+    auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, stream);
     auto logits =
-        mlx::core::tensordot(normed, lm_head, std::vector<int>{1}, std::vector<int>{1}, device);
-    out = mlx::core::argmax(logits, 1, false, device);
+        mlx::core::tensordot(normed, lm_head, std::vector<int>{1}, std::vector<int>{1}, stream);
+    out = mlx::core::argmax(logits, 1, false, stream);
     return true;
   } catch (const std::exception &e) {
     error = e.what();
@@ -1031,7 +1031,7 @@ bool v_forward_greedy_from_hidden(const mlx::core::array &hidden, std::vector<La
                                    std::vector<KVCache> &kv, const mlx::core::array &norm,
                                    const mlx::core::array &lm_head, int offset, double scale,
                                    int head_dim, double theta, double eps, bool return_token_id,
-                                   const mlx::core::Device &device, mlx::core::array &token_out,
+                                   mlx::core::StreamOrDevice stream, mlx::core::array &token_out,
                                    int64_t &token_id_out, std::vector<mlx::core::array> &k_out,
                                    std::vector<mlx::core::array> &v_out, std::string &error) {
   try {
@@ -1063,7 +1063,7 @@ bool v_forward_greedy_from_hidden(const mlx::core::array &hidden, std::vector<La
       mlx::core::array k_new = *kv[i].k;
       mlx::core::array v_new = *kv[i].v;
       current = layer_dense_impl(current, layers[i], kv[i], offset, (float)scale, head_dim,
-                                  (float)theta, (float)eps, device, &k_new, &v_new);
+                                  (float)theta, (float)eps, stream, &k_new, &v_new);
 
       eval_arrays.push_back(k_new);
       eval_arrays.push_back(v_new);
@@ -1084,14 +1084,14 @@ bool v_forward_greedy_from_hidden(const mlx::core::array &hidden, std::vector<La
       return false;
     }
 
-    auto last = (T == 1) ? mlx::core::reshape(current, {B, H}, device)
+    auto last = (T == 1) ? mlx::core::reshape(current, {B, H}, stream)
                           : mlx::core::reshape(mlx::core::slice(current, to_shape({0, T - 1, 0}),
-                                                                 to_shape({B, T, H}), device),
-                                                {B, H}, device);
+                                                                 to_shape({B, T, H}), stream),
+                                                {B, H}, stream);
 
-    auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, device);
-    auto logits = linear_out_in(normed, lm_head, device);
-    auto token = mlx::core::argmax(logits, 1, false, device);
+    auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, stream);
+    auto logits = linear_out_in(normed, lm_head, stream);
+    auto token = mlx::core::argmax(logits, 1, false, stream);
 
     if (return_token_id) {
       eval_arrays.push_back(token);
@@ -1117,7 +1117,7 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
                                  const mlx::core::array &lm_head, int offset, int count,
                                  double scale, int head_dim, double theta, double eps,
                                  bool submit_each_step,
-                                 const mlx::core::Device &device,
+                                 mlx::core::StreamOrDevice stream,
                                  std::vector<mlx::core::array> &token_out,
                                  std::vector<mlx::core::array> &k_out,
                                  std::vector<mlx::core::array> &v_out, std::string &error) {
@@ -1169,9 +1169,9 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
       int B = current_ids.shape(0);
       int T = current_ids.shape(1);
 
-      auto ids = mlx::core::reshape(current_ids, {B * T}, device);
-      auto current = mlx::core::reshape(mlx::core::take(embed_tokens, ids, 0, device),
-                                         {B, T, embed_tokens.shape(1)}, device);
+      auto ids = mlx::core::reshape(current_ids, {B * T}, stream);
+      auto current = mlx::core::reshape(mlx::core::take(embed_tokens, ids, 0, stream),
+                                         {B, T, embed_tokens.shape(1)}, stream);
 
       next_k_cache.clear();
       next_v_cache.clear();
@@ -1190,7 +1190,7 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
         mlx::core::array k_new = *kv.k;
         mlx::core::array v_new = *kv.v;
         current = layer_dense_impl(current, layers[layer_idx], kv, current_offset, (float)scale,
-                                    head_dim, (float)theta, (float)eps, device, &k_new, &v_new);
+                                    head_dim, (float)theta, (float)eps, stream, &k_new, &v_new);
 
         next_k_cache.push_back(k_new);
         next_v_cache.push_back(v_new);
@@ -1202,14 +1202,14 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
 
       auto last =
           (T_out == 1)
-              ? mlx::core::reshape(current, {B_out, H_out}, device)
+              ? mlx::core::reshape(current, {B_out, H_out}, stream)
               : mlx::core::reshape(mlx::core::slice(current, to_shape({0, T_out - 1, 0}),
-                                                     to_shape({B_out, T_out, H_out}), device),
-                                    {B_out, H_out}, device);
+                                                     to_shape({B_out, T_out, H_out}), stream),
+                                    {B_out, H_out}, stream);
 
-      auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, device);
-      auto logits = linear_out_in(normed, lm_head, device);
-      auto token = mlx::core::argmax(logits, 1, false, device);
+      auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, stream);
+      auto logits = linear_out_in(normed, lm_head, stream);
+      auto token = mlx::core::argmax(logits, 1, false, stream);
 
       if (submit_each_step) {
         std::vector<mlx::core::array> eval_arrays;
@@ -1223,7 +1223,7 @@ bool v_forward_greedy_ids_chunk(const mlx::core::array &input_ids,
       }
 
       token_arrays.push_back(token);
-      current_ids = mlx::core::reshape(token, {B_out, 1}, device);
+      current_ids = mlx::core::reshape(token, {B_out, 1}, stream);
       k_cache.swap(next_k_cache);
       v_cache.swap(next_v_cache);
       current_offset += 1;
@@ -1246,7 +1246,7 @@ bool v_forward_greedy_ids_chunk_quantized(
     const mlx::core::array &input_ids, const mlx::core::array &embed_tokens,
     std::vector<LayerParamsQ> &layers, std::vector<KVCache> &initial_kv,
     const mlx::core::array &norm, const LinearWeight &lm_head, int offset, int count,
-    double scale, int head_dim, double theta, double eps, const mlx::core::Device &device,
+    double scale, int head_dim, double theta, double eps, mlx::core::StreamOrDevice stream,
     std::vector<mlx::core::array> &token_out, std::vector<mlx::core::array> &k_out,
     std::vector<mlx::core::array> &v_out, std::string &error) {
   try {
@@ -1296,9 +1296,9 @@ bool v_forward_greedy_ids_chunk_quantized(
       int B = current_ids.shape(0);
       int T = current_ids.shape(1);
 
-      auto ids = mlx::core::reshape(current_ids, {B * T}, device);
-      auto current = mlx::core::reshape(mlx::core::take(embed_tokens, ids, 0, device),
-                                         {B, T, embed_tokens.shape(1)}, device);
+      auto ids = mlx::core::reshape(current_ids, {B * T}, stream);
+      auto current = mlx::core::reshape(mlx::core::take(embed_tokens, ids, 0, stream),
+                                         {B, T, embed_tokens.shape(1)}, stream);
 
       next_k_cache.clear();
       next_v_cache.clear();
@@ -1318,7 +1318,7 @@ bool v_forward_greedy_ids_chunk_quantized(
         mlx::core::array v_new = *kv.v;
         current = layer_core_generalized(current, layers[layer_idx], kv, current_offset,
                                           (float)scale, head_dim, (float)theta, (float)eps,
-                                          device, &k_new, &v_new);
+                                          stream, &k_new, &v_new);
 
         next_k_cache.push_back(k_new);
         next_v_cache.push_back(v_new);
@@ -1330,17 +1330,17 @@ bool v_forward_greedy_ids_chunk_quantized(
 
       auto last =
           (T_out == 1)
-              ? mlx::core::reshape(current, {B_out, H_out}, device)
+              ? mlx::core::reshape(current, {B_out, H_out}, stream)
               : mlx::core::reshape(mlx::core::slice(current, to_shape({0, T_out - 1, 0}),
-                                                     to_shape({B_out, T_out, H_out}), device),
-                                    {B_out, H_out}, device);
+                                                     to_shape({B_out, T_out, H_out}), stream),
+                                    {B_out, H_out}, stream);
 
-      auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, device);
-      auto logits = apply_linear(normed, lm_head, device);
-      auto token = mlx::core::argmax(logits, 1, false, device);
+      auto normed = mlx::core::fast::rms_norm(last, norm, (float)eps, stream);
+      auto logits = apply_linear(normed, lm_head, stream);
+      auto token = mlx::core::argmax(logits, 1, false, stream);
 
       token_arrays.push_back(token);
-      current_ids = mlx::core::reshape(token, {B_out, 1}, device);
+      current_ids = mlx::core::reshape(token, {B_out, 1}, stream);
       k_cache.swap(next_k_cache);
       v_cache.swap(next_v_cache);
       current_offset += 1;
@@ -1585,7 +1585,7 @@ plugin_mlp(const emlx::plugin::call_t &call,
   if (!v_mlp(call.operands[0], call.operands[1],
              call.operands[2], call.operands[3],
              call.operands[4], f64_from_bits(call.attrs[0]),
-             call.device, output, error))
+             call.stream, output, error))
     return error;
   outputs.push_back(std::move(output));
   return std::nullopt;
@@ -1612,7 +1612,7 @@ plugin_kv_cache_attention(const emlx::plugin::call_t &call,
   if (!v_kv_cache_attention(
           call.operands[0], call.operands[1], call.operands[2],
           k_cache, v_cache, offset, f64_from_bits(call.attrs[1]), head_dim,
-          f64_from_bits(call.attrs[3]), call.device, output,
+          f64_from_bits(call.attrs[3]), call.stream, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1639,7 +1639,7 @@ plugin_kv_cache_attention_tensor(const emlx::plugin::call_t &call,
           call.operands[0], call.operands[1], call.operands[2],
           call.operands[3], call.operands[4], call.operands[5],
           f64_from_bits(call.attrs[0]), head_dim,
-          f64_from_bits(call.attrs[2]), call.device, attention,
+          f64_from_bits(call.attrs[2]), call.stream, attention,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(attention));
@@ -1658,7 +1658,7 @@ plugin_attention_residual(const emlx::plugin::call_t &call,
   }
   auto output = call.operands[0];
   if (!v_attention_residual(call.operands[0], call.operands[1],
-                            call.operands[2], call.device,
+                            call.operands[2], call.stream,
                             output, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1689,7 +1689,7 @@ plugin_attention_block(const emlx::plugin::call_t &call,
           call.operands[6], call.operands[7], k_cache, v_cache,
           offset, f64_from_bits(call.attrs[1]), head_dim,
           f64_from_bits(call.attrs[3]),
-          f64_from_bits(call.attrs[4]), call.device, output,
+          f64_from_bits(call.attrs[4]), call.stream, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1724,7 +1724,7 @@ plugin_layer_dense(const emlx::plugin::call_t &call,
   if (!v_layer_dense(
           operands[0], layer, cache, offset, f64_from_bits(call.attrs[1]),
           head_dim, f64_from_bits(call.attrs[3]),
-          f64_from_bits(call.attrs[4]), call.device, output,
+          f64_from_bits(call.attrs[4]), call.stream, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1782,7 +1782,7 @@ plugin_layer_generalized(const emlx::plugin::call_t &call,
           call.operands[0], layer, cache, offset,
           f64_from_bits(call.attrs[2]), head_dim,
           f64_from_bits(call.attrs[4]),
-          f64_from_bits(call.attrs[5]), call.device, output,
+          f64_from_bits(call.attrs[5]), call.stream, output,
           k_updated, v_updated, error))
     return error;
   outputs.push_back(std::move(output));
@@ -1802,7 +1802,7 @@ plugin_final_greedy(const emlx::plugin::call_t &call,
   auto output = call.operands[0];
   if (!v_final_greedy(call.operands[0], call.operands[1],
                       call.operands[2], f64_from_bits(call.attrs[0]),
-                      call.device, output, error))
+                      call.stream, output, error))
     return error;
   outputs.push_back(std::move(output));
   return std::nullopt;
@@ -1898,7 +1898,7 @@ plugin_forward_dense(const emlx::plugin::call_t &call,
           operands[0], layers, caches, operands[tail], operands[tail + 1],
           offset, f64_from_bits(call.attrs[2]), head_dim,
           f64_from_bits(call.attrs[4]), f64_from_bits(call.attrs[5]),
-          false, call.device, token, ignored_token_id, keys, values,
+          false, call.stream, token, ignored_token_id, keys, values,
           error))
     return error;
   outputs.reserve(expected_outputs);
@@ -1942,11 +1942,11 @@ plugin_chunk_dense(const emlx::plugin::call_t &call,
           operands[tail + 1], offset, count, f64_from_bits(call.attrs[3]),
           head_dim, f64_from_bits(call.attrs[5]),
           f64_from_bits(call.attrs[6]), call.attrs[7] == 1,
-          call.device, tokens, keys, values, error))
+          call.stream, tokens, keys, values, error))
     return error;
   outputs.reserve(expected_outputs);
   outputs.push_back(mlx::core::reshape(
-      mlx::core::stack(tokens, 0, call.device), {count}, call.device));
+      mlx::core::stack(tokens, 0, call.stream), {count}, call.stream));
   for (size_t index = 0; index < keys.size(); ++index) {
     outputs.push_back(std::move(keys[index]));
     outputs.push_back(std::move(values[index]));
@@ -2027,12 +2027,12 @@ plugin_chunk_generalized(const emlx::plugin::call_t &call,
           call.operands[0], call.operands[1], layers, caches, norm,
           lm_head, offset, count, f64_from_bits(call.attrs[4]), head_dim,
           f64_from_bits(call.attrs[6]),
-          f64_from_bits(call.attrs[7]), call.device, tokens,
+          f64_from_bits(call.attrs[7]), call.stream, tokens,
           keys, values, error))
     return error;
   outputs.reserve(expected_outputs);
   outputs.push_back(mlx::core::reshape(
-      mlx::core::stack(tokens, 0, call.device), {count}, call.device));
+      mlx::core::stack(tokens, 0, call.stream), {count}, call.stream));
   for (size_t index = 0; index < keys.size(); ++index) {
     outputs.push_back(std::move(keys[index]));
     outputs.push_back(std::move(values[index]));

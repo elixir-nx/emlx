@@ -2272,7 +2272,13 @@ defmodule EMLX.Native.Expr do
 
     wrapped_callback = fn {value, chain_in}, _opts ->
       callback.(value)
-      {value, Nx.add(chain_in, 1)}
+      # Keep the keepalive counter on BinaryBackend. `Nx.to_tensor(1)` would
+      # otherwise allocate an EMLX scalar on whichever worker
+      # `resolve_worker/1` picks inside the runtime_call callback (often a
+      # different OS thread than the one that owns Stream(cpu, 0)), and
+      # MLX 0.32's thread-local CPU encoders then fail at `to_binary`.
+      one = Nx.tensor(1, type: @hook_chain_type, backend: Nx.BinaryBackend)
+      {value, Nx.add(chain_in, one)}
     end
 
     {result_refs, state} =

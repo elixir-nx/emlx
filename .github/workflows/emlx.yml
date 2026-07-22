@@ -80,19 +80,26 @@ jobs:
           mix test --warnings-as-errors
 
   macos:
-    name: macOS ${{ matrix.job.gpu && 'gpu' || 'cpu' }} (${{ matrix.job.elixir }}, ${{ matrix.job.otp }})
-    runs-on: macos-26
+    name: ${{ matrix.job.os }} ${{ matrix.job.gpu && 'gpu' || 'cpu' }}${{ matrix.job.compat && ' compat' || '' }} (${{ matrix.job.elixir }}, ${{ matrix.job.otp }})
+    runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
         job:
           # Format only on Elixir 1.20 / OTP 28 so CI matches local formatter output
-          - { otp: "28.5.0.1", elixir: "1.20.1", lint: true }
-          - { otp: "25.3.2.15", elixir: "1.17.0", build: true }
-          - { otp: "25.3.2.15", elixir: "1.17.0", gpu: true }
-          - { otp: "25.3.2.15", elixir: "1.17.0", gpu: true, build: true }
+          - { os: macos-26, otp: "28.5.0.1", elixir: "1.20.1", lint: true }
+          - { os: macos-26, otp: "25.3.2.15", elixir: "1.17.0", build: true }
+          - { os: macos-26, otp: "25.3.2.15", elixir: "1.17.0", gpu: true }
+          - { os: macos-26, otp: "25.3.2.15", elixir: "1.17.0", gpu: true, build: true }
+          # #127: portable 14.0 prebuilt (LIBMLX_MACOS_COMPAT) on Sequoia
+          - { os: macos-15, otp: "28.5.0.1", elixir: "1.20.1", compat: true }
+          - { os: macos-15, otp: "28.5.0.1", elixir: "1.20.1", compat: true, gpu: true }
     env:
       MIX_ENV: test
+      # Job-level: mix.exs resolves libmlx while loading project/0 (including
+      # `mix local.hex` in Setup Mix). Per-step exports below are too late for
+      # macos-15 hosts that must use the 14.0 archive (#127).
+      LIBMLX_MACOS_COMPAT: ${{ matrix.job.compat && 'true' || '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,7 +132,7 @@ jobs:
         id: mix-cache # id to use in retrieve action
         with:
           path: ${{ github.workspace }}/emlx/deps
-          key: ${{ runner.os }}-Elixir-v${{ matrix.job.elixir }}-OTP-${{ matrix.job.otp }}-${{ hashFiles(format('{0}/emlx/mix.lock', github.workspace)) }}-v1
+          key: ${{ matrix.job.os }}-Elixir-v${{ matrix.job.elixir }}-OTP-${{ matrix.job.otp }}-${{ hashFiles(format('{0}/emlx/mix.lock', github.workspace)) }}-v1
 
       - name: Install dependencies
         if: ${{ steps.mix-cache.outputs.cache-hit != 'true' }}
@@ -141,6 +148,9 @@ jobs:
           if [ "${{ matrix.job.build }}" = "true" ]; then
             export LIBMLX_BUILD=true
           fi
+          if [ "${{ matrix.job.compat }}" = "true" ]; then
+            export LIBMLX_MACOS_COMPAT=true
+          fi
           mix compile --warnings-as-errors
 
       - name: Check formatting
@@ -150,6 +160,9 @@ jobs:
           export PATH="${{ steps.setup.outputs.path }}:${PATH}"
           if [ "${{ matrix.job.build }}" = "true" ]; then
             export LIBMLX_BUILD=true
+          fi
+          if [ "${{ matrix.job.compat }}" = "true" ]; then
+            export LIBMLX_MACOS_COMPAT=true
           fi
           mix format --check-formatted
 
@@ -166,6 +179,9 @@ jobs:
 
           if [ "${{ matrix.job.build }}" = "true" ]; then
             export LIBMLX_BUILD=true
+          fi
+          if [ "${{ matrix.job.compat }}" = "true" ]; then
+            export LIBMLX_MACOS_COMPAT=true
           fi
 
           if [ "${{ matrix.job.gpu }}" = "true" ]; then

@@ -48,13 +48,17 @@ public:
   using Job = std::function<void()>;
 
   // Spawns the worker thread. The fresh mlx::core::Stream is allocated
-  // *inside* the worker thread — MLX 0.31.2 has thread-local state for
-  // GPU streams (mlx-lm#1090, mlx-lm#1179: "There is no Stream(gpu, N)
-  // in current thread"), so a stream created on thread A cannot be
-  // synchronized or dispatched to from thread B. We block here until
-  // the worker thread has created the stream and signalled ready, so
-  // that callers can rely on stream() / device() being valid the
-  // moment the constructor returns.
+  // *inside* the worker thread — MLX has thread-local command encoders
+  // for GPU (0.31+) and CPU (0.32+, ml-explore/mlx#3537), so a stream
+  // created on thread A cannot be synchronized or dispatched to from
+  // thread B ("There is no Stream(gpu|cpu, N) in current thread"). We
+  // block here until the worker thread has created the stream and
+  // signalled ready, so callers can rely on stream() / device() being
+  // valid the moment the constructor returns.
+  //
+  // Mixed-device graphs (e.g. GPU tensor + Nx scalar on the default CPU
+  // backend) are handled in Elixir by promoting operands onto the op's
+  // target device in `prepare_tensors!/1` before the NIF runs.
   explicit Worker(mlx::core::Device device)
       : device_(device), stream_(/*placeholder index*/ -1, device) {
     std::promise<mlx::core::Stream> stream_promise;
@@ -165,13 +169,10 @@ public:
 
 private:
   void thread_main(std::promise<mlx::core::Stream> stream_promise) {
-    // Allocate the stream on THIS thread (MLX 0.31.2 thread-locality
-    // requirement — see constructor comment). Pin all MLX ops issued
-    // from this thread to our stream by making it the per-thread
-    // default. Graph-construction NIFs continue to run on BEAM
-    // scheduler threads (and use those threads' defaults); only ops
-    // invoked *inside* a posted job (currently mx::eval and
-    // mx::synchronize) inherit this binding.
+    // Allocate the stream on THIS thread (MLX thread-locality requirement —
+    // see constructor comment). Pin all MLX ops issued from this thread to
+    // our stream by making it the per-thread default. Only ops invoked
+    // *inside* a posted job inherit this binding.
     try {
       mlx::core::Stream stream = mlx::core::new_stream(device_);
       mlx::core::set_default_stream(stream);

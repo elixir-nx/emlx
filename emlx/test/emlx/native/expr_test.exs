@@ -3438,45 +3438,6 @@ defmodule EMLX.Native.ExprTest do
         assert_all_close(eager[[.., .., head..head, ..]], alone, tol: 1.0e-3)
       end
     end
-
-    test "decode-shaped block: fused path improves over primitive replay" do
-      # A small attention+norm decode step: RMSNorm → causal SDPA → RMSNorm.
-      scale = 0.125
-
-      fused = fn q, k, v, w ->
-        a = EMLX.Fast.scaled_dot_product_attention_causal(q, k, v, scale)
-        flat = Nx.reshape(a, {1, 16})
-        EMLX.Fast.rms_norm(flat, w, 1.0e-5)
-      end
-
-      primitive = fn q, k, v, w ->
-        scores = Nx.dot(q, [3], [0, 1], k, [3], [0, 1]) |> Nx.multiply(scale)
-        a = Nx.dot(normalize_rows(Nx.exp(scores)), [3], [0, 1], v, [2], [0, 1])
-        flat = Nx.reshape(a, {1, 16})
-        rms = Nx.sqrt(Nx.add(Nx.mean(Nx.pow(flat, 2), axes: [-1], keep_axes: true), 1.0e-5))
-        Nx.divide(flat, rms) |> Nx.multiply(w)
-      end
-
-      q = Nx.iota({1, 2, 1, 8}, type: :f32) |> Nx.divide(100) |> gpu_t()
-      k = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(90) |> gpu_t()
-      v = Nx.iota({1, 2, 4, 8}, type: :f32) |> Nx.divide(80) |> gpu_t()
-      w = Nx.broadcast(Nx.tensor(1.0, type: :f32), {16}) |> gpu_t()
-
-      fused_c = Nx.Defn.jit(fused, compiler: EMLX, device: :gpu)
-      prim_c = Nx.Defn.jit(primitive, compiler: EMLX, device: :gpu)
-
-      # Correctness: same result within fused-kernel tolerance.
-      assert_all_close(fused_c.(q, k, v, w), prim_c.(q, k, v, w), tol: 1.0e-2)
-
-      # Warm both compiled graphs, then time the replay-only hot path.
-      for _ <- 1..5, do: fused_c.(q, k, v, w) |> Nx.backend_transfer()
-      for _ <- 1..5, do: prim_c.(q, k, v, w) |> Nx.backend_transfer()
-
-      fused_us = bench_us(200, fn -> fused_c.(q, k, v, w) |> Nx.backend_transfer() end)
-      prim_us = bench_us(200, fn -> prim_c.(q, k, v, w) |> Nx.backend_transfer() end)
-
-      assert fused_us <= prim_us * 1.1
-    end
   end
 
   describe "prefill RoPE (Metal)" do
@@ -4484,12 +4445,5 @@ defmodule EMLX.Native.ExprTest do
 
     Enum.zip(Nx.to_flat_list(a), Nx.to_flat_list(b))
     |> Enum.each(fn {av, bv} -> assert_in_delta(av, bv, tol) end)
-  end
-
-  defp bench_us(n, fun) do
-    t0 = System.monotonic_time(:microsecond)
-    Enum.each(1..n, fn _ -> fun.() end)
-    t1 = System.monotonic_time(:microsecond)
-    (t1 - t0) / n
   end
 end

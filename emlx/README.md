@@ -81,6 +81,25 @@ The binaries are always downloaded to match the current configuration, so you sh
 
 The version of the MLX binary to download. By default EMLX will always use the latest version possible.
 
+##### `LIBMLX_MACOS_COMPAT`
+
+Defaults to `false`.
+
+On Apple Silicon macOS, precompiled libmlx archives are keyed by deployment target ([mlx-build](https://github.com/cocoa-xu/mlx-build#macos)):
+
+| deployment target | runs on     | AOT NAX kernels |
+|-------------------|-------------|-----------------|
+| `26.2` (default)  | macOS 26.2+ | yes             |
+| `14.0`            | macOS 14+   | no              |
+
+The reduced featureset is only the missing **ahead-of-time NAX kernels** — MLX's fast GEMM/attention paths on Apple's `MetalPerformancePrimitives` (Metal 4). The `14.0` archive still provides normal Metal GPU ops. On macOS 26.2+, `LIBMLX_ENABLE_JIT=true` can still JIT-compile NAX at runtime even with the `14.0` archive.
+
+Set `LIBMLX_MACOS_COMPAT=true` to download the `14.0` archive. Use this on macOS 15 (and any host older than 26.2); the default `26.2` build will refuse to compile there instead of crashing the VM at runtime.
+
+##### `LIBMLX_DEPLOYMENT_TARGET`
+
+Optional explicit override of the macOS deployment target segment. Accepted values: `26.2`, `14.0`. When set, this wins over `LIBMLX_MACOS_COMPAT`.
+
 ##### `LIBMLX_ENABLE_JIT`
 
 Defaults to `false`.
@@ -102,3 +121,14 @@ The directory to store the downloaded and built archives in. Defaults to the sta
 If you want to compile MLX from source, you can do so by setting the `LIBMLX_BUILD` environment variable to `true`.
 
 Environment variables listed in the previous section will still apply.
+
+#### Testing on macOS 15
+
+On a macOS 15 machine locally:
+
+```bash
+export LIBMLX_MACOS_COMPAT=true
+cd emlx && mix deps.get && mix test
+```
+
+Without that flag, compilation fails with a message naming `LIBMLX_MACOS_COMPAT` instead of crashing the VM at runtime.
