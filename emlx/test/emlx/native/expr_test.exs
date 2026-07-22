@@ -3438,7 +3438,6 @@ defmodule EMLX.Native.ExprTest do
         assert_all_close(eager[[.., .., head..head, ..]], alone, tol: 1.0e-3)
       end
     end
-
   end
 
   describe "prefill RoPE (Metal)" do
@@ -4447,5 +4446,4 @@ defmodule EMLX.Native.ExprTest do
     Enum.zip(Nx.to_flat_list(a), Nx.to_flat_list(b))
     |> Enum.each(fn {av, bv} -> assert_in_delta(av, bv, tol) end)
   end
-
 end
