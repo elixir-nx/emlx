@@ -1,21 +1,22 @@
 // Async NIF dispatch built on top of emlx::Worker.
 //
-// MLX 0.31.2 makes both Metal CommandEncoders (mlx/backend/metal/device.cpp:
-// `static thread_local std::unordered_map<int, CommandEncoder> encoders;`)
-// and the per-device default Stream (mlx/stream.cpp: `static thread_local
-// auto default_streams = ...`) thread-local. Because `mlx::core::eval` walks
-// the tape and calls `gpu::eval(arr)` *directly* on the calling thread (it
-// is NOT trampolined to a `scheduler::StreamThread`; see
-// mlx/transforms.cpp:eval_impl), every op for a given GPU stream — both
-// graph construction AND eval — must happen on the OS thread that called
-// `mlx::core::new_stream(d)` for that stream. Otherwise the eval thread's
-// thread-local encoder map will not contain an entry for the stream's
-// index, producing the runtime error
-//   "There is no Stream(gpu, N) in current thread."
+// MLX makes Metal CommandEncoders thread-local (0.31+) and, as of 0.32
+// (ml-explore/mlx#3537), CPU CommandEncoders too. The per-device default
+// Stream is also thread-local (mlx/stream.cpp). Because `mlx::core::eval`
+// walks the tape and calls `gpu::eval` / `cpu::eval` *directly* on the
+// calling thread (it is NOT trampolined to a `scheduler::StreamThread`),
+// every op for a given stream — both graph construction AND eval — must
+// happen on the OS thread that called `mlx::core::new_stream(d)` for that
+// stream. Otherwise the eval thread's encoder map misses the stream
+// index and raises
+//   "There is no Stream(gpu|cpu, N) in current thread."
 //
 // Consequence for EMLX: every NIF that touches the MLX graph must run on
-// the worker thread that owns the stream. We achieve this without
-// rewriting each NIF body by:
+// the worker thread that owns the stream. Mixed-device operand lists are
+// normalized in Elixir (`prepare_tensors!/1`) so a CPU scalar created via
+// `Nx.to_tensor/1` (default backend) is moved onto the op's device before
+// the graph is built. We achieve worker routing without rewriting each
+// NIF body by:
 //
 //   1. Defining each "sync" NIF (e.g. `add`, `reshape`, `eval`, ...) as
 //      a normal C++ function with the ERTS NIF signature.

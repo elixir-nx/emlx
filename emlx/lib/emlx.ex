@@ -1403,27 +1403,78 @@ defmodule EMLX do
   defp wrap_tensor(tuple, device) when is_tuple(tuple),
     do: tuple |> Tuple.to_list() |> Enum.map(&{device, &1}) |> List.to_tuple()
 
-  defp prepare_tensors_list!(tensors_list, device) do
-    Enum.map_reduce(tensors_list, device, fn
-      {dev, ref}, device when is_tensor(dev, ref) ->
-        {ref, merge_device(device, dev)}
+  # Unwrap EMLX tensors to raw refs for the NIF, after moving every operand
+  # onto the op's merged device. Required since MLX 0.32: CPU streams are
+  # thread-local, so a GPU op cannot eval a CPU scalar that `Nx.to_tensor/1`
+  # allocated on the default CPU backend (`Stream(cpu, N)` lives on the CPU
+  # worker). Promoting here keeps the graph single-device / single-worker.
+  defp prepare_tensors!(tensors) do
+    target = merge_devices(tensors)
 
-      bad_tensor, _device ->
-        raise ArgumentError, "expected a EMLX tensor, got: #{inspect(bad_tensor)}"
+    prepared =
+      Enum.map(tensors, fn
+        {dev, ref} = tensor when is_tensor(dev, ref) ->
+          elem(ensure_on_device!(tensor, target), 1)
+
+        [{dev, ref} | _] = list when is_tensor(dev, ref) ->
+          Enum.map(list, fn tensor -> elem(ensure_on_device!(tensor, target), 1) end)
+
+        bad_tensor ->
+          raise ArgumentError, "expected a EMLX tensor, got: #{inspect(bad_tensor)}"
+      end)
+
+    {prepared, target}
+  end
+
+  defp merge_devices(tensors) do
+    Enum.reduce(tensors, :cpu, fn
+      {dev, ref}, device when is_tensor(dev, ref) ->
+        merge_device(device, dev)
+
+      list, device when is_list(list) ->
+        Enum.reduce(list, device, fn
+          {dev, ref}, acc when is_tensor(dev, ref) -> merge_device(acc, dev)
+          bad, _ -> raise ArgumentError, "expected a EMLX tensor, got: #{inspect(bad)}"
+        end)
+
+      bad, _ ->
+        raise ArgumentError, "expected a EMLX tensor, got: #{inspect(bad)}"
     end)
   end
 
-  defp prepare_tensors!(tensors) do
-    Enum.map_reduce(tensors, :cpu, fn
-      {dev, ref}, device when is_tensor(dev, ref) ->
-        {ref, merge_device(device, dev)}
+  defp ensure_on_device!({dev, _} = tensor, dev), do: tensor
 
-      [{dev, ref} | _] = tensors, device when is_tensor(dev, ref) ->
-        prepare_tensors_list!(tensors, device)
+  defp ensure_on_device!(tensor, target_device), do: to_device(tensor, target_device)
 
-      bad_tensor, _device ->
-        raise ArgumentError, "expected a EMLX tensor, got: #{inspect(bad_tensor)}"
-    end)
+  # Passthrough EMLX tensors into a runtime_call still live on the
+  # eval_program / default worker's stream. Same device atom (`:cpu`) as the
+  # bound `runtime_call_worker`, so `to_device/2` alone is a no-op — eval on
+  # the home worker, then contiguous onto the bound stream.
+  defp adopt_passthrough_tensor(
+         %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref} = tensor_ref}} = tensor
+       )
+       when is_tensor(device, ref) do
+    case Process.get(:emlx_command_queue) do
+      {worker, ^device} = bound ->
+        Process.delete(:emlx_command_queue)
+
+        try do
+          eval(tensor_ref)
+        after
+          Process.put(:emlx_command_queue, bound)
+        end
+
+        new_ref =
+          EMLX.NIF.to_device(worker, ref, device)
+          |> unwrap!()
+          |> await_worker()
+          |> wrap_tensor(device)
+
+        %{tensor | data: %{tensor.data | ref: new_ref}}
+
+      _ ->
+        tensor
+    end
   end
 
   defp merge_device(:gpu, _), do: :gpu
@@ -1498,10 +1549,11 @@ defmodule EMLX do
     end
   end
 
-  # CPU and GPU operations do not share thread-local Metal encoder state, so
-  # routing a CPU tensor through a GPU queue (or vice-versa) is safe — MLX
-  # inserts the necessary cross-stream synchronization internally. We therefore
-  # do NOT force an intermediate eval; we let MLX manage the graph dependency.
+  # CPU and GPU workers each own thread-local stream encoders (MLX 0.32+).
+  # Cross-device operand lists are normalized in `prepare_tensors!/1` before
+  # the NIF runs; when a process-bound queue's device differs from the
+  # requested tensor device we fall back to that device's default worker
+  # unless `:cross_device_promotion` is enabled.
   defp resolve_cross_device(requested, worker, bound) do
     if Application.get_env(:emlx, :cross_device_promotion, false) do
       if Application.get_env(:emlx, :warn_cross_device, false) do
@@ -1585,25 +1637,6 @@ defmodule EMLX do
       opts: opts
     } = Enum.at(runtime_calls, callback_index)
 
-    {args_container, {[], []}} =
-      Nx.Defn.Composite.traverse(
-        args_template,
-        {args_binaries, positions},
-        fn leaf, {[bin | bins_rest], [pos | pos_rest]} ->
-          value =
-            case pos && Enum.at(tensors, pos) do
-              %Nx.Tensor{data: %EMLX.Backend{quantization_config: %EMLX.Quantization.Config{}}} =
-                  t ->
-                t
-
-              _ ->
-                bin |> Nx.from_binary(leaf.type) |> Nx.reshape(leaf.shape)
-            end
-
-          {value, {bins_rest, pos_rest}}
-        end
-      )
-
     callback_queue = %EMLX.CommandQueue{
       ref: EMLX.Application.runtime_call_worker(dev),
       device: dev
@@ -1613,6 +1646,30 @@ defmodule EMLX do
       try do
         binaries =
           EMLX.CommandQueue.with_queue(callback_queue, fn ->
+            # Allocate reconstructed args on this bound worker (MLX 0.32:
+            # CPU streams are thread-local). Only quantized passthrough
+            # tensors still need an explicit adopt from the eval_program
+            # worker — they keep their original refs.
+            {args_container, {[], []}} =
+              Nx.Defn.Composite.traverse(
+                args_template,
+                {args_binaries, positions},
+                fn leaf, {[bin | bins_rest], [pos | pos_rest]} ->
+                  value =
+                    case pos && Enum.at(tensors, pos) do
+                      %Nx.Tensor{
+                        data: %EMLX.Backend{quantization_config: %EMLX.Quantization.Config{}}
+                      } = t ->
+                        adopt_passthrough_tensor(t)
+
+                      _ ->
+                        bin |> Nx.from_binary(leaf.type) |> Nx.reshape(leaf.shape)
+                    end
+
+                  {value, {bins_rest, pos_rest}}
+                end
+              )
+
             result = callback.(args_container, opts)
 
             [result]
@@ -1990,12 +2047,21 @@ defmodule EMLX do
   end
 
   # Materialises defn input lazy refs to real bound %Nx.Tensor{} values on
-  # `dev` (copying any non-EMLX-backed tensor).
+  # `dev`. Already-EMLX tensors on another device are moved with `to_device/2`
+  # — required since MLX 0.32: `eval_program` runs on `dev`'s worker, and a
+  # lazy CPU graph (e.g. `Nx.broadcast`) still tagged `Stream(cpu, N)` cannot
+  # be eval'd on the GPU worker when `opts[:device]`/`default_device()` is `:gpu`.
   defp materialise_input_tensors(params, dev) do
     Enum.map(params, fn lazy ->
       case lazy.() do
-        %Nx.Tensor{data: %EMLX.Backend{}} = t -> t
-        %Nx.Tensor{} = t -> Nx.backend_copy(t, {EMLX.Backend, device: dev})
+        %Nx.Tensor{data: %EMLX.Backend{ref: {^dev, _}}} = t ->
+          t
+
+        %Nx.Tensor{data: %EMLX.Backend{ref: ref}} = t ->
+          %{t | data: %{t.data | ref: to_device(ref, dev)}}
+
+        %Nx.Tensor{} = t ->
+          Nx.backend_copy(t, {EMLX.Backend, device: dev})
       end
     end)
   end

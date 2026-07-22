@@ -47,6 +47,12 @@ ifeq ($(UNAME_S),Darwin)
     MLX_SO ?= $(MLX_LIB_DIR)/libmlx.dylib
     LDFLAGS += -undefined dynamic_lookup -flat_namespace -rpath @loader_path/mlx/lib
     LDFLAGS += -framework Metal -framework Foundation -framework Accelerate
+    # Match the precompiled libmlx deployment target so ld does not warn about
+    # linking a newer minos dylib (mlx-build Darwin variants).
+    ifneq ($(MACOSX_DEPLOYMENT_TARGET),)
+      CFLAGS += -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
+      LDFLAGS += -mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
+    endif
 		MAKE_DEFAULT_JOBS = $(shell sysctl -n hw.ncpu)
 else
     MLX_SO ?= $(MLX_LIB_DIR)/libmlx.so

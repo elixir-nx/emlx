@@ -3,8 +3,13 @@ defmodule EMLX.MixProject do
 
   @app :emlx
   @version "0.4.0"
-  @mlx_version "0.31.2"
+  @mlx_version "0.32.0"
   @source_url "https://github.com/elixir-nx/emlx"
+  # mlx-build Darwin archives from v0.31.0+ encode the deployment target in the
+  # filename. 26.2 ships AOT NAX (Metal 4); 14.0 is the portable reduced set.
+  @macos_deployment_target_latest "26.2"
+  @macos_deployment_target_compat "14.0"
+  @macos_deployment_targets [@macos_deployment_target_compat, @macos_deployment_target_latest]
 
   require Logger
 
@@ -41,7 +46,8 @@ defmodule EMLX.MixProject do
           "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
           "EMLX_VERSION" => @version,
           "LIBMLX_ENABLE_DEBUG" => to_string(libmlx_config.features.debug?),
-          "FINE_INCLUDE_DIR" => Fine.include_dir()
+          "FINE_INCLUDE_DIR" => Fine.include_dir(),
+          "MACOSX_DEPLOYMENT_TARGET" => libmlx_config.macos_deployment_target
         }
       end,
 
@@ -70,7 +76,7 @@ defmodule EMLX.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       {:fine, "~> 0.1", runtime: false},
-      {:nx, "~> 0.12"},
+      {:nx, "~> 0.12.0"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
@@ -219,9 +225,16 @@ defmodule EMLX.MixProject do
       build?: to_boolean(System.get_env("LIBMLX_BUILD"))
     }
 
-    variant = to_variant(features)
-
     current_target = current_target!()
+
+    macos_deployment_target =
+      unless features.build? do
+        resolve_macos_deployment_target(current_target)
+      end
+
+    # Deployment target is a Darwin archive-name segment (mlx-build), not a
+    # sorted feature flag — keep it ahead of `-debug`/`-jit`.
+    variant = to_variant(features, macos_deployment_target)
 
     cache_dir =
       if dir = System.get_env("LIBMLX_CACHE") do
@@ -259,6 +272,7 @@ defmodule EMLX.MixProject do
       dir: Path.join(cache_dir, "libmlx-#{version}-#{current_target}#{variant}"),
       features: features,
       variant: variant,
+      macos_deployment_target: macos_deployment_target,
       cache_dir: cache_dir
     }
   end
@@ -269,17 +283,123 @@ defmodule EMLX.MixProject do
     String.downcase(to_string(var)) in ["1", "true", "on", "yes", "y"]
   end
 
-  defp to_variant(features) do
-    [
-      if(features.build?, do: "build", else: nil),
-      if(features.debug?, do: "debug", else: nil),
-      if(features.jit?, do: "jit", else: nil)
-    ]
-    |> Enum.filter(&(&1 != nil))
-    |> Enum.sort()
-    |> Enum.map(&"-#{&1}")
-    |> Enum.join("")
+  defp to_variant(features, macos_deployment_target) do
+    feature_variant =
+      [
+        if(features.build?, do: "build"),
+        if(features.debug?, do: "debug"),
+        if(features.jit?, do: "jit")
+      ]
+      |> Enum.filter(&(&1 != nil))
+      |> Enum.sort()
+      |> Enum.join("-")
+
+    feature_variant = if feature_variant != "", do: "-#{feature_variant}", else: ""
+
+    case macos_deployment_target do
+      nil -> feature_variant
+      deployment_target -> "-#{deployment_target}#{feature_variant}"
+    end
   end
+
+  defp resolve_macos_deployment_target(target) do
+    if String.contains?(target, "apple-darwin") do
+      selected = selected_macos_deployment_target()
+      assert_macos_deployment_target_compatible!(selected)
+      selected
+    end
+  end
+
+  defp selected_macos_deployment_target do
+    case System.get_env("LIBMLX_DEPLOYMENT_TARGET") do
+      nil ->
+        if to_boolean(System.get_env("LIBMLX_MACOS_COMPAT")) do
+          @macos_deployment_target_compat
+        else
+          @macos_deployment_target_latest
+        end
+
+      target when target in @macos_deployment_targets ->
+        target
+
+      other ->
+        Mix.raise("""
+        Invalid LIBMLX_DEPLOYMENT_TARGET=#{inspect(other)}.
+
+        Supported values: #{Enum.join(@macos_deployment_targets, ", ")}.
+
+        Use #{@macos_deployment_target_latest} (default) for the full macOS feature set \
+        including AOT NAX kernels, or #{@macos_deployment_target_compat} / \
+        LIBMLX_MACOS_COMPAT=true for the reduced-featureset build that runs on macOS 14+.
+        """)
+    end
+  end
+
+  defp assert_macos_deployment_target_compatible!(deployment_target) do
+    # Cross-compiling via TARGET_* — host sw_vers is not the runtime OS.
+    if current_target_from_env() do
+      :ok
+    else
+      case macos_product_version() do
+        nil ->
+          :ok
+
+        host_version ->
+          min_version = parse_dotted_version!(deployment_target)
+
+          if version_lt?(host_version, min_version) do
+            Mix.raise("""
+            Precompiled libmlx for macOS deployment target #{deployment_target} cannot run \
+            on this host (macOS #{format_dotted_version(host_version)}).
+
+            This is the failure mode behind https://github.com/elixir-nx/emlx/issues/127 \
+            (VM crash: mutex lock failed).
+
+            For macOS 15 and other hosts older than #{@macos_deployment_target_latest}, use \
+            the reduced-featureset archive:
+
+                export LIBMLX_MACOS_COMPAT=true
+
+            or set LIBMLX_DEPLOYMENT_TARGET=#{@macos_deployment_target_compat} explicitly.
+            """)
+          else
+            :ok
+          end
+      end
+    end
+  end
+
+  defp macos_product_version do
+    case :os.type() do
+      {:unix, :darwin} ->
+        case System.cmd("sw_vers", ["-productVersion"], stderr_to_stdout: true) do
+          {version, 0} -> parse_dotted_version!(String.trim(version))
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp parse_dotted_version!(version) do
+    case String.split(version, ".", trim: true) do
+      [major, minor | _rest] ->
+        {String.to_integer(major), String.to_integer(minor)}
+
+      [major] ->
+        {String.to_integer(major), 0}
+    end
+  rescue
+    ArgumentError ->
+      Mix.raise("Could not parse macOS version #{inspect(version)}")
+  end
+
+  defp version_lt?({maj_a, min_a}, {maj_b, min_b}) do
+    maj_a < maj_b or (maj_a == maj_b and min_a < min_b)
+  end
+
+  defp format_dotted_version({major, minor}), do: "#{major}.#{minor}"
 
   defp download_and_unarchive(args) do
     libmlx_config = libmlx_config()
