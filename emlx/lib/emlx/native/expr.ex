@@ -28,7 +28,10 @@ defmodule EMLX.Native.Expr do
   @type node_ref :: reference()
   @type runtime_call :: %{
           index: non_neg_integer(),
-          callback: (Nx.Container.t(), keyword() -> Nx.Container.t()),
+          # `:runtime_call` — arity-2 `(args, opts) -> result`.
+          # `:io_call` — arity-1 `(args) -> any` side effect (return ignored).
+          kind: :runtime_call | :io_call,
+          callback: function(),
           args_template: Nx.Container.t(),
           arg_param_positions: [non_neg_integer() | nil],
           opts: keyword()
@@ -39,23 +42,9 @@ defmodule EMLX.Native.Expr do
           constants: [{node_ref(), number(), Nx.Type.t()}],
           instructions: [{node_ref(), atom(), [node_ref()], [integer()]}],
           outputs: [node_ref()],
-          # Hooks (`:token`/`:attach_token`) lower to inline `:runtime_call`s
-          # (see the `:token` clause of `expand_node/2`) chained through a
-          # single running "keepalive" ref per program: each hook's runtime
-          # call both fires the real Elixir side effect *and* threads a
-          # scalar forward, so (a) MLX's lazy evaluator is forced to actually
-          # run a hook whose value would otherwise be unreferenced by the
-          # real output (matching a hook's own token/attach_token becoming
-          # reachable, without needing that specific hook's value to be),
-          # and (b) hooks that aren't already ordered by a genuine data
-          # dependency still fire in declaration order, without relying on
-          # unspecified scheduling order between independent primitives.
-          # `keepalive_refs` holds the *final* tip of that chain (0 or 1
-          # refs) -- appended to `outputs` on the wire (see `to_native/1`,
-          # which also records the real/keepalive boundary in
-          # `EMLX.Native.Program.num_real_outputs`) and dropped natively by
-          # `eval_program` before it returns (the real firing already
-          # happened inline, during evaluation) -- Elixir never sees it.
+          # Always empty now — kept on the struct so `to_native/1`'s
+          # `outputs ++ keepalive_refs` / `num_real_outputs` wire shape stays
+          # stable. Hooks/io_calls alias inputs to outputs instead.
           keepalive_refs: [node_ref()],
           runtime_calls: [runtime_call()]
         }
@@ -79,8 +68,6 @@ defmodule EMLX.Native.Expr do
       quant_signature: quant_signature,
       while_nesting_depth: 0,
       stable_positions: %{},
-      hook_chain_ref: nil,
-      hooked_value_refs: %{},
       refcounts: compute_refcounts(ordered)
     }
 
@@ -127,7 +114,7 @@ defmodule EMLX.Native.Expr do
       constants: Enum.reverse(state.constants),
       instructions: Enum.reverse(state.instructions),
       outputs: output_refs,
-      keepalive_refs: List.wrap(state.hook_chain_ref),
+      keepalive_refs: [],
       runtime_calls: Enum.reverse(state.runtime_calls)
     }
   end
@@ -1993,64 +1980,65 @@ defmodule EMLX.Native.Expr do
 
   defp expand_node(%T{data: %Nx.Defn.Expr{op: :fun}}, state), do: state
 
-  # A hook lowers to an inline `:runtime_call` (see `emit_hook_runtime_call/3`)
-  # instead of the old "extra program output fired once after the whole
-  # compiled program returns" scheme: that older scheme couldn't represent
-  # "once per iteration" inside a native `:while`, which is exactly why
-  # `native_eligible_node?/1` used to reject `:token` outright. Firing inline
-  # gets per-iteration semantics for free (same mechanism validated for
-  # `:runtime_call` generally -- see `EMLXRuntimeCall`'s moduledoc in
-  # emlx/compiler.cpp), and each hook's runtime call also threads a
-  # `hook_chain_ref` scalar through `state`: this is what still makes a hook
-  # fire even when *this specific token's* hook value has no other consumer
-  # (matching Evaluator's "the token, not the individual hook expr, is what
-  # attach_token makes reachable" semantics -- see `Nx.Defn.Kernel.hook/3`'s
-  # doc), and forces a deterministic firing order between hooks that aren't
-  # already ordered by a genuine data dependency (MLX's own execution order
-  # for independent primitives is not a documented guarantee). See
-  # `EMLX.Native.Expr.t/0`'s `keepalive_refs` doc for where the final tip of
-  # this chain ends up.
+  # `:hook` (Nx 0.13) and `:io_call` (nx main) share one lowering: an inline
+  # `:io_call` instruction on the same `EMLXRuntimeCall` bridge as
+  # `:runtime_call`, with `alias_inputs` so outputs are zero-copy aliases of
+  # the trailing operands (callback is side-effect-only). See
+  # `emit_io_call_refs/5`.
   defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}},
+         %T{
+           data: %Nx.Defn.Expr{
+             id: id,
+             op: op,
+             args: [tensor_expr, callback_spec, _template, _ref]
+           }
+         },
          state
-       ) do
+       )
+       when op in [:hook, :io_call] do
     unless MapSet.member?(state.top_scope_ids, id) do
       raise ArgumentError,
-            "cannot lower a hook nested inside a cond branch: EMLX's cond compiles by " <>
+            "cannot lower a #{op} nested inside a cond branch: EMLX's cond compiles by " <>
               "evaluating every branch unconditionally (:select), which would fire this " <>
-              "hook on every call regardless of which branch is actually taken -- a " <>
+              "#{op} on every call regardless of which branch is actually taken -- a " <>
               "behavior divergence from Nx.Defn.Evaluator (which only fires the selected " <>
-              "branch's hook). Move the hook outside the cond."
+              "branch's #{op}). Move the #{op} outside the cond."
     end
 
-    # `token.hooks` stores the most-recently-declared hook at the head (see
-    # Nx.Defn.Token's moduledoc) -- reverse to chain them in true declaration
-    # order.
-    Enum.reduce(Enum.reverse(hooks), state, fn
-      %{callback: nil}, state ->
-        state
+    case callback_spec do
+      {:named, _name, nil} ->
+        %{
+          state
+          | node_to_ref: Map.put(state.node_to_ref, id, container_node_ref(tensor_expr, state))
+        }
 
-      %{callback: callback, expr: expr}, state ->
-        emit_hook_runtime_call(expr, callback, state)
-    end)
-  end
+      {:token_hook, hooked_expr, inner_spec} ->
+        # Prefix hooked leaves as callback-only operands; trailing tensor
+        # leaves are aliased to this node's outputs so evaluating the
+        # pass-through forces the side effect (no keepalive chain).
+        case hook_callback(inner_spec) do
+          nil ->
+            %{
+              state
+              | node_to_ref:
+                  Map.put(state.node_to_ref, id, container_node_ref(tensor_expr, state))
+            }
 
-  # Resolves to the hooked (post-side-effect) value when `expr` is one of
-  # *this* token's own hooked expressions -- see `emit_hook_runtime_call/3`'s
-  # `hooked_value_refs` doc -- falling back to the plain ref otherwise (a
-  # name-only hook with no callback, or `attach_token` wrapping something
-  # that isn't itself hooked).
-  defp expand_node(
-         %T{data: %Nx.Defn.Expr{id: id, op: :attach_token, args: [_token, expr]}},
-         state
-       ) do
-    ref =
-      case Map.fetch(state.hooked_value_refs, expr.data.id) do
-        {:ok, hooked_ref} -> hooked_ref
-        :error -> Map.fetch!(state.node_to_ref, expr.data.id)
-      end
+          callback ->
+            {value_ref, state} =
+              emit_io_call_refs(hooked_expr, tensor_expr, callback, state)
 
-    %{state | node_to_ref: Map.put(state.node_to_ref, id, ref)}
+            %{state | node_to_ref: Map.put(state.node_to_ref, id, value_ref)}
+        end
+
+      spec ->
+        callback =
+          hook_callback(spec) ||
+            raise ArgumentError, "invalid #{op} callback_spec: #{inspect(spec)}"
+
+        {value_ref, state} = emit_io_call_refs(nil, tensor_expr, callback, state)
+        %{state | node_to_ref: Map.put(state.node_to_ref, id, value_ref)}
+    end
   end
 
   defp expand_node(
@@ -2160,15 +2148,9 @@ defmodule EMLX.Native.Expr do
 
   # Emits one `:runtime_call` instruction from already-resolved operand refs
   # (as opposed to the `:runtime_call` op's own `expand_node` clause, which
-  # additionally has to resolve those refs from a real `Nx.Defn.Expr` --
-  # `emit_hook_runtime_call/3` builds its operands from a hook's `expr`
-  # instead). Shared so both call sites stay byte-for-byte identical in how
-  # they build the wire `attrs`/`runtime_call` map. Always returns a *list*
-  # of result refs (even for a single output) -- safe for the instruction's
-  # own result identifier (`register_result_refs/3` treats a 1-element list
-  # the same as a bare ref), but callers that need `node_to_ref` to hold a
-  # bare ref for a bare-tensor output must unwrap it themselves (see the
-  # `:runtime_call` clause above).
+  # additionally has to resolve those refs from a real `Nx.Defn.Expr`).
+  # Always returns a *list* of result refs — callers that need `node_to_ref`
+  # to hold a bare ref for a bare-tensor output must unwrap it themselves.
   defp emit_runtime_call_refs(
          operand_refs,
          arg_param_positions,
@@ -2178,6 +2160,33 @@ defmodule EMLX.Native.Expr do
          output_templates,
          state
        ) do
+    emit_bridge_call_refs(
+      :runtime_call,
+      operand_refs,
+      arg_param_positions,
+      args_template,
+      callback,
+      opts,
+      output_templates,
+      state
+    )
+  end
+
+  # Shared wire builder for `:runtime_call` and `:io_call` — same attrs shape
+  # (`[callback_index, n_outputs, dtype/shape...]`); the opcode selects
+  # whether `EMLXRuntimeCall` aliases inputs (io_call) or expects returned
+  # binaries (runtime_call).
+  defp emit_bridge_call_refs(
+         kind,
+         operand_refs,
+         arg_param_positions,
+         args_template,
+         callback,
+         opts,
+         output_templates,
+         state
+       )
+       when kind in [:runtime_call, :io_call] do
     callback_index = length(state.runtime_calls)
 
     attrs =
@@ -2190,6 +2199,7 @@ defmodule EMLX.Native.Expr do
 
     runtime_call = %{
       index: callback_index,
+      kind: kind,
       callback: callback,
       args_template: args_template,
       arg_param_positions: arg_param_positions,
@@ -2200,11 +2210,61 @@ defmodule EMLX.Native.Expr do
 
     state = %{
       state
-      | instructions: [{result_refs, :runtime_call, operand_refs, attrs} | state.instructions],
+      | instructions: [{result_refs, kind, operand_refs, attrs} | state.instructions],
         runtime_calls: [runtime_call | state.runtime_calls]
     }
 
     {result_refs, state}
+  end
+
+  # Emits an `:io_call` instruction. `callback_expr` (optional) is prefixed
+  # as callback-only operands; `passthrough_expr` leaves are aliased to the
+  # outputs. When `callback_expr` is nil, passthrough leaves are both sent
+  # to the callback and aliased (modern hook/io_call).
+  defp emit_io_call_refs(callback_expr, passthrough_expr, callback, state) do
+    {cb_refs, cb_positions, cb_template} =
+      case callback_expr do
+        nil ->
+          {[], [], nil}
+
+        expr ->
+          leaves = Composite.flatten_list([expr])
+
+          {Enum.map(leaves, &Map.fetch!(state.node_to_ref, &1.data.id)),
+           Enum.map(leaves, &Map.get(state.stable_positions, &1.data.id)),
+           Composite.traverse(expr, &Nx.to_template/1)}
+      end
+
+    pt_leaves = Composite.flatten_list([passthrough_expr])
+    pt_refs = Enum.map(pt_leaves, &Map.fetch!(state.node_to_ref, &1.data.id))
+    pt_positions = Enum.map(pt_leaves, &Map.get(state.stable_positions, &1.data.id))
+    pt_template = Composite.traverse(passthrough_expr, &Nx.to_template/1)
+
+    {args_template, arg_positions} =
+      if cb_template do
+        {cb_template, cb_positions}
+      else
+        {pt_template, pt_positions}
+      end
+
+    output_templates = Composite.flatten_list([pt_template])
+
+    {result_refs, state} =
+      emit_bridge_call_refs(
+        :io_call,
+        cb_refs ++ pt_refs,
+        # positions only matter for the binaries Elixir reconstructs
+        # (callback args); pad/truncate to match args_template leaves.
+        arg_positions,
+        args_template,
+        callback,
+        [],
+        output_templates,
+        state
+      )
+
+    value_ref = if match?([_], result_refs), do: hd(result_refs), else: result_refs
+    {value_ref, state}
   end
 
   # Sibling of `emit_runtime_call_refs/7` for the `:__emlx_native_multi_op__`
@@ -2227,81 +2287,18 @@ defmodule EMLX.Native.Expr do
     {result_refs, state}
   end
 
-  # Emits a scalar (shape `{}`) constant, mirroring the `:constant` op's own
-  # shape-`{}` case (see that `expand_node/2` clause) -- used to seed the
-  # hook keepalive chain (see `emit_hook_runtime_call/3`) when there's no
-  # earlier hook in the current scope to chain from.
-  defp emit_scalar_constant(number, type, state) do
-    ref = make_ref()
-    {ref, %{state | constants: [{ref, number, type} | state.constants]}}
-  end
+  defp hook_callback({:fn, callback}) when is_function(callback, 1), do: callback
+  defp hook_callback({:named, _name, callback}) when is_function(callback, 1), do: callback
+  defp hook_callback({:named, _name, nil}), do: nil
+  defp hook_callback({:token_hook, _hooked_expr, inner_spec}), do: hook_callback(inner_spec)
+  defp hook_callback(_), do: nil
 
-  @hook_chain_type {:u, 32}
-
-  # Converts one hook (`%{expr: ..., callback: ...}` from a `:token` node's
-  # hook list) into an inline `:runtime_call`. The callback's *real* job
-  # (calling the user's function for its side effect) is wrapped in a
-  # closure that also passes the value through unchanged and advances the
-  # keepalive chain -- see `EMLX.Native.Expr.t/0`'s `keepalive_refs` doc for
-  # why the chain exists at all.
-  #
-  # `state.hooked_value_refs` (id of the *hooked* leaf -> its post-side-effect
-  # ref) is separate from `state.node_to_ref` -- deliberately: `expr`'s own
-  # `node_to_ref` entry (already computed by ordinary `expand_node`
-  # processing before this `:token` node is reached) must be left untouched,
-  # since some *other*, non-hooked use of the same underlying value elsewhere
-  # in the graph must not be delayed behind this hook's side effect. Only
-  # `:attach_token`'s own clause consults `hooked_value_refs`, which is
-  # exactly the one place Nx's semantics say the hooked identity should be
-  # visible.
-  defp emit_hook_runtime_call(hook_expr, callback, state) do
-    leaves = Composite.flatten_list([hook_expr])
-    leaf_refs = Enum.map(leaves, &Map.fetch!(state.node_to_ref, &1.data.id))
-    leaf_positions = Enum.map(leaves, &Map.get(state.stable_positions, &1.data.id))
-    hook_template = Composite.traverse(hook_expr, &Nx.to_template/1)
-    chain_template = Nx.template({}, @hook_chain_type)
-
-    {chain_in_ref, state} =
-      case state.hook_chain_ref do
-        nil -> emit_scalar_constant(0, @hook_chain_type, state)
-        ref -> {ref, state}
-      end
-
-    args_template = {hook_template, chain_template}
-    output_templates = Composite.flatten_list([args_template])
-
-    wrapped_callback = fn {value, chain_in}, _opts ->
-      callback.(value)
-      # Keep the keepalive counter on BinaryBackend. `Nx.to_tensor(1)` would
-      # otherwise allocate an EMLX scalar on whichever worker
-      # `resolve_worker/1` picks inside the runtime_call callback (often a
-      # different OS thread than the one that owns Stream(cpu, 0)), and
-      # MLX 0.32's thread-local CPU encoders then fail at `to_binary`.
-      one = Nx.tensor(1, type: @hook_chain_type, backend: Nx.BinaryBackend)
-      {value, Nx.add(chain_in, one)}
-    end
-
-    {result_refs, state} =
-      emit_runtime_call_refs(
-        leaf_refs ++ [chain_in_ref],
-        leaf_positions ++ [nil],
-        args_template,
-        wrapped_callback,
-        [],
-        output_templates,
-        state
-      )
-
-    {value_refs, [chain_out_ref]} = Enum.split(result_refs, length(result_refs) - 1)
-
-    hooked_value_refs =
-      leaves
-      |> Enum.zip(value_refs)
-      |> Enum.reduce(state.hooked_value_refs, fn {leaf, ref}, acc ->
-        Map.put(acc, leaf.data.id, ref)
-      end)
-
-    %{state | hook_chain_ref: chain_out_ref, hooked_value_refs: hooked_value_refs}
+  # Flat leaf refs for a tensor/container already lowered into `node_to_ref`
+  # -- single leaf unwraps to a bare ref (matching `:runtime_call` /
+  # `:elem` conventions).
+  defp container_node_ref(expr, state) do
+    refs = Enum.map(Composite.flatten_list([expr]), &Map.fetch!(state.node_to_ref, &1.data.id))
+    if match?([_], refs), do: hd(refs), else: refs
   end
 
   @doc false
@@ -2627,9 +2624,7 @@ defmodule EMLX.Native.Expr do
          captures: inner_state.captures,
          constants: inner_state.constants,
          inputs: inner_state.inputs,
-         runtime_calls: inner_state.runtime_calls,
-         hook_chain_ref: inner_state.hook_chain_ref,
-         hooked_value_refs: inner_state.hooked_value_refs
+         runtime_calls: inner_state.runtime_calls
      }}
   end
 
@@ -2645,9 +2640,9 @@ defmodule EMLX.Native.Expr do
   # inside one `eval_program` NIF call.
 
   # A `:while` loop is native-lowerable unconditionally now: `:runtime_call`
-  # and `:token`/hooks (which lower to an inline `:runtime_call`, see
-  # `emit_hook_runtime_call/3`) are both native-eligible inside a while's
-  # condition/body -- see `native_eligible_node?/1`. `native_while_eligible?/2`
+  # and `:hook`/`:io_call` (inline aliased `:io_call` instructions) are both
+  # native-eligible inside a while's condition/body -- see
+  # `native_eligible_node?/1`. `native_while_eligible?/2`
   # is kept as an explicit, named check (rather than inlining `true`) so
   # `EMLX.ex`'s `split_point?/1` has a single shared source of truth to call,
   # in case a future node type needs to reintroduce a real restriction here.
@@ -2686,13 +2681,12 @@ defmodule EMLX.Native.Expr do
   # while-inside-while nesting -- see `EMLXWhile`'s moduledoc comment in
   # emlx/compiler.cpp). See `propagate_stable_carry_positions/4` for how a
   # `:runtime_call` operand recovers its true top-level position when it's a
-  # `while`-carried value instead of a direct top-level parameter. `:token`
-  # (hooks) lowers to an inline `:runtime_call` too (see
-  # `emit_hook_runtime_call/3`), same per-iteration semantics -- the only
-  # remaining restriction is structural, not eligibility-based: a hook whose
-  # value isn't already the condition's own boolean result can't sit inside
-  # a `:while` *condition* (fixed at exactly one output -- see
-  # `expand_while_native/6`'s keepalive-widening raise).
+  # `while`-carried value instead of a direct top-level parameter. `:hook` /
+  # `:io_call` lower to an inline aliased `:io_call`, same per-iteration
+  # semantics -- the only remaining restriction is structural, not
+  # eligibility-based: a hook whose value isn't already the condition's own
+  # boolean result can't sit inside a `:while` *condition* (fixed at exactly
+  # one output) unless that hook *is* the condition root.
   defp native_eligible_node?(%T{}), do: true
 
   # Defensive cap on lexical `:while`-inside-`:while` nesting depth: each
@@ -2728,108 +2722,34 @@ defmodule EMLX.Native.Expr do
     stable_positions =
       propagate_stable_carry_positions(arg_list, body_list, initial_list, state.stable_positions)
 
-    # A hook inside cond/body needs its own scope-local keepalive chain (see
-    # `EMLX.Native.Expr.t/0`'s `keepalive_refs` doc) -- `Nx.Defn.while`'s
-    # closure rules mean cond/body can't reference anything outside their own
-    # carry/captures/constants (enforced structurally: a sub-program's own
-    # `{:result, i}` numbering is local, see `to_native_subprogram/3`), so an
-    # *ambient* chain from outside this `:while` can't simply be read inside
-    # -- it has to come in as one more (fixed-width, invariant-shape) carry
-    # slot instead, exactly like any other loop-invariant value threaded
-    # through untouched. Only paid for when a hook is actually present.
-    needs_keepalive? = while_scope_contains_hook?(condition) or while_scope_contains_hook?(body)
-
-    {keepalive_seed, init_refs, sub_carry_refs, state} =
-      if needs_keepalive? do
-        {seed_ref, state} =
-          case state.hook_chain_ref do
-            nil -> emit_scalar_constant(0, @hook_chain_type, state)
-            ref -> {ref, state}
-          end
-
-        keepalive_carry_ref = make_ref()
-        {keepalive_carry_ref, init_refs ++ [seed_ref], carry_refs ++ [keepalive_carry_ref], state}
-      else
-        {nil, init_refs, carry_refs, state}
-      end
-
     nested_state = %{
       state
       | while_nesting_depth: depth + 1,
-        stable_positions: stable_positions,
-        hook_chain_ref: keepalive_seed,
-        hooked_value_refs: %{}
+        stable_positions: stable_positions
     }
 
     {cond_sub, state} =
-      lower_while_subprogram([condition], sub_carry_refs, param_ref_by_pos, nested_state)
-
-    if cond_sub.hook_chain_ref != keepalive_seed do
-      raise ArgumentError,
-            "cannot lower a hook inside a :while condition unless its value is exactly the " <>
-              "condition's own boolean result -- EMLXWhile's condition sub-program is fixed " <>
-              "at exactly one output (see EMLXWhile::evaluate_predicate in " <>
-              "emlx/compiler.cpp), so there is no way to force evaluation of a hook whose " <>
-              "value the returned boolean doesn't already depend on. Move the hook into the " <>
-              "while's body instead."
-    end
+      lower_while_subprogram([condition], carry_refs, param_ref_by_pos, nested_state)
 
     {body_sub, state} =
-      lower_while_subprogram(body_list, sub_carry_refs, param_ref_by_pos, %{
+      lower_while_subprogram(body_list, carry_refs, param_ref_by_pos, %{
         state
         | while_nesting_depth: depth + 1,
-          stable_positions: stable_positions,
-          hook_chain_ref: keepalive_seed,
-          hooked_value_refs: %{}
+          stable_positions: stable_positions
       })
 
     state = %{state | while_nesting_depth: depth}
 
-    body_sub =
-      if needs_keepalive? do
-        %{body_sub | outputs: body_sub.outputs ++ [body_sub.hook_chain_ref]}
-      else
-        body_sub
-      end
-
     result_refs = Enum.map(init_refs, fn _ -> make_ref() end)
-
-    {real_result_refs, outer_chain_ref} =
-      if needs_keepalive? do
-        {real_refs, [chain_ref]} = Enum.split(result_refs, length(result_refs) - 1)
-        {real_refs, chain_ref}
-      else
-        {result_refs, nil}
-      end
-
-    result_id = if match?([_], real_result_refs), do: hd(real_result_refs), else: real_result_refs
+    result_id = if match?([_], result_refs), do: hd(result_refs), else: result_refs
 
     instr = {result_refs, :while, init_refs, [], [cond_sub, body_sub]}
 
     %{
       state
       | instructions: [instr | state.instructions],
-        node_to_ref: Map.put(state.node_to_ref, id, result_id),
-        hook_chain_ref: outer_chain_ref
+        node_to_ref: Map.put(state.node_to_ref, id, result_id)
     }
-  end
-
-  # Cheap pre-scan (separate from `native_eligible_node?`'s own traversal,
-  # since we need this decided *before* lowering starts, to size the carry --
-  # see `expand_while_native/6`) for whether a `:while` scope needs the extra
-  # keepalive carry slot at all. A name-only hook (nil callback) never emits
-  # a runtime_call (see `emit_hook_runtime_call/3`'s caller), so it doesn't
-  # count.
-  defp while_scope_contains_hook?(container) do
-    container
-    |> EMLX.Defn.Tree.post_order(&scope_dependencies/1)
-    |> Enum.any?(fn
-      %T{data: %Nx.Defn.Expr{op: :token, args: [%Nx.Defn.Token{hooks: hooks}]}} ->
-        Enum.any?(hooks, &(&1.callback != nil))
-
-      _ ->
-        false
-    end)
   end
 
   defp while_leaf_list(container) when is_tuple(container), do: Tuple.to_list(container)
@@ -2910,8 +2830,7 @@ defmodule EMLX.Native.Expr do
     sub_program = %{
       carry_refs: carry_refs,
       instructions: Enum.reverse(inner_state.instructions),
-      outputs: output_refs,
-      hook_chain_ref: inner_state.hook_chain_ref
+      outputs: output_refs
     }
 
     {sub_program,
@@ -3016,9 +2935,7 @@ defmodule EMLX.Native.Expr do
          captures: inner_state.captures,
          constants: inner_state.constants,
          inputs: inner_state.inputs,
-         runtime_calls: inner_state.runtime_calls,
-         hook_chain_ref: inner_state.hook_chain_ref,
-         hooked_value_refs: inner_state.hooked_value_refs
+         runtime_calls: inner_state.runtime_calls
      }}
   end
 

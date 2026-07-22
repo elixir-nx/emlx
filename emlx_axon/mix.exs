@@ -42,6 +42,8 @@ defmodule EMLXAxon.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       emlx_dep(),
+      # Bumblebee still requires nx ~> 0.12.0; override until it allows 0.13.
+      {:nx, "~> 0.13.0", override: true},
       {:axon, "~> 0.7"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}
