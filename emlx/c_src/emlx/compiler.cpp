@@ -1851,8 +1851,14 @@ private:
 
 class EMLXRuntimeCall : public mlx::core::Primitive {
 public:
-  EMLXRuntimeCall(mlx::core::Stream stream, int64_t callback_index)
-      : mlx::core::Primitive(stream), callback_index_(callback_index) {}
+  // `alias_inputs` distinguishes `Nx.runtime_call` (callback returns new
+  // tensors written into freshly allocated outputs) from `Nx.io_call` /
+  // hooks (callback is side-effect-only; outputs alias the trailing
+  // inputs — see invoke_runtime_call's alias mode).
+  EMLXRuntimeCall(mlx::core::Stream stream, int64_t callback_index,
+                  bool alias_inputs)
+      : mlx::core::Primitive(stream), callback_index_(callback_index),
+        alias_inputs_(alias_inputs) {}
 
   void eval_cpu(const std::vector<mlx::core::array> &inputs,
                 std::vector<mlx::core::array> &outputs) override {
@@ -1870,16 +1876,58 @@ public:
     return false;
   }
 
-  const char *name() const override { return "EMLXRuntimeCall"; }
+  const char *name() const override {
+    return alias_inputs_ ? "EMLXIOCall" : "EMLXRuntimeCall";
+  }
 
 private:
   void eval(const std::vector<mlx::core::array> &inputs,
             std::vector<mlx::core::array> &outputs) {
-    emlx::native::invoke_runtime_call(callback_index_, inputs, outputs);
+    emlx::native::invoke_runtime_call(callback_index_, inputs, outputs,
+                                      alias_inputs_);
   }
 
   int64_t callback_index_;
+  bool alias_inputs_;
 };
+
+static std::vector<mlx::core::array>
+make_runtime_or_io_call(const std::vector<mlx::core::array> &ops,
+                        const std::vector<Attr> &attrs, bool alias_inputs) {
+  size_t off = 0;
+  int64_t callback_index = attrs[off++];
+  int64_t n_outputs = attrs[off++];
+
+  std::vector<mlx::core::Shape> shapes;
+  std::vector<mlx::core::Dtype> dtypes;
+  shapes.reserve(static_cast<size_t>(n_outputs));
+  dtypes.reserve(static_cast<size_t>(n_outputs));
+
+  for (int64_t i = 0; i < n_outputs; i++) {
+    dtypes.push_back(attrs[off++].as_dtype());
+    int64_t n_dims = attrs[off++];
+    std::vector<int> dims(static_cast<size_t>(n_dims));
+    for (int64_t d = 0; d < n_dims; d++) {
+      dims[static_cast<size_t>(d)] = static_cast<int>(attrs[off++]);
+    }
+    shapes.push_back(to_shape(dims));
+  }
+
+  // Pinned to the CPU stream (like the linalg factorizations above),
+  // regardless of the compiled graph's default device. eval_gpu is
+  // never actually reached this way: the primitive does no Metal work
+  // of its own (it only blocks the worker thread on the Elixir
+  // round-trip — and for runtime_call, memcpy's the reply into the
+  // output buffer), and running it under mlx::core::gpu::eval's Metal
+  // command-buffer bookkeeping segfaults — see
+  // workdir/native-compiler/32a for details. MLX handles the
+  // cross-stream data dependencies (GPU operand arrays feeding a
+  // CPU-pinned primitive, and vice versa) the same way it does for the
+  // linalg ops.
+  auto primitive = std::make_shared<EMLXRuntimeCall>(
+      mlx::core::default_stream(k_linalg_cpu), callback_index, alias_inputs);
+  return mlx::core::array::make_arrays(shapes, dtypes, primitive, ops);
+}
 
 static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // runtime_call: operands = flattened callback-argument leaves, in order.
@@ -1889,38 +1937,17 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // EMLXRuntimeCall primitive above (never eagerly computed here).
     {"runtime_call",
      [](const auto &ops, const auto &attrs) -> std::vector<mlx::core::array> {
-       size_t off = 0;
-       int64_t callback_index = attrs[off++];
-       int64_t n_outputs = attrs[off++];
+       return make_runtime_or_io_call(ops, attrs, /*alias_inputs=*/false);
+     }},
 
-       std::vector<mlx::core::Shape> shapes;
-       std::vector<mlx::core::Dtype> dtypes;
-       shapes.reserve(static_cast<size_t>(n_outputs));
-       dtypes.reserve(static_cast<size_t>(n_outputs));
-
-       for (int64_t i = 0; i < n_outputs; i++) {
-         dtypes.push_back(attrs[off++].as_dtype());
-         int64_t n_dims = attrs[off++];
-         std::vector<int> dims(static_cast<size_t>(n_dims));
-         for (int64_t d = 0; d < n_dims; d++) {
-           dims[static_cast<size_t>(d)] = static_cast<int>(attrs[off++]);
-         }
-         shapes.push_back(to_shape(dims));
-       }
-
-       // Pinned to the CPU stream (like the linalg factorizations above),
-       // regardless of the compiled graph's default device. eval_gpu is
-       // never actually reached this way: the primitive does no Metal work
-       // of its own (it only blocks the worker thread on the Elixir
-       // round-trip and memcpy's the reply into the output buffer), and
-       // running it under mlx::core::gpu::eval's Metal command-buffer
-       // bookkeeping segfaults — see workdir/native-compiler/32a for
-       // details. MLX handles the cross-stream data dependencies (GPU
-       // operand arrays feeding a CPU-pinned primitive, and vice versa)
-       // the same way it does for the linalg ops.
-       auto primitive = std::make_shared<EMLXRuntimeCall>(
-           mlx::core::default_stream(k_linalg_cpu), callback_index);
-       return mlx::core::array::make_arrays(shapes, dtypes, primitive, ops);
+    // io_call: same wire attrs / EMLXRuntimeCall primitive as runtime_call,
+    // but alias_inputs=true — Elixir fires a side-effect callback and
+    // replies with [], then outputs alias the trailing inputs (see
+    // invoke_runtime_call). operands may be longer than n_outputs when a
+    // deprecated token_hook prefixes callback-only hooked leaves.
+    {"io_call",
+     [](const auto &ops, const auto &attrs) -> std::vector<mlx::core::array> {
+       return make_runtime_or_io_call(ops, attrs, /*alias_inputs=*/true);
      }},
 
     // qr (reduced mode): operands = [a]; outputs = [q, r].
@@ -2347,7 +2374,7 @@ static void validate_and_resolve_instructions(
     if (op_registry.find(name) == op_registry.end() &&
         multi_op_registry.find(name) == multi_op_registry.end())
       throw std::runtime_error("emlx::native: unknown op \"" + name + "\"");
-    if (name == "runtime_call")
+    if (name == "runtime_call" || name == "io_call")
       has_runtime_call = true;
   }
 }

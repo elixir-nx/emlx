@@ -259,9 +259,7 @@ defmodule EMLX.Native.ExprTest do
   end
 
   # A hook inside an inner `while`'s body, itself nested inside an outer
-  # `while` -- exercises the keepalive chain threading through two levels
-  # of `EMLXWhile` nesting (each level gets its own scope-local chain, see
-  # `expand_while_native/6`'s moduledoc).
+  # `while` -- exercises aliased `:io_call` firing under nested EMLXWhile.
   defn hook_in_nested_while(a) do
     {result, _} =
       while {outer_acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
@@ -278,9 +276,8 @@ defmodule EMLX.Native.ExprTest do
   end
 
   # Two hooks per iteration, the second depending on the first's value --
-  # regression for the `hook_chain_ref` ordering mechanism (see this
-  # module's `expand_node/2` clause for `op: :token`): both must fire, in
-  # order, on every iteration, matching Evaluator.
+  # data dependence orders them (aliased `:io_call` outputs); both must
+  # fire, in order, on every iteration, matching Evaluator.
   defn two_hooks_in_while_body(a) do
     {result, _} =
       while {acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
@@ -3717,15 +3714,13 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  describe "hooks (token/attach_token, inline runtime_call design)" do
-    # `Nx.Defn.Kernel.hook/2,3` is fire-and-forget, not control flow (see
-    # `EMLX.Native.Expr`'s moduledoc "Hooks" section): each hook lowers to an
-    # inline `:runtime_call` (see `emit_hook_runtime_call/3`) that fires the
-    # callback host-side as a side effect of the NIF evaluating the tape --
-    # no separate post-eval pass and no `Nx.Defn.Graph.split` host round-trip
-    # needed, so hooks inside `while` bodies fire once per native iteration
-    # too (see the "hook_chain_ref" keepalive mechanism in
-    # `expand_while_native/6`).
+  describe "hooks (:hook/:io_call, aliased io_call design)" do
+    # `Nx.Defn.Kernel.hook/2,3` is fire-and-forget, not control flow: each
+    # hook lowers to an inline `:io_call` that aliases inputs to outputs and
+    # fires the callback host-side as a side effect of the NIF evaluating
+    # the tape -- no separate post-eval pass and no `Nx.Defn.Graph.split`
+    # host round-trip needed, so hooks inside `while` bodies fire once per
+    # native iteration too.
     test "top-level hook fires once with the correct value; result unaffected" do
       a = Nx.tensor(1, backend: EMLX.Backend)
       b = Nx.tensor(2, backend: EMLX.Backend)

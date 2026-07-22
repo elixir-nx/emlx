@@ -76,9 +76,16 @@ struct PendingRuntimeCall {
 // on any failure (no caller pid in scope, send failure, or a callback that
 // errored) — the caller (`eval_cpu`/`eval_gpu`, reached through
 // `eval_program`'s `CATCH()` macro) turns that into `{:error, _}`.
+// `alias_inputs`: when true this is an `Nx.io_call` / hook side-effect —
+// Elixir replies with an empty binary list and we alias the trailing
+// `outputs.size()` inputs onto the outputs (zero-copy passthrough). The
+// leading `inputs.size() - outputs.size()` inputs are callback-only (used
+// by deprecated `{:token_hook, ...}`); when `outputs.size() == inputs.size()`
+// every input is both sent to the callback and aliased (modern io_call).
 inline void invoke_runtime_call(int64_t callback_index,
                                 const std::vector<mlx::core::array> &inputs,
-                                std::vector<mlx::core::array> &outputs) {
+                                std::vector<mlx::core::array> &outputs,
+                                bool alias_inputs = false) {
   // `EMLXRuntimeCall` is pinned to its own dedicated `k_linalg_cpu` stream
   // (emlx/compiler.cpp), separate from whichever stream actually computed
   // each `inputs[i]` (e.g. the calling worker's own bound stream, for any
@@ -105,6 +112,11 @@ inline void invoke_runtime_call(int64_t callback_index,
   }
   ErlNifPid caller_pid = *g_current_caller_pid;
 
+  if (alias_inputs && outputs.size() > inputs.size()) {
+    throw std::runtime_error(
+        "emlx::native: io_call alias mode requires outputs.size() <= inputs.size()");
+  }
+
   auto *pending = static_cast<PendingRuntimeCall *>(enif_alloc_resource(
       resource_object<PendingRuntimeCall>::type, sizeof(PendingRuntimeCall)));
   if (pending == nullptr) {
@@ -113,13 +125,16 @@ inline void invoke_runtime_call(int64_t callback_index,
   }
   new (pending) PendingRuntimeCall();
 
-  // Pre-allocate every output buffer now so the destination pointers are
-  // stable before we hand the request to the Elixir side.
-  pending->outputs.reserve(outputs.size());
-  for (auto &out : outputs) {
-    out.set_data(mlx::core::allocator::malloc(out.nbytes()));
-    pending->outputs.emplace_back(out.data<uint8_t>(), out.nbytes());
+  if (!alias_inputs) {
+    // Pre-allocate every output buffer now so the destination pointers are
+    // stable before we hand the request to the Elixir side.
+    pending->outputs.reserve(outputs.size());
+    for (auto &out : outputs) {
+      out.set_data(mlx::core::allocator::malloc(out.nbytes()));
+      pending->outputs.emplace_back(out.data<uint8_t>(), out.nbytes());
+    }
   }
+  // alias_inputs: leave pending->outputs empty; Elixir replies :ok + [].
 
   ErlNifEnv *msg_env = enif_alloc_env();
   if (msg_env == nullptr) {
@@ -127,9 +142,19 @@ inline void invoke_runtime_call(int64_t callback_index,
     throw std::runtime_error("emlx::native: failed to allocate msg env for runtime_call");
   }
 
+  // How many leading inputs to send to Elixir:
+  //   runtime_call — all inputs (callback returns new tensors into outputs)
+  //   io_call      — all inputs when every input is also aliased to an output
+  //   token_hook   — only the prefix ahead of the aliased passthrough suffix
+  size_t n_callback_args = inputs.size();
+  if (alias_inputs && outputs.size() < inputs.size()) {
+    n_callback_args = inputs.size() - outputs.size();
+  }
+
   std::vector<ERL_NIF_TERM> arg_terms;
-  arg_terms.reserve(inputs.size());
-  for (const auto &in : inputs) {
+  arg_terms.reserve(n_callback_args);
+  for (size_t i = 0; i < n_callback_args; i++) {
+    const auto &in = inputs[i];
     size_t nbytes = in.nbytes();
     ErlNifBinary bin;
     if (!enif_alloc_binary(nbytes, &bin)) {
@@ -190,6 +215,13 @@ inline void invoke_runtime_call(int64_t callback_index,
   std::lock_guard<std::mutex> lock(pending->mu);
   if (!pending->ok) {
     throw std::runtime_error("emlx::native: runtime_call callback failed: " + pending->error);
+  }
+
+  if (alias_inputs) {
+    size_t passthrough_start = inputs.size() - outputs.size();
+    for (size_t i = passthrough_start; i < outputs.size(); i++) {
+      outputs[i].copy_shared_buffer(inputs[i]);
+    }
   }
 }
 

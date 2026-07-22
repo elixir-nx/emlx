@@ -1617,25 +1617,25 @@ defmodule EMLX do
   # see `EMLX.Native.Expr`'s moduledoc "Runtime calls" section and
   # `arg_param_positions`'s doc.
   #
-  # The real callback AND the result's `Nx.to_binary/1` conversion both run
-  # inside one `EMLX.CommandQueue.with_queue/2` bound to
+  # The real callback (and for `:runtime_call`, the result's
+  # `Nx.to_binary/1` conversion) both run inside one
+  # `EMLX.CommandQueue.with_queue/2` bound to
   # `EMLX.Application.runtime_call_worker(dev)` — see that function's doc
-  # for why: any eager EMLX call either makes (e.g.
-  # `EMLX.Quantization.dequantize_callback/2` calling `EMLX.dequantize/1`,
-  # or a hook's wrapped callback advancing its `hook_chain_ref` with
-  # `Nx.add/2` — see `emit_hook_runtime_call/3`) must never be routed back
-  # to the worker that is, right now, blocked inside
-  # `EMLXRuntimeCall::eval_cpu`/`eval_gpu` waiting for exactly this callback
-  # to return. `to_binary` is no exception: it may need to force an `eval`
-  # of a not-yet-materialised result (e.g. `Nx.add(chain_in, 1)`'s lazy sum),
-  # and that `eval` is itself an eager EMLX call subject to the same rule.
+  # for why: any eager EMLX call the callback makes (e.g.
+  # `EMLX.Quantization.dequantize_callback/2` calling `EMLX.dequantize/1`)
+  # must never be routed back to the worker that is, right now, blocked
+  # inside `EMLXRuntimeCall::eval_cpu`/`eval_gpu` waiting for exactly this
+  # callback to return.
   defp handle_runtime_call(pending, callback_index, args_binaries, runtime_calls, tensors, dev) do
     %{
       callback: callback,
       args_template: args_template,
       arg_param_positions: positions,
       opts: opts
-    } = Enum.at(runtime_calls, callback_index)
+    } = entry = Enum.at(runtime_calls, callback_index)
+
+    # Pre-`kind` entries (and any map missing the field) are runtime_calls.
+    kind = Map.get(entry, :kind, :runtime_call)
 
     callback_queue = %EMLX.CommandQueue{
       ref: EMLX.Application.runtime_call_worker(dev),
@@ -1644,40 +1644,56 @@ defmodule EMLX do
 
     reply =
       try do
-        binaries =
-          EMLX.CommandQueue.with_queue(callback_queue, fn ->
-            # Allocate reconstructed args on this bound worker (MLX 0.32:
-            # CPU streams are thread-local). Only quantized passthrough
-            # tensors still need an explicit adopt from the eval_program
-            # worker — they keep their original refs.
-            {args_container, {[], []}} =
-              Nx.Defn.Composite.traverse(
-                args_template,
-                {args_binaries, positions},
-                fn leaf, {[bin | bins_rest], [pos | pos_rest]} ->
-                  value =
-                    case pos && Enum.at(tensors, pos) do
-                      %Nx.Tensor{
-                        data: %EMLX.Backend{quantization_config: %EMLX.Quantization.Config{}}
-                      } = t ->
-                        adopt_passthrough_tensor(t)
+        EMLX.CommandQueue.with_queue(callback_queue, fn ->
+          # Allocate reconstructed args on this bound worker (MLX 0.32:
+          # CPU streams are thread-local). Only quantized passthrough
+          # tensors still need an explicit adopt from the eval_program
+          # worker — they keep their original refs.
+          {args_container, {[], []}} =
+            Nx.Defn.Composite.traverse(
+              args_template,
+              {args_binaries, positions},
+              fn leaf, {[bin | bins_rest], [pos | pos_rest]} ->
+                value =
+                  case {kind, pos && Enum.at(tensors, pos)} do
+                    {:runtime_call,
+                     %Nx.Tensor{
+                       data: %EMLX.Backend{quantization_config: %EMLX.Quantization.Config{}}
+                     } = t} ->
+                      adopt_passthrough_tensor(t)
 
-                      _ ->
-                        bin |> Nx.from_binary(leaf.type) |> Nx.reshape(leaf.shape)
-                    end
+                    {:io_call, _} ->
+                      # Side-effect callbacks (and any process they `send` to)
+                      # must not hold tensors bound to the runtime_call
+                      # worker's stream — reconstruct on BinaryBackend.
+                      bin
+                      |> Nx.from_binary(leaf.type, backend: Nx.BinaryBackend)
+                      |> Nx.reshape(leaf.shape)
 
-                  {value, {bins_rest, pos_rest}}
-                end
-              )
+                    {:runtime_call, _} ->
+                      bin |> Nx.from_binary(leaf.type) |> Nx.reshape(leaf.shape)
+                  end
 
-            result = callback.(args_container, opts)
+                {value, {bins_rest, pos_rest}}
+              end
+            )
 
-            [result]
-            |> Nx.Defn.Composite.flatten_list()
-            |> Enum.map(&Nx.to_binary/1)
-          end)
+          case kind do
+            :io_call ->
+              callback.(args_container)
+              {:ok, []}
 
-        {:ok, binaries}
+            :runtime_call ->
+              result = callback.(args_container, opts)
+
+              binaries =
+                [result]
+                |> Nx.Defn.Composite.flatten_list()
+                |> Enum.map(&Nx.to_binary/1)
+
+              {:ok, binaries}
+          end
+        end)
       rescue
         e -> {:error, Exception.format(:error, e, __STACKTRACE__)}
       end
