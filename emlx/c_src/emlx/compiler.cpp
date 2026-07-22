@@ -1877,7 +1877,7 @@ public:
   }
 
   const char *name() const override {
-    return alias_inputs_ ? "EMLXIoCall" : "EMLXRuntimeCall";
+    return alias_inputs_ ? "EMLXIOCall" : "EMLXRuntimeCall";
   }
 
 private:
