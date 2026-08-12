@@ -1741,7 +1741,16 @@ defmodule EMLX do
   # Known EMLX-specific compiler opts. `:command_queue` is injected by
   # `__partitions_options__/1` but may also be passed directly by callers
   # that manage their own queues (equivalent to a manual `with_queue`).
-  @valid_compiler_keys [:device, :max_concurrency, :command_queue]
+  #
+  # `:hooks` isn't EMLX-specific — `Nx.Defn.compile/3`/`jit/2` always forward
+  # it (defaulting to `%{}`) to whichever compiler is selected (see
+  # `Nx.Defn.prepare_options/1`), so every `Nx.Defn.Compiler` callback must
+  # accept it even if unused. `:hook`/`:io_call` *expr nodes* (each carrying
+  # their own inline default callback) do lower natively — see
+  # `EMLX.Native.Expr`'s `:hook`/`:io_call` clause — but the *named-override*
+  # map this option carries (swapping in a different callback per hook name
+  # at compile time) isn't wired through, so it's only accepted when empty.
+  @valid_compiler_keys [:device, :max_concurrency, :command_queue, :hooks]
 
   # Process-lifetime dispatch cache backing `dispatch_key/3` +
   # `get_or_compile_program/6` (see their docs) — a compiled program is keyed
@@ -1772,6 +1781,19 @@ defmodule EMLX do
   @impl Nx.Defn.Compiler
   def __compile__(_key, vars, fun, opts) do
     Keyword.validate!(opts, @valid_compiler_keys)
+
+    case Keyword.get(opts, :hooks, %{}) do
+      empty when empty == %{} ->
+        :ok
+
+      hooks ->
+        raise ArgumentError,
+              "EMLX does not support the :hooks named-override map (got callbacks for " <>
+                "#{inspect(Map.keys(hooks))}) — :hook/:io_call expr nodes lower natively " <>
+                "with their own inline default callback, but swapping in a different " <>
+                "callback per hook name via compiler opts isn't wired through"
+    end
+
     queue = Keyword.get(opts, :command_queue)
     device = Keyword.get(opts, :device, default_device())
 
