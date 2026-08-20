@@ -1764,9 +1764,75 @@ defmodule EMLX do
   # `dispatch_key/3` still has to fall back to the structural walk on a miss.)
   @dispatch_key_by_id_table :emlx_dispatch_key_by_id
 
+  # Closures returned by `__compile__/4`, keyed by the `key` Nx supplies plus
+  # the shapes/types of `vars` and the options that affect lowering.
+  #
+  # Without this, every `Nx.Defn.jit/2` call re-runs `fun.(vars)` and walks the
+  # resulting expression, only to arrive at a program that is already in
+  # `@program_table`. The program cache stays as it is — its structural key is
+  # what lets structurally identical layers share one program across *different*
+  # call sites. This table is the layer above: it short-circuits *repeat* calls
+  # of the same call site with the same argument shapes, which is the shape of
+  # every decode loop and every training step.
+  @jit_closure_table :emlx_jit_closures
+
   @impl Nx.Defn.Compiler
   def __jit__(key, vars, fun, args_list, opts) do
-    __compile__(key, vars, fun, opts).(args_list)
+    case jit_cache_key(key, vars, opts) do
+      nil ->
+        __compile__(key, vars, fun, opts).(args_list)
+
+      cache_key ->
+        closure =
+          case :ets.lookup(jit_closure_table(), cache_key) do
+            [{^cache_key, cached}] ->
+              cached
+
+            [] ->
+              built = __compile__(key, vars, fun, opts)
+              :ets.insert(jit_closure_table(), {cache_key, built})
+              built
+          end
+
+        closure.(args_list)
+    end
+  end
+
+  # `nil` means "do not cache": an unhashable key, or options carrying a
+  # caller-owned resource whose lifetime we must not extend.
+  defp jit_cache_key(key, vars, opts) do
+    if Keyword.has_key?(opts, :command_queue) or Keyword.has_key?(opts, :hooks) do
+      nil
+    else
+      templates =
+        vars
+        |> Nx.Defn.Composite.flatten_list()
+        |> Enum.map(fn %Nx.Tensor{shape: shape, type: type} -> {shape, type} end)
+
+      {key, templates, Keyword.get(opts, :device, default_device())}
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp jit_closure_table do
+    case :ets.whereis(@jit_closure_table) do
+      :undefined ->
+        try do
+          :ets.new(@jit_closure_table, [
+            :named_table,
+            :public,
+            :set,
+            read_concurrency: true,
+            write_concurrency: true
+          ])
+        rescue
+          ArgumentError -> @jit_closure_table
+        end
+
+      _ ->
+        @jit_closure_table
+    end
   end
 
   @impl Nx.Defn.Compiler
