@@ -436,6 +436,64 @@ defmodule EMLX do
   ## Quantization operations (for 4-bit model support)
 
   @doc """
+  Quantized matmul with per-row expert selection (`mx::gather_qmm`).
+
+  Same contract as `quantized_matmul/8`, plus two index tensors. `w` carries
+  every expert stacked on a leading axis; `rhs_indices` picks the expert for
+  each row of `x`, and `lhs_indices` picks the row of `x` (pass `nil` to take
+  them in order). Set `sorted_indices` when `rhs_indices` is already sorted —
+  the kernel then skips its own sort.
+
+  This is what a mixture-of-experts layer needs: the gather happens inside the
+  kernel, so no per-token copy of the expert weights is ever materialised.
+  """
+  @mlx_function {:gather_qmm, 13}
+  def gather_qmm(
+        {dev_x, ref_x} = _tensor_x,
+        {dev_w, ref_w} = _tensor_w,
+        {dev_s, ref_s} = _tensor_scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        transpose \\ true,
+        group_size \\ 64,
+        bits \\ 4,
+        mode \\ "affine",
+        sorted_indices \\ false
+      )
+      when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) do
+    {ref_b, biases_device} = unwrap_optional_tensor(biases)
+    {ref_lhs, lhs_device} = unwrap_optional_tensor(lhs_indices)
+    {ref_rhs, rhs_device} = unwrap_optional_tensor(rhs_indices)
+
+    device =
+      [dev_x, dev_w, dev_s, biases_device, lhs_device, rhs_device]
+      |> Enum.reduce(&merge_device(&2, &1))
+
+    {worker, effective_device} = resolve_worker(device)
+
+    job_ref =
+      EMLX.NIF.gather_qmm(
+        worker,
+        ref_x,
+        ref_w,
+        ref_s,
+        ref_b,
+        ref_lhs,
+        ref_rhs,
+        transpose,
+        group_size,
+        bits,
+        mode,
+        sorted_indices,
+        effective_device
+      )
+      |> unwrap!()
+
+    await_worker(job_ref) |> wrap_tensor(effective_device)
+  end
+
+  @doc """
   Performs quantized matrix multiplication.
 
   This is the key operation for efficient 4-bit inference. It multiplies `x` with
