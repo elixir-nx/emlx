@@ -310,6 +310,77 @@ defmodule EMLX.Quantization do
   end
 
   @doc """
+  Run a gathered quantized matmul via `Nx.runtime_call`.
+
+  The mixture-of-experts counterpart of `quantized_matmul/2`: `qw` stacks every
+  expert on its leading axis and `rhs_indices` names the expert for each row,
+  so the gather happens inside `mx::gather_qmm` and no per-token copy of the
+  expert weights is ever materialised. Safe inside `Nx.Defn.jit`-traced
+  forward passes.
+
+  Output shape is `{batch_dims..., rows, out_features}`, where the batch dims
+  come from broadcasting the activation's leading axes against `rhs_indices`
+  and `out_features` is the second dimension of `qw`. Output type follows the
+  same rule as `quantized_matmul/2`.
+
+  ## Options
+
+    * `:lhs_indices` - reorders the activation rows; `nil` takes them in order
+    * `:sorted_indices` - set when `rhs_indices` is already sorted, so the
+      kernel can skip its own sort
+  """
+  deftransform gather_quantized_matmul(activation, qw, rhs_indices, opts \\ []) do
+    opts = Keyword.validate!(opts, lhs_indices: nil, sorted_indices: false)
+
+    {_experts, out_features, _in_features} = Nx.shape(qw)
+
+    act_dims = Nx.shape(activation) |> Tuple.to_list()
+    {act_batch, [rows, _cols]} = Enum.split(act_dims, -2)
+    act_batch = List.to_tuple(act_batch)
+    idx_shape = Nx.shape(rhs_indices)
+
+    # Same right-aligned rule MLX applies to the batch axes inside the kernel.
+    {batch, _names} =
+      Nx.Shape.binary_broadcast(
+        act_batch,
+        List.duplicate(nil, tuple_size(act_batch)),
+        idx_shape,
+        List.duplicate(nil, tuple_size(idx_shape))
+      )
+
+    out_shape = List.to_tuple(Tuple.to_list(batch) ++ [rows, out_features])
+
+    out_type =
+      case qw do
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{mode: "affine", scales: s}}} ->
+          Nx.type(s)
+
+        %Nx.Tensor{data: %EMLX.Backend{quantization_config: %Config{}}} ->
+          Nx.type(activation)
+
+        _ ->
+          Nx.Type.merge(Nx.type(activation), Nx.type(qw))
+      end
+
+    out = Nx.template(out_shape, out_type)
+
+    Nx.runtime_call(
+      out,
+      {activation, qw, rhs_indices},
+      opts,
+      &__MODULE__.gather_quantized_matmul_callback/2
+    )
+  end
+
+  @doc false
+  def gather_quantized_matmul_callback(
+        {%Nx.Tensor{} = activation, %Nx.Tensor{} = qw, %Nx.Tensor{} = rhs_indices},
+        opts
+      ) do
+    EMLX.gather_quantized_matmul(activation, qw, rhs_indices, opts)
+  end
+
+  @doc """
   Returns `true` if the tensor has quantization metadata on its backend.
   """
   def quantized?(%Nx.Tensor{data: %EMLX.Backend{quantization_config: cfg}}) when not is_nil(cfg),

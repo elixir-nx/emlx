@@ -1379,6 +1379,57 @@ defmodule EMLX do
     EMLX.Backend.to_nx(result)
   end
 
+  @doc """
+  Run `gather_qmm` at the `Nx.Tensor` level: pick an expert per row, then
+  multiply.
+
+  `qw` must be a quantized tensor produced by `EMLX.quantize/2` whose leading
+  axis stacks the experts. `rhs_indices` names the expert for each row; pass
+  `lhs_indices` to reorder the activation rows as well, or `nil` to take them
+  in order. Set `:sorted_indices` when `rhs_indices` is already sorted so the
+  kernel can skip its own sort.
+  """
+  def gather_quantized_matmul(
+        %Nx.Tensor{} = activation,
+        %Nx.Tensor{} = qw,
+        %Nx.Tensor{} = rhs_indices,
+        opts \\ []
+      ) do
+    opts = Keyword.validate!(opts, lhs_indices: nil, sorted_indices: false)
+    cfg = qw.data.quantization_config
+
+    if is_nil(cfg) do
+      raise ArgumentError,
+            "EMLX.gather_quantized_matmul/4: second argument must be a quantized tensor"
+    end
+
+    if not is_nil(activation.data.quantization_config) do
+      raise ArgumentError,
+            "EMLX.gather_quantized_matmul/4 requires a dense activation as the " <>
+              "first argument; got two quantized tensors. Dequantize one of them first."
+    end
+
+    lhs_ref = opts[:lhs_indices] && EMLX.Backend.from_nx(opts[:lhs_indices])
+    biases_ref = cfg.biases && EMLX.Backend.from_nx(cfg.biases)
+
+    result =
+      EMLX.gather_qmm(
+        EMLX.Backend.from_nx(activation),
+        qw.data.ref,
+        EMLX.Backend.from_nx(cfg.scales),
+        biases_ref,
+        lhs_ref,
+        EMLX.Backend.from_nx(rhs_indices),
+        true,
+        cfg.group_size,
+        cfg.bits,
+        cfg.mode,
+        opts[:sorted_indices]
+      )
+
+    EMLX.Backend.to_nx(result)
+  end
+
   def to_blob({device, ref} = tensor) when is_tensor(device, ref) do
     maybe_profile(EMLX.Profiling.inc_to_blob())
     # Eval first so the underlying MLX array is materialised; then ask the
