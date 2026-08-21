@@ -4441,4 +4441,35 @@ defmodule EMLX.Native.ExprTest do
     Enum.zip(Nx.to_flat_list(a), Nx.to_flat_list(b))
     |> Enum.each(fn {av, bv} -> assert_in_delta(av, bv, tol) end)
   end
+  describe "non-contiguous runtime_call arguments" do
+    # nbytes() is the logical size, so copying that many bytes out of a
+    # stride-0 array's buffer used to read past the end: the callback saw the
+    # first element and zeros. Shapes were right and nothing raised, which made
+    # it silent and data-dependent.
+    defp echo(tensor) do
+      Nx.runtime_call(Nx.to_template(tensor), {tensor}, [], fn {t}, _opts -> t end)
+    end
+
+    test "a broadcast argument arrives whole" do
+      fun = Nx.Defn.compile(&echo/1, [Nx.template({4}, :f32)], compiler: EMLX)
+      assert_close(fun.(Nx.broadcast(2.5, {4})), Nx.broadcast(2.5, {4}))
+    end
+
+    test "a transposed argument arrives whole" do
+      dense = Nx.iota({2, 3}, type: :f32)
+      transposed = Nx.transpose(dense)
+
+      fun = Nx.Defn.compile(&echo/1, [Nx.to_template(transposed)], compiler: EMLX)
+      assert_close(fun.(transposed), transposed)
+    end
+
+    test "the callback sees every element, not just the first" do
+      sum = fn t ->
+        Nx.runtime_call(Nx.template({}, :f32), {t}, [], fn {inner}, _ -> Nx.sum(inner) end)
+      end
+
+      fun = Nx.Defn.compile(sum, [Nx.template({4}, :f32)], compiler: EMLX)
+      assert_close(fun.(Nx.broadcast(2.5, {4})), Nx.tensor(10.0))
+    end
+  end
 end
