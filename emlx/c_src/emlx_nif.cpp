@@ -1386,6 +1386,42 @@ NIF(as_strided) {
 // mode: "affine" (default, real biases) or a microscaled variant
 // ("mxfp4"/"mxfp8"/"nvfp4" — no biases; mx::fp_quantize returns only
 // (wq, scales)). biases is `nil` from Elixir for microscaled modes.
+// gather_qmm - quantized matmul where each row picks which weight matrix to
+// use. This is the primitive behind mixture-of-experts: `w` holds every
+// expert, `rhs_indices` says which expert each token routes to, and the
+// gather happens inside the kernel instead of materialising a per-token copy
+// of the weights.
+// MLX API: gather_qmm(x, w, scales, biases, lhs_indices, rhs_indices,
+//                     transpose, group_size, bits, mode, sorted_indices, stream)
+NIF(gather_qmm) {
+  TENSOR_PARAM(0, x);       // Input tensor [batch, seq, hidden]
+  TENSOR_PARAM(1, w);       // Quantized experts [num_experts, out/8, in]
+  TENSOR_PARAM(2, scales);  // Per-group scales
+  OPTIONAL_TENSOR_PARAM(3, biases);       // nil for microscaled modes
+  OPTIONAL_TENSOR_PARAM(4, lhs_indices);  // nil selects rows in order
+  OPTIONAL_TENSOR_PARAM(5, rhs_indices);  // expert id per row
+  PARAM(6, bool, transpose);
+  PARAM(7, int, group_size);
+  PARAM(8, int, bits);
+  std::string mode;
+  if (!nx::nif::get(env, argv[9], mode)) {
+    return nx::nif::error(env, "Unable to get mode param.");
+  }
+  PARAM(10, bool, sorted_indices);
+  DEVICE_PARAM(11, device);
+
+  std::optional<mlx::core::array> biases_opt =
+      biases ? std::make_optional(*biases) : std::nullopt;
+  std::optional<mlx::core::array> lhs_opt =
+      lhs_indices ? std::make_optional(*lhs_indices) : std::nullopt;
+  std::optional<mlx::core::array> rhs_opt =
+      rhs_indices ? std::make_optional(*rhs_indices) : std::nullopt;
+
+  TENSOR(mlx::core::gather_qmm(*x, *w, *scales, biases_opt, lhs_opt, rhs_opt,
+                               transpose, group_size, bits, mode,
+                               sorted_indices, device));
+}
+
 NIF(quantized_matmul) {
   TENSOR_PARAM(0, x);       // Input tensor [batch, seq, hidden]
   TENSOR_PARAM(1, w);       // Quantized weights [out/8, in] (uint32 packed)
@@ -1457,6 +1493,7 @@ NIF(quantize) {
   CATCH()
 }
 
+ASYNC_NIF(gather_qmm)
 ASYNC_NIF(quantized_matmul)
 ASYNC_NIF(dequantize)
 ASYNC_NIF(quantize)
@@ -2010,6 +2047,7 @@ static ErlNifFunc nif_funcs[] = {
     {"command_queue_new", 1, command_queue_new},
     {"command_queue_synchronize", 1, command_queue_synchronize},
     // Quantization operations (async — must run on a worker thread)
+    {"gather_qmm", 13, gather_qmm_async},
     {"quantized_matmul", 10, quantized_matmul_async},
     {"dequantize", 8, dequantize_async},
     {"quantize", 6, quantize_async},
