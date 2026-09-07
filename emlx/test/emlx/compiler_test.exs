@@ -1,10 +1,7 @@
 defmodule EMLX.CompilerTest do
-  # Tests for EMLX's Nx.Defn.Compiler callbacks:
-  #   __jit__/5, __compile__/4, __partitions_options__/1, __to_backend__/1
-  #
-  # async: false because tests inspect process-dict state set by CommandQueue
-  # and check Logger output — both are process-global.
   use ExUnit.Case, async: false
+
+  import Nx.Testing
 
   alias EMLX.CommandQueue
 
@@ -126,6 +123,36 @@ defmodule EMLX.CompilerTest do
 
       assert Process.get(:emlx_command_queue) == nil
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6
+    end
+
+    # elixir-nx/emlx#141: two same-device queues share one compiled program.
+    # Compile is a portable function; eval uses the bound worker. Materialise
+    # inside with_queue — a later to_blob on the default worker is a different
+    # hole (lazy result after unbind).
+    test "two CPU queues can jit the same graph" do
+      q1 = CommandQueue.new!(:cpu)
+      q2 = CommandQueue.new!(:cpu)
+
+      defmodule DotExpTwoQueues do
+        import Nx.Defn
+
+        defn call(a, b), do: a |> Nx.dot(b) |> Nx.exp()
+      end
+
+      jitted = Nx.Defn.jit(&DotExpTwoQueues.call/2, compiler: EMLX, device: :cpu)
+
+      run = fn q ->
+        CommandQueue.with_queue(q, fn ->
+          a = Nx.tensor([[1.0, 2.0], [3.0, 4.0]], backend: {EMLX.Backend, device: :cpu})
+          b = Nx.tensor([[5.0, 6.0], [7.0, 8.0]], backend: {EMLX.Backend, device: :cpu})
+          jitted.(a, b) |> Nx.sum() |> Nx.to_number()
+        end)
+      end
+
+      r1 = run.(q1)
+      r2 = run.(q2)
+
+      assert_all_close(r1, r2)
     end
   end
 

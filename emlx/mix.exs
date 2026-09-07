@@ -2,7 +2,7 @@ defmodule EMLX.MixProject do
   use Mix.Project
 
   @app :emlx
-  @version "0.4.0"
+  @version "0.4.2"
   @mlx_version "0.32.0"
   @source_url "https://github.com/elixir-nx/emlx"
   # mlx-build Darwin archives from v0.31.0+ encode the deployment target in the
@@ -76,7 +76,7 @@ defmodule EMLX.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       {:fine, "~> 0.1", runtime: false},
-      {:nx, "~> 0.13.0"},
+      {:nx, "~> 0.13.1"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]

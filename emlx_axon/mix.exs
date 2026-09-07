@@ -1,7 +1,7 @@
 defmodule EMLXAxon.MixProject do
   use Mix.Project
 
-  @version "0.4.0"
+  @version "0.4.2"
   @source_url "https://github.com/elixir-nx/emlx"
 
   def project do
@@ -43,7 +43,7 @@ defmodule EMLXAxon.MixProject do
       {:elixir_make, "~> 0.6"},
       emlx_dep(),
       # Bumblebee still requires nx ~> 0.12.0; override until it allows 0.13.
-      {:nx, "~> 0.13.0", override: true},
+      {:nx, "~> 0.13.1"},
       {:axon, "~> 0.7"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}
@@ -53,15 +53,6 @@ defmodule EMLXAxon.MixProject do
   defp emlx_dep do
     cond do
       System.get_env("EMLX_AXON_LOCAL_EMLX") == "true" ->
-        {:emlx, path: "../emlx", override: true}
-
-      System.get_env("EMLX_AXON_LOCAL_EMLX") == "false" ->
-        hex_emlx_dep()
-
-      # Monorepo checkout: prefer the sibling package so plugin builds see the
-      # in-tree ABI header under priv/include. Hex remains the default when
-      # ../emlx is absent (Hex installs) or when EMLX_AXON_LOCAL_EMLX=false.
-      File.dir?(Path.expand("../emlx", __DIR__)) ->
         {:emlx, path: "../emlx", override: true}
 
       true ->
@@ -74,7 +65,7 @@ defmodule EMLXAxon.MixProject do
     # after v0.4.0. Keep the Hex requirement publishable until the maintainer
     # assigns and releases that EMLX version, then raise this lower bound before
     # publishing the matching EMLXAxon release.
-    {:emlx, "~> 0.4.0"}
+    {:emlx, "~> 0.4.2"}
   end
 
   def cli do
