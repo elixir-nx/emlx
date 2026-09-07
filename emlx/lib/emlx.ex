@@ -146,20 +146,15 @@ defmodule EMLX do
 
   ## Compile once, replay many times
 
-  `Nx.Defn.jit/2` and `Nx.Defn.jit_apply/3` **retrace** the given function
-  from scratch on every call. For most ops that's cheap relative to the
-  actual computation, but for a hot loop (e.g. a decode step, or any call
-  site invoked with the same input shapes/types repeatedly) it means paying
-  full retrace + dispatch-key computation cost on every single call — for
-  some ops (e.g. `Nx.LinAlg.svd/1`, which traces a large, normally-unused
-  fallback algorithm as part of every trace) this cost can dominate over the
-  actual native computation.
+  `Nx.Defn.jit/2` and `Nx.Defn.jit_apply/3` still retrace through Nx on every
+  call, but `EMLX.__compile__/4` caches the resulting eval closure in
+  `EMLX.CompileCache`, keyed by function identity, input templates, and
+  device. Repeated jit of the same `&Mod.f/a` with the same shapes hits that
+  cache and skips `native_compile/3`.
 
-  If you know you'll call the same function repeatedly with the same input
-  shapes/types, prefer `Nx.Defn.compile/3`, which traces and lowers **once**
-  and returns a plain closure that replays the already-compiled program on
-  every subsequent call — no retrace, no re-lowering, no dispatch-key
-  recomputation:
+  For a hot loop (e.g. a decode step), prefer `Nx.Defn.compile/3`, which traces
+  and lowers **once** and returns a plain closure the caller holds — no ETS
+  lookup, no retrace:
 
       svd = Nx.Defn.compile(&Nx.LinAlg.svd/1, [Nx.template({128, 128}, {:f, 32})], compiler: EMLX)
       # Hold onto `svd` (e.g. in a GenServer, or a module attribute at startup)
@@ -167,14 +162,14 @@ defmodule EMLX do
       {u, s, vt} = svd.(a)
 
   This is exactly the strategy `Nx.Serving` and Bumblebee already rely on for
-  other compilers, and it works identically here — no `EMLX`-specific code
-  needed. EMLX additionally keeps a persistent, structural (shape/op-based,
-  not object-identity) dispatch-key cache across calls (see `dispatch_key/3`
-  in the source), which is what makes `Nx.Defn.Graph.run/3`'s per-call
-  re-tracing and structurally-identical-but-distinct call sites (e.g. many
-  copies of the same layer in a model) cheap too — but a caller-held
-  `Nx.Defn.compile/3` closure is always cheaper still, since it skips
-  retracing entirely.
+  other compilers, and it works identically here. EMLX additionally keeps a
+  persistent, structural (shape/op-based, not object-identity) dispatch-key
+  cache across calls (see `dispatch_key/3` in the source), which is what makes
+  `Nx.Defn.Graph.run/3`'s per-call re-tracing and structurally-identical-but-
+  distinct call sites (e.g. many copies of the same layer in a model) cheap
+  too — but a caller-held `Nx.Defn.compile/3` closure is always cheaper still.
+
+  Cache bounds are documented on `EMLX.CompileCache`.
 
   ## Compile-time debug flags
 
@@ -1859,26 +1854,6 @@ defmodule EMLX do
   # Expr-id cache in front of `dispatch_key/3`.
   @dispatch_key_by_id_table :emlx_dispatch_key_by_id
 
-  # `native_compile/3` closures. Created by `init/0`.
-  @compile_closure_table :emlx_compile_closures
-
-  @doc false
-  def init do
-    case :ets.whereis(@compile_closure_table) do
-      :undefined ->
-        :ets.new(@compile_closure_table, [
-          :named_table,
-          :public,
-          :set,
-          read_concurrency: true,
-          write_concurrency: true
-        ])
-
-      _ ->
-        :ok
-    end
-  end
-
   @impl Nx.Defn.Compiler
   def __jit__(key, vars, fun, args_list, opts) do
     __compile__(key, vars, fun, opts).(args_list)
@@ -1915,14 +1890,13 @@ defmodule EMLX do
     cache_key = compile_cache_key(key, vars, hooks, device)
 
     eval_fn =
-      case :ets.lookup(@compile_closure_table, cache_key) do
-        [{^cache_key, cached}] ->
+      case EMLX.CompileCache.fetch(cache_key) do
+        {:ok, cached} ->
           cached
 
-        [] ->
+        {:error, :cache_miss} ->
           built = native_compile(vars, fun, device)
-          :ets.insert(@compile_closure_table, {cache_key, built})
-          built
+          EMLX.CompileCache.put(cache_key, built)
       end
 
     wrap_with_queue(queue, eval_fn)
