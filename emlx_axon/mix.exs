@@ -1,7 +1,7 @@
 defmodule EMLXAxon.MixProject do
   use Mix.Project
 
-  @version "0.4.2"
+  @version "0.5.0"
   @source_url "https://github.com/elixir-nx/emlx"
 
   def project do
@@ -42,9 +42,8 @@ defmodule EMLXAxon.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       emlx_dep(),
-      # Bumblebee still requires nx ~> 0.12.0; override until it allows 0.13.
-      {:nx, "~> 0.13.1"},
-      {:axon, "~> 0.7"},
+      {:nx, "~> 1.0"},
+      {:axon, "~> 0.9"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
@@ -61,11 +60,7 @@ defmodule EMLXAxon.MixProject do
   end
 
   defp hex_emlx_dep do
-    # Release sequencing: this source tree needs the generic plugin ABI added
-    # after v0.4.0. Keep the Hex requirement publishable until the maintainer
-    # assigns and releases that EMLX version, then raise this lower bound before
-    # publishing the matching EMLXAxon release.
-    {:emlx, "~> 0.4.2"}
+    {:emlx, "~> 0.5.0"}
   end
 
   def cli do

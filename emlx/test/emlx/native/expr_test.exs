@@ -207,29 +207,29 @@ defmodule EMLX.Native.ExprTest do
   end
 
   defn hook_top_level(a, b) do
-    hooked = hook(Nx.multiply(Nx.add(a, b), 2), :mid, fn t -> send(self(), {:mid, t}) end)
+    hooked = io_call(Nx.multiply(Nx.add(a, b), 2), :mid, fn t -> send(self(), {:mid, t}) end)
     Nx.subtract(hooked, 1)
   end
 
   defn hook_unused_value(a, b) do
-    _ = hook(Nx.multiply(a, b), :dbg, fn t -> send(self(), {:dbg, t}) end)
+    _ = io_call(Nx.multiply(a, b), :dbg, fn t -> send(self(), {:dbg, t}) end)
     Nx.add(a, b)
   end
 
   defn hook_name_only(a, b) do
-    _ = hook(Nx.multiply(a, b), :no_fn)
+    _ = io_call(Nx.multiply(a, b), :no_fn)
     Nx.add(a, b)
   end
 
   defn hook_tuple_payload(a, b) do
-    hook({Nx.add(a, b), Nx.subtract(a, b)}, :pair, fn {s, d} -> send(self(), {:pair, s, d}) end)
+    io_call({Nx.add(a, b), Nx.subtract(a, b)}, :pair, fn {s, d} -> send(self(), {:pair, s, d}) end)
   end
 
   defn hook_in_cond_branch(a, b) do
     pred = Nx.any(Nx.greater(a, 0))
 
     cond do
-      pred -> hook(Nx.add(a, b), :branch_true, fn t -> send(self(), {:branch_true, t}) end)
+      pred -> io_call(Nx.add(a, b), :branch_true, fn t -> send(self(), {:branch_true, t}) end)
       true -> Nx.subtract(a, b)
     end
   end
@@ -237,7 +237,7 @@ defmodule EMLX.Native.ExprTest do
   defn hook_in_while_body(a) do
     {result, _} =
       while {acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
-        acc = hook(Nx.add(acc, i), :iter, fn t -> send(self(), {:iter, t}) end)
+        acc = io_call(Nx.add(acc, i), :iter, fn t -> send(self(), {:iter, t}) end)
         {acc, i - 1}
       end
 
@@ -251,7 +251,7 @@ defmodule EMLX.Native.ExprTest do
   defn hook_unused_in_while_body(a) do
     {result, _} =
       while {acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
-        _ = hook(Nx.multiply(acc, i), :dbg, fn t -> send(self(), {:dbg, t}) end)
+        _ = io_call(Nx.multiply(acc, i), :dbg, fn t -> send(self(), {:dbg, t}) end)
         {Nx.add(acc, i), i - 1}
       end
 
@@ -265,7 +265,7 @@ defmodule EMLX.Native.ExprTest do
       while {outer_acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
         {inner_acc, _} =
           while {acc = outer_acc, j = Nx.tensor(2)}, Nx.less(0, j) do
-            hooked = hook(Nx.add(acc, 1), :inner, fn t -> send(self(), {:inner, t}) end)
+            hooked = io_call(Nx.add(acc, 1), :inner, fn t -> send(self(), {:inner, t}) end)
             {hooked, j - 1}
           end
 
@@ -281,8 +281,8 @@ defmodule EMLX.Native.ExprTest do
   defn two_hooks_in_while_body(a) do
     {result, _} =
       while {acc = Nx.tensor(0), i = a}, Nx.less(0, i) do
-        step1 = hook(Nx.add(acc, i), :step1, fn t -> send(self(), {:step1, t}) end)
-        step2 = hook(Nx.multiply(step1, 2), :step2, fn t -> send(self(), {:step2, t}) end)
+        step1 = io_call(Nx.add(acc, i), :step1, fn t -> send(self(), {:step1, t}) end)
+        step2 = io_call(Nx.multiply(step1, 2), :step2, fn t -> send(self(), {:step2, t}) end)
         {step2, i - 1}
       end
 
@@ -325,19 +325,19 @@ defmodule EMLX.Native.ExprTest do
   # this is the shape that surfaced the `Nx.Defn.Graph` `:token` rewrite gap
   # (see Results).
   defn hook_around_while(a) do
-    seed = hook(Nx.multiply(a, 2), :seed, fn t -> send(self(), {:seed, t}) end)
+    seed = io_call(Nx.multiply(a, 2), :seed, fn t -> send(self(), {:seed, t}) end)
 
     {result, _} =
       while {acc = Nx.tensor(0), i = seed}, Nx.less(0, i) do
         {Nx.add(acc, i), i - 1}
       end
 
-    hook(Nx.add(result, 1), :final, fn t -> send(self(), {:final, t}) end)
+    io_call(Nx.add(result, 1), :final, fn t -> send(self(), {:final, t}) end)
   end
 
   defn hook_in_reduce_body(t) do
     Nx.reduce(t, Nx.tensor(0), fn x, acc ->
-      hook(Nx.add(acc, x), :step, fn v -> send(self(), {:step, v}) end)
+      io_call(Nx.add(acc, x), :step, fn v -> send(self(), {:step, v}) end)
     end)
   end
 
@@ -348,7 +348,7 @@ defmodule EMLX.Native.ExprTest do
     Nx.reduce(t, Nx.tensor(0), fn x, acc ->
       cond do
         Nx.any(Nx.greater(x, 0)) ->
-          hook(Nx.add(acc, x), :pos, fn v -> send(self(), {:pos, v}) end)
+          io_call(Nx.add(acc, x), :pos, fn v -> send(self(), {:pos, v}) end)
 
         true ->
           acc
@@ -3774,7 +3774,7 @@ defmodule EMLX.Native.ExprTest do
 
       expr = Nx.Defn.debug_expr_apply(&hook_in_cond_branch/2, templates)
 
-      assert_raise ArgumentError, ~r/cannot lower a hook nested inside a cond branch/, fn ->
+      assert_raise ArgumentError, ~r/cannot lower a io_call nested inside a cond branch/, fn ->
         Expr.lower(expr, 2)
       end
     end
@@ -3949,7 +3949,7 @@ defmodule EMLX.Native.ExprTest do
 
       expr = Nx.Defn.debug_expr_apply(&hook_in_cond_in_reduce_body/1, [template])
 
-      assert_raise ArgumentError, ~r/cannot lower a hook nested inside a cond branch/, fn ->
+      assert_raise ArgumentError, ~r/cannot lower a io_call nested inside a cond branch/, fn ->
         Expr.lower(expr, 1)
       end
     end
