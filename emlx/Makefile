@@ -68,7 +68,7 @@ HEADERS = c_src/nx_nif_utils.hpp c_src/emlx_worker.hpp c_src/emlx_async.hpp c_sr
 OBJECTS = $(patsubst c_src/%.cpp,$(call esc,$(BUILD_DIR))/%.o,$(SOURCES))
 
 # Main targets
-all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_PLUGIN_ABI_HEADER)) $(call esc,$(EMLX_SO))
+all: $(call esc,$(MLX_SO)) $(call esc,$(EMLX_PLUGIN_ABI_HEADER)) $(call esc,$(EMLX_SO)) $(if $(filter true,$(EMLX_MLXC)),mlx_c,)
 	@ echo > /dev/null
 
 $(call esc,$(PRIV_DIR)):
@@ -128,5 +128,81 @@ $(call esc,$(EMLX_SO)): $(call esc,$(PRIV_DIR)) $(call esc,$(MLX_SO)) $(call esc
 clean:
 	rm -rf "$(PRIV_DIR)"
 	rm -rf "$(BUILD_DIR)"
+	rm -rf "$(BUILD_DIR)_c"
 
-.PHONY: all clean
+.PHONY: all clean mlx_c
+
+# ─── mlx-c lane (opt-in: `make mlx_c`, or EMLX_MLXC=true mix compile) ────
+#
+# Fetches the official mlx-c bindings (pinned tag; its CMake FetchContent
+# pins the matching libmlx minor version and builds everything itself) and
+# links two lane libraries exposing the same binary-in/binary-out op surface:
+#
+#   priv/libemlx_c.so    - ops via the mlx-c API    (EMLX.C.NIF)
+#   priv/libemlx_ref.so  - same ops via direct C++    (EMLX.C.RefNIF)
+#
+# Each .so statically links its own libmlx, so the lanes run side-by-side
+# with the main libemlx.so for differential testing and benchmarking.
+# Selected at runtime via `config :emlx, :mlx_api, :c | :cpp`.
+#
+# Currently verified on Apple Silicon; contributions for other platforms welcome.
+
+MLXC_VERSION ?= v0.7.0
+MLXC_VER = $(patsubst v%,%,$(MLXC_VERSION))
+MLXC_CACHE = $(EMLX_CACHE_DIR)/mlx-c/$(MLXC_VERSION)
+MLXC_SRC = $(MLXC_CACHE)/mlx-c-$(MLXC_VER)
+MLXC_BUILD = $(MLXC_CACHE)/build
+MLXC_ARCHIVE = $(MLXC_CACHE)/mlx-c-$(MLXC_VERSION).tar.gz
+EMLX_C_SO = $(PRIV_DIR)/libemlx_c.so
+EMLX_REF_SO = $(PRIV_DIR)/libemlx_ref.so
+
+ifeq ($(UNAME_S),Darwin)
+MLXC_LIBS_C = -Wl,-force_load,$(call esc,$(MLXC_BUILD)/libmlxc.a) \
+              -Wl,-force_load,$(call esc,$(MLXC_BUILD)/_deps/mlx-build/libmlx.a) \
+              -Wl,-force_load,$(call esc,$(MLXC_BUILD)/jaccl/libjaccl.a) \
+              -Wl,-force_load,$(call esc,$(MLXC_BUILD)/_deps/mlx-build/mlx/io/libgguflib.a)
+MLXC_LIBS_REF = -Wl,-force_load,$(call esc,$(MLXC_BUILD)/_deps/mlx-build/libmlx.a) \
+                -Wl,-force_load,$(call esc,$(MLXC_BUILD)/jaccl/libjaccl.a) \
+                -Wl,-force_load,$(call esc,$(MLXC_BUILD)/_deps/mlx-build/mlx/io/libgguflib.a)
+MLXC_FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
+MLXC_METALLIB = $(firstwildcard $(MLXC_BUILD)/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib)
+else
+MLXC_LIBS_C = $(MLXC_BUILD)/libmlxc.a $(MLXC_BUILD)/_deps/mlx-build/libmlx.a
+MLXC_LIBS_REF = $(MLXC_BUILD)/_deps/mlx-build/libmlx.a
+MLXC_FRAMEWORKS =
+MLXC_METALLIB =
+endif
+
+mlx_c: $(MLXC_BUILD)/libmlxc.a $(EMLX_C_SO) $(EMLX_REF_SO)
+	@ if [ -f "$(MLXC_BUILD)/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib" ]; then \
+		cp -f "$(MLXC_BUILD)/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib" "$(PRIV_DIR)/"; \
+	fi
+	@ echo "mlx-c lane built: $(EMLX_C_SO), $(EMLX_REF_SO)"
+
+$(call esc,$(MLXC_ARCHIVE)):
+	@ mkdir -p "$(MLXC_CACHE)"
+	curl -fSL "https://github.com/ml-explore/mlx-c/archive/refs/tags/$(MLXC_VERSION).tar.gz" -o "$@"
+
+$(call esc,$(MLXC_SRC)): $(call esc,$(MLXC_ARCHIVE))
+	tar -xzf "$(MLXC_ARCHIVE)" -C "$(MLXC_CACHE)"
+
+$(call esc,$(MLXC_BUILD))/libmlxc.a: $(call esc,$(MLXC_SRC))
+	cmake -B "$(MLXC_BUILD)" -S "$(MLXC_SRC)" \
+		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
+		-DMLX_C_BUILD_EXAMPLES=OFF
+	cmake --build "$(MLXC_BUILD)" -j$(MAKE_JOBS)
+
+$(call esc,$(BUILD_DIR))_c/emlx_c_nif.o: c_src/emlx_c/emlx_c_nif.cpp
+	@ mkdir -p "$(BUILD_DIR)_c"
+	$(CXX) $(CFLAGS) -I$(call esc,$(MLXC_SRC)) -c "$<" -o "$@"
+
+$(call esc,$(BUILD_DIR))_c/emlx_ref_nif.o: c_src/emlx_c/emlx_ref_nif.cpp
+	@ mkdir -p "$(BUILD_DIR)_c"
+	$(CXX) $(CFLAGS) -c "$<" -o "$@"
+
+$(call esc,$(EMLX_C_SO)): $(call esc,$(BUILD_DIR))_c/emlx_c_nif.o $(call esc,$(MLXC_BUILD))/libmlxc.a $(PRIV_DIR)
+	$(CXX) $(CFLAGS) -shared "$<" -o "$@" $(MLXC_LIBS_C) $(MLXC_FRAMEWORKS) -undefined dynamic_lookup $(if $(MACOSX_DEPLOYMENT_TARGET),-mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET),)
+
+# The reference lane links the very same libmlx EMLX itself builds against.
+$(call esc,$(EMLX_REF_SO)): $(call esc,$(BUILD_DIR))_c/emlx_ref_nif.o $(PRIV_DIR)
+	$(CXX) $(CFLAGS) -shared "$<" -o "$@" $(LDFLAGS)

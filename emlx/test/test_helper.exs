@@ -70,4 +70,19 @@ gpu_exclude =
 debug_flags_exclude =
   if System.get_env("EMLX_DEBUG_FLAGS") == "1", do: [], else: [:debug_flags_functional]
 
-ExUnit.start(exclude: distributed_exclude ++ gpu_exclude ++ debug_flags_exclude)
+# The mlx-c lane libraries are opt-in (`EMLX_MLXC=true mix compile`);
+# differential tests are excluded unless both lanes loaded.
+mlx_c_exclude =
+  try do
+    case {EMLX.C.RefNIF.device_check(), EMLX.C.NIF.device_check()} do
+      {{:ok, _}, {:ok, _, _}} -> []
+      {{:ok, _, _}, {:ok, _, _}} -> []
+      _ -> [:mlx_c]
+    end
+  rescue
+    _ -> [:mlx_c]
+  catch
+    _, _ -> [:mlx_c]
+  end
+
+ExUnit.start(exclude: distributed_exclude ++ gpu_exclude ++ debug_flags_exclude ++ mlx_c_exclude)

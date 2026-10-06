@@ -132,3 +132,64 @@ cd emlx && mix deps.get && mix test
 ```
 
 Without that flag, compilation fails with a message naming `LIBMLX_MACOS_COMPAT` instead of crashing the VM at runtime.
+
+### The `mlx-c` lane (experimental, opt-in)
+
+[`mlx-c`](https://github.com/ml-explore/mlx-c) is Apple's official C API
+for MLX. This branch adds an opt-in dispatch layer built on it, so Elixir
+can reach MLX through the officially maintained binding instead of direct
+`mlx::core` C++ calls.
+
+Build the two lane libraries (fetches the pinned `mlx-c` release and builds
+its CMake-pinned `libmlx` alongside EMLX's own):
+
+```bash
+EMLX_MLXC=true mix compile
+```
+
+This produces two self-contained libraries in `priv/`, each statically
+linking its own `libmlx` so they run side-by-side with `libemlx.so`:
+
+* `libemlx_c.so` (`EMLX.C.NIF`) — ops implemented with `mlx_c_*` calls
+* `libemlx_ref.so` (`EMLX.C.RefNIF`) — the identical op surface via direct
+  C++, used as the differential reference
+
+Select the layer at runtime:
+
+```elixir
+config :emlx, :mlx_api, :c    # or :cpp (default)
+```
+
+`EMLX.C.matmul(a_bin, b_bin, :float32, :gpu, m, k, n)` then dispatches
+through the configured lane (binary in, evaluated binary out).
+
+Differential tests (both lanes must produce bit-identical outputs):
+
+```bash
+EMLX_MLXC=true mix test test/emlx/c_test.exs
+```
+
+Benchmark (interleaved lane sampling; prints min latencies and the ratio):
+
+```bash
+REPS=25 TINY_ITERS=50000 mix run bench/emlx_c_bench.exs
+```
+
+On an M3 Ultra, across matmul/bmm/add/softmax/transpose/astype/sdpa/svd on
+GPU and CPU, the mlx-c lane matched the direct-C++ lane within measurement
+noise (ratios 0.8–1.1, results bit-exact, including a 50k-iteration tiny
+matmul dispatch loop).
+
+#### Caveats
+
+* The pinned `mlx-c` (v0.7.0) builds against `libmlx` 0.32.2, while the
+  default EMLX path currently ships prebuilt 0.32.0 — the lanes are built
+  and versioned independently by design, but bumping EMLX's `@mlx_version`
+  to the mlx-c pin would keep a single MLX version across the project.
+* `mlx-c` out-params are struct handles: they must be initialized with the
+  matching `mlx_*_new()` constructors before use (uninitialized stack
+  garbage faults hard inside `mlx_get_default_stream`-style calls).
+* The lane currently exposes a representative op set with binary I/O;
+  resource-tensor plumbing, async dispatch (`EMLX.CommandQueue`), and the
+  remaining ops (`emlx_fast` custom kernels, compiler/plugins) stay on the
+  C++ path for now.

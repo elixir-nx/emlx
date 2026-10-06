@@ -1,5 +1,11 @@
 import Config
 
+# Selects the MLX-facing dispatch layer used by `EMLX.C`:
+# `:c` routes through the official mlx-c API, `:cpp` (default) through
+# direct mlx::core C++ calls (the reference implementation).
+# Build the lanes with `EMLX_MLXC=true mix compile`.
+config :emlx, :mlx_api, :cpp
+
 if config_env() == :test do
   config :emlx, :add_backend_on_inspect, false
 

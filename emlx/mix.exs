@@ -46,6 +46,7 @@ defmodule EMLX.MixProject do
           "EMLX_CACHE_DIR" => libmlx_config.cache_dir,
           "EMLX_VERSION" => @version,
           "LIBMLX_ENABLE_DEBUG" => to_string(libmlx_config.features.debug?),
+          "EMLX_MLXC" => to_string(libmlx_config.features.mlxc?),
           "FINE_INCLUDE_DIR" => Fine.include_dir(),
           "MACOSX_DEPLOYMENT_TARGET" => libmlx_config.macos_deployment_target
         }
@@ -222,7 +223,8 @@ defmodule EMLX.MixProject do
     features = %{
       jit?: to_boolean(System.get_env("LIBMLX_ENABLE_JIT")),
       debug?: to_boolean(System.get_env("LIBMLX_ENABLE_DEBUG")),
-      build?: to_boolean(System.get_env("LIBMLX_BUILD"))
+      build?: to_boolean(System.get_env("LIBMLX_BUILD")),
+      mlxc?: to_boolean(System.get_env("EMLX_MLXC"))
     }
 
     current_target = current_target!()
