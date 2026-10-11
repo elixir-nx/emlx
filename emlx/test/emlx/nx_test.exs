@@ -184,6 +184,17 @@ defmodule EMLX.NxTest do
     end
   end
 
+  describe "pad with a wider pad value" do
+    test "pads in the merged type" do
+      assert_equal(Nx.pad(Nx.tensor([1]), 0.5, [{1, 0, 0}]), Nx.tensor([0.5, 1.0]))
+
+      assert_equal(
+        Nx.pad(Nx.tensor([1, 2], type: :u8), -1, [{1, 1, 0}]),
+        Nx.tensor([-1, 1, 2, -1], type: :s16)
+      )
+    end
+  end
+
   # quotient/2 works only with integers, so we put it here.
   describe "binary bitwise ops" do
     for op <- @bitwise_ops ++ [:quotient],

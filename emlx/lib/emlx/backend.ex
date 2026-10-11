@@ -567,12 +567,15 @@ defmodule EMLX.Backend do
           {[i | axes], [max(low, 0) | lows], [max(high, 0) | highs]}
       end)
 
-    pad_value_mx = from_nx(pad_value)
+    # Nx.pad merges the tensor and pad value types; cast both to the output type.
+    mlx_type = to_mlx_type(out.type)
+    pad_value_mx = pad_value |> from_nx() |> EMLX.astype(mlx_type)
 
     interior_padding = Enum.map(input_config, fn {_low, _high, interior} -> interior end)
 
     tensor
     |> from_nx()
+    |> EMLX.astype(mlx_type)
     |> interior_padding_mlx(pad_value_mx, interior_padding)
     |> slice_negative_padding(input_config)
     |> EMLX.pad(axes, low_pad_size, high_pad_size, pad_value_mx)
