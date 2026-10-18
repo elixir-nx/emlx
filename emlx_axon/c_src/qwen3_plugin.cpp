@@ -574,7 +574,7 @@ bool tensor_offset_attention(
       stream);
   auto attended = mlx::core::fast::scaled_dot_product_attention(
       query_bn, k_updated, v_updated, scale, "array", mask, std::nullopt,
-      stream);
+      /*force_fused=*/false, stream);
   attention = mlx::core::reshape(
       mlx::core::transpose(attended, {0, 2, 1, 3}, stream),
       {batch, tokens, query_heads * width}, stream);
@@ -587,10 +587,11 @@ mlx::core::array sdpa(const mlx::core::array &q_rope, const mlx::core::array &k_
                        int valid_len, mlx::core::StreamOrDevice stream) {
   return (T_new == 1)
              ? mlx::core::fast::scaled_dot_product_attention(
-                   q_rope, k_valid, v_valid, scale, "", std::nullopt, std::nullopt, stream)
+                   q_rope, k_valid, v_valid, scale, "", std::nullopt, std::nullopt, /*force_fused=*/false, stream)
              : mlx::core::fast::scaled_dot_product_attention(
                    q_rope, k_valid, v_valid, scale, "array",
-                   build_prefill_mask(q_rope, T_new, valid_len, stream), std::nullopt, stream);
+                   build_prefill_mask(q_rope, T_new, valid_len, stream), std::nullopt,
+                   /*force_fused=*/false, stream);
 }
 
 // ── Generalized (dense-or-quantized) per-layer compute ───────────────────

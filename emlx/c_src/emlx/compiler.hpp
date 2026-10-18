@@ -9,6 +9,7 @@
 
 #include "emlx_nif_shared.hpp"
 #include "emlx/plugin/registry.hpp"
+#include "mlx/compile_impl.h"
 #include <variant>
 
 namespace emlx {
@@ -117,7 +118,7 @@ struct Program {
 // compile_program bakes the program into a capturing lambda, wraps it with
 // mlx::core::detail::compile() (using a unique per-Expr ID) so MLX traces and
 // caches the graph.  eval_program just calls compiled_fn(inputs).
-// The destructor evicts the per-ID entry from MLX's global compile cache.
+// The destructor evicts the per-ID entry from each MLX compile cache it is in.
 struct Expr {
   int num_inputs = 0;
   std::uintptr_t compile_id = 0;  // unique key for mlx::core::detail compile cache
@@ -134,6 +135,9 @@ struct Expr {
   // emlx::native::Program::num_real_outputs.
   int num_real_outputs = 0;
   emlx::function compiled_fn;
+  // MLX keeps one compile cache per thread, and compiled_fn adds its graph to
+  // the cache of the thread that calls it. These are the caches to erase from.
+  std::vector<mlx::core::detail::CompileCacheWeakPtr> compile_caches;
 
   ~Expr();
 };

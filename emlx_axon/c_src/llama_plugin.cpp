@@ -285,10 +285,11 @@ mlx::core::array sdpa(const mlx::core::array &q_rope, const mlx::core::array &k_
                        int valid_len, mlx::core::StreamOrDevice stream) {
   return (T_new == 1)
              ? mlx::core::fast::scaled_dot_product_attention(
-                   q_rope, k_valid, v_valid, scale, "", std::nullopt, std::nullopt, stream)
+                   q_rope, k_valid, v_valid, scale, "", std::nullopt, std::nullopt, /*force_fused=*/false, stream)
              : mlx::core::fast::scaled_dot_product_attention(
                    q_rope, k_valid, v_valid, scale, "array",
-                   build_prefill_mask(q_rope, T_new, valid_len, stream), std::nullopt, stream);
+                   build_prefill_mask(q_rope, T_new, valid_len, stream), std::nullopt,
+                   /*force_fused=*/false, stream);
 }
 
 mlx::core::array layer_dense_impl(const mlx::core::array &hidden, const LayerParams &layer,

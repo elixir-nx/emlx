@@ -2321,15 +2321,27 @@ static std::mutex s_mlx_compile_mutex;
 // ── Expr destructor
 // ───────────────────────────────────────────────────────────
 //
-// Evicts the per-Expr entry from MLX's global compile cache so stale compiled
-// graphs don't accumulate.  Called by default_dtor<Expr> when the BEAM resource
-// is GC'd.
+// Evicts the per-Expr entry from each MLX compile cache it is in, so stale
+// compiled graphs don't accumulate.  Called by default_dtor<Expr> when the BEAM
+// resource is GC'd.
 
 Expr::~Expr() {
   if (compile_id != 0) {
     std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
-    mlx::core::detail::compile_erase(compile_id);
+    for (const auto &cache : compile_caches)
+      mlx::core::detail::compile_erase(cache, compile_id);
   }
+}
+
+// Records the compile cache of the calling thread, the one that compiled_fn just
+// used. Called with s_mlx_compile_mutex held.
+static void remember_compile_cache(Expr &prog) {
+  auto cache = mlx::core::detail::compile_cache();
+  auto current = cache.lock();
+  for (const auto &known : prog.compile_caches)
+    if (known.lock() == current)
+      return;
+  prog.compile_caches.push_back(cache);
 }
 
 // ── NIF implementations
@@ -2473,6 +2485,7 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     {
       std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
       outputs = prog->compiled_fn(inputs);
+      remember_compile_cache(*prog);
     }
 
     // A program containing an inlined `:runtime_call` node must be forced to
