@@ -158,6 +158,42 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
 
 namespace fine {
 
+// Decode a constant entry {value, mlx_dtype} where value is either an Erlang
+// float (for finite constants) or one of the atoms :infinity, :neg_infinity,
+// :nan (for non-finite IEEE 754 values).  Erlang's bit-syntax float decoder
+// rejects NaN and infinity, so the Elixir side passes atoms instead and this
+// specialisation maps them to the appropriate C double.
+template <>
+struct Decoder<std::tuple<double, mlx::core::Dtype>> {
+  static std::tuple<double, mlx::core::Dtype>
+  decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+    int arity;
+    const ERL_NIF_TERM *elems;
+    if (!enif_get_tuple(env, term, &arity, &elems) || arity != 2) {
+      throw std::invalid_argument(
+          "decode failed, expected a 2-tuple for constant, got: " +
+          format_term(env, term));
+    }
+    double value;
+    char atom[64];
+    if (enif_get_atom(env, elems[0], atom, sizeof(atom), ERL_NIF_LATIN1)) {
+      if (std::strcmp(atom, "infinity") == 0)
+        value = std::numeric_limits<double>::infinity();
+      else if (std::strcmp(atom, "neg_infinity") == 0)
+        value = -std::numeric_limits<double>::infinity();
+      else if (std::strcmp(atom, "nan") == 0)
+        value = std::numeric_limits<double>::quiet_NaN();
+      else
+        throw std::invalid_argument(
+            "decode failed, unexpected atom for constant value: " +
+            std::string(atom));
+    } else {
+      value = fine::decode<double>(env, elems[0]);
+    }
+    return {value, fine::decode<mlx::core::Dtype>(env, elems[1])};
+  }
+};
+
 template <> struct Decoder<emlx::native::Ref> {
   static emlx::native::Ref decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
     auto [kind_atom, index] =

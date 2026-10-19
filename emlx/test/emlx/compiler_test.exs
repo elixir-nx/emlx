@@ -328,4 +328,59 @@ defmodule EMLX.CompilerTest do
     result = Nx.Defn.jit(chain, compiler: EMLX).(Nx.tensor(0.5, backend: EMLX.Backend))
     assert_all_close(result, chain.(Nx.tensor(0.5, backend: Nx.BinaryBackend)))
   end
+
+  describe "non-finite constants in compiled graphs" do
+    # Nx.Constants.neg_infinity/infinity/nan return constant tensors whose
+    # value is stored as an atom (:neg_infinity, :infinity, :nan) in the
+    # compiled program's constants table.  Before the fix, to_native/1 called
+    # `v * 1.0` on every constant value, which raises ArithmeticError for atoms.
+
+    for type <- [:f32, :f16, :bf16] do
+      @type_under_test type
+
+      test "neg_infinity constant compiles and produces -inf (#{type})" do
+        t = @type_under_test
+
+        x = Nx.tensor([1.0, -2.0], type: t, backend: EMLX.Backend)
+
+        result =
+          Nx.Defn.jit(
+            fn x -> Nx.select(Nx.greater(x, 0), Nx.Constants.neg_infinity(t), x) end,
+            compiler: EMLX
+          ).(x)
+
+        assert_all_close(result, Nx.tensor([:neg_infinity, -2.0], type: t))
+      end
+
+      test "infinity constant compiles and produces +inf (#{type})" do
+        t = @type_under_test
+
+        x = Nx.tensor([1.0, -2.0], type: t, backend: EMLX.Backend)
+
+        result =
+          Nx.Defn.jit(
+            fn x -> Nx.select(Nx.greater(x, 0), Nx.Constants.infinity(t), x) end,
+            compiler: EMLX
+          ).(x)
+
+        assert_all_close(result, Nx.tensor([:infinity, -2.0], type: t))
+      end
+
+      test "nan constant compiles and NaN propagates through arithmetic (#{type})" do
+        t = @type_under_test
+
+        x = Nx.tensor([1.0, -2.0], type: t, backend: EMLX.Backend)
+
+        result =
+          Nx.Defn.jit(
+            fn x -> Nx.select(Nx.greater(x, 0), Nx.Constants.nan(t), x) end,
+            compiler: EMLX
+          ).(x)
+
+        # The first element should be NaN; check via is_nan.
+        assert Nx.to_number(Nx.is_nan(result[0])) == 1
+        assert_all_close(result[1], Nx.tensor(-2.0, type: t))
+      end
+    end
+  end
 end

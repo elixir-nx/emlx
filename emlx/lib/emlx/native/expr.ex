@@ -39,7 +39,7 @@ defmodule EMLX.Native.Expr do
   @type t :: %__MODULE__{
           inputs: [node_ref()],
           captures: [{node_ref(), Nx.Tensor.t()}],
-          constants: [{node_ref(), number(), Nx.Type.t()}],
+          constants: [{node_ref(), number() | :infinity | :neg_infinity | :nan, Nx.Type.t()}],
           instructions: [{node_ref(), atom(), [node_ref()], [integer()]}],
           outputs: [node_ref()],
           # Always empty now — kept on the struct so `to_native/1`'s
@@ -3329,7 +3329,13 @@ defmodule EMLX.Native.Expr do
       end)
 
     wire_constants =
-      Enum.map(prog.constants, fn {_, v, t} -> {v * 1.0, EMLX.Native.to_mlx_type(t)} end)
+      Enum.map(prog.constants, fn
+        {_, atom, t} when atom in [:infinity, :neg_infinity, :nan] ->
+          {atom, EMLX.Native.to_mlx_type(t)}
+
+        {_, v, t} ->
+          {v * 1.0, EMLX.Native.to_mlx_type(t)}
+      end)
 
     %EMLX.Native.Program{
       num_inputs: length(prog.inputs),
