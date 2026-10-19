@@ -2,7 +2,7 @@
 
 // emlx::Worker — one OS thread + one mlx::core::Stream.
 //
-// Each Worker owns a dedicated std::thread that pulls Jobs from a
+// Each Worker owns a dedicated OS thread that pulls Jobs from a
 // FIFO queue and runs them. The thread sets the worker's MLX Stream
 // as its current-thread default on startup, so any MLX op invoked
 // from inside a Job (mx::eval, mx::synchronize, etc.) dispatches to
@@ -28,8 +28,8 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <pthread.h>
 #include <stdexcept>
-#include <thread>
 
 namespace emlx {
 
@@ -61,9 +61,8 @@ public:
   // target device in `prepare_tensors!/1` before the NIF runs.
   explicit Worker(mlx::core::Device device)
       : device_(device), stream_(/*placeholder index*/ -1, device) {
-    std::promise<mlx::core::Stream> stream_promise;
-    auto stream_future = stream_promise.get_future();
-    thread_ = std::thread(&Worker::thread_main, this, std::move(stream_promise));
+    auto stream_future = stream_promise_.get_future();
+    start_thread();
     // Blocks (or rethrows) until the worker thread has registered its
     // stream and signalled ready.
     //
@@ -75,9 +74,7 @@ public:
     try {
       stream_ = stream_future.get();
     } catch (...) {
-      if (thread_.joinable()) {
-        thread_.join();
-      }
+      join();
       throw;
     }
   }
@@ -93,9 +90,7 @@ public:
       stop_ = true;
     }
     cv_.notify_all();
-    if (thread_.joinable()) {
-      thread_.join();
-    }
+    join();
   }
 
   Worker(const Worker &) = delete;
@@ -168,7 +163,38 @@ public:
   }
 
 private:
-  void thread_main(std::promise<mlx::core::Stream> stream_promise) {
+  // MLX compiles a graph with recursion as deep as the graph (compile_dfs).
+  // std::thread gets the default stack of a secondary thread, which is
+  // 512 KB on macOS, and a compiled chain of 10,000 ops overflows it with
+  // SIGBUS. 64 MB holds a chain of 200,000 ops. The OS maps stack pages
+  // only when they are used, so a deep compile is the only cost.
+  static constexpr size_t kStackSize = 64 * 1024 * 1024;
+
+  void start_thread() {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, kStackSize);
+    int rc = pthread_create(&thread_, &attr, &Worker::thread_entry, this);
+    pthread_attr_destroy(&attr);
+    if (rc != 0) {
+      throw std::runtime_error("could not start the EMLX worker thread");
+    }
+    joinable_ = true;
+  }
+
+  static void *thread_entry(void *worker) {
+    static_cast<Worker *>(worker)->thread_main();
+    return nullptr;
+  }
+
+  void join() {
+    if (joinable_) {
+      pthread_join(thread_, nullptr);
+      joinable_ = false;
+    }
+  }
+
+  void thread_main() {
     // Allocate the stream on THIS thread (MLX thread-locality requirement —
     // see constructor comment). Pin all MLX ops issued from this thread to
     // our stream by making it the per-thread default. Only ops invoked
@@ -176,9 +202,9 @@ private:
     try {
       mlx::core::Stream stream = mlx::core::new_stream(device_);
       mlx::core::set_default_stream(stream);
-      stream_promise.set_value(stream);
+      stream_promise_.set_value(stream);
     } catch (...) {
-      stream_promise.set_exception(std::current_exception());
+      stream_promise_.set_exception(std::current_exception());
       return;
     }
 
@@ -200,8 +226,8 @@ private:
 
       // Jobs are responsible for their own exception handling and for
       // delivering a reply to the calling BEAM process via enif_send.
-      // We never let an exception escape into the std::thread wrapper
-      // (which would call std::terminate).
+      // We never let an exception escape the thread function (which
+      // would call std::terminate).
       try {
         job();
       } catch (...) {
@@ -221,7 +247,9 @@ private:
 
   mlx::core::Device device_;
   mlx::core::Stream stream_;
-  std::thread thread_;
+  std::promise<mlx::core::Stream> stream_promise_;
+  pthread_t thread_;
+  bool joinable_ = false;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::deque<Job> queue_;
