@@ -1405,7 +1405,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
-           std::nullopt, stream);
+           std::nullopt, /*force_fused=*/false, stream);
      }},
 
     // sdpa (no mask, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
@@ -1413,7 +1413,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
-           ops[3], stream);
+           ops[3], /*force_fused=*/false, stream);
      }},
 
     // sdpa (array mask): operands = [q, k, v, mask]; attrs = [scale_bits].
@@ -1421,7 +1421,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
-           std::nullopt, stream);
+           std::nullopt, /*force_fused=*/false, stream);
      }},
 
     // sdpa (array mask, + sinks): operands = [q, k, v, mask, sinks];
@@ -1430,7 +1430,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
-           ops[4], stream);
+           ops[4], /*force_fused=*/false, stream);
      }},
 
     // sdpa (causal): operands = [q, k, v]; attrs = [scale_bits].
@@ -1438,7 +1438,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
-           std::nullopt, std::nullopt, stream);
+           std::nullopt, std::nullopt, /*force_fused=*/false, stream);
      }},
 
     // sdpa (causal, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
@@ -1446,7 +1446,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
-           std::nullopt, ops[3], stream);
+           std::nullopt, ops[3], /*force_fused=*/false, stream);
      }},
 
     // sdpa (causal + key_mask): operands = [q, k, v, key_mask];
@@ -1482,7 +1482,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_t = mlx::core::fast::scaled_dot_product_attention(
-           q, k, v, scale, "array", additive, std::nullopt, stream);
+           q, k, v, scale, "array", additive, std::nullopt, /*force_fused=*/false, stream);
 
        // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
        // in Flash-Attention when seq_len >= Metal tile size, but semantically
@@ -1525,7 +1525,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_t = mlx::core::fast::scaled_dot_product_attention(
-           q, k, v, scale, "array", additive, sinks, stream);
+           q, k, v, scale, "array", additive, sinks, /*force_fused=*/false, stream);
 
        // See "fast_sdpa_causal_key_masked" above: NaN-guard all-masked rows.
        return mlx::core::where(mlx::core::isnan(attn_t, stream),
@@ -2058,7 +2058,7 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
        auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_out = mlx::core::fast::scaled_dot_product_attention(
-           q_t, k_t, v_t, scale, "array", additive, std::nullopt, stream);
+           q_t, k_t, v_t, scale, "array", additive, std::nullopt, /*force_fused=*/false, stream);
 
        // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
        // in Flash-Attention when seq_len >= Metal tile size, but semantically
