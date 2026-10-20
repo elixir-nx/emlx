@@ -156,6 +156,44 @@ defmodule EMLX.CompilerTest do
     end
   end
 
+  # MLX uses one process-wide default device (the GPU with Metal), so an op without
+  # an explicit stream runs on the GPU even inside a :cpu program. The CPU and GPU
+  # kernels round differently for these shapes, so equal bits prove the device.
+  describe "compiled programs on the :cpu device" do
+    for {op, shapes} <- [
+          dot: [{256, 512}, {512, 256}],
+          sum: [{256, 512}],
+          exp_sum: [{256, 512}],
+          conv: [{1, 128, 64, 64}, {128, 128, 3, 3}]
+        ] do
+      @tag :metal
+      test "#{op} gives the eager CPU result" do
+        fun = device_op(unquote(op))
+        key = Nx.Random.key(7)
+
+        {args, _key} =
+          Enum.map_reduce(unquote(Macro.escape(shapes)), key, fn shape, key ->
+            Nx.Random.normal(key, shape: shape, type: :f32)
+          end)
+
+        args = Enum.map(args, &Nx.backend_transfer(&1, {EMLX.Backend, device: :cpu}))
+        eager = apply(fun, args) |> Nx.backend_transfer(Nx.BinaryBackend)
+
+        compiled =
+          Nx.Defn.jit(fun, compiler: EMLX, device: :cpu)
+          |> apply(args)
+          |> Nx.backend_transfer(Nx.BinaryBackend)
+
+        assert Nx.to_binary(compiled) == Nx.to_binary(eager)
+      end
+    end
+  end
+
+  defp device_op(:dot), do: &Nx.dot/2
+  defp device_op(:sum), do: &Nx.sum(&1, axes: [1])
+  defp device_op(:exp_sum), do: &(&1 |> Nx.exp() |> Nx.sum(axes: [0]))
+  defp device_op(:conv), do: &Nx.conv(&1, &2, padding: :same)
+
   describe "__compile__/4 queue wrapping" do
     test "without :command_queue, the compiled closure is returned as-is" do
       # Compile a minimal defn function and verify the closure can be called.
@@ -219,5 +257,16 @@ defmodule EMLX.CompilerTest do
         assert :ets.info(table, :owner) == Process.whereis(EMLX.CompileCache)
       end
     end
+  end
+
+  # MLX compiles with recursion as deep as the graph. A 512 KB thread stack
+  # overflows on this chain and the VM stops with SIGBUS.
+  test "compiles a chain of 20,000 ops" do
+    chain = fn x ->
+      Enum.reduce(1..10_000, x, fn _, acc -> acc |> Nx.sin() |> Nx.add(0.001) end)
+    end
+
+    result = Nx.Defn.jit(chain, compiler: EMLX).(Nx.tensor(0.5, backend: EMLX.Backend))
+    assert_all_close(result, chain.(Nx.tensor(0.5, backend: Nx.BinaryBackend)))
   end
 end
