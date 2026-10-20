@@ -194,6 +194,38 @@ defmodule EMLX.CompilerTest do
   defp device_op(:exp_sum), do: &(&1 |> Nx.exp() |> Nx.sum(axes: [0]))
   defp device_op(:conv), do: &Nx.conv(&1, &2, padding: :same)
 
+  # The loop condition is a carry that the graph before the loop computes. MLX runs
+  # the :while primitive on the worker thread, possibly before the stream thread
+  # computes that carry. Without a barrier, the loop can read the condition before
+  # it is computed and then not run.
+  describe "compiled :while" do
+    defmodule CountDown do
+      import Nx.Defn
+
+      defn count_down(x) do
+        {x, _} =
+          while {x, positive = Nx.greater(Nx.sum(x), 0)}, positive do
+            x = Nx.subtract(x, 1)
+            {x, Nx.greater(Nx.sum(x), 0)}
+          end
+
+        x
+      end
+    end
+
+    test "reads a condition that the graph before the loop computes" do
+      fun = Nx.Defn.jit(&CountDown.count_down/1, compiler: EMLX, device: :cpu)
+
+      results =
+        for _ <- 1..100 do
+          fun.(Nx.tensor([3.0, 2.0], backend: {EMLX.Backend, device: :cpu}))
+          |> Nx.to_flat_list()
+        end
+
+      assert Enum.uniq(results) == [[0.0, -1.0]]
+    end
+  end
+
   describe "__compile__/4 queue wrapping" do
     test "without :command_queue, the compiled closure is returned as-is" do
       # Compile a minimal defn function and verify the closure can be called.
