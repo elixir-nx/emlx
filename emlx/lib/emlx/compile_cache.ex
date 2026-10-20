@@ -32,6 +32,9 @@ defmodule EMLX.CompileCache do
 
   @impl true
   def init(opts) do
+    # The dispatch tables belong to this process, so they live as long as the application.
+    EMLX.__create_dispatch_tables__()
+
     state = %{
       table: :ets.new(:emlx_compile_closures, [:set, :private]),
       counter: 0,

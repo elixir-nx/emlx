@@ -241,6 +241,24 @@ defmodule EMLX.CompilerTest do
     end
   end
 
+  describe "dispatch cache tables" do
+    test "survive the exit of the first process that compiles" do
+      add_one = fn x -> Nx.add(x, 1) end
+
+      task =
+        Task.async(fn ->
+          input = Nx.tensor([0.0, 1.0], backend: {EMLX.Backend, device: :cpu})
+          Nx.Defn.jit(add_one, compiler: EMLX, device: :cpu).(input) |> Nx.to_flat_list()
+        end)
+
+      assert Task.await(task) == [1.0, 2.0]
+
+      for table <- [:emlx_native_dispatch_cache, :emlx_dispatch_key_by_id] do
+        assert :ets.info(table, :owner) == Process.whereis(EMLX.CompileCache)
+      end
+    end
+  end
+
   # MLX compiles with recursion as deep as the graph. A 512 KB thread stack
   # overflows on this chain and the VM stops with SIGBUS.
   test "compiles a chain of 20,000 ops" do

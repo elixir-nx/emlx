@@ -3325,6 +3325,9 @@ defmodule EMLX.Native.ExprTest do
       k_cache0 = Nx.broadcast(0.0, {1, 5, 1, 8}) |> Nx.as_type(:f32) |> gpu_t()
       v_cache0 = Nx.broadcast(0.0, {1, 5, 1, 8}) |> Nx.as_type(:f32) |> gpu_t()
 
+      # kv_cache_while_ref/5 is the same program, and the fusion runs only when a
+      # program is lowered. Empty the dispatch cache, so this jit lowers again.
+      :ets.delete_all_objects(:emlx_native_dispatch_cache)
       EMLX.Native.Expr.reset_kv_cache_fusion_count()
 
       {fused_k, fused_v, fused_attn} =
