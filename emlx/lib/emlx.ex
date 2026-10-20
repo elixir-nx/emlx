@@ -2508,7 +2508,7 @@ defmodule EMLX do
 
   # The program embeds the literal's values, so they are part of the key.
   defp sanitize_key_term(%Nx.Tensor{} = t, _positions) do
-    {:tensor_literal, t.shape, t.type, :erlang.md5(Nx.to_binary(t))}
+    {:tensor_literal, t.shape, t.type, Nx.to_binary(t)}
   end
 
   defp sanitize_key_term(fun, _positions) when is_function(fun) do
