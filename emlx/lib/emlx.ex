@@ -2298,6 +2298,15 @@ defmodule EMLX do
   # writes are needed to publish it — the atom name is the handle.
   defp dispatch_cache_table, do: ensure_named_ets_table(@native_dispatch_cache_table)
 
+  # ETS deletes a table when its owner exits. EMLX.CompileCache calls this at application
+  # start, so the tables do not belong to the first process that compiles.
+  @doc false
+  def __create_dispatch_tables__ do
+    ensure_named_ets_table(@native_dispatch_cache_table)
+    ensure_named_ets_table(@dispatch_key_by_id_table)
+    :ok
+  end
+
   # Lazily creates (idempotently — races are resolved by `:ets.new/2` raising
   # `ArgumentError` on the loser, which we swallow) a named, public,
   # process-lifetime ETS table. Named (not `:persistent_term`-stashed) so no

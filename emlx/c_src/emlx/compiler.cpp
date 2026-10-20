@@ -36,11 +36,13 @@ namespace native {
 // attribute channel passed verbatim from the IR.
 //
 // This is the single source of truth for op semantics on the compiler path.
-// No explicit device: ops run on the default stream of the current worker
-// thread.
+// Each lambda receives an explicit `stream` (the calling worker's stream) and
+// forwards it to every mlx::core / mlx::fast call, so compiled programs
+// dispatch to the correct device rather than the global MLX default.
 
 using OpFn = std::function<mlx::core::array(
-    const std::vector<mlx::core::array> &ops, const std::vector<Attr> &attrs)>;
+    const std::vector<mlx::core::array> &ops, const std::vector<Attr> &attrs,
+    mlx::core::StreamOrDevice stream)>;
 
 // Float opts (eps/scale/base) ride the int64 attr channel as their IEEE-754
 // double bits (see EMLX.Native.Expr.f64_bits/1).  Reverse the reinterpret here.
@@ -69,7 +71,8 @@ static inline float attr_to_float(int64_t bits) {
 // prefill RoPE stays in one NIF replay.
 static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
                                                 const mlx::core::array &angles,
-                                                int dims) {
+                                                int dims,
+                                                mlx::core::StreamOrDevice stream) {
   using namespace mlx::core;
 
   int B = a.shape(0);
@@ -79,25 +82,25 @@ static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
   int half = dims / 2;
 
   auto cos_bt1h =
-      astype(reshape(cos(angles), to_shape({B, T, 1, half})), a.dtype());
+      astype(reshape(cos(angles, stream), to_shape({B, T, 1, half}), stream), a.dtype(), stream);
   auto sin_bt1h =
-      astype(reshape(sin(angles), to_shape({B, T, 1, half})), a.dtype());
+      astype(reshape(sin(angles, stream), to_shape({B, T, 1, half}), stream), a.dtype(), stream);
 
-  auto cos_full = concatenate(std::vector<array>{cos_bt1h, cos_bt1h}, 3);
-  auto sin_full = concatenate(std::vector<array>{sin_bt1h, sin_bt1h}, 3);
+  auto cos_full = concatenate(std::vector<array>{cos_bt1h, cos_bt1h}, 3, stream);
+  auto sin_full = concatenate(std::vector<array>{sin_bt1h, sin_bt1h}, 3, stream);
 
-  auto x1 = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, half}));
-  auto x2 = slice(a, to_shape({0, 0, 0, half}), to_shape({B, T, H, dims}));
-  auto rotated = concatenate(std::vector<array>{negative(x2), x1}, 3);
+  auto x1 = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, half}), stream);
+  auto x2 = slice(a, to_shape({0, 0, 0, half}), to_shape({B, T, H, dims}), stream);
+  auto rotated = concatenate(std::vector<array>{negative(x2, stream), x1}, 3, stream);
 
-  auto a_head = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, dims}));
-  auto rope_head = add(multiply(a_head, cos_full), multiply(rotated, sin_full));
+  auto a_head = slice(a, to_shape({0, 0, 0, 0}), to_shape({B, T, H, dims}), stream);
+  auto rope_head = add(multiply(a_head, cos_full, stream), multiply(rotated, sin_full, stream), stream);
 
   if (dims == D) {
     return rope_head;
   }
-  auto tail = slice(a, to_shape({0, 0, 0, dims}), to_shape({B, T, H, D}));
-  return concatenate(std::vector<array>{rope_head, tail}, 3);
+  auto tail = slice(a, to_shape({0, 0, 0, dims}), to_shape({B, T, H, D}), stream);
+  return concatenate(std::vector<array>{rope_head, tail}, 3, stream);
 }
 
 // ── Window-op helpers ─────────────────────────────────────────────────────
@@ -111,7 +114,8 @@ static mlx::core::array rope_rotate_from_angles(const mlx::core::array &a,
 static mlx::core::array
 compiler_sliding_window_view(const mlx::core::array &padded,
                              const std::vector<int> &window,
-                             const std::vector<int> &strides) {
+                             const std::vector<int> &strides,
+                             mlx::core::StreamOrDevice stream) {
   int n = padded.ndim();
   auto ps = padded.shape();
 
@@ -129,7 +133,7 @@ compiler_sliding_window_view(const mlx::core::array &padded,
     view_shape.push_back(w);
 
   auto strided = mlx::core::as_strided(padded, to_shape(view_shape),
-                                       to_strides(view_strides), 0);
+                                       to_strides(view_strides), 0, stream);
 
   std::vector<int> starts(2 * n, 0);
   std::vector<int> stops = view_shape;
@@ -138,7 +142,7 @@ compiler_sliding_window_view(const mlx::core::array &padded,
     sl_strides.push_back(1);
 
   return mlx::core::slice(strided, to_shape(starts), to_shape(stops),
-                          to_shape(sl_strides));
+                          to_shape(sl_strides), stream);
 }
 
 // Decode attrs and run a window reduction (sum/product/max/min).
@@ -146,7 +150,8 @@ compiler_sliding_window_view(const mlx::core::array &padded,
 // attrs = [n_dims, op_int, lo0, hi0, …, s0, …, w0, …, wd0, …]
 static mlx::core::array window_reduce_impl(const mlx::core::array &t,
                                            const std::vector<Attr> &attrs,
-                                           int op_code) {
+                                           int op_code,
+                                           mlx::core::StreamOrDevice stream) {
   int n = static_cast<int>(attrs[0]);
   // attrs[1] is op_int — matches op_code parameter; keep in sync.
 
@@ -172,8 +177,8 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
     expanded_window[i] = window[i] + (window[i] - 1) * (wd[i] - 1);
 
   // Build a 1-filled window mask (bools), dilated via pad + interior zeros.
-  auto one_bool = mlx::core::ones(to_shape(window), mlx::core::bool_);
-  auto zero_bool = mlx::core::zeros({}, mlx::core::bool_);
+  auto one_bool = mlx::core::ones(to_shape(window), mlx::core::bool_, stream);
+  auto zero_bool = mlx::core::zeros({}, mlx::core::bool_, stream);
   auto window_mask = one_bool;
   for (int i = 0; i < n; ++i) {
     if (wd[i] > 1) {
@@ -196,29 +201,29 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
       int new_size = w_i + (w_i - 1) * interior;
       // Build dilated axis: start with zeros, then set positions 0, wd, 2*wd,
       // ...
-      auto arange_full = mlx::core::arange(0, new_size, 1, mlx::core::int32);
+      auto arange_full = mlx::core::arange(0, new_size, 1, mlx::core::int32, stream);
       // Positions occupied by real values: 0, wd, 2*wd, ...
       auto divisible = mlx::core::equal(
           mlx::core::remainder(arange_full,
-                               mlx::core::full({}, wd[i], mlx::core::int32)),
-          mlx::core::zeros({}, mlx::core::int32));
+                               mlx::core::full({}, wd[i], mlx::core::int32, stream), stream),
+          mlx::core::zeros({}, mlx::core::int32, stream), stream);
       // Build dilated from current using take at strided positions.
       // Take the [0, wd, 2*wd, ...] positions from the window_mask axis i.
       auto src_idx = mlx::core::astype(
           mlx::core::divide(arange_full,
-                            mlx::core::full({}, wd[i], mlx::core::int32)),
-          mlx::core::uint32);
+                            mlx::core::full({}, wd[i], mlx::core::int32, stream), stream),
+          mlx::core::uint32, stream);
       // For interior positions, take from mask (value 1); replace interior
       // zeros. It's simpler to: take all, then where(divisible, val, 0).
-      auto taken = mlx::core::take(window_mask, src_idx, i);
+      auto taken = mlx::core::take(window_mask, src_idx, i, stream);
       // Mask out non-original positions.
       // Broadcast divisible to match taken shape.
       std::vector<int> div_shape(window_mask.ndim(), 1);
       div_shape[i] = new_size;
-      auto div_nd = mlx::core::reshape(divisible, to_shape(div_shape));
-      auto div_bc = mlx::core::broadcast_to(div_nd, taken.shape());
+      auto div_nd = mlx::core::reshape(divisible, to_shape(div_shape), stream);
+      auto div_bc = mlx::core::broadcast_to(div_nd, taken.shape(), stream);
       window_mask = mlx::core::where(div_bc, taken,
-                                     mlx::core::zeros({}, mlx::core::bool_));
+                                     mlx::core::zeros({}, mlx::core::bool_, stream), stream);
     }
   }
   // expanded_window is now the shape of window_mask.
@@ -231,24 +236,24 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
   auto make_pad_val = [&]() -> mlx::core::array {
     switch (op_code) {
     case 0: // sum: 0
-      return mlx::core::full({}, 0, t.dtype());
+      return mlx::core::full({}, 0, t.dtype(), stream);
     case 1: // product: 1
-      return mlx::core::full({}, 1, t.dtype());
+      return mlx::core::full({}, 1, t.dtype(), stream);
     case 2: // max: lowest representable value
       if (mlx::core::issubdtype(t.dtype(), mlx::core::floating)) {
         return mlx::core::full({}, -std::numeric_limits<float>::infinity(),
-                               t.dtype());
+                               t.dtype(), stream);
       } else {
         return mlx::core::full({}, std::numeric_limits<int32_t>::min(),
-                               t.dtype());
+                               t.dtype(), stream);
       }
     case 3: // min: highest representable value
       if (mlx::core::issubdtype(t.dtype(), mlx::core::floating)) {
         return mlx::core::full({}, std::numeric_limits<float>::infinity(),
-                               t.dtype());
+                               t.dtype(), stream);
       } else {
         return mlx::core::full({}, std::numeric_limits<int32_t>::max(),
-                               t.dtype());
+                               t.dtype(), stream);
       }
     default:
       throw std::runtime_error("window_reduce_impl: unknown op_code");
@@ -257,25 +262,25 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
   auto pad_val = make_pad_val();
 
   auto padded = mlx::core::pad(t, all_axes, to_shape(low_pad),
-                               to_shape(high_pad), pad_val, "constant");
+                               to_shape(high_pad), pad_val, "constant", stream);
 
   // Sliding window view: shape [o0,...,on-1, w0,...,wn-1].
-  auto view = compiler_sliding_window_view(padded, expanded_window, strides);
+  auto view = compiler_sliding_window_view(padded, expanded_window, strides, stream);
 
   // Broadcast window_mask (shape expanded_window) to match view: all batch dims
   // are 1.
   std::vector<int> mask_bc_shape(n, 1);
   for (int w : expanded_window)
     mask_bc_shape.push_back(w);
-  auto mask_reshaped = mlx::core::reshape(window_mask, to_shape(mask_bc_shape));
-  auto mask_bc = mlx::core::broadcast_to(mask_reshaped, view.shape());
+  auto mask_reshaped = mlx::core::reshape(window_mask, to_shape(mask_bc_shape), stream);
+  auto mask_bc = mlx::core::broadcast_to(mask_reshaped, view.shape(), stream);
 
   // Apply mask: replace masked-out positions with pad_val.
   auto masked_view = mlx::core::where(
       mask_bc, view,
       mlx::core::broadcast_to(
-          mlx::core::reshape(pad_val, to_shape(std::vector<int>{})),
-          view.shape()));
+          mlx::core::reshape(pad_val, to_shape(std::vector<int>{}), stream),
+          view.shape(), stream), stream);
 
   // Reduce over the last n dims (the window axes).
   std::vector<int> window_axes;
@@ -284,13 +289,13 @@ static mlx::core::array window_reduce_impl(const mlx::core::array &t,
 
   switch (op_code) {
   case 0:
-    return mlx::core::sum(masked_view, window_axes, false);
+    return mlx::core::sum(masked_view, window_axes, false, stream);
   case 1:
-    return mlx::core::prod(masked_view, window_axes, false);
+    return mlx::core::prod(masked_view, window_axes, false, stream);
   case 2:
-    return mlx::core::max(masked_view, window_axes, false);
+    return mlx::core::max(masked_view, window_axes, false, stream);
   case 3:
-    return mlx::core::min(masked_view, window_axes, false);
+    return mlx::core::min(masked_view, window_axes, false, stream);
   default:
     throw std::runtime_error("window_reduce_impl: unknown op_code");
   }
@@ -303,7 +308,8 @@ static mlx::core::array
 window_scatter_impl_compiler(const mlx::core::array &tensor_t,
                              const mlx::core::array &tensor_source,
                              const mlx::core::array &tensor_init_value,
-                             const std::vector<Attr> &attrs, bool scatter_max) {
+                             const std::vector<Attr> &attrs, bool scatter_max,
+                             mlx::core::StreamOrDevice stream) {
   int n = static_cast<int>(attrs[0]);
   std::vector<int> low_pad(n), high_pad(n), strides(n), window(n);
   int off = 1;
@@ -316,16 +322,16 @@ window_scatter_impl_compiler(const mlx::core::array &tensor_t,
   for (int i = 0; i < n; ++i)
     window[i] = static_cast<int>(attrs[off++]);
 
-  auto init_casted = mlx::core::astype(tensor_init_value, tensor_t.dtype());
+  auto init_casted = mlx::core::astype(tensor_init_value, tensor_t.dtype(), stream);
   std::vector<int> all_axes(n);
   std::iota(all_axes.begin(), all_axes.end(), 0);
   auto padded = mlx::core::pad(tensor_t, all_axes, to_shape(low_pad),
-                               to_shape(high_pad), init_casted, "constant");
+                               to_shape(high_pad), init_casted, "constant", stream);
 
   auto padded_shape = padded.shape();
   std::vector<int> padded_shape_vec(padded_shape.begin(), padded_shape.end());
 
-  auto window_view = compiler_sliding_window_view(padded, window, strides);
+  auto window_view = compiler_sliding_window_view(padded, window, strides, stream);
 
   std::vector<int> out_shape(window_view.shape().begin(),
                              window_view.shape().begin() + n);
@@ -336,56 +342,56 @@ window_scatter_impl_compiler(const mlx::core::array &tensor_t,
 
   std::vector<int> flat_shape = out_shape;
   flat_shape.push_back(K);
-  auto windows_flat = mlx::core::reshape(window_view, to_shape(flat_shape));
+  auto windows_flat = mlx::core::reshape(window_view, to_shape(flat_shape), stream);
 
   auto arg_idx = [&]() -> mlx::core::array {
     if (scatter_max) {
-      return mlx::core::argmax(windows_flat, n, false);
+      return mlx::core::argmax(windows_flat, n, false, stream);
     }
-    auto m = mlx::core::min(windows_flat, std::vector<int>{n}, true);
+    auto m = mlx::core::min(windows_flat, std::vector<int>{n}, true, stream);
     auto mask =
-        mlx::core::astype(mlx::core::equal(windows_flat, m), mlx::core::uint32);
+        mlx::core::astype(mlx::core::equal(windows_flat, m, stream), mlx::core::uint32, stream);
     auto arange_k =
-        mlx::core::astype(mlx::core::arange(0, K, 1), mlx::core::uint32);
+        mlx::core::astype(mlx::core::arange(0, K, 1, stream), mlx::core::uint32, stream);
     std::vector<int> arange_shape(n + 1, 1);
     arange_shape[n] = K;
-    auto arange_nd = mlx::core::reshape(arange_k, to_shape(arange_shape));
-    auto weighted = mlx::core::multiply(mask, arange_nd);
-    return mlx::core::argmax(weighted, n, false);
+    auto arange_nd = mlx::core::reshape(arange_k, to_shape(arange_shape), stream);
+    auto weighted = mlx::core::multiply(mask, arange_nd, stream);
+    return mlx::core::argmax(weighted, n, false, stream);
   }();
 
   std::vector<int> arg_exp_shape = out_shape;
   arg_exp_shape.push_back(1);
-  auto arg_idx_exp = mlx::core::reshape(arg_idx, to_shape(arg_exp_shape));
+  auto arg_idx_exp = mlx::core::reshape(arg_idx, to_shape(arg_exp_shape), stream);
 
   std::vector<mlx::core::array> abs_indices;
   for (int a = 0; a < n; ++a) {
     auto arange_a = mlx::core::astype(
-        mlx::core::arange(0, (int)padded_shape[a], 1), mlx::core::int32);
+        mlx::core::arange(0, (int)padded_shape[a], 1, stream), mlx::core::int32, stream);
     std::vector<int> iota_shape(n, 1);
     iota_shape[a] = (int)padded_shape[a];
-    auto iota_nd = mlx::core::reshape(arange_a, to_shape(iota_shape));
-    auto iota_bc = mlx::core::broadcast_to(iota_nd, to_shape(padded_shape_vec));
-    auto iota_view = compiler_sliding_window_view(iota_bc, window, strides);
-    auto iota_flat = mlx::core::reshape(iota_view, to_shape(flat_shape));
-    auto abs_a = mlx::core::take_along_axis(iota_flat, arg_idx_exp, n);
-    abs_indices.push_back(mlx::core::reshape(abs_a, to_shape(out_shape)));
+    auto iota_nd = mlx::core::reshape(arange_a, to_shape(iota_shape), stream);
+    auto iota_bc = mlx::core::broadcast_to(iota_nd, to_shape(padded_shape_vec), stream);
+    auto iota_view = compiler_sliding_window_view(iota_bc, window, strides, stream);
+    auto iota_flat = mlx::core::reshape(iota_view, to_shape(flat_shape), stream);
+    auto abs_a = mlx::core::take_along_axis(iota_flat, arg_idx_exp, n, stream);
+    abs_indices.push_back(mlx::core::reshape(abs_a, to_shape(out_shape), stream));
   }
 
   auto source_shape_2n = std::vector<int>(tensor_source.shape().begin(),
                                           tensor_source.shape().end());
   for (int i = 0; i < n; ++i)
     source_shape_2n.push_back(1);
-  auto updates = mlx::core::reshape(tensor_source, to_shape(source_shape_2n));
+  auto updates = mlx::core::reshape(tensor_source, to_shape(source_shape_2n), stream);
 
   auto buffer = mlx::core::broadcast_to(
-      mlx::core::reshape(init_casted, to_shape(std::vector<int>{})),
-      to_shape(padded_shape_vec));
+      mlx::core::reshape(init_casted, to_shape(std::vector<int>{}), stream),
+      to_shape(padded_shape_vec), stream);
 
   std::vector<int> scatter_axes(n);
   std::iota(scatter_axes.begin(), scatter_axes.end(), 0);
   auto scattered =
-      mlx::core::scatter_add(buffer, abs_indices, updates, scatter_axes);
+      mlx::core::scatter_add(buffer, abs_indices, updates, scatter_axes, stream);
 
   auto orig_shape = tensor_t.shape();
   std::vector<int> slice_starts = low_pad;
@@ -394,7 +400,7 @@ window_scatter_impl_compiler(const mlx::core::array &tensor_t,
     slice_stops[i] = low_pad[i] + (int)orig_shape[i];
   std::vector<int> slice_ones(n, 1);
   return mlx::core::slice(scattered, to_shape(slice_starts),
-                          to_shape(slice_stops), to_shape(slice_ones));
+                          to_shape(slice_stops), to_shape(slice_ones), stream);
 }
 
 // MLX linalg primitives are CPU-only.  Pin them to the CPU device so they
@@ -406,130 +412,130 @@ static const mlx::core::Device k_linalg_cpu(mlx::core::Device::DeviceType::cpu,
 static const std::unordered_map<std::string, OpFn> op_registry = {
     // ── cast ──────────────────────────────────────────────────────────────
     {"astype",
-     [](const auto &ops, const auto &attrs) {
-       return mlx::core::astype(ops[0], attrs[0].as_dtype());
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return mlx::core::astype(ops[0], attrs[0].as_dtype(), stream);
      }},
 
     // ── unary ops ─────────────────────────────────────────────────────────
-    {"abs", [](const auto &ops, const auto &) { return mlx::core::abs(ops[0]); }},
-    {"ceil", [](const auto &ops, const auto &) { return mlx::core::ceil(ops[0]); }},
-    {"floor", [](const auto &ops, const auto &) { return mlx::core::floor(ops[0]); }},
-    {"negate", [](const auto &ops, const auto &) { return mlx::core::negative(ops[0]); }},
-    {"round", [](const auto &ops, const auto &) { return mlx::core::round(ops[0]); }},
-    {"sign", [](const auto &ops, const auto &) { return mlx::core::sign(ops[0]); }},
-    {"real", [](const auto &ops, const auto &) { return mlx::core::real(ops[0]); }},
-    {"imag", [](const auto &ops, const auto &) { return mlx::core::imag(ops[0]); }},
-    {"is_nan", [](const auto &ops, const auto &) { return mlx::core::isnan(ops[0]); }},
-    {"is_infinity", [](const auto &ops, const auto &) { return mlx::core::isinf(ops[0]); }},
+    {"abs", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::abs(ops[0], stream); }},
+    {"ceil", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::ceil(ops[0], stream); }},
+    {"floor", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::floor(ops[0], stream); }},
+    {"negate", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::negative(ops[0], stream); }},
+    {"round", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::round(ops[0], stream); }},
+    {"sign", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::sign(ops[0], stream); }},
+    {"real", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::real(ops[0], stream); }},
+    {"imag", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::imag(ops[0], stream); }},
+    {"is_nan", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::isnan(ops[0], stream); }},
+    {"is_infinity", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::isinf(ops[0], stream); }},
     {"bitwise_not",
-     [](const auto &ops, const auto &) {
-       return mlx::core::bitwise_invert(ops[0]);
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
+       return mlx::core::bitwise_invert(ops[0], stream);
      }},
     {"conjugate",
-     [](const auto &ops, const auto &) { return mlx::core::conjugate(ops[0]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::conjugate(ops[0], stream); }},
     {"logical_not",
-     [](const auto &ops, const auto &) { return mlx::core::logical_not(ops[0]); }},
-    {"sigmoid", [](const auto &ops, const auto &) { return mlx::core::sigmoid(ops[0]); }},
-    {"asin", [](const auto &ops, const auto &) { return mlx::core::arcsin(ops[0]); }},
-    {"asinh", [](const auto &ops, const auto &) { return mlx::core::arcsinh(ops[0]); }},
-    {"acos", [](const auto &ops, const auto &) { return mlx::core::arccos(ops[0]); }},
-    {"acosh", [](const auto &ops, const auto &) { return mlx::core::arccosh(ops[0]); }},
-    {"atan", [](const auto &ops, const auto &) { return mlx::core::arctan(ops[0]); }},
-    {"atanh", [](const auto &ops, const auto &) { return mlx::core::arctanh(ops[0]); }},
-    {"cos", [](const auto &ops, const auto &) { return mlx::core::cos(ops[0]); }},
-    {"cosh", [](const auto &ops, const auto &) { return mlx::core::cosh(ops[0]); }},
-    {"erf", [](const auto &ops, const auto &) { return mlx::core::erf(ops[0]); }},
-    {"erf_inv", [](const auto &ops, const auto &) { return mlx::core::erfinv(ops[0]); }},
-    {"exp", [](const auto &ops, const auto &) { return mlx::core::exp(ops[0]); }},
-    {"expm1", [](const auto &ops, const auto &) { return mlx::core::expm1(ops[0]); }},
-    {"log", [](const auto &ops, const auto &) { return mlx::core::log(ops[0]); }},
-    {"log1p", [](const auto &ops, const auto &) { return mlx::core::log1p(ops[0]); }},
-    {"rsqrt", [](const auto &ops, const auto &) { return mlx::core::rsqrt(ops[0]); }},
-    {"sin", [](const auto &ops, const auto &) { return mlx::core::sin(ops[0]); }},
-    {"sinh", [](const auto &ops, const auto &) { return mlx::core::sinh(ops[0]); }},
-    {"sqrt", [](const auto &ops, const auto &) { return mlx::core::sqrt(ops[0]); }},
-    {"tan", [](const auto &ops, const auto &) { return mlx::core::tan(ops[0]); }},
-    {"tanh", [](const auto &ops, const auto &) { return mlx::core::tanh(ops[0]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::logical_not(ops[0], stream); }},
+    {"sigmoid", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::sigmoid(ops[0], stream); }},
+    {"asin", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::arcsin(ops[0], stream); }},
+    {"asinh", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::arcsinh(ops[0], stream); }},
+    {"acos", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::arccos(ops[0], stream); }},
+    {"acosh", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::arccosh(ops[0], stream); }},
+    {"atan", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::arctan(ops[0], stream); }},
+    {"atanh", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::arctanh(ops[0], stream); }},
+    {"cos", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::cos(ops[0], stream); }},
+    {"cosh", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::cosh(ops[0], stream); }},
+    {"erf", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::erf(ops[0], stream); }},
+    {"erf_inv", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::erfinv(ops[0], stream); }},
+    {"exp", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::exp(ops[0], stream); }},
+    {"expm1", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::expm1(ops[0], stream); }},
+    {"log", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::log(ops[0], stream); }},
+    {"log1p", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::log1p(ops[0], stream); }},
+    {"rsqrt", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::rsqrt(ops[0], stream); }},
+    {"sin", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::sin(ops[0], stream); }},
+    {"sinh", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::sinh(ops[0], stream); }},
+    {"sqrt", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::sqrt(ops[0], stream); }},
+    {"tan", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::tan(ops[0], stream); }},
+    {"tanh", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::tanh(ops[0], stream); }},
 
     // cbrt = x^(1/3); returns NaN for negative real inputs (matches EMLX.Backend)
     {"cbrt",
-     [](const auto &ops, const auto &) {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
        return mlx::core::power(
-           ops[0], mlx::core::full({}, static_cast<float>(1.0 / 3.0), mlx::core::float32));
+           ops[0], mlx::core::full({}, static_cast<float>(1.0 / 3.0), mlx::core::float32, stream), stream);
      }},
 
     // erfc = 1 - erf(x)
     {"erfc",
-     [](const auto &ops, const auto &) {
-       auto e = mlx::core::erf(ops[0]);
-       return mlx::core::subtract(mlx::core::ones({}, e.dtype()), e);
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
+       auto e = mlx::core::erf(ops[0], stream);
+       return mlx::core::subtract(mlx::core::ones({}, e.dtype(), stream), e, stream);
      }},
 
     // ── binary ops ────────────────────────────────────────────────────────
-    {"add", [](const auto &ops, const auto &) { return mlx::core::add(ops[0], ops[1]); }},
+    {"add", [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::add(ops[0], ops[1], stream); }},
     {"subtract",
-     [](const auto &ops, const auto &) { return mlx::core::subtract(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::subtract(ops[0], ops[1], stream); }},
     {"multiply",
-     [](const auto &ops, const auto &) { return mlx::core::multiply(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::multiply(ops[0], ops[1], stream); }},
     {"divide",
-     [](const auto &ops, const auto &) { return mlx::core::divide(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::divide(ops[0], ops[1], stream); }},
     {"pow",
-     [](const auto &ops, const auto &) { return mlx::core::power(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::power(ops[0], ops[1], stream); }},
     {"atan2",
-     [](const auto &ops, const auto &) { return mlx::core::arctan2(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::arctan2(ops[0], ops[1], stream); }},
     {"min",
-     [](const auto &ops, const auto &) { return mlx::core::minimum(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::minimum(ops[0], ops[1], stream); }},
     {"max",
-     [](const auto &ops, const auto &) { return mlx::core::maximum(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::maximum(ops[0], ops[1], stream); }},
     {"quotient",
-     [](const auto &ops, const auto &) { return mlx::core::floor_divide(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::floor_divide(ops[0], ops[1], stream); }},
     {"left_shift",
-     [](const auto &ops, const auto &) { return mlx::core::left_shift(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::left_shift(ops[0], ops[1], stream); }},
     {"right_shift",
-     [](const auto &ops, const auto &) { return mlx::core::right_shift(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::right_shift(ops[0], ops[1], stream); }},
     {"bitwise_and",
-     [](const auto &ops, const auto &) { return mlx::core::bitwise_and(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::bitwise_and(ops[0], ops[1], stream); }},
     {"bitwise_or",
-     [](const auto &ops, const auto &) { return mlx::core::bitwise_or(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::bitwise_or(ops[0], ops[1], stream); }},
     {"bitwise_xor",
-     [](const auto &ops, const auto &) { return mlx::core::bitwise_xor(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::bitwise_xor(ops[0], ops[1], stream); }},
 
     // remainder: MLX uses floor-division semantics; fix up to truncation (same sign as dividend)
     // to match EMLX.Backend.remainder which applies this same correction.
     {"remainder",
-     [](const auto &ops, const auto &) {
-       auto rem = mlx::core::remainder(ops[0], ops[1]);
-       auto zero = mlx::core::full({}, 0, ops[0].dtype());
-       auto neg_dividend = mlx::core::less(ops[0], zero);
-       auto adjusted = mlx::core::subtract(rem, ops[1]);
-       return mlx::core::where(neg_dividend, adjusted, rem);
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
+       auto rem = mlx::core::remainder(ops[0], ops[1], stream);
+       auto zero = mlx::core::full({}, 0, ops[0].dtype(), stream);
+       auto neg_dividend = mlx::core::less(ops[0], zero, stream);
+       auto adjusted = mlx::core::subtract(rem, ops[1], stream);
+       return mlx::core::where(neg_dividend, adjusted, rem, stream);
      }},
 
     // compare — result is MLX bool_; Elixir lowerer emits astype(bool_, uint8) after
     {"equal",
-     [](const auto &ops, const auto &) { return mlx::core::equal(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::equal(ops[0], ops[1], stream); }},
     {"not_equal",
-     [](const auto &ops, const auto &) { return mlx::core::not_equal(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::not_equal(ops[0], ops[1], stream); }},
     {"greater",
-     [](const auto &ops, const auto &) { return mlx::core::greater(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::greater(ops[0], ops[1], stream); }},
     {"less",
-     [](const auto &ops, const auto &) { return mlx::core::less(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::less(ops[0], ops[1], stream); }},
     {"greater_equal",
-     [](const auto &ops, const auto &) { return mlx::core::greater_equal(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::greater_equal(ops[0], ops[1], stream); }},
     {"less_equal",
-     [](const auto &ops, const auto &) { return mlx::core::less_equal(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::less_equal(ops[0], ops[1], stream); }},
 
     // logical binary
     {"logical_and",
-     [](const auto &ops, const auto &) { return mlx::core::logical_and(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::logical_and(ops[0], ops[1], stream); }},
     {"logical_or",
-     [](const auto &ops, const auto &) { return mlx::core::logical_or(ops[0], ops[1]); }},
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) { return mlx::core::logical_or(ops[0], ops[1], stream); }},
     // logical_xor = (a || b) && !(a && b)
     {"logical_xor",
-     [](const auto &ops, const auto &) {
-       auto t1 = mlx::core::logical_or(ops[0], ops[1]);
-       auto t2 = mlx::core::logical_not(mlx::core::logical_and(ops[0], ops[1]));
-       return mlx::core::logical_and(t1, t2);
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
+       auto t1 = mlx::core::logical_or(ops[0], ops[1], stream);
+       auto t2 = mlx::core::logical_not(mlx::core::logical_and(ops[0], ops[1], stream), stream);
+       return mlx::core::logical_and(t1, t2, stream);
      }},
 
     // ── shape / movement ops ──────────────────────────────────────────────────
@@ -546,43 +552,43 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     //   stack:       attrs = [axis]; ops = all input tensors
 
     {"reshape",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        std::vector<int> shape;
        shape.reserve(attrs.size());
        for (auto d : attrs)
          shape.push_back(static_cast<int>(d));
-       return mlx::core::reshape(ops[0], to_shape(shape));
+       return mlx::core::reshape(ops[0], to_shape(shape), stream);
      }},
 
     {"squeeze",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        if (attrs.empty())
          return ops[0];
        std::vector<int> axes;
        axes.reserve(attrs.size());
        for (auto a : attrs)
          axes.push_back(static_cast<int>(a));
-       return mlx::core::squeeze(ops[0], axes);
+       return mlx::core::squeeze(ops[0], axes, stream);
      }},
 
     {"transpose",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        std::vector<int> axes;
        axes.reserve(attrs.size());
        for (auto a : attrs)
          axes.push_back(static_cast<int>(a));
-       return mlx::core::transpose(ops[0], axes);
+       return mlx::core::transpose(ops[0], axes, stream);
      }},
 
     {"bitcast",
-     [](const auto &ops, const auto &attrs) {
-       return mlx::core::view(ops[0], attrs[0].as_dtype());
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return mlx::core::view(ops[0], attrs[0].as_dtype(), stream);
      }},
 
     // broadcast: reshape input to place source dims at the axis positions, then broadcast_to.
     // Mirrors EMLX.Backend.broadcast / maybe_reshape logic exactly.
     {"broadcast",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_shape = static_cast<int>(attrs[0]);
        std::vector<int> target_shape;
        target_shape.reserve(n_shape);
@@ -604,13 +610,13 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          if (!in_shape.empty())
            broadcast_shape[axes[i]] = static_cast<int>(in_shape[i]);
        }
-       auto reshaped = mlx::core::reshape(tensor, to_shape(broadcast_shape));
-       return mlx::core::broadcast_to(reshaped, to_shape(target_shape));
+       auto reshaped = mlx::core::reshape(tensor, to_shape(broadcast_shape), stream);
+       return mlx::core::broadcast_to(reshaped, to_shape(target_shape), stream);
      }},
 
     // pad: non-negative lo/hi, interior always 0 (Elixir raises otherwise).
     {"pad",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_dims = static_cast<int>(attrs[0]);
        std::vector<int> axes, low_pads, high_pads;
        axes.reserve(n_dims);
@@ -623,12 +629,12 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          // attrs[1 + i*3 + 2] = interior, always 0 (validated in Elixir lowerer)
        }
        return mlx::core::pad(ops[0], axes, to_shape(low_pads), to_shape(high_pads), ops[1],
-                             "constant");
+                             "constant", stream);
      }},
 
     // reverse: implemented via slice with negative strides, matching EMLX.Backend.reverse_mlx.
     {"reverse",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        auto tensor = ops[0];
        auto shape = tensor.shape();
        int rank = static_cast<int>(shape.size());
@@ -646,19 +652,19 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          stops[ax] = -(d + 1);
          strides[ax] = -1;
        }
-       return mlx::core::slice(tensor, to_shape(starts), to_shape(stops), to_shape(strides));
+       return mlx::core::slice(tensor, to_shape(starts), to_shape(stops), to_shape(strides), stream);
      }},
 
     {"concatenate",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
-       return mlx::core::concatenate(ops, axis);
+       return mlx::core::concatenate(ops, axis, stream);
      }},
 
     {"stack",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
-       return mlx::core::stack(ops, axis);
+       return mlx::core::stack(ops, axis, stream);
      }},
 
     // ── reductions ────────────────────────────────────────────────────────────
@@ -669,87 +675,87 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // all, any: Elixir always emits astype since MLX returns bool_.
 
     {"sum",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        bool keepdims = static_cast<bool>(attrs[0]);
        std::vector<int> axes;
        for (size_t i = 1; i < attrs.size(); i++)
          axes.push_back(static_cast<int>(attrs[i]));
-       return mlx::core::sum(ops[0], axes, keepdims);
+       return mlx::core::sum(ops[0], axes, keepdims, stream);
      }},
 
     {"product",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        bool keepdims = static_cast<bool>(attrs[0]);
        std::vector<int> axes;
        for (size_t i = 1; i < attrs.size(); i++)
          axes.push_back(static_cast<int>(attrs[i]));
-       return mlx::core::prod(ops[0], axes, keepdims);
+       return mlx::core::prod(ops[0], axes, keepdims, stream);
      }},
 
     {"all",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        bool keepdims = static_cast<bool>(attrs[0]);
        std::vector<int> axes;
        for (size_t i = 1; i < attrs.size(); i++)
          axes.push_back(static_cast<int>(attrs[i]));
-       return mlx::core::all(ops[0], axes, keepdims);
+       return mlx::core::all(ops[0], axes, keepdims, stream);
      }},
 
     {"any",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        bool keepdims = static_cast<bool>(attrs[0]);
        std::vector<int> axes;
        for (size_t i = 1; i < attrs.size(); i++)
          axes.push_back(static_cast<int>(attrs[i]));
-       return mlx::core::any(ops[0], axes, keepdims);
+       return mlx::core::any(ops[0], axes, keepdims, stream);
      }},
 
     {"reduce_max",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        bool keepdims = static_cast<bool>(attrs[0]);
        std::vector<int> axes;
        for (size_t i = 1; i < attrs.size(); i++)
          axes.push_back(static_cast<int>(attrs[i]));
-       return mlx::core::max(ops[0], axes, keepdims);
+       return mlx::core::max(ops[0], axes, keepdims, stream);
      }},
 
     {"reduce_min",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        bool keepdims = static_cast<bool>(attrs[0]);
        std::vector<int> axes;
        for (size_t i = 1; i < attrs.size(); i++)
          axes.push_back(static_cast<int>(attrs[i]));
-       return mlx::core::min(ops[0], axes, keepdims);
+       return mlx::core::min(ops[0], axes, keepdims, stream);
      }},
 
     // argmax / argmin — iattrs = [axis, keep_axis_int]; axis = -1 means global.
     {"argmax",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool keepdims = static_cast<bool>(attrs[1]);
        if (axis < 0)
-         return mlx::core::argmax(ops[0], keepdims);
-       return mlx::core::argmax(ops[0], axis, keepdims);
+         return mlx::core::argmax(ops[0], keepdims, stream);
+       return mlx::core::argmax(ops[0], axis, keepdims, stream);
      }},
 
     {"argmin",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool keepdims = static_cast<bool>(attrs[1]);
        if (axis < 0)
-         return mlx::core::argmin(ops[0], keepdims);
-       return mlx::core::argmin(ops[0], axis, keepdims);
+         return mlx::core::argmin(ops[0], keepdims, stream);
+       return mlx::core::argmin(ops[0], axis, keepdims, stream);
      }},
 
     // ── dot ───────────────────────────────────────────────────────────────────
     //
     // iattrs = [n_ca, ca…, n_cb, cb…, n_ba, ba…, n_bb, bb…]
     // Elixir lowerer casts both operands to computation_type before the dot op.
-    // Non-batched (n_ba=0, n_bb=0): mlx::core::tensordot(left, right, ca, cb).
+    // Non-batched (n_ba=0, n_bb=0): mlx::core::tensordot(left, right, ca, cb, stream).
     // Batched: rebuild einsum spec from shapes + 4 axis lists, call einsum.
 
     {"dot",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        // Parse 4 length-delimited axis lists.
        size_t off = 0;
        auto parse_axis_list = [&]() -> std::vector<int> {
@@ -765,7 +771,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        auto bb = parse_axis_list();
 
        if (ba.empty() && bb.empty()) {
-         return mlx::core::tensordot(ops[0], ops[1], ca, cb);
+         return mlx::core::tensordot(ops[0], ops[1], ca, cb, stream);
        }
 
        // Batched: build einsum spec by assigning letter labels.
@@ -806,7 +812,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
        std::string spec = std::string(ll.begin(), ll.end()) + "," +
                           std::string(rl.begin(), rl.end()) + "->" + output;
-       return mlx::core::einsum(spec, {ops[0], ops[1]});
+       return mlx::core::einsum(spec, {ops[0], ops[1]}, stream);
      }},
 
     // ── quantized_matmul ──────────────────────────────────────────────────────
@@ -819,7 +825,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // EMLX.Native.Expr's "Quantized dot specialization" moduledoc section);
     // `weight` is the untouched physical (packed) parameter ref.
     {"quantized_matmul",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int group_size = static_cast<int>(attrs[0]);
        int bits = static_cast<int>(attrs[1]);
        bool transpose = attrs[2] != 0;
@@ -828,21 +834,21 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        std::optional<mlx::core::array> biases_opt =
            has_bias ? std::make_optional(ops[3]) : std::nullopt;
        return mlx::core::quantized_matmul(ops[0], ops[1], ops[2], biases_opt,
-                                          transpose, group_size, bits, mode);
+                                          transpose, group_size, bits, mode, stream);
      }},
 
     // ── indexing / selection ─────────────────────────────────────────────────
     //
     // select: operands = [pred, on_true, on_false]; no attrs.
     {"select",
-     [](const auto &ops, const auto &) {
-       return mlx::core::where(ops[0], ops[1], ops[2]);
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
+       return mlx::core::where(ops[0], ops[1], ops[2], stream);
      }},
 
     // clip: operands = [tensor, min, max]; no attrs.
     {"clip",
-     [](const auto &ops, const auto &) {
-       return mlx::core::clip(ops[0], ops[1], ops[2]);
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
+       return mlx::core::clip(ops[0], ops[1], ops[2], stream);
      }},
 
     // slice: attrs = [n_dims, dyn_mask, d0..dn-1, l0..ln-1, str0..strn-1, sv0..svn-1]
@@ -851,7 +857,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // Strategy: one static mlx::core::slice for all static dims (full span for dynamic dims),
     // then mlx::core::take per dynamic dim to apply the dynamic start + strided selection.
     {"slice",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_dims = static_cast<int>(attrs[0]);
        int64_t dyn_mask = attrs[1];
 
@@ -880,7 +886,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          }
        }
        auto result =
-           mlx::core::slice(ops[0], to_shape(starts), to_shape(stops), to_shape(slice_strides));
+           mlx::core::slice(ops[0], to_shape(starts), to_shape(stops), to_shape(slice_strides), stream);
 
        // For each dynamic dim, apply take with arange*stride + clamped_start.
        int dyn_op_idx = 1;
@@ -890,16 +896,16 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          int len_i = lengths[i];
          int str_i = strides_v[i];
          // clamped_start = clip(start_arr, 0, dim_i - len_i)
-         auto s = mlx::core::astype(ops[dyn_op_idx++], mlx::core::int32);
-         auto zero = mlx::core::zeros({}, mlx::core::int32);
-         auto max_s = mlx::core::full({}, input_shape[i] - len_i, mlx::core::int32);
-         auto clamped = mlx::core::minimum(mlx::core::maximum(s, zero), max_s);
+         auto s = mlx::core::astype(ops[dyn_op_idx++], mlx::core::int32, stream);
+         auto zero = mlx::core::zeros({}, mlx::core::int32, stream);
+         auto max_s = mlx::core::full({}, input_shape[i] - len_i, mlx::core::int32, stream);
+         auto clamped = mlx::core::minimum(mlx::core::maximum(s, zero, stream), max_s, stream);
          // idx = arange(len_i) * str_i + clamped
-         auto base = mlx::core::arange(0, len_i, 1, mlx::core::int32);
+         auto base = mlx::core::arange(0, len_i, 1, mlx::core::int32, stream);
          if (str_i != 1)
-           base = mlx::core::multiply(base, mlx::core::full({}, str_i, mlx::core::int32));
-         auto idx = mlx::core::add(base, clamped);
-         result = mlx::core::take(result, idx, i);
+           base = mlx::core::multiply(base, mlx::core::full({}, str_i, mlx::core::int32, stream), stream);
+         auto idx = mlx::core::add(base, clamped, stream);
+         result = mlx::core::take(result, idx, i, stream);
        }
        return result;
      }},
@@ -909,7 +915,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     //
     // Builds a clamped int32 start array and calls the dynamic slice_update overload.
     {"put_slice",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_dims = static_cast<int>(attrs[0]);
        int64_t dyn_mask = attrs[1];
 
@@ -928,28 +934,28 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        for (int i = 0; i < n_dims; i++) {
          int max_start_i = input_shape[i] - lengths[i];
          if ((dyn_mask >> i) & 1) {
-           auto s = mlx::core::astype(ops[dyn_op_idx++], mlx::core::int32);
-           s = mlx::core::reshape(s, {1});
-           auto max_s = mlx::core::full({1}, max_start_i, mlx::core::int32);
-           auto zero = mlx::core::zeros({1}, mlx::core::int32);
-           start_components.push_back(mlx::core::minimum(mlx::core::maximum(s, zero), max_s));
+           auto s = mlx::core::astype(ops[dyn_op_idx++], mlx::core::int32, stream);
+           s = mlx::core::reshape(s, {1}, stream);
+           auto max_s = mlx::core::full({1}, max_start_i, mlx::core::int32, stream);
+           auto zero = mlx::core::zeros({1}, mlx::core::int32, stream);
+           start_components.push_back(mlx::core::minimum(mlx::core::maximum(s, zero, stream), max_s, stream));
          } else {
            int clamped_i = std::max(0, std::min(sv[i], max_start_i));
-           start_components.push_back(mlx::core::full({1}, clamped_i, mlx::core::int32));
+           start_components.push_back(mlx::core::full({1}, clamped_i, mlx::core::int32, stream));
          }
        }
-       auto start_arr = mlx::core::concatenate(start_components, 0);
+       auto start_arr = mlx::core::concatenate(start_components, 0, stream);
 
        // All axes: [0, 1, ..., n_dims-1]
        std::vector<int> all_axes(n_dims);
        std::iota(all_axes.begin(), all_axes.end(), 0);
-       return mlx::core::slice_update(ops[0], ops[1], start_arr, all_axes);
+       return mlx::core::slice_update(ops[0], ops[1], start_arr, all_axes, stream);
      }},
 
     // gather: attrs = [n_gather_axes, a0…, n_tensor_dims, ss0…, n_out_dims, od0…]
     // Operands: [tensor, indices]  — indices shape = [batch…, n_gather_axes]
     {"gather",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_gather_axes = static_cast<int>(attrs[0]);
        std::vector<int> axes(n_gather_axes);
        for (int i = 0; i < n_gather_axes; i++)
@@ -980,33 +986,33 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          s_starts[last] = i;
          s_stops[last] = i + 1;
          auto sl = mlx::core::slice(indices, to_shape(s_starts), to_shape(s_stops),
-                                    to_shape(s_strides));
-         indices_list.push_back(mlx::core::squeeze(sl, {last}));
+                                    to_shape(s_strides), stream);
+         indices_list.push_back(mlx::core::squeeze(sl, {last}, stream));
        }
 
-       auto result = mlx::core::gather(ops[0], indices_list, axes, to_shape(slice_sizes));
-       return mlx::core::reshape(result, to_shape(out_shape_v));
+       auto result = mlx::core::gather(ops[0], indices_list, axes, to_shape(slice_sizes), stream);
+       return mlx::core::reshape(result, to_shape(out_shape_v), stream);
      }},
 
     // take: operands = [tensor, indices]; attrs = [axis].
     {"take",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
-       return mlx::core::take(ops[0], ops[1], axis);
+       return mlx::core::take(ops[0], ops[1], axis, stream);
      }},
 
     // take_along_axis: operands = [tensor, indices]; attrs = [axis].
     {"take_along_axis",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
-       return mlx::core::take_along_axis(ops[0], ops[1], axis);
+       return mlx::core::take_along_axis(ops[0], ops[1], axis, stream);
      }},
 
     // indexed_add: attrs = [n_axes, a0…, n_updates_shape, us0…]
     // Operands: [target, indices, updates_pre_reshape]
     // Mirrors EMLX.Backend.indexed_op(:scatter_add, …)
     {"indexed_add",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_axes = static_cast<int>(attrs[0]);
        std::vector<int> axes(n_axes);
        for (int i = 0; i < n_axes; i++)
@@ -1030,17 +1036,17 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          s_starts[last] = i;
          s_stops[last] = i + 1;
          auto sl = mlx::core::slice(indices, to_shape(s_starts), to_shape(s_stops),
-                                    to_shape(s_strides));
-         indices_list.push_back(mlx::core::squeeze(sl, {last}));
+                                    to_shape(s_strides), stream);
+         indices_list.push_back(mlx::core::squeeze(sl, {last}, stream));
        }
 
-       auto updates_reshaped = mlx::core::reshape(ops[2], to_shape(upd_shape));
-       return mlx::core::scatter_add(ops[0], indices_list, updates_reshaped, axes);
+       auto updates_reshaped = mlx::core::reshape(ops[2], to_shape(upd_shape), stream);
+       return mlx::core::scatter_add(ops[0], indices_list, updates_reshaped, axes, stream);
      }},
 
     // indexed_put: same structure as indexed_add but uses scatter (replace semantics).
     {"indexed_put",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_axes = static_cast<int>(attrs[0]);
        std::vector<int> axes(n_axes);
        for (int i = 0; i < n_axes; i++)
@@ -1064,12 +1070,12 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          s_starts[last] = i;
          s_stops[last] = i + 1;
          auto sl = mlx::core::slice(indices, to_shape(s_starts), to_shape(s_stops),
-                                    to_shape(s_strides));
-         indices_list.push_back(mlx::core::squeeze(sl, {last}));
+                                    to_shape(s_strides), stream);
+         indices_list.push_back(mlx::core::squeeze(sl, {last}, stream));
        }
 
-       auto updates_reshaped = mlx::core::reshape(ops[2], to_shape(upd_shape));
-       return mlx::core::scatter(ops[0], indices_list, updates_reshaped, axes);
+       auto updates_reshaped = mlx::core::reshape(ops[2], to_shape(upd_shape), stream);
+       return mlx::core::scatter(ops[0], indices_list, updates_reshaped, axes, stream);
      }},
 
     // ── sort / argsort ─────────────────────────────────────────────────────────
@@ -1087,57 +1093,57 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // argsort: same but step 5 applies partition to sort_indices.
 
     {"sort",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool asc = (attrs[1] != 0);
 
        // Step 1: get initial argsort indices.
        auto t = ops[0];
-       auto sort_input = asc ? t : mlx::core::negative(t);
-       auto sort_idx = mlx::core::argsort(sort_input, axis);
+       auto sort_input = asc ? t : mlx::core::negative(t, stream);
+       auto sort_idx = mlx::core::argsort(sort_input, axis, stream);
 
        // Step 2: gather sorted values.
-       auto sorted_vals = mlx::core::take_along_axis(t, sort_idx, axis);
+       auto sorted_vals = mlx::core::take_along_axis(t, sort_idx, axis, stream);
 
        // Step 3: NaN mask.
-       auto is_nan = mlx::core::isnan(sorted_vals);
+       auto is_nan = mlx::core::isnan(sorted_vals, stream);
 
        // Step 4: partition indices (move NaNs to correct end).
-       auto is_nan_u8 = mlx::core::astype(is_nan, mlx::core::uint8);
+       auto is_nan_u8 = mlx::core::astype(is_nan, mlx::core::uint8, stream);
        mlx::core::array partition_input =
            asc ? is_nan_u8
-               : mlx::core::astype(mlx::core::logical_not(is_nan), mlx::core::uint8);
-       auto partition = mlx::core::argsort(partition_input, axis);
+               : mlx::core::astype(mlx::core::logical_not(is_nan, stream), mlx::core::uint8, stream);
+       auto partition = mlx::core::argsort(partition_input, axis, stream);
 
        // Step 5: reorder sorted_values by partition.
-       return mlx::core::take_along_axis(sorted_vals, partition, axis);
+       return mlx::core::take_along_axis(sorted_vals, partition, axis, stream);
      }},
 
     {"argsort",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool asc = (attrs[1] != 0);
 
        // Step 1: get initial argsort indices.
        auto t = ops[0];
-       auto sort_input = asc ? t : mlx::core::negative(t);
-       auto sort_idx = mlx::core::argsort(sort_input, axis);
+       auto sort_input = asc ? t : mlx::core::negative(t, stream);
+       auto sort_idx = mlx::core::argsort(sort_input, axis, stream);
 
        // Step 2: gather sorted values to check NaN.
-       auto sorted_vals = mlx::core::take_along_axis(t, sort_idx, axis);
+       auto sorted_vals = mlx::core::take_along_axis(t, sort_idx, axis, stream);
 
        // Step 3: NaN mask.
-       auto is_nan = mlx::core::isnan(sorted_vals);
+       auto is_nan = mlx::core::isnan(sorted_vals, stream);
 
        // Step 4: partition indices.
-       auto is_nan_u8 = mlx::core::astype(is_nan, mlx::core::uint8);
+       auto is_nan_u8 = mlx::core::astype(is_nan, mlx::core::uint8, stream);
        mlx::core::array partition_input =
            asc ? is_nan_u8
-               : mlx::core::astype(mlx::core::logical_not(is_nan), mlx::core::uint8);
-       auto partition = mlx::core::argsort(partition_input, axis);
+               : mlx::core::astype(mlx::core::logical_not(is_nan, stream), mlx::core::uint8, stream);
+       auto partition = mlx::core::argsort(partition_input, axis, stream);
 
        // Step 5: reorder sort_idx by partition.
-       return mlx::core::take_along_axis(sort_idx, partition, axis);
+       return mlx::core::take_along_axis(sort_idx, partition, axis, stream);
      }},
 
     // ── window reductions ─────────────────────────────────────────────────────
@@ -1154,20 +1160,20 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     //   window_dilations: n_dims values
 
     {"window_sum",
-     [](const auto &ops, const auto &attrs) {
-       return window_reduce_impl(ops[0], attrs, 0);
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return window_reduce_impl(ops[0], attrs, 0, stream);
      }},
     {"window_product",
-     [](const auto &ops, const auto &attrs) {
-       return window_reduce_impl(ops[0], attrs, 1);
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return window_reduce_impl(ops[0], attrs, 1, stream);
      }},
     {"window_max",
-     [](const auto &ops, const auto &attrs) {
-       return window_reduce_impl(ops[0], attrs, 2);
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return window_reduce_impl(ops[0], attrs, 2, stream);
      }},
     {"window_min",
-     [](const auto &ops, const auto &attrs) {
-       return window_reduce_impl(ops[0], attrs, 3);
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return window_reduce_impl(ops[0], attrs, 3, stream);
      }},
 
     // ── window_scatter_max / min ───────────────────────────────────────────────
@@ -1177,12 +1183,12 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // Replicates window_scatter_impl from emlx_nif.cpp.
 
     {"window_scatter_max",
-     [](const auto &ops, const auto &attrs) {
-       return window_scatter_impl_compiler(ops[0], ops[1], ops[2], attrs, true);
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return window_scatter_impl_compiler(ops[0], ops[1], ops[2], attrs, true, stream);
      }},
     {"window_scatter_min",
-     [](const auto &ops, const auto &attrs) {
-       return window_scatter_impl_compiler(ops[0], ops[1], ops[2], attrs, false);
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return window_scatter_impl_compiler(ops[0], ops[1], ops[2], attrs, false, stream);
      }},
 
     // ── cumulative reductions ─────────────────────────────────────────────────
@@ -1191,28 +1197,28 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // inclusive is always 1 (matches Nx semantics).
 
     {"cumulative_sum",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool rev = (attrs[1] != 0);
-       return mlx::core::cumsum(ops[0], axis, rev, true);
+       return mlx::core::cumsum(ops[0], axis, rev, true, stream);
      }},
     {"cumulative_product",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool rev = (attrs[1] != 0);
-       return mlx::core::cumprod(ops[0], axis, rev, true);
+       return mlx::core::cumprod(ops[0], axis, rev, true, stream);
      }},
     {"cumulative_min",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool rev = (attrs[1] != 0);
-       return mlx::core::cummin(ops[0], axis, rev, true);
+       return mlx::core::cummin(ops[0], axis, rev, true, stream);
      }},
     {"cumulative_max",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        bool rev = (attrs[1] != 0);
-       return mlx::core::cummax(ops[0], axis, rev, true);
+       return mlx::core::cummax(ops[0], axis, rev, true, stream);
      }},
 
     // ── fft / ifft ────────────────────────────────────────────────────────────
@@ -1220,16 +1226,16 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // iattrs = [axis, n]  where n is the FFT length.
 
     {"fft",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        int n = static_cast<int>(attrs[1]);
-       return mlx::core::fft::fft(ops[0], n, axis, mlx::core::fft::FFTNorm::Backward);
+       return mlx::core::fft::fft(ops[0], n, axis, mlx::core::fft::FFTNorm::Backward, stream);
      }},
     {"ifft",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int axis = static_cast<int>(attrs[0]);
        int n = static_cast<int>(attrs[1]);
-       return mlx::core::fft::ifft(ops[0], n, axis, mlx::core::fft::FFTNorm::Backward);
+       return mlx::core::fft::ifft(ops[0], n, axis, mlx::core::fft::FFTNorm::Backward, stream);
      }},
 
     // ── fft2 / ifft2 ──────────────────────────────────────────────────────────
@@ -1237,18 +1243,18 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // iattrs = [ax0, ax1, n0, n1]
 
     {"fft2",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        std::vector<int> axes = {static_cast<int>(attrs[0]), static_cast<int>(attrs[1])};
        std::vector<int> ns = {static_cast<int>(attrs[2]), static_cast<int>(attrs[3])};
        return mlx::core::fft::fft2(ops[0], to_shape(ns), axes,
-                                   mlx::core::fft::FFTNorm::Backward);
+                                   mlx::core::fft::FFTNorm::Backward, stream);
      }},
     {"ifft2",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        std::vector<int> axes = {static_cast<int>(attrs[0]), static_cast<int>(attrs[1])};
        std::vector<int> ns = {static_cast<int>(attrs[2]), static_cast<int>(attrs[3])};
        return mlx::core::fft::ifft2(ops[0], to_shape(ns), axes,
-                                    mlx::core::fft::FFTNorm::Backward);
+                                    mlx::core::fft::FFTNorm::Backward, stream);
      }},
 
     // ── creation ops ─────────────────────────────────────────────────────────
@@ -1256,7 +1262,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // iota: attrs = [dtype_int, n_dims, axis_int, d0..dn-1]
     // No operands.  axis_int = -1 means flat enumeration (no axis).
     {"iota",
-     [](const auto & /*ops*/, const auto &attrs) {
+     [](const auto & /*ops*/, const auto &attrs, mlx::core::StreamOrDevice stream) {
        auto dtype = attrs[0].as_dtype();
        int n = static_cast<int>(attrs[1]);
        int axis = static_cast<int>(attrs[2]);
@@ -1267,7 +1273,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
        if (n == 0) {
          // scalar iota: always 0
-         return mlx::core::astype(mlx::core::full({}, 0, mlx::core::int32), dtype);
+         return mlx::core::astype(mlx::core::full({}, 0, mlx::core::int32, stream), dtype, stream);
        }
 
        if (axis == -1) {
@@ -1275,33 +1281,38 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          int total = 1;
          for (int d : shape)
            total *= d;
-         auto flat = mlx::core::arange(0, total, 1, mlx::core::int32);
-         auto reshaped = mlx::core::reshape(flat, to_shape(shape));
-         return mlx::core::astype(reshaped, dtype);
+         auto flat = mlx::core::arange(0, total, 1, mlx::core::int32, stream);
+         auto reshaped = mlx::core::reshape(flat, to_shape(shape), stream);
+         return mlx::core::astype(reshaped, dtype, stream);
        } else {
          // axis-specific iota: arange(0, shape[axis]), broadcast to full shape
          int dim = shape[axis];
-         auto linear = mlx::core::arange(0, dim, 1, mlx::core::int32);
+         auto linear = mlx::core::arange(0, dim, 1, mlx::core::int32, stream);
          std::vector<int> rs(n, 1);
          rs[axis] = dim;
-         auto r = mlx::core::reshape(linear, to_shape(rs));
-         auto bc = mlx::core::broadcast_to(r, to_shape(shape));
-         return mlx::core::astype(bc, dtype);
+         auto r = mlx::core::reshape(linear, to_shape(rs), stream);
+         auto bc = mlx::core::broadcast_to(r, to_shape(shape), stream);
+         return mlx::core::astype(bc, dtype, stream);
        }
      }},
 
     // eye: attrs = [dtype_int, m, n].  No operands.
     {"eye",
-     [](const auto & /*ops*/, const auto &attrs) {
+     [](const auto & /*ops*/, const auto &attrs, mlx::core::StreamOrDevice stream) {
        auto dtype = attrs[0].as_dtype();
        int m = static_cast<int>(attrs[1]);
        int n = static_cast<int>(attrs[2]);
-       return mlx::core::eye(m, n, 0, dtype);
+       return mlx::core::eye(m, n, 0, dtype, stream);
      }},
 
     // ── conv_general ─────────────────────────────────────────────────────────
+    //
+    // stream is forwarded from OpFn — same as every other entry in this
+    // registry.  Convolution is listed explicitly here because it was the
+    // first op found to produce observable numeric differences (GPU Winograd
+    // vs CPU direct conv) when the stream was missing.
     {"conv_general",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int n_dims = static_cast<int>(attrs[0]);
        int off = 1;
 
@@ -1320,8 +1331,9 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
          input_dilation[i] = static_cast<int>(attrs[off++]);
        int fgs = static_cast<int>(attrs[off]);
 
-      return mlx::core::conv_general(ops[0], ops[1], strides, padding_lo, padding_hi,
-                                     kernel_dilation, input_dilation, fgs);
+       return mlx::core::conv_general(ops[0], ops[1], strides, padding_lo,
+                                      padding_hi, kernel_dilation,
+                                      input_dilation, fgs, /*flip=*/false, stream);
      }},
 
     // ── linalg (single-output) ────────────────────────────────────────────
@@ -1333,7 +1345,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
     // cholesky: operands = [a]; no attrs.  Lower-triangular factor (upper=false).
     {"cholesky",
-     [](const auto &ops, const auto &) {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
        return mlx::core::contiguous(
            mlx::core::linalg::cholesky(ops[0], /*upper=*/false, k_linalg_cpu),
            false, k_linalg_cpu);
@@ -1341,14 +1353,14 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
     // solve: operands = [a, b]; no attrs.  Solves A x = b.
     {"solve",
-     [](const auto &ops, const auto &) {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
        return mlx::core::contiguous(
            mlx::core::linalg::solve(ops[0], ops[1], k_linalg_cpu), false, k_linalg_cpu);
      }},
 
     // solve_triangular: operands = [a, b]; attrs = [upper_int].
     {"solve_triangular",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        bool upper = (attrs[0] != 0);
        return mlx::core::contiguous(
            mlx::core::linalg::solve_triangular(ops[0], ops[1], upper, k_linalg_cpu),
@@ -1364,77 +1376,77 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
     // rms_norm: operands = [x, weight]; attrs = [eps_bits].
     {"fast_rms_norm",
-     [](const auto &ops, const auto &attrs) {
-       return mlx::core::fast::rms_norm(ops[0], ops[1], attr_to_float(attrs[0]));
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return mlx::core::fast::rms_norm(ops[0], ops[1], attr_to_float(attrs[0]), stream);
      }},
 
     // layer_norm (with bias): operands = [x, weight, bias]; attrs = [eps_bits].
     {"fast_layer_norm",
-     [](const auto &ops, const auto &attrs) {
-       return mlx::core::fast::layer_norm(ops[0], ops[1], ops[2], attr_to_float(attrs[0]));
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       return mlx::core::fast::layer_norm(ops[0], ops[1], ops[2], attr_to_float(attrs[0]), stream);
      }},
 
     // layer_norm (weight-only): operands = [x, weight]; attrs = [eps_bits].
     {"fast_layer_norm_no_bias",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::layer_norm(ops[0], ops[1], std::nullopt,
-                                          attr_to_float(attrs[0]));
+                                          attr_to_float(attrs[0]), stream);
      }},
 
     // swiglu: operands = [gate, up]; no attrs.  silu(gate) * up.
     {"fast_swiglu",
-     [](const auto &ops, const auto &) {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) {
        return mlx::core::multiply(
-           mlx::core::multiply(ops[0], mlx::core::sigmoid(ops[0])), ops[1]);
+           mlx::core::multiply(ops[0], mlx::core::sigmoid(ops[0], stream), stream), ops[1], stream);
      }},
 
     // sdpa (no mask): operands = [q, k, v]; attrs = [scale_bits].
     {"fast_sdpa",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
-           std::nullopt);
+           std::nullopt, stream);
      }},
 
     // sdpa (no mask, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
     {"fast_sdpa_sinks",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
-           ops[3]);
+           ops[3], stream);
      }},
 
     // sdpa (array mask): operands = [q, k, v, mask]; attrs = [scale_bits].
     {"fast_sdpa_masked",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
-           std::nullopt);
+           std::nullopt, stream);
      }},
 
     // sdpa (array mask, + sinks): operands = [q, k, v, mask, sinks];
     // attrs = [scale_bits].
     {"fast_sdpa_masked_sinks",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
-           ops[4]);
+           ops[4], stream);
      }},
 
     // sdpa (causal): operands = [q, k, v]; attrs = [scale_bits].
     {"fast_sdpa_causal",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
-           std::nullopt, std::nullopt);
+           std::nullopt, std::nullopt, stream);
      }},
 
     // sdpa (causal, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
     {"fast_sdpa_causal_sinks",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
-           std::nullopt, ops[3]);
+           std::nullopt, ops[3], stream);
      }},
 
     // sdpa (causal + key_mask): operands = [q, k, v, key_mask];
@@ -1442,7 +1454,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // graph cannot branch on a runtime `all(key_mask)` (that forces an eval),
     // so we always build the combined causal+key_mask additive mask in-graph.
     {"fast_sdpa_causal_key_masked",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        const auto &q = ops[0];
        const auto &k = ops[1];
        const auto &v = ops[2];
@@ -1451,40 +1463,40 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        int kv_offset = static_cast<int>(attrs[1]);
 
        auto km = mlx::core::reshape(
-           key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)});
+           key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)}, stream);
        int T_q = q.shape(2);
        int T_kv = k.shape(2);
 
-       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32),
-                                     {1, 1, T_q, 1});
-       auto col = mlx::core::reshape(mlx::core::arange(T_kv, mlx::core::int32),
-                                     {1, 1, 1, T_kv});
+       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32, stream),
+                                     {1, 1, T_q, 1}, stream);
+       auto col = mlx::core::reshape(mlx::core::arange(T_kv, mlx::core::int32, stream),
+                                     {1, 1, 1, T_kv}, stream);
        auto causal_bool = mlx::core::less_equal(
-           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32)));
-       auto keep = mlx::core::logical_and(km, causal_bool);
+           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), stream), stream);
+       auto keep = mlx::core::logical_and(km, causal_bool, stream);
 
        auto mask_dtype = q.dtype();
-       auto zero_val = mlx::core::zeros({}, mask_dtype);
+       auto zero_val = mlx::core::zeros({}, mask_dtype, stream);
        auto neginf_val = mlx::core::full(
-           {}, -std::numeric_limits<float>::infinity(), mask_dtype);
-       auto additive = mlx::core::where(keep, zero_val, neginf_val);
+           {}, -std::numeric_limits<float>::infinity(), mask_dtype, stream);
+       auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_t = mlx::core::fast::scaled_dot_product_attention(
-           q, k, v, scale, "array", additive, std::nullopt);
+           q, k, v, scale, "array", additive, std::nullopt, stream);
 
        // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
        // in Flash-Attention when seq_len >= Metal tile size, but semantically
        // = 0) -- happens for left-padded prefill query rows that have no
        // causally-visible *and* key_mask-valid key at all.
-       return mlx::core::where(mlx::core::isnan(attn_t),
-                               mlx::core::zeros_like(attn_t), attn_t);
+       return mlx::core::where(mlx::core::isnan(attn_t, stream),
+                               mlx::core::zeros_like(attn_t, stream), attn_t, stream);
      }},
 
     // sdpa (causal + key_mask, + sinks): operands = [q, k, v, key_mask,
     // sinks]; attrs = [scale_bits, kv_offset]. Same in-graph combined mask as
     // "fast_sdpa_causal_key_masked" above, plus the sinks operand.
     {"fast_sdpa_causal_key_masked_sinks",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        const auto &q = ops[0];
        const auto &k = ops[1];
        const auto &v = ops[2];
@@ -1494,40 +1506,40 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        int kv_offset = static_cast<int>(attrs[1]);
 
        auto km = mlx::core::reshape(
-           key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)});
+           key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)}, stream);
        int T_q = q.shape(2);
        int T_kv = k.shape(2);
 
-       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32),
-                                     {1, 1, T_q, 1});
-       auto col = mlx::core::reshape(mlx::core::arange(T_kv, mlx::core::int32),
-                                     {1, 1, 1, T_kv});
+       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32, stream),
+                                     {1, 1, T_q, 1}, stream);
+       auto col = mlx::core::reshape(mlx::core::arange(T_kv, mlx::core::int32, stream),
+                                     {1, 1, 1, T_kv}, stream);
        auto causal_bool = mlx::core::less_equal(
-           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32)));
-       auto keep = mlx::core::logical_and(km, causal_bool);
+           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), stream), stream);
+       auto keep = mlx::core::logical_and(km, causal_bool, stream);
 
        auto mask_dtype = q.dtype();
-       auto zero_val = mlx::core::zeros({}, mask_dtype);
+       auto zero_val = mlx::core::zeros({}, mask_dtype, stream);
        auto neginf_val = mlx::core::full(
-           {}, -std::numeric_limits<float>::infinity(), mask_dtype);
-       auto additive = mlx::core::where(keep, zero_val, neginf_val);
+           {}, -std::numeric_limits<float>::infinity(), mask_dtype, stream);
+       auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_t = mlx::core::fast::scaled_dot_product_attention(
-           q, k, v, scale, "array", additive, sinks);
+           q, k, v, scale, "array", additive, sinks, stream);
 
        // See "fast_sdpa_causal_key_masked" above: NaN-guard all-masked rows.
-       return mlx::core::where(mlx::core::isnan(attn_t),
-                               mlx::core::zeros_like(attn_t), attn_t);
+       return mlx::core::where(mlx::core::isnan(attn_t, stream),
+                               mlx::core::zeros_like(attn_t, stream), attn_t, stream);
      }},
 
     // rope (scalar offset): operands = [a];
     // attrs = [dims, traditional, base_bits, scale_bits, offset].
     {"fast_rope",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::rope(
            ops[0], static_cast<int>(attrs[0]), attrs[1] != 0,
            attr_to_float(attrs[2]), attr_to_float(attrs[3]),
-           static_cast<int>(attrs[4]), std::nullopt);
+           static_cast<int>(attrs[4]), std::nullopt, stream);
      }},
 
     // rope (per-batch offset array): operands = [a, position_ids];
@@ -1541,7 +1553,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // mlx::core::fast::rope path. The full position_ids operand is already
     // available here, so no offset+arange reconstruction is needed.
     {"fast_rope_ids",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        const auto &a = ops[0];
        const auto &pos = ops[1];
        int dims = static_cast<int>(attrs[0]);
@@ -1567,25 +1579,25 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
          int B = pos.shape(0);
          int T = pos.shape(1);
-         auto pos_f = mlx::core::astype(pos, mlx::core::float32);
-         auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}));
-         auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}));
+         auto pos_f = mlx::core::astype(pos, mlx::core::float32, stream);
+         auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}), stream);
+         auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}), stream);
          auto angles = mlx::core::multiply(
-             mlx::core::multiply(pos_bt1, inv_11h),
-             mlx::core::array(scale, mlx::core::float32));
+             mlx::core::multiply(pos_bt1, inv_11h, stream),
+             mlx::core::array(scale, mlx::core::float32), stream);
 
-         return rope_rotate_from_angles(a, angles, dims);
+         return rope_rotate_from_angles(a, angles, dims, stream);
        }
 
        int B = pos.shape(0);
        auto offsets = mlx::core::reshape(
            mlx::core::slice(pos, to_shape({0, 0}), to_shape({B, 1}),
-                            to_shape({1, 1})),
-           to_shape({B}));
+                            to_shape({1, 1}), stream),
+           to_shape({B}), stream);
        return mlx::core::fast::rope(
            a, dims, traditional,
            attr_to_float(attrs[2]), attr_to_float(attrs[3]), offsets,
-           std::nullopt);
+           std::nullopt, stream);
      }},
 
     // rope (precomputed freqs): operands = [a, position_ids, freqs];
@@ -1595,7 +1607,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // "fast_rope_ids" comment above and emlx_fast.cpp's multi-head-safe RoPE
     // helpers comment. H==1 keeps the fused mlx::core::fast::rope path.
     {"fast_rope_with_freqs",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        const auto &a = ops[0];
        const auto &pos = ops[1];
        const auto &freqs = ops[2];
@@ -1613,25 +1625,25 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
          int B = pos.shape(0);
          int T = pos.shape(1);
-         auto pos_f = mlx::core::astype(pos, mlx::core::float32);
-         auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}));
-         auto inv_freq = mlx::core::reciprocal(mlx::core::astype(freqs, mlx::core::float32));
-         auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}));
+         auto pos_f = mlx::core::astype(pos, mlx::core::float32, stream);
+         auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}), stream);
+         auto inv_freq = mlx::core::reciprocal(mlx::core::astype(freqs, mlx::core::float32, stream), stream);
+         auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}), stream);
          auto angles = mlx::core::multiply(
-             mlx::core::multiply(pos_bt1, inv_11h),
-             mlx::core::array(scale, mlx::core::float32));
+             mlx::core::multiply(pos_bt1, inv_11h, stream),
+             mlx::core::array(scale, mlx::core::float32), stream);
 
-         return rope_rotate_from_angles(a, angles, dims);
+         return rope_rotate_from_angles(a, angles, dims, stream);
        }
 
        int B = pos.shape(0);
        auto offsets = mlx::core::reshape(
            mlx::core::slice(pos, to_shape({0, 0}), to_shape({B, 1}),
-                            to_shape({1, 1})),
-           to_shape({B}));
+                            to_shape({1, 1}), stream),
+           to_shape({B}), stream);
        return mlx::core::fast::rope(
            a, dims, traditional, std::nullopt,
-           attr_to_float(attrs[2]), offsets, freqs);
+           attr_to_float(attrs[2]), offsets, freqs, stream);
      }},
 
     // rope (arbitrary per-token position_ids, base-derived inv_freq):
@@ -1639,7 +1651,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // scale_bits]. Prefill path (T>1) / high-base decode — mirrors
     // emlx_fast.cpp's fast_rope_positions eager NIF.
     {"fast_rope_positions",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int dims = static_cast<int>(attrs[0]);
        bool traditional = attrs[1] != 0;
        if (traditional) {
@@ -1662,14 +1674,14 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
        int B = pos.shape(0);
        int T = pos.shape(1);
-       auto pos_f = mlx::core::astype(pos, mlx::core::float32);
-       auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}));
-       auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}));
+       auto pos_f = mlx::core::astype(pos, mlx::core::float32, stream);
+       auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}), stream);
+       auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}), stream);
        auto angles = mlx::core::multiply(
-           mlx::core::multiply(pos_bt1, inv_11h),
-           mlx::core::array(scale, mlx::core::float32));
+           mlx::core::multiply(pos_bt1, inv_11h, stream),
+           mlx::core::array(scale, mlx::core::float32), stream);
 
-       return rope_rotate_from_angles(a, angles, dims);
+       return rope_rotate_from_angles(a, angles, dims, stream);
      }},
 
     // rope (arbitrary per-token position_ids, precomputed freqs):
@@ -1681,7 +1693,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
     // rather than using `freqs` directly, to stay bit-for-bit with the eager
     // EMLX.Fast.rope_with_freqs_callback path this replaces.
     {"fast_rope_with_freqs_positions",
-     [](const auto &ops, const auto &attrs) {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        int dims = static_cast<int>(attrs[0]);
        bool traditional = attrs[1] != 0;
        if (traditional) {
@@ -1696,15 +1708,15 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 
        int B = pos.shape(0);
        int T = pos.shape(1);
-       auto pos_f = mlx::core::astype(pos, mlx::core::float32);
-       auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}));
-       auto inv_freq = mlx::core::reciprocal(mlx::core::astype(freqs, mlx::core::float32));
-       auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}));
+       auto pos_f = mlx::core::astype(pos, mlx::core::float32, stream);
+       auto pos_bt1 = mlx::core::reshape(pos_f, to_shape({B, T, 1}), stream);
+       auto inv_freq = mlx::core::reciprocal(mlx::core::astype(freqs, mlx::core::float32, stream), stream);
+       auto inv_11h = mlx::core::reshape(inv_freq, to_shape({1, 1, half}), stream);
        auto angles = mlx::core::multiply(
-           mlx::core::multiply(pos_bt1, inv_11h),
-           mlx::core::array(scale, mlx::core::float32));
+           mlx::core::multiply(pos_bt1, inv_11h, stream),
+           mlx::core::array(scale, mlx::core::float32), stream);
 
-       return rope_rotate_from_angles(a, angles, dims);
+       return rope_rotate_from_angles(a, angles, dims, stream);
      }},
 };
 
@@ -1716,7 +1728,8 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
 // the Elixir lowerer assigns consecutive result indices to the matching output
 // refs (see to_native/1's list-result handling).  Pinned to the CPU device.
 using MultiOpFn = std::function<std::vector<mlx::core::array>(
-    const std::vector<mlx::core::array> &ops, const std::vector<Attr> &attrs)>;
+    const std::vector<mlx::core::array> &ops, const std::vector<Attr> &attrs,
+    mlx::core::StreamOrDevice stream)>;
 
 // Force each linalg output to contiguous layout (on the CPU stream).  MLX's
 // factorizations can return strided views; if such a view is a program output
@@ -1743,6 +1756,14 @@ contiguous_all(std::vector<mlx::core::array> arrs) {
 // interpret its cond/body SubPrograms; the free function's own definition
 // (further below) constructs EMLXWhile instances for nested/top-level
 // `:while` instructions, hence the mutual forward reference.
+// The stream of the worker that runs this program. MLX has one process-wide default
+// device (the GPU when Metal is available), so an op without an explicit stream
+// would run on the GPU even inside a :cpu program.
+static mlx::core::StreamOrDevice worker_stream() {
+  return emlx::g_current_worker ? mlx::core::StreamOrDevice{emlx::g_current_worker->stream()}
+                                : mlx::core::StreamOrDevice{};
+}
+
 static std::vector<mlx::core::array> interpret_instructions(
     const std::vector<Instruction> &instructions,
     const std::vector<Ref> &output_refs,
@@ -1766,7 +1787,7 @@ static std::vector<mlx::core::array> interpret_instructions(
 // iteration's graph depth (see the loop comment) — never reenter MLX's GPU
 // command buffer scheduling from inside eval_gpu. This nested/reentrant
 // eval-inside-a-CPU-pinned-primitive's-eval_cpu pattern (itself reached via
-// eval_program's outer mlx::core::eval(outputs)) was validated safe by an
+// eval_program's outer mlx::core::eval(outputs, stream)) was validated safe by an
 // earlier de-risking spike (a hardcoded-iteration-count primitive, since
 // removed — see git history on pv-feat/lower-while for the original spike).
 //
@@ -1936,7 +1957,7 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // outputs = one array per declared output, produced by the
     // EMLXRuntimeCall primitive above (never eagerly computed here).
     {"runtime_call",
-     [](const auto &ops, const auto &attrs) -> std::vector<mlx::core::array> {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) -> std::vector<mlx::core::array> {
        return make_runtime_or_io_call(ops, attrs, /*alias_inputs=*/false);
      }},
 
@@ -1946,13 +1967,13 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // invoke_runtime_call). operands may be longer than n_outputs when a
     // deprecated token_hook prefixes callback-only hooked leaves.
     {"io_call",
-     [](const auto &ops, const auto &attrs) -> std::vector<mlx::core::array> {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) -> std::vector<mlx::core::array> {
        return make_runtime_or_io_call(ops, attrs, /*alias_inputs=*/true);
      }},
 
     // qr (reduced mode): operands = [a]; outputs = [q, r].
     {"qr",
-     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) -> std::vector<mlx::core::array> {
        auto [q, r] = mlx::core::linalg::qr(ops[0], k_linalg_cpu);
        return contiguous_all({q, r});
      }},
@@ -1960,14 +1981,14 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // eigh (lower triangle): operands = [a]; outputs = [eigenvalues,
     // eigenvectors].
     {"eigh",
-     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) -> std::vector<mlx::core::array> {
        auto [w, v] = mlx::core::linalg::eigh(ops[0], "L", k_linalg_cpu);
        return contiguous_all({w, v});
      }},
 
     // svd (full matrices): operands = [a]; outputs = [u, s, vt].
     {"svd",
-     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) -> std::vector<mlx::core::array> {
        return contiguous_all(
            mlx::core::linalg::svd(ops[0], /*compute_uv=*/true, k_linalg_cpu));
      }},
@@ -1975,7 +1996,7 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // lu: operands = [a]; outputs = [pivots, l, u] (pivots is a uint32 index
     // vector; the lowerer rebuilds the permutation matrix via eye + take).
     {"lu",
-     [](const auto &ops, const auto &) -> std::vector<mlx::core::array> {
+     [](const auto &ops, const auto &, mlx::core::StreamOrDevice stream) -> std::vector<mlx::core::array> {
        return contiguous_all(mlx::core::linalg::lu(ops[0], k_linalg_cpu));
      }},
     // The head-transpose needed for `fast::scaled_dot_product_attention`
@@ -1986,7 +2007,7 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
     // calling SDPA); fusing does not add a second one, since k_upd/v_upd
     // are returned pre-transpose.
     {"kv_cache_sdpa_update",
-     [](const auto &ops, const auto &attrs) -> std::vector<mlx::core::array> {
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) -> std::vector<mlx::core::array> {
        const auto &q = ops[0];
        const auto &new_k = ops[1];
        const auto &new_v = ops[2];
@@ -2004,40 +2025,40 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
        // same clamp-and-concatenate construction as op_registry["put_slice"]
        // (T_max-T_q_write, not T_max-1, so the write itself never runs past
        // the cache's last valid row when T_q_write > 1, e.g. prefill).
-       auto s = mlx::core::reshape(mlx::core::astype(offset, mlx::core::int32), {1});
-       auto max_s = mlx::core::full({1}, T_max - T_q_write, mlx::core::int32);
-       auto zero1 = mlx::core::zeros({1}, mlx::core::int32);
-       auto offset_clamped = mlx::core::minimum(mlx::core::maximum(s, zero1), max_s);
-       auto start = mlx::core::concatenate({zero1, offset_clamped, zero1, zero1}, 0);
+       auto s = mlx::core::reshape(mlx::core::astype(offset, mlx::core::int32, stream), {1}, stream);
+       auto max_s = mlx::core::full({1}, T_max - T_q_write, mlx::core::int32, stream);
+       auto zero1 = mlx::core::zeros({1}, mlx::core::int32, stream);
+       auto offset_clamped = mlx::core::minimum(mlx::core::maximum(s, zero1, stream), max_s, stream);
+       auto start = mlx::core::concatenate({zero1, offset_clamped, zero1, zero1}, 0, stream);
 
        std::vector<int> all_axes = {0, 1, 2, 3};
-       auto k_upd = mlx::core::slice_update(k_cache, new_k, start, all_axes);
-       auto v_upd = mlx::core::slice_update(v_cache, new_v, start, all_axes);
+       auto k_upd = mlx::core::slice_update(k_cache, new_k, start, all_axes, stream);
+       auto v_upd = mlx::core::slice_update(v_cache, new_v, start, all_axes, stream);
 
        // Head-transpose for SDPA: {B, T, N, D} -> {B, N, T, D}. Mirrors
        // build_sdpa_layer's own Nx.transpose(axes: [0, 2, 1, 3]) exactly.
        std::vector<int> head_transpose = {0, 2, 1, 3};
-       auto q_t = mlx::core::transpose(q, head_transpose);
-       auto k_t = mlx::core::transpose(k_upd, head_transpose);
-       auto v_t = mlx::core::transpose(v_upd, head_transpose);
+       auto q_t = mlx::core::transpose(q, head_transpose, stream);
+       auto k_t = mlx::core::transpose(k_upd, head_transpose, stream);
+       auto v_t = mlx::core::transpose(v_upd, head_transpose, stream);
 
        // Combined causal + key_mask additive mask -- verbatim copy of
        // "fast_sdpa_causal_key_masked"'s formula above (T_kv = T_max here).
-       auto km = mlx::core::reshape(key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)});
+       auto km = mlx::core::reshape(key_mask, {key_mask.shape(0), 1, 1, key_mask.shape(1)}, stream);
        int T_q = q_t.shape(2);
-       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32), {1, 1, T_q, 1});
-       auto col = mlx::core::reshape(mlx::core::arange(T_max, mlx::core::int32), {1, 1, 1, T_max});
+       auto row = mlx::core::reshape(mlx::core::arange(T_q, mlx::core::int32, stream), {1, 1, T_q, 1}, stream);
+       auto col = mlx::core::reshape(mlx::core::arange(T_max, mlx::core::int32, stream), {1, 1, 1, T_max}, stream);
        auto causal_bool = mlx::core::less_equal(
-           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32)));
-       auto keep = mlx::core::logical_and(km, causal_bool);
+           col, mlx::core::add(row, mlx::core::array(kv_offset, mlx::core::int32), stream), stream);
+       auto keep = mlx::core::logical_and(km, causal_bool, stream);
        auto mask_dtype = q_t.dtype();
-       auto zero_val = mlx::core::zeros({}, mask_dtype);
+       auto zero_val = mlx::core::zeros({}, mask_dtype, stream);
        auto neginf_val =
-           mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype);
-       auto additive = mlx::core::where(keep, zero_val, neginf_val);
+           mlx::core::full({}, -std::numeric_limits<float>::infinity(), mask_dtype, stream);
+       auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_out = mlx::core::fast::scaled_dot_product_attention(
-           q_t, k_t, v_t, scale, "array", additive, std::nullopt);
+           q_t, k_t, v_t, scale, "array", additive, std::nullopt, stream);
 
        // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
        // in Flash-Attention when seq_len >= Metal tile size, but semantically
@@ -2045,8 +2066,8 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
        // causally-visible *and* key_mask-valid key at all. See
        // "fast_sdpa_causal_key_masked" above for the unfused version of this
        // same guard.
-       attn_out = mlx::core::where(mlx::core::isnan(attn_out),
-                                   mlx::core::zeros_like(attn_out), attn_out);
+       attn_out = mlx::core::where(mlx::core::isnan(attn_out, stream),
+                                   mlx::core::zeros_like(attn_out, stream), attn_out, stream);
 
        return {attn_out, k_upd, v_upd};
      }},
@@ -2286,14 +2307,16 @@ static std::vector<mlx::core::array> interpret_instructions(
       continue;
     }
 
+    const mlx::core::StreamOrDevice op_stream = worker_stream();
+
     auto multi_it = multi_op_registry.find(name);
     if (multi_it != multi_op_registry.end()) {
       // Multi-output op: append each result in order to the flat accumulator.
-      auto outs = multi_it->second(op_inputs, instr.attrs);
+      auto outs = multi_it->second(op_inputs, instr.attrs, op_stream);
       for (auto &o : outs)
         results.push_back(o);
     } else {
-      results.push_back(op_registry.at(name)(op_inputs, instr.attrs));
+      results.push_back(op_registry.at(name)(op_inputs, instr.attrs, op_stream));
     }
   }
 
@@ -2400,7 +2423,7 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   std::vector<mlx::core::array> constants;
   constants.reserve(program.constants.size());
   for (const auto &[value, dtype] : program.constants) {
-    constants.push_back(mlx::core::full({}, value, dtype));
+    constants.push_back(mlx::core::full({}, value, dtype, worker_stream()));
   }
 
   int num_inputs_val = program.num_inputs;
@@ -2501,7 +2524,7 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     // program keeps today's lazy/deferred return (no eval() call here).
     if (prog->has_runtime_call) {
       mlx::core::eval(outputs);
-      mlx::core::synchronize();
+      mlx::core::synchronize(emlx::g_current_worker->stream());
     }
 
     // Only the real outputs are converted to resources and returned to
