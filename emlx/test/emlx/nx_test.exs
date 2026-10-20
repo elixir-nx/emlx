@@ -1860,6 +1860,44 @@ defmodule EMLX.NxTest do
       )
     end
   end
+
+  describe "indexed_add and indexed_put with axes" do
+    for {shape, axes, indices} <- [
+          {{2, 3}, [1], [[0], [2]]},
+          {{2, 4, 3}, [1], [[1], [3]]},
+          {{3, 4, 5}, [0, 2], [[0, 1], [2, 4]]}
+        ],
+        op <- [:indexed_add, :indexed_put] do
+      test "#{op} with axes #{inspect(axes)} on #{inspect(shape)}" do
+        shape = unquote(Macro.escape(shape))
+        axes = unquote(axes)
+        indices = Nx.tensor(unquote(indices), backend: Nx.BinaryBackend)
+
+        update_dims =
+          for {size, axis} <- Enum.with_index(Tuple.to_list(shape)), axis not in axes, do: size
+
+        updates =
+          Nx.iota(List.to_tuple([Nx.axis_size(indices, 0) | update_dims]),
+            type: :f32,
+            backend: Nx.BinaryBackend
+          )
+          |> Nx.add(Nx.tensor(100.0, backend: Nx.BinaryBackend))
+
+        target = Nx.iota(shape, type: :f32, backend: Nx.BinaryBackend)
+        expected = apply(Nx, unquote(op), [target, indices, updates, [axes: axes]])
+
+        result =
+          apply(Nx, unquote(op), [
+            Nx.backend_transfer(target, EMLX.Backend),
+            Nx.backend_transfer(indices, EMLX.Backend),
+            Nx.backend_transfer(updates, EMLX.Backend),
+            [axes: axes]
+          ])
+
+        assert_equal(Nx.backend_transfer(result, Nx.BinaryBackend), expected)
+      end
+    end
+  end
 end
 
 defmodule EMLX.RuntimeCallTest do
