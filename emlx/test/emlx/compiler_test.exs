@@ -240,4 +240,15 @@ defmodule EMLX.CompilerTest do
       assert_in_delta Nx.to_number(result), 3.0, 1.0e-6
     end
   end
+
+  # MLX compiles with recursion as deep as the graph. A 512 KB thread stack
+  # overflows on this chain and the VM stops with SIGBUS.
+  test "compiles a chain of 20,000 ops" do
+    chain = fn x ->
+      Enum.reduce(1..10_000, x, fn _, acc -> acc |> Nx.sin() |> Nx.add(0.001) end)
+    end
+
+    result = Nx.Defn.jit(chain, compiler: EMLX).(Nx.tensor(0.5, backend: EMLX.Backend))
+    assert_all_close(result, chain.(Nx.tensor(0.5, backend: Nx.BinaryBackend)))
+  end
 end
