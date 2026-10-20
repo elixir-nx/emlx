@@ -1993,19 +1993,16 @@ defmodule EMLX.Backend do
         ref
       end)
 
-    insert_index =
-      axes
-      |> Enum.scan(&(&1 - &2))
-      |> Enum.find_index(&(&1 > 1))
-      |> then(&(&1 || num_axes))
-
+    # MLX scatter takes one update slice per index with the target's rank: size 1 on the
+    # indexed axes and the update's dimensions on the others, in the target's axis order.
     [num_updates | updates_inner_shape] = Tuple.to_list(updates.shape)
 
-    updates_shape =
-      [num_updates | List.duplicate(1, num_axes)]
-      |> List.insert_at(insert_index + 1, updates_inner_shape)
-      |> List.flatten()
-      |> List.to_tuple()
+    {slice_shape, []} =
+      Enum.map_reduce(Nx.axes(target), updates_inner_shape, fn axis, rest ->
+        if axis in axes, do: {1, rest}, else: {hd(rest), tl(rest)}
+      end)
+
+    updates_shape = List.to_tuple([num_updates | slice_shape])
 
     updates_mx = from_nx(updates) |> EMLX.reshape(updates_shape)
 
