@@ -1405,7 +1405,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
-           std::nullopt, stream);
+           std::nullopt, /*force_fused=*/false, stream);
      }},
 
     // sdpa (no mask, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
@@ -1413,7 +1413,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "", std::nullopt,
-           ops[3], stream);
+           ops[3], /*force_fused=*/false, stream);
      }},
 
     // sdpa (array mask): operands = [q, k, v, mask]; attrs = [scale_bits].
@@ -1421,7 +1421,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
-           std::nullopt, stream);
+           std::nullopt, /*force_fused=*/false, stream);
      }},
 
     // sdpa (array mask, + sinks): operands = [q, k, v, mask, sinks];
@@ -1430,7 +1430,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "array", ops[3],
-           ops[4], stream);
+           ops[4], /*force_fused=*/false, stream);
      }},
 
     // sdpa (causal): operands = [q, k, v]; attrs = [scale_bits].
@@ -1438,7 +1438,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
-           std::nullopt, std::nullopt, stream);
+           std::nullopt, std::nullopt, /*force_fused=*/false, stream);
      }},
 
     // sdpa (causal, + sinks): operands = [q, k, v, sinks]; attrs = [scale_bits].
@@ -1446,7 +1446,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
      [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
        return mlx::core::fast::scaled_dot_product_attention(
            ops[0], ops[1], ops[2], attr_to_float(attrs[0]), "causal",
-           std::nullopt, ops[3], stream);
+           std::nullopt, ops[3], /*force_fused=*/false, stream);
      }},
 
     // sdpa (causal + key_mask): operands = [q, k, v, key_mask];
@@ -1482,7 +1482,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_t = mlx::core::fast::scaled_dot_product_attention(
-           q, k, v, scale, "array", additive, std::nullopt, stream);
+           q, k, v, scale, "array", additive, std::nullopt, /*force_fused=*/false, stream);
 
        // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
        // in Flash-Attention when seq_len >= Metal tile size, but semantically
@@ -1525,7 +1525,7 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
        auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_t = mlx::core::fast::scaled_dot_product_attention(
-           q, k, v, scale, "array", additive, sinks, stream);
+           q, k, v, scale, "array", additive, sinks, /*force_fused=*/false, stream);
 
        // See "fast_sdpa_causal_key_masked" above: NaN-guard all-masked rows.
        return mlx::core::where(mlx::core::isnan(attn_t, stream),
@@ -2061,7 +2061,7 @@ static const std::unordered_map<std::string, MultiOpFn> multi_op_registry = {
        auto additive = mlx::core::where(keep, zero_val, neginf_val, stream);
 
        auto attn_out = mlx::core::fast::scaled_dot_product_attention(
-           q_t, k_t, v_t, scale, "array", additive, std::nullopt, stream);
+           q_t, k_t, v_t, scale, "array", additive, std::nullopt, /*force_fused=*/false, stream);
 
        // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN
        // in Flash-Attention when seq_len >= Metal tile size, but semantically
@@ -2347,15 +2347,27 @@ static std::mutex s_mlx_compile_mutex;
 // ── Expr destructor
 // ───────────────────────────────────────────────────────────
 //
-// Evicts the per-Expr entry from MLX's global compile cache so stale compiled
-// graphs don't accumulate.  Called by default_dtor<Expr> when the BEAM resource
-// is GC'd.
+// Evicts the per-Expr entry from each MLX compile cache it is in, so stale
+// compiled graphs don't accumulate.  Called by default_dtor<Expr> when the BEAM
+// resource is GC'd.
 
 Expr::~Expr() {
   if (compile_id != 0) {
     std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
-    mlx::core::detail::compile_erase(compile_id);
+    for (const auto &cache : compile_caches)
+      mlx::core::detail::compile_erase(cache, compile_id);
   }
+}
+
+// Records the compile cache of the calling thread, the one that compiled_fn just
+// used. Called with s_mlx_compile_mutex held.
+static void remember_compile_cache(Expr &prog) {
+  auto cache = mlx::core::detail::compile_cache();
+  auto current = cache.lock();
+  for (const auto &known : prog.compile_caches)
+    if (known.lock() == current)
+      return;
+  prog.compile_caches.push_back(cache);
 }
 
 // ── NIF implementations
@@ -2499,6 +2511,7 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     {
       std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
       outputs = prog->compiled_fn(inputs);
+      remember_compile_cache(*prog);
     }
 
     // A program containing an inlined `:runtime_call` node must be forced to

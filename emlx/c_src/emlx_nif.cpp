@@ -184,19 +184,10 @@ NIF(from_blob) {
                           "Binary size is too small for the requested shape");
 
   try {
-    // Allocate MLX buffer and copy data from blob
-    size_t byte_size = blob.size;
-    allocator::Buffer mlx_buf = allocator::malloc(byte_size);
-    void *buf_ptr = mlx_buf.raw_ptr();
-
-    // Copy binary data to MLX buffer
-    std::memcpy(buf_ptr, blob.data, byte_size);
-
-    // Create deleter for the buffer
-    auto deleter = [](allocator::Buffer buf) { allocator::free(buf); };
-
-    // Create MLX array from the buffer
-    TENSOR(mlx::core::array(mlx_buf, to_shape(shape), type, deleter));
+    // Allocate MLX memory, copy the binary into it, and give it to the array
+    allocator::Data data = allocator::malloc(blob.size);
+    std::memcpy(data.buffer().raw_ptr(), blob.data, blob.size);
+    TENSOR(mlx::core::array(std::move(data), to_shape(shape), type));
   } catch (const std::exception &e) {
     return nx::nif::error(env, e.what());
   } catch (...) {
@@ -1419,7 +1410,8 @@ NIF(gather_qmm) {
 
   TENSOR(mlx::core::gather_qmm(*x, *w, *scales, biases_opt, lhs_opt, rhs_opt,
                                transpose, group_size, bits, mode,
-                               sorted_indices, device));
+                               /*global_scale=*/std::nullopt, sorted_indices,
+                               device));
 }
 
 NIF(quantized_matmul) {

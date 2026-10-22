@@ -3,7 +3,7 @@ defmodule EMLX.MixProject do
 
   @app :emlx
   @version "0.5.0"
-  @mlx_version "0.32.0"
+  @mlx_version "0.32.4"
   @source_url "https://github.com/elixir-nx/emlx"
   # mlx-build Darwin archives from v0.31.0+ encode the deployment target in the
   # filename. 26.2 ships AOT NAX (Metal 4); 14.0 is the portable reduced set.

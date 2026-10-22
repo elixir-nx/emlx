@@ -126,7 +126,7 @@ mlx::core::array fast_sdpa_impl(ErlNifEnv *env, TensorArg q, TensorArg k,
       sinks ? std::make_optional(**sinks) : std::nullopt;
 
   return fast::scaled_dot_product_attention(
-      *q, *k, *v, (float)scale, "", std::nullopt, sinks_opt, device);
+      *q, *k, *v, (float)scale, "", std::nullopt, sinks_opt, /*force_fused=*/false, device);
 }
 FINE_ASYNC_NIF(fast_sdpa)
 
@@ -141,7 +141,7 @@ mlx::core::array fast_sdpa_masked_impl(ErlNifEnv *env, TensorArg q,
       sinks ? std::make_optional(**sinks) : std::nullopt;
 
   return fast::scaled_dot_product_attention(
-      *q, *k, *v, (float)scale, "array", *mask, sinks_opt, device);
+      *q, *k, *v, (float)scale, "array", *mask, sinks_opt, /*force_fused=*/false, device);
 }
 FINE_ASYNC_NIF(fast_sdpa_masked)
 
@@ -316,7 +316,7 @@ mlx::core::array fast_sdpa_causal_key_masked_impl(
 
   if (trivial) {
     return fast::scaled_dot_product_attention(
-        *q, *k, *v, (float)scale, "causal", std::nullopt, sinks_opt, device);
+        *q, *k, *v, (float)scale, "causal", std::nullopt, sinks_opt, /*force_fused=*/false, device);
   } else {
     // Expand key_mask {B, T_kv} → {B, 1, 1, T_kv} for broadcasting.
     auto km = reshape(*key_mask, {key_mask->shape(0), 1, 1, key_mask->shape(1)});
@@ -340,7 +340,7 @@ mlx::core::array fast_sdpa_causal_key_masked_impl(
     auto additive = where(keep, zero_val, neginf_val);
 
     auto attn_t = fast::scaled_dot_product_attention(
-        *q, *k, *v, (float)scale, "array", additive, sinks_opt, device);
+        *q, *k, *v, (float)scale, "array", additive, sinks_opt, /*force_fused=*/false, device);
 
     // Replace NaN with 0 for all-masked rows (softmax(-inf,...,-inf) = NaN in
     // Flash-Attention when seq_len >= Metal tile size, but semantically = 0).
@@ -372,7 +372,7 @@ mlx::core::array fast_sdpa_causal_impl(ErlNifEnv *env, TensorArg q,
       sinks ? std::make_optional(**sinks) : std::nullopt;
 
   return fast::scaled_dot_product_attention(
-      *q, *k, *v, (float)scale, "causal", std::nullopt, sinks_opt, device);
+      *q, *k, *v, (float)scale, "causal", std::nullopt, sinks_opt, /*force_fused=*/false, device);
 }
 FINE_ASYNC_NIF(fast_sdpa_causal)
 
@@ -459,9 +459,9 @@ kv_cache_attention_impl(ErlNifEnv *env, TensorArg q, TensorArg new_k,
 
   auto attn_t = (T_new == 1)
     ? mlx::core::fast::scaled_dot_product_attention(
-          q_t, k_valid_t, v_valid_t, (float)scale, "", std::nullopt, std::nullopt, device)
+          q_t, k_valid_t, v_valid_t, (float)scale, "", std::nullopt, std::nullopt, /*force_fused=*/false, device)
     : mlx::core::fast::scaled_dot_product_attention(
-          q_t, k_valid_t, v_valid_t, (float)scale, "array", build_prefill_mask(), std::nullopt, device);
+          q_t, k_valid_t, v_valid_t, (float)scale, "array", build_prefill_mask(), std::nullopt, /*force_fused=*/false, device);
 
   // 5. Transpose output back: {B, N_q, T_q, D} → {B, T_q, N_q, D} (Bumblebee format).
   auto attn_out = mlx::core::transpose(attn_t, {0, 2, 1, 3}, device);
@@ -558,7 +558,7 @@ kv_cache_attention_masked_impl(ErlNifEnv *env, TensorArg q,       // {B, T_q,   
       auto additive = mlx::core::where(km, zero_val, neginf_val, device);
       return mlx::core::fast::scaled_dot_product_attention(
           q_t, k_valid_t, v_valid_t, (float)scale, "array",
-          additive, std::nullopt, device);
+          additive, std::nullopt, /*force_fused=*/false, device);
     } else {
       // Prefill (T_q > 1): full causal + key_mask combined additive mask.
       //   kv_offset: valid_len - T_q (= 0 for a fresh prefill of length T_q).
@@ -579,7 +579,7 @@ kv_cache_attention_masked_impl(ErlNifEnv *env, TensorArg q,       // {B, T_q,   
 
       return mlx::core::fast::scaled_dot_product_attention(
           q_t, k_valid_t, v_valid_t, (float)scale, "array",
-          additive, std::nullopt, device);
+          additive, std::nullopt, /*force_fused=*/false, device);
     }
   }();
 
@@ -683,9 +683,9 @@ kv_cache_sdpa_update_impl(ErlNifEnv *env, TensorArg q, TensorArg new_k,
 
   auto attn_out = (T_new == 1)
     ? mlx::core::fast::scaled_dot_product_attention(
-          *q, k_valid, v_valid, (float)scale, "", std::nullopt, std::nullopt, device)
+          *q, k_valid, v_valid, (float)scale, "", std::nullopt, std::nullopt, /*force_fused=*/false, device)
     : mlx::core::fast::scaled_dot_product_attention(
-          *q, k_valid, v_valid, (float)scale, "array", build_prefill_mask(), std::nullopt, device);
+          *q, k_valid, v_valid, (float)scale, "array", build_prefill_mask(), std::nullopt, /*force_fused=*/false, device);
   // k_cache_owned and v_cache_owned destruct here → use_count 2 → 1.
 
   return {attn_out, k_upd, v_upd};
