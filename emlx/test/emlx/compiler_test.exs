@@ -88,6 +88,33 @@ defmodule EMLX.CompilerTest do
     end
   end
 
+  describe ":cache option" do
+    test "cache: false compiles without an entry in EMLX.CompileCache" do
+      defmodule CacheFn do
+        import Nx.Defn
+        defn double(x), do: x * 2
+      end
+
+      table = :sys.get_state(EMLX.CompileCache).table
+      before = :ets.info(table, :size)
+      x = Nx.tensor([1.0, 2.0, 3.0], backend: {EMLX.Backend, device: :cpu})
+
+      compile = fn opts ->
+        Nx.Defn.compile(
+          &CacheFn.double/1,
+          [Nx.template({3}, :f32)],
+          [compiler: EMLX, device: :cpu] ++ opts
+        )
+      end
+
+      assert_all_close(compile.(cache: false).(x), Nx.tensor([2.0, 4.0, 6.0]))
+      assert :ets.info(table, :size) == before
+
+      assert_all_close(compile.([]).(x), Nx.tensor([2.0, 4.0, 6.0]))
+      assert :ets.info(table, :size) == before + 1
+    end
+  end
+
   describe "__jit__/5 queue wrapping" do
     test "without :command_queue, the jit closure is returned as-is" do
       defmodule SumJitFn do
