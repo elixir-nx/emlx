@@ -72,6 +72,30 @@ struct PendingRuntimeCall {
   std::vector<std::pair<uint8_t *, size_t>> outputs;
 };
 
+// Waits for all the work that this thread has scheduled on its streams.
+//
+// MLX calls the eval of a primitive on the eval thread when it gets to the
+// primitive in the tape. A primitive that runs host code there (EMLXWhile,
+// EMLXRuntimeCall) must call this first, before it reads an input or starts a
+// nested eval. At that point, the CPU ops that compute its inputs can still wait
+// in the queue of the stream thread. The GPU ops can still be in a command
+// buffer that the outer eval commits only when it ends.
+//
+// The GPU goes first. A CPU stream can hold a fence wait on a GPU command buffer
+// that is not committed yet. A nested eval on that CPU stream queues behind the
+// fence wait. The outer eval cannot commit the buffer while it waits for the
+// nested eval, so each waits for the other.
+//
+// A worker thread uses only these two streams. Its own stream is the default
+// stream for its device. The ops of the other device use the default stream of
+// that device.
+inline void synchronize_thread_streams() {
+  if (mlx::core::is_available(mlx::core::Device::gpu)) {
+    mlx::core::synchronize(mlx::core::default_stream(mlx::core::Device::gpu));
+  }
+  mlx::core::synchronize(mlx::core::default_stream(mlx::core::Device::cpu));
+}
+
 // Blocks the calling (worker) thread until the Elixir side invokes
 // `EMLX.NIF.resolve_runtime_call/3` for this call. Called from
 // `EMLXRuntimeCall::eval()` (emlx/compiler.cpp). Throws `std::runtime_error`
@@ -88,23 +112,13 @@ inline void invoke_runtime_call(int64_t callback_index,
                                 const std::vector<mlx::core::array> &inputs,
                                 std::vector<mlx::core::array> &outputs,
                                 bool alias_inputs = false) {
-  // `EMLXRuntimeCall` is pinned to its own dedicated `k_linalg_cpu` stream
-  // (emlx/compiler.cpp), separate from whichever stream actually computed
-  // each `inputs[i]` (e.g. the calling worker's own bound stream, for any
-  // operand that isn't a bare top-level parameter/capture -- those need no
-  // computation at all, so they're trivially visible with no barrier).
-  // `array::is_available()`/`status()` only report *that* array's own
-  // producer stream finished scheduling it; they say nothing about whether
-  // that write has been synchronized so that *this*, different stream can
-  // safely read it via `in.data<uint8_t>()` below. Without this barrier, a
-  // genuinely computed (non-parameter) operand intermittently reads back as
-  // all-zero (the destination buffer's initial contents) -- reproduced with
-  // as little as `Nx.runtime_call(t, Nx.multiply(Nx.add(a, b), 2), ...)`.
-  // A full `synchronize()` is coarser than strictly necessary (it waits on
-  // every active stream, not just each operand's own), but `invoke_runtime_call`
-  // already pays for a much more expensive blocking Elixir round-trip right
-  // below, so this is not a meaningful additional cost.
-  mlx::core::synchronize();
+  // `array::is_available()`/`status()` only report that MLX scheduled an
+  // input, not that a stream computed it. Without this barrier, a computed
+  // (non-parameter) operand intermittently reads back as all-zero (the
+  // destination buffer's initial contents) -- reproduced with as little as
+  // `Nx.runtime_call(t, Nx.multiply(Nx.add(a, b), 2), ...)`. The barrier costs
+  // little next to the blocking Elixir round-trip below.
+  synchronize_thread_streams();
 
   if (g_current_caller_pid == nullptr) {
     throw std::runtime_error(

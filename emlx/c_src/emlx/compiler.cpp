@@ -1790,6 +1790,8 @@ static std::vector<mlx::core::array> interpret_instructions(
 // eval_program's outer mlx::core::eval(outputs, stream)) was validated safe by an
 // earlier de-risking spike (a hardcoded-iteration-count primitive, since
 // removed — see git history on pv-feat/lower-while for the original spike).
+// The pattern is safe only after eval() calls synchronize_thread_streams()
+// (emlx_runtime_call_bridge.hpp), which tells why.
 //
 // `captures_`/`constants_` are shared with the enclosing Program's own
 // interpreter (never duplicated per SubProgram — see EMLX.Native.SubProgram
@@ -1853,6 +1855,7 @@ private:
 
   void eval(const std::vector<mlx::core::array> &inputs,
             std::vector<mlx::core::array> &outputs) {
+    emlx::native::synchronize_thread_streams();
     std::vector<mlx::core::array> carry = inputs;
 
     while (evaluate_predicate(carry)) {
