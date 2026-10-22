@@ -170,9 +170,7 @@ defmodule EMLX do
   too — but a caller-held `Nx.Defn.compile/3` closure is always cheaper still.
 
   Cache bounds are documented on `EMLX.CompileCache`. A caller that keeps the
-  `Nx.Defn.compile/3` closure can pass `cache: false`. Then `EMLX.CompileCache`
-  does not keep a second reference to the closure, so the closure is freed when
-  the caller drops it. The structural dispatch-key cache still applies.
+  `Nx.Defn.compile/3` closure can pass `cache: false` to bypass the cache mechanism.
 
   ## Compile-time debug flags
 
