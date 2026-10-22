@@ -169,7 +169,8 @@ defmodule EMLX do
   distinct call sites (e.g. many copies of the same layer in a model) cheap
   too — but a caller-held `Nx.Defn.compile/3` closure is always cheaper still.
 
-  Cache bounds are documented on `EMLX.CompileCache`.
+  Cache bounds are documented on `EMLX.CompileCache`. A caller that keeps the
+  `Nx.Defn.compile/3` closure can pass `cache: false` to bypass the cache mechanism.
 
   ## Compile-time debug flags
 
@@ -1846,7 +1847,7 @@ defmodule EMLX do
 
   @behaviour Nx.Defn.Compiler
 
-  @valid_compiler_keys [:device, :max_concurrency, :command_queue, :hooks]
+  @valid_compiler_keys [:device, :max_concurrency, :command_queue, :hooks, :cache]
 
   # Structural program cache for `get_or_compile_program/6`.
   @native_dispatch_cache_table :emlx_native_dispatch_cache
@@ -1887,19 +1888,25 @@ defmodule EMLX do
     queue = Keyword.get(opts, :command_queue)
     device = Keyword.get(opts, :device, default_device())
 
-    cache_key = compile_cache_key(key, vars, hooks, device)
-
     eval_fn =
-      case EMLX.CompileCache.fetch(cache_key) do
-        {:ok, cached} ->
-          cached
-
-        {:error, :cache_miss} ->
-          built = native_compile(vars, fun, device)
-          EMLX.CompileCache.put(cache_key, built)
+      if Keyword.get(opts, :cache, true) do
+        cached_compile(compile_cache_key(key, vars, hooks, device), vars, fun, device)
+      else
+        native_compile(vars, fun, device)
       end
 
     wrap_with_queue(queue, eval_fn)
+  end
+
+  defp cached_compile(cache_key, vars, fun, device) do
+    case EMLX.CompileCache.fetch(cache_key) do
+      {:ok, cached} ->
+        cached
+
+      {:error, :cache_miss} ->
+        built = native_compile(vars, fun, device)
+        EMLX.CompileCache.put(cache_key, built)
+    end
   end
 
   # Attempts to lower `fun.(vars)` to an `EMLX.Native.Expr` program and build a
