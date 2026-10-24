@@ -2502,8 +2502,13 @@ defmodule EMLX do
     end
   end
 
-  defp sanitize_key_term(%Nx.Tensor{} = t, _positions) do
+  defp sanitize_key_term(%Nx.Tensor{data: %Nx.TemplateBackend{}} = t, _positions) do
     {:tensor_literal, t.shape, t.type}
+  end
+
+  # The program embeds the literal's values, so they are part of the key.
+  defp sanitize_key_term(%Nx.Tensor{} = t, _positions) do
+    {:tensor_literal, t.shape, t.type, Nx.to_binary(t)}
   end
 
   defp sanitize_key_term(fun, _positions) when is_function(fun) do

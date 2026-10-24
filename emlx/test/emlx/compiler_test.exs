@@ -383,4 +383,18 @@ defmodule EMLX.CompilerTest do
       end
     end
   end
+
+  describe "dispatch cache" do
+    test "functions that differ only in a tensor literal get different programs" do
+      a = Nx.tensor([1.0, 2.0, 3.0], backend: Nx.BinaryBackend)
+      b = Nx.tensor([10.0, 20.0, 30.0], backend: Nx.BinaryBackend)
+      zero = Nx.tensor([0.0, 0.0, 0.0], backend: {EMLX.Backend, device: :cpu})
+
+      add_a = Nx.Defn.jit(fn x -> Nx.add(x, a) end, compiler: EMLX, device: :cpu)
+      add_b = Nx.Defn.jit(fn x -> Nx.add(x, b) end, compiler: EMLX, device: :cpu)
+
+      assert_equal(Nx.backend_transfer(add_a.(zero), Nx.BinaryBackend), a)
+      assert_equal(Nx.backend_transfer(add_b.(zero), Nx.BinaryBackend), b)
+    end
+  end
 end
