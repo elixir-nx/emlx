@@ -557,7 +557,7 @@ defmodule EMLX.MixProject do
         ] ++ cacerts_options()
     ]
 
-    options = [body_format: :binary]
+    options = [body_format: :binary, max_header_size: 65_536]
 
     case :httpc.request(:get, {url_charlist, []}, https_options, options) do
       {:ok, {{_, 200, _}, _headers, body}} ->
