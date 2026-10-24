@@ -82,6 +82,10 @@ defmodule EMLX.NIF do
     :erlang.nif_error(:nif_not_loaded)
   end
 
+  def is_available(_device) do
+    :erlang.nif_error(:nif_not_loaded)
+  end
+
   def tensor_data_ptr(_tensor) do
     :erlang.nif_error(:nif_not_loaded)
   end
