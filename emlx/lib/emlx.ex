@@ -1992,7 +1992,7 @@ defmodule EMLX do
       # looked up (or compiled once and cached) here — see
       # get_or_compile_program/6. `fn -> fun.(vars) end` is only forced on
       # that cache's own miss (once per distinct `{base_key, quant_signature}`
-      # for the process's lifetime) — never eagerly, so a cache *hit* here
+      # while it stays in the cache) — never eagerly, so a cache *hit* here
       # costs nothing beyond the lookup itself.
       {program_resource, runtime_calls} =
         if quant_signature == %{} do
@@ -2251,17 +2251,17 @@ defmodule EMLX do
   end
 
   # Looks up (or lazily lowers+compiles) the program for `{base_key,
-  # quant_signature}` in the process-lifetime dispatch cache.
+  # quant_signature}` in the dispatch cache, which `EMLX.CompileCache` bounds.
   # `base_key` (see `dispatch_key/3`) is a structural signature of the
   # `Expr` — stable across `Nx.Defn.Graph.run/3`'s per-call re-tracing and
   # shared across structurally-identical call sites (e.g. every one of
   # Qwen3's 28 attention layers's surrounding stages), not scoped to one
   # `build_native_eval_fn/6` closure the way this cache was pre-Stage-32.
   # First-compile-wins under concurrent calls with a never-before-seen key:
-  # `:ets.insert_new/2` returning `false` means another caller raced us and
-  # won — we discard our (still valid, just unused) compiled resource and
-  # reuse theirs. Wasted work on that race, not a correctness hazard (no
-  # shared mutable state is corrupted).
+  # `EMLX.CompileCache.put_new/4` keeps the first insert and returns it, so a
+  # caller that raced and lost discards its (still valid, just unused)
+  # compiled resource and reuses the winner's. Wasted work on that race, not
+  # a correctness hazard.
   #
   # `output_expr_thunk` (a 0-arity fun, not `output_expr` itself) is only
   # forced on this cache's own miss (the `[]` branch below) — callers that
@@ -2282,19 +2282,13 @@ defmodule EMLX do
     table = dispatch_cache_table()
 
     case :ets.lookup(table, cache_key) do
-      [{_key, resource, runtime_calls}] ->
-        {resource, runtime_calls}
+      [{_key, compiled, _inserted_ms, _index}] ->
+        compiled
 
       [] ->
         program = EMLX.Native.Expr.lower(output_expr_thunk.(), num_inputs, quant_signature)
         resource = compile_native_program(worker, dev, program)
-
-        if :ets.insert_new(table, {cache_key, resource, program.runtime_calls}) do
-          {resource, program.runtime_calls}
-        else
-          [{_key, winner_resource, winner_runtime_calls}] = :ets.lookup(table, cache_key)
-          {winner_resource, winner_runtime_calls}
-        end
+        EMLX.CompileCache.put_new(table, cache_key, {resource, program.runtime_calls})
     end
   end
 
@@ -2364,13 +2358,12 @@ defmodule EMLX do
     table = ensure_named_ets_table(@dispatch_key_by_id_table)
 
     case :ets.lookup(table, id_key) do
-      [{_key, base_key}] ->
+      [{_key, base_key, _inserted_ms, _index}] ->
         base_key
 
       [] ->
         base_key = compute_dispatch_key(output_expr, num_inputs, device)
-        :ets.insert(table, {id_key, base_key})
-        base_key
+        EMLX.CompileCache.put_new(table, id_key, base_key)
     end
   end
 
@@ -2388,7 +2381,11 @@ defmodule EMLX do
 
     try do
       {node_sigs, output_sigs} = expr_structural_signature(output_expr)
-      {node_sigs, output_sigs, num_inputs, device}
+
+      # The signature grows with the graph, to megabytes for a large model. A
+      # digest keeps the cache rows and the eval closure that holds the key small.
+      signature = {node_sigs, output_sigs, num_inputs, device}
+      :crypto.hash(:sha256, :erlang.term_to_binary(signature, [:deterministic]))
     after
       Process.delete(@dispatch_key_memo_pdict_key)
     end
