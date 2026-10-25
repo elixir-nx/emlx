@@ -2497,15 +2497,15 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
 
     LIST_PARAM(1, std::vector<mlx::core::array>, inputs);
 
-    // Force-evaluate all inputs on the worker thread before passing them to the
+    // Schedule all inputs on the worker thread before passing them to the
     // compiled function.  MLX tensors created via Elixir (e.g. Nx.tensor/2) may
     // arrive as unevaluated lazy nodes associated with a different computation.
     // If they are consumed inside compiled_fn while still lazy, MLX may
     // propagate stale or garbage data from a previously-evaluated graph that
-    // happened to share the same underlying buffer.  Forcing eval here ensures
-    // all inputs are materialized scalars/arrays on the worker's stream before
-    // the compiled graph is built or replayed.
-    mlx::core::eval(inputs);
+    // happened to share the same underlying buffer.  Scheduled inputs are not
+    // lazy nodes anymore, and async_eval does not wait for them, so the caller
+    // can build the next call while the device runs this one.
+    mlx::core::async_eval(inputs);
 
     std::vector<mlx::core::array> outputs;
     {
