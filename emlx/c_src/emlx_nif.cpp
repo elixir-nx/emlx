@@ -1349,6 +1349,18 @@ NIF(metal_stop_capture) {
   CATCH()
 }
 
+// Reads device availability only, so it runs on the calling BEAM scheduler
+// without a worker.
+NIF(is_available) {
+  ATOM_PARAM(0, device_atom);
+
+  try {
+    mlx::core::Device device = string2device(device_atom);
+    return nx::nif::ok(env, nx::nif::make(env, mlx::core::is_available(device)));
+  }
+  CATCH()
+}
+
 NIF(strides) {
   TENSOR_PARAM(0, t);
 
@@ -2034,6 +2046,7 @@ static ErlNifFunc nif_funcs[] = {
     {"set_cache_limit", 1, set_cache_limit},
     {"metal_start_capture", 1, metal_start_capture},
     {"metal_stop_capture", 0, metal_stop_capture},
+    {"is_available", 1, is_available},
 
     // ── Worker control NIFs.
     {"command_queue_new", 1, command_queue_new},

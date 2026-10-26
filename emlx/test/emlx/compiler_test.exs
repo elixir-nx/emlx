@@ -16,6 +16,41 @@ defmodule EMLX.CompilerTest do
     end
   end
 
+  describe "EMLX.Application.configure_default_device/0" do
+    setup do
+      config = Application.fetch_env(:emlx, :default_device)
+
+      on_exit(fn ->
+        case config do
+          {:ok, device} -> Application.put_env(:emlx, :default_device, device)
+          :error -> Application.delete_env(:emlx, :default_device)
+        end
+      end)
+    end
+
+    # Metal hosts take the :gpu branch and the Linux CI jobs take the :cpu branch.
+    test "keeps :gpu without config when MLX reports the GPU as available, else sets :cpu" do
+      Application.delete_env(:emlx, :default_device)
+      EMLX.Application.configure_default_device()
+      expected = if EMLX.NIF.is_available(:gpu) == {:ok, true}, do: :gpu, else: :cpu
+      assert EMLX.default_device() == expected
+    end
+
+    test "keeps a configured :cpu" do
+      Application.put_env(:emlx, :default_device, :cpu)
+      EMLX.Application.configure_default_device()
+      assert EMLX.default_device() == :cpu
+    end
+
+    test "raises on an unknown configured device" do
+      Application.put_env(:emlx, :default_device, :tpu)
+
+      assert_raise EMLX.NIFError, ~r/Unknown device: tpu/, fn ->
+        EMLX.Application.configure_default_device()
+      end
+    end
+  end
+
   describe "__partitions_options__/1" do
     @tag :metal
     test "returns a single-element list by default" do
