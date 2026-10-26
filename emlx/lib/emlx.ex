@@ -2384,8 +2384,8 @@ defmodule EMLX do
 
       # The signature grows with the graph, to megabytes for a large model. A
       # digest keeps the cache rows and the eval closure that holds the key small.
-      signature = {node_sigs, output_sigs, num_inputs, device}
-      :crypto.hash(:sha256, :erlang.term_to_binary(signature, [:deterministic]))
+      node_hash = :crypto.hash(:sha256, :erlang.term_to_binary(node_sigs, [:deterministic]))
+      {node_hash, output_sigs, num_inputs, device}
     after
       Process.delete(@dispatch_key_memo_pdict_key)
     end
