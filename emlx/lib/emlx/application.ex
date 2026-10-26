@@ -34,6 +34,11 @@ defmodule EMLX.Application do
   `EMLX.eval/1` calls on a GPU tensor will raise at use time with the
   underlying `:persistent_term` `ArgumentError`.
 
+  At boot, this module also checks the configured `:default_device` (`:gpu`
+  when not set) with `mlx::core::is_available`. When MLX does not have that
+  device, it sets `:default_device` to `:cpu`, so `EMLX.default_device/0`
+  returns `:cpu`.
+
   ## CPU JIT compilation and SIGCHLD
 
   Hitting `** (EMLX.NIFError) ... pclose() failed.` on the CPU backend? See
@@ -47,6 +52,7 @@ defmodule EMLX.Application do
   @doc false
   def start(_type, _args) do
     EMLX.Profiling.init()
+    configure_default_device()
     ensure_default_worker!(:cpu, _gpu_optional? = false)
     ensure_default_worker!(:gpu, _gpu_optional? = true)
     ensure_worker!(:runtime_call_worker, :cpu, _gpu_optional? = false)
@@ -97,6 +103,19 @@ defmodule EMLX.Application do
   """
   def runtime_call_worker(device) when device in [:cpu, :gpu] do
     :persistent_term.get(persistent_term_key(:runtime_call_worker, device))
+  end
+
+  # Sets :default_device to :cpu when MLX does not have the configured device,
+  # for example :gpu on Linux without Metal. See "GPU absence" above.
+  @doc false
+  def configure_default_device do
+    device = Application.get_env(:emlx, :default_device, :gpu)
+
+    unless EMLX.NIF.is_available(device) |> EMLX.unwrap!() do
+      Application.put_env(:emlx, :default_device, :cpu)
+    end
+
+    :ok
   end
 
   defp ensure_default_worker!(device, gpu_optional?) do
