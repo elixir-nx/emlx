@@ -91,12 +91,14 @@ public:
   TensorP(const TensorP &) = delete;
   TensorP &operator=(const TensorP &) = delete;
 
+  // The resource starts with a count of 1, which deallocate() takes away, and each
+  // TensorP adds 1 while it lives. So the TensorP that brings the count to 0 is the last
+  // user of a deallocated tensor. It replaces the array with a scalar of 4 bytes, which
+  // frees the MLX buffer now. The array object stays valid, because the resource
+  // destructor still destroys it when the BEAM collects the term.
   ~TensorP() {
-    if (is_valid()) {
-      // decrease reference count
-      if (refcount->fetch_sub(1) == 0) {
-        ptr->~array(); // Call MLX tensor destructor
-      }
+    if (is_valid() && refcount->fetch_sub(1) == 1) {
+      *ptr = mlx::core::array(0.0f);
     }
   }
 

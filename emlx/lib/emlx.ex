@@ -1590,7 +1590,20 @@ defmodule EMLX do
   defp merge_device(_, :gpu), do: :gpu
   defp merge_device(_, _), do: :cpu
 
-  defvalue deallocate(tensor_ref)
+  @doc """
+  Frees the MLX array of `tensor_ref` now, without waiting for the BEAM to collect the
+  term. A later use of the tensor raises. Returns `:ok`, or `:already_deallocated` for a
+  tensor that was already deallocated, as `Nx.backend_deallocate/1` expects.
+  """
+  @mlx_function {:deallocate, 1}
+  def deallocate(tensor_ref) do
+    {[tensor_ref], _device} = prepare_tensors!([tensor_ref])
+
+    case EMLX.NIF.deallocate(tensor_ref) do
+      :already_deallocated -> :already_deallocated
+      result -> unwrap!(result)
+    end
+  end
 
   @doc """
   Evaluates a (possibly lazy) MLX tensor by routing the work through an

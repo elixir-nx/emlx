@@ -121,36 +121,33 @@ NIF(copy) {
 // legacy path; a process-independent msg_env for the worker path).
 static ERL_NIF_TERM to_blob_term(ErlNifEnv *out_env, mlx::core::array *t,
                                  size_t byte_size) {
-  if (t->flags().row_contiguous) {
-    // Zero-copy: alias the MLX buffer via the existing tensor resource.
-    // Invariant: lib/emlx.ex calls eval(tensor) before this NIF, so
-    // data<void>() is guaranteed non-null and stable (MLX arrays are immutable
-    // once materialised). enif_make_resource_binary keeps the resource alive
-    // until the binary is GC'd, decoupling the binary lifetime from Elixir GC
-    // of the tensor term.
-    return enif_make_resource_binary(out_env, static_cast<void *>(t),
-                                     t->data<void>(), byte_size);
+  // Zero-copy: the binary aliases the MLX buffer. Invariant: lib/emlx.ex calls
+  // eval(tensor) before this NIF, so data<void>() is non-null and stable (MLX
+  // arrays are immutable once materialised). A non-contiguous tensor first gets
+  // a fresh row-major copy.
+  //
+  // The binary keeps a minimal ERTS resource alive until it is GC'd. That
+  // resource holds its own mlx::core::array, which shares the buffer, so the
+  // binary stays valid after a deallocate frees the array of the tensor. The
+  // resource holds only sizeof(mlx::core::array), without the TensorP refcount
+  // and deleted-flag tail, because TensorP and the Elixir side never see it;
+  // default_dtor<array> (~array()) is its only destructor path.
+  mlx::core::array source = *t;
+  if (!t->flags().row_contiguous) {
+    source = mlx::core::contiguous(*t);
+    mlx::core::eval(source);
   }
 
-  // Non-contiguous: materialise a fresh row-major copy, wrap it in a minimal
-  // ERTS resource, and alias that buffer zero-copy.
-  // The resource holds only sizeof(mlx::core::array) — no TensorP refcount/
-  // deleted-flag tail — because it is never exposed to TensorP or the Elixir
-  // side; only the binary holds a reference and default_dtor<array>
-  // (~array()) is the sole destructor path.
-  auto ct = mlx::core::contiguous(*t);
-  mlx::core::eval(ct);
-
-  auto *ct_ptr = static_cast<mlx::core::array *>(enif_alloc_resource(
+  auto *ptr = static_cast<mlx::core::array *>(enif_alloc_resource(
       resource_object<mlx::core::array>::type, sizeof(mlx::core::array)));
-  if (!ct_ptr) {
-    throw std::runtime_error("Unable to allocate contiguous-copy resource");
+  if (!ptr) {
+    throw std::runtime_error("Unable to allocate the resource of a binary");
   }
 
-  new (ct_ptr) mlx::core::array(std::move(ct));
-  ERL_NIF_TERM resource_bin = enif_make_resource_binary(
-      out_env, ct_ptr, ct_ptr->data<void>(), byte_size);
-  enif_release_resource(ct_ptr);
+  new (ptr) mlx::core::array(std::move(source));
+  ERL_NIF_TERM resource_bin =
+      enif_make_resource_binary(out_env, ptr, ptr->data<void>(), byte_size);
+  enif_release_resource(ptr);
   return resource_bin;
 }
 
