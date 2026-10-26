@@ -267,9 +267,9 @@ defmodule EMLX.Backend do
     case opts[:mode] do
       :local ->
         # Eval happens inside tensor_data_ptr (same pattern as to_blob).
-        # The pointer is valid until another mx::eval on the same array or
-        # until the Elixir tensor term is GC'd. On Apple Silicon (unified
-        # memory) the address is accessible from both CPU and GPU.
+        # The pointer is valid until another mx::eval on the same array, or
+        # until the tensor is deallocated or its Elixir term is GC'd. On Apple
+        # Silicon (unified memory) the address is accessible from both CPU and GPU.
         {addr, byte_size} = EMLX.tensor_data_ptr(ref)
         %Nx.Pointer{kind: :local, address: addr, data_size: byte_size}
 
