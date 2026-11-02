@@ -2828,6 +2828,15 @@ defmodule EMLX.Native.ExprTest do
       assert Nx.to_number(native) == 1
     end
 
+    test "all_close: rtol scales with b and atol does not, eager and compiled" do
+      # |a - b| = 0.005 is within rtol * |b| = 0.01, but not within atol = 1.0e-8.
+      a = Nx.tensor([1000.0], type: :f32, backend: EMLX.Backend)
+      b = Nx.tensor([1000.005], type: :f32, backend: EMLX.Backend)
+
+      assert Nx.to_number(Nx.all_close(a, b)) == 1
+      assert Nx.to_number(Nx.Defn.jit(&all_close_defn/2, compiler: EMLX).(a, b)) == 1
+    end
+
     test "all_close: not-close tensors vs EMLX.Backend" do
       a = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
       b = Nx.tensor([1.0, 2.0, 4.0], type: :f32, backend: EMLX.Backend)
