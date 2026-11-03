@@ -1,9 +1,14 @@
 defmodule EMLX.CompileCache do
   @moduledoc """
-  Bounded cache of `native_compile/3` eval closures and compiled programs.
+  Configurable cache of callback-free eval closures and compiled programs.
 
   `EMLX.__compile__/4` stores one closure per `{fun, templates, hooks, device}`
-  so repeated `Nx.Defn.jit/2` of the same call site skips retrace. The
+  so repeated `Nx.Defn.jit/2` of the same call site skips retrace. Executables
+  with runtime callbacks (including inline/default hooks) and compilations
+  with nonempty `:hooks` options bypass these caches: callback closures may
+  capture request-specific aliases and must live only as long as the returned
+  executable. Keep a `Nx.Defn.compile/3` result to reuse such an executable.
+  The
   structural program table `:emlx_native_dispatch_cache` and its key table
   `:emlx_dispatch_key_by_id` are shared across call sites. Each compiled
   program holds device memory, for example its captured constants. All three

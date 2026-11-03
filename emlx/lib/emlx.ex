@@ -146,11 +146,11 @@ defmodule EMLX do
 
   ## Compile once, replay many times
 
-  `Nx.Defn.jit/2` and `Nx.Defn.jit_apply/3` still retrace through Nx on every
+  For callback-free functions, `Nx.Defn.jit/2` and `Nx.Defn.jit_apply/3` retrace through Nx on every
   call, but `EMLX.__compile__/4` caches the resulting eval closure in
   `EMLX.CompileCache`, keyed by function identity, input templates, and
   device. Repeated jit of the same `&Mod.f/a` with the same shapes hits that
-  cache and skips `native_compile/3`.
+  cache and skips native compilation.
 
   For a hot loop (e.g. a decode step), prefer `Nx.Defn.compile/3`, which traces
   and lowers **once** and returns a plain closure the caller holds — no ETS
@@ -171,6 +171,23 @@ defmodule EMLX do
 
   Cache bounds are documented on `EMLX.CompileCache`. A caller that keeps the
   `Nx.Defn.compile/3` closure can pass `cache: false` to bypass the cache mechanism.
+
+  ## Named hooks
+
+  The compiler's `:hooks` map overrides named `hook` callbacks on Nx 0.13 and
+  named `io_call` callbacks on Nx 1.x. Missing, nil, or false overrides use the
+  inline default; a name without a default is a no-op. Matching overrides must
+  be functions of arity one. Hooks in native while bodies run per iteration.
+
+  Compilations with nonempty `:hooks` and executables containing runtime
+  callbacks bypass global caches, including the structural program cache.
+  This keeps request-specific callback closures and receiver aliases out of
+  process-lifetime storage. A caller-held `Nx.Defn.compile/3` executable still
+  supports repeated invocation with its own callbacks. Side effects inside
+  conditional branches remain unsupported.
+
+  If a callback caller dies, the native bridge abandons its pending callback
+  wait and rejects late replies. This does not preempt a running MLX kernel.
 
   ## Compile-time debug flags
 
@@ -1805,6 +1822,8 @@ defmodule EMLX do
         end)
       rescue
         e -> {:error, Exception.format(:error, e, __STACKTRACE__)}
+      catch
+        kind, reason -> {:error, Exception.format(kind, reason, __STACKTRACE__)}
       end
 
     case reply do
@@ -1849,7 +1868,7 @@ defmodule EMLX do
 
   @valid_compiler_keys [:device, :max_concurrency, :command_queue, :hooks, :cache]
 
-  # Structural program cache for `get_or_compile_program/6`.
+  # Structural program cache for callback-free programs.
   @native_dispatch_cache_table :emlx_native_dispatch_cache
 
   # Expr-id cache in front of `dispatch_key/3`.
@@ -1873,26 +1892,17 @@ defmodule EMLX do
 
     hooks = Keyword.get(opts, :hooks, %{})
 
-    case hooks do
-      empty when empty == %{} ->
-        :ok
-
-      _ ->
-        raise ArgumentError,
-              "EMLX does not support the :hooks named-override map (got callbacks for " <>
-                "#{inspect(Map.keys(hooks))}) — :hook/:io_call expr nodes lower natively " <>
-                "with their own inline default callback, but swapping in a different " <>
-                "callback per hook name via compiler opts isn't wired through"
-    end
+    unless is_map(hooks), do: raise(ArgumentError, ":hooks option must be a map")
 
     queue = Keyword.get(opts, :command_queue)
     device = Keyword.get(opts, :device, default_device())
 
     eval_fn =
-      if Keyword.get(opts, :cache, true) do
+      if Keyword.get(opts, :cache, true) and hooks == %{} do
         cached_compile(compile_cache_key(key, vars, hooks, device), vars, fun, device)
       else
-        native_compile(vars, fun, device)
+        {built, _cacheable?} = native_compile(vars, fun, device, hooks)
+        built
       end
 
     wrap_with_queue(queue, eval_fn)
@@ -1904,16 +1914,16 @@ defmodule EMLX do
         cached
 
       {:error, :cache_miss} ->
-        built = native_compile(vars, fun, device)
-        EMLX.CompileCache.put(cache_key, built)
+        {built, cacheable?} = native_compile(vars, fun, device, %{})
+        if cacheable?, do: EMLX.CompileCache.put(cache_key, built), else: built
     end
   end
 
   # Attempts to lower `fun.(vars)` to an `EMLX.Native.Expr` program and build a
-  # compiled program resource, returning the resulting eval closure. Single-mode:
+  # compiled program resource, returning the eval closure and cache eligibility. Single-mode:
   # any op not yet implemented raises `ArgumentError` ("does not yet lower op
   # ...") straight through to the caller — there is no whole-`defn` fallback lane.
-  defp native_compile(vars, fun, device) do
+  defp native_compile(vars, fun, device, hooks) do
     output_expr = fun.(vars)
     {worker, effective_device} = resolve_worker(device)
     # `vars`' flattened leaf count is the true call arity — passed through so
@@ -1921,7 +1931,11 @@ defmodule EMLX do
     # reference every parameter position (see EMLX.Native.Expr.lower/2 doc).
     num_inputs = vars |> Nx.Defn.Composite.flatten_list() |> length()
 
-    base_key = dispatch_key(output_expr, num_inputs, effective_device)
+    program = EMLX.Native.Expr.lower(output_expr, num_inputs, %{}, hooks)
+
+    base_key =
+      if program.runtime_calls == [] and hooks == %{},
+        do: dispatch_key(output_expr, num_inputs, effective_device)
 
     {resource, runtime_calls} =
       get_or_compile_program(
@@ -1930,7 +1944,9 @@ defmodule EMLX do
         fn -> output_expr end,
         num_inputs,
         worker,
-        effective_device
+        effective_device,
+        hooks,
+        program
       )
 
     output_template = Nx.Defn.Composite.traverse(output_expr, &Nx.to_template/1)
@@ -1981,7 +1997,7 @@ defmodule EMLX do
           nil
       end)
 
-    fn [params] ->
+    eval_fn = fn [params] ->
       {worker, dev} = resolve_worker(effective_device)
       tensors = materialise_input_tensors(params, dev)
       quant_signature = quant_signature(tensors, quantizable_positions)
@@ -1990,7 +2006,7 @@ defmodule EMLX do
       # (and cached under `{base_key, %{}}`) by our caller, so the common
       # case skips a redundant cache round-trip; a quantized signature is
       # looked up (or compiled once and cached) here — see
-      # get_or_compile_program/6. `fn -> fun.(vars) end` is only forced on
+      # get_or_compile_program. For callback-free programs, `fn -> fun.(vars) end` is only forced on
       # that cache's own miss (once per distinct `{base_key, quant_signature}`
       # while it stays in the cache) — never eagerly, so a cache *hit* here
       # costs nothing beyond the lookup itself.
@@ -2004,7 +2020,8 @@ defmodule EMLX do
             fn -> fun.(vars) end,
             num_inputs,
             worker,
-            dev
+            dev,
+            hooks
           )
         end
 
@@ -2085,6 +2102,10 @@ defmodule EMLX do
 
       [output_container]
     end
+
+    # Callbacks may capture request aliases or other short-lived state. Their
+    # lifetime belongs to this returned executable, never to a global cache.
+    {eval_fn, runtime_calls == []}
   end
 
   # Reassembles the 2-3 physical refs `EMLX.Native.Expr.lower/2` emitted for
@@ -2276,19 +2297,30 @@ defmodule EMLX do
          output_expr_thunk,
          num_inputs,
          worker,
-         dev
+         dev,
+         hooks,
+         program \\ nil
        ) do
     cache_key = {base_key, quant_signature}
     table = dispatch_cache_table()
 
-    case :ets.lookup(table, cache_key) do
+    case if(base_key, do: :ets.lookup(table, cache_key), else: []) do
       [{_key, compiled, _inserted_ms, _index}] ->
         compiled
 
       [] ->
-        program = EMLX.Native.Expr.lower(output_expr_thunk.(), num_inputs, quant_signature)
+        program =
+          program ||
+            EMLX.Native.Expr.lower(output_expr_thunk.(), num_inputs, quant_signature, hooks)
+
         resource = compile_native_program(worker, dev, program)
-        EMLX.CompileCache.put_new(table, cache_key, {resource, program.runtime_calls})
+        compiled = {resource, program.runtime_calls}
+
+        if base_key != nil and program.runtime_calls == [] do
+          EMLX.CompileCache.put_new(table, cache_key, compiled)
+        else
+          compiled
+        end
     end
   end
 

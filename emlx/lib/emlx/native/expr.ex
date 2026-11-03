@@ -52,7 +52,7 @@ defmodule EMLX.Native.Expr do
   # ── lowering ──────────────────────────────────────────────────────────────
 
   @doc false
-  def lower(output, num_inputs \\ nil, quant_signature \\ %{}) do
+  def lower(output, num_inputs \\ nil, quant_signature \\ %{}, hooks \\ %{}) do
     ordered = EMLX.Defn.Tree.post_order(output, &scope_dependencies/1)
     top_scope_ids = top_scope_ids(output, ordered)
 
@@ -64,6 +64,7 @@ defmodule EMLX.Native.Expr do
       instructions: [],
       node_to_ref: %{},
       runtime_calls: [],
+      hooks: hooks,
       top_scope_ids: top_scope_ids,
       quant_signature: quant_signature,
       while_nesting_depth: 0,
@@ -2006,17 +2007,11 @@ defmodule EMLX.Native.Expr do
     end
 
     case callback_spec do
-      {:named, _name, nil} ->
-        %{
-          state
-          | node_to_ref: Map.put(state.node_to_ref, id, container_node_ref(tensor_expr, state))
-        }
-
       {:token_hook, hooked_expr, inner_spec} ->
         # Prefix hooked leaves as callback-only operands; trailing tensor
         # leaves are aliased to this node's outputs so evaluating the
         # pass-through forces the side effect (no keepalive chain).
-        case hook_callback(inner_spec) do
+        case hook_callback(inner_spec, state.hooks) do
           nil ->
             %{
               state
@@ -2032,12 +2027,18 @@ defmodule EMLX.Native.Expr do
         end
 
       spec ->
-        callback =
-          hook_callback(spec) ||
-            raise ArgumentError, "invalid #{op} callback_spec: #{inspect(spec)}"
+        case hook_callback(spec, state.hooks) do
+          nil ->
+            %{
+              state
+              | node_to_ref:
+                  Map.put(state.node_to_ref, id, container_node_ref(tensor_expr, state))
+            }
 
-        {value_ref, state} = emit_io_call_refs(nil, tensor_expr, callback, state)
-        %{state | node_to_ref: Map.put(state.node_to_ref, id, value_ref)}
+          callback ->
+            {value_ref, state} = emit_io_call_refs(nil, tensor_expr, callback, state)
+            %{state | node_to_ref: Map.put(state.node_to_ref, id, value_ref)}
+        end
     end
   end
 
@@ -2287,11 +2288,25 @@ defmodule EMLX.Native.Expr do
     {result_refs, state}
   end
 
-  defp hook_callback({:fn, callback}) when is_function(callback, 1), do: callback
-  defp hook_callback({:named, _name, callback}) when is_function(callback, 1), do: callback
-  defp hook_callback({:named, _name, nil}), do: nil
-  defp hook_callback({:token_hook, _hooked_expr, inner_spec}), do: hook_callback(inner_spec)
-  defp hook_callback(_), do: nil
+  defp hook_callback({:fn, callback}, _hooks) when is_function(callback, 1), do: callback
+
+  defp hook_callback({:named, name, default}, hooks) do
+    # Nx treats nil/false overrides as absent. Unused map entries are ignored.
+    case hooks[name] || default do
+      nil ->
+        nil
+
+      callback when is_function(callback, 1) ->
+        callback
+
+      callback ->
+        raise ArgumentError,
+              "invalid callback for hook #{inspect(name)}: expected a function of arity 1, got: #{inspect(callback)}"
+    end
+  end
+
+  defp hook_callback(spec, _hooks),
+    do: raise(ArgumentError, "invalid hook callback_spec: #{inspect(spec)}")
 
   # Flat leaf refs for a tensor/container already lowered into `node_to_ref`
   # -- single leaf unwraps to a bare ref (matching `:runtime_call` /

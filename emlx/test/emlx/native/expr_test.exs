@@ -4234,8 +4234,8 @@ defmodule EMLX.Native.ExprTest do
     :emlx_native_dispatch_cache |> :ets.tab2list() |> MapSet.new(&elem(&1, 0))
   end
 
-  describe "runtime_call split-point dispatch cache (compile once, reuse)" do
-    test "calling the same runtime_call-split defn twice compiles its flat stages once" do
+  describe "runtime_call executable ownership" do
+    test "calling a runtime_call defn twice does not retain its callbacks globally" do
       shape = {19, 128}
       w1 = Nx.iota(shape, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
       w2 = Nx.iota(shape, type: :f32) |> Nx.divide(7) |> Nx.backend_transfer(EMLX.Backend)
@@ -4248,7 +4248,7 @@ defmodule EMLX.Native.ExprTest do
           Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw1)
         end)
 
-      assert first > 0
+      assert first == 0
 
       {native2, second} =
         new_dispatch_cache_entries(fn ->
@@ -4263,7 +4263,7 @@ defmodule EMLX.Native.ExprTest do
       assert_all_close(native2, eager2)
     end
 
-    test "two structurally-identical but distinct call sites share one cache entry" do
+    test "structurally-identical callback-bearing call sites do not populate the cache" do
       shape = {23, 192}
       w1 = Nx.iota(shape, type: :f32) |> Nx.divide(10) |> Nx.backend_transfer(EMLX.Backend)
       w2 = Nx.iota(shape, type: :f32) |> Nx.divide(7) |> Nx.backend_transfer(EMLX.Backend)
