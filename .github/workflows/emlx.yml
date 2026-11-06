@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         job:
-          - { arch: "x86_64", runs-os: ubuntu-latest, otp: "25.3.2.15", elixir: "1.17.0" }
+          - { arch: "x86_64", runs-os: ubuntu-24.04, otp: "25.3.2.15", elixir: "1.17.0" }
           - { arch: "aarch64", runs-os: ubuntu-24.04-arm, otp: "25.3.2.15", elixir: "1.17.0" }
     env:
       MIX_ENV: test
