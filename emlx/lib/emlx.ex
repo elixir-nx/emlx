@@ -1597,6 +1597,11 @@ defmodule EMLX do
   `EMLX.CommandQueue`. Blocks the caller until the worker thread has
   finished `mlx::core::eval/1` for this tensor.
 
+  It waits for this tensor only. Other work on the same stream, such as
+  tensors that `async_eval/1` scheduled after it, can still run when it
+  returns. Use `EMLX.CommandQueue.synchronize/1` to wait for all the work of
+  a queue.
+
   Resolves the queue via `resolve_worker/1`:
 
     1. If the calling process has bound a queue with
@@ -1611,6 +1616,38 @@ defmodule EMLX do
       {worker, _effective_device} = resolve_worker(device)
       job_ref = EMLX.NIF.eval(worker, ref) |> unwrap!()
       await_worker(job_ref)
+    end)
+  end
+
+  @doc """
+  Schedules one or more (possibly lazy) MLX tensors on their device and
+  returns without waiting for the result.
+
+  The worker thread builds the command buffers of the tensors and commits
+  them, so the device starts to compute them. A later `eval/1`, `item/1` or
+  `to_blob/1` of one of the tensors waits only for that tensor. A compiled
+  call that takes a scheduled tensor as an input does not wait for it either.
+
+  This lets a loop build its next step while the device runs the current
+  one. For example, a decode loop calls the compiled step `t + 1` with the
+  lazy token of step `t`, schedules step `t + 1`, and then reads the token
+  of step `t`:
+
+      next = step.(token)
+      EMLX.async_eval(EMLX.Backend.from_nx(next))
+      Nx.to_number(token)
+
+  Takes a tensor ref (`{device, ref}`) or a list of them. Tensors of each
+  device go to the worker of that device, resolved as in `eval/1`.
+  """
+  def async_eval({device, ref} = tensor) when is_tensor(device, ref), do: async_eval([tensor])
+
+  def async_eval(tensors) when is_list(tensors) do
+    tensors
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Enum.each(fn {device, refs} ->
+      {worker, _effective_device} = resolve_worker(device)
+      EMLX.NIF.async_eval(worker, refs) |> unwrap!() |> await_worker()
     end)
   end
 

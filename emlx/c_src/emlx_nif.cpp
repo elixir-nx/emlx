@@ -444,10 +444,11 @@ NIF(argsort) {
   TENSOR(mlx::core::argsort(*t, axis, device));
 }
 
+// No stream-wide synchronize: it would also wait for the work that
+// async_eval scheduled after this array, such as the next decode step.
 NIF(eval) {
   TENSOR_PARAM(0, t);
   mlx::core::eval(*t);
-  mlx::core::synchronize();
   return nx::nif::ok(env);
 }
 
@@ -462,6 +463,12 @@ NIF(eval_many) {
   LIST_PARAM(0, std::vector<mlx::core::array>, inputs);
   mlx::core::eval(inputs);
   mlx::core::synchronize();
+  return nx::nif::ok(env);
+}
+
+NIF(async_eval) {
+  LIST_PARAM(0, std::vector<mlx::core::array>, inputs);
+  mlx::core::async_eval(inputs);
   return nx::nif::ok(env);
 }
 
@@ -1747,6 +1754,7 @@ NIF(window_scatter_min) {
 
 ASYNC_NIF(eval)
 ASYNC_NIF(eval_many)
+ASYNC_NIF(async_eval)
 ASYNC_NIF(to_blob)
 ASYNC_NIF(tensor_to_shm)
 ASYNC_NIF(item)
@@ -1895,6 +1903,7 @@ static ErlNifFunc nif_funcs[] = {
     // as the ~150 sibling ASYNC_NIF ops below (item 3.8 fold-in).
     {"eval", 2, eval_async},
     {"eval_many", 2, eval_many_async},
+    {"async_eval", 2, async_eval_async},
     {"to_device", 3, to_device_async},
     {"to_blob", 2, to_blob_async},
     {"to_blob", 3, to_blob_async},
