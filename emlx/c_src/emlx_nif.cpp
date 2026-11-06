@@ -55,7 +55,7 @@ NIF(deallocate) {
   if (t.deallocate()) {
     return nx::nif::ok(env);
   } else {
-    return nx::nif::atom(env, "already_deallocated");
+    return nx::nif::ok(env, nx::nif::atom(env, "already_deallocated"));
   }
 }
 

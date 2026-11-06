@@ -1599,10 +1599,9 @@ defmodule EMLX do
   def deallocate(tensor_ref) do
     {[tensor_ref], _device} = prepare_tensors!([tensor_ref])
 
-    case EMLX.NIF.deallocate(tensor_ref) do
-      :already_deallocated -> :already_deallocated
-      result -> unwrap!(result)
-    end
+    tensor_ref
+    |> EMLX.NIF.deallocate()
+    |> unwrap!()
   end
 
   @doc """

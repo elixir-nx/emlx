@@ -42,7 +42,23 @@ defmodule EMLX.MemoryTest do
     before = EMLX.memory_info().active_memory
 
     assert Nx.backend_deallocate(t) == :ok
-    assert EMLX.memory_info().active_memory <= before - 1024 * 1024 * 4 + 4
+    assert wait_for_memory(before - 1024 * 1024 * 4 + 4)
+  end
+
+  # On the CPU stream, the thread that ran the eval can still hold a copy of the array for a
+  # short time after the eval returns, so the buffer frees a moment after the deallocate.
+  defp wait_for_memory(limit, attempts \\ 100) do
+    cond do
+      EMLX.memory_info().active_memory <= limit ->
+        true
+
+      attempts == 0 ->
+        false
+
+      true ->
+        Process.sleep(10)
+        wait_for_memory(limit, attempts - 1)
+    end
   end
 
   test "a deallocated tensor raises on use, and a second deallocate does nothing" do
