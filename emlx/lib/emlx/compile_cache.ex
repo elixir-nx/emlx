@@ -1,23 +1,26 @@
 defmodule EMLX.CompileCache do
   @moduledoc """
-  Bounded cache of `native_compile/3` eval closures.
+  Bounded cache of `native_compile/3` eval closures and compiled programs.
 
   `EMLX.__compile__/4` stores one closure per `{fun, templates, hooks, device}`
-  so repeated `Nx.Defn.jit/2` of the same call site skips retrace. Unbounded
-  unless the host sets:
+  so repeated `Nx.Defn.jit/2` of the same call site skips retrace. The
+  structural program table `:emlx_native_dispatch_cache` and its key table
+  `:emlx_dispatch_key_by_id` are shared across call sites. Each compiled
+  program holds device memory, for example its captured constants. All three
+  tables are unbounded unless the host sets:
 
       config :emlx, EMLX.CompileCache,
         max_items: 1024,
         ttl: :timer.minutes(30)
 
-  Both default to `:infinity`. Overflow is FIFO by insert index. TTL is from
-  insert time and is swept by this process (`send_after(self(), :expire_entries,
-  div(ttl, 2))`), not on cache reads. A sweeper that is already running re-reads
-  app env each tick; if TTL is `:infinity` at start, nothing is scheduled until
-  the process restarts.
+  Both default to `:infinity` and apply to each table. Overflow is FIFO by
+  insert index. TTL is from insert time and is swept by this process
+  (`send_after(self(), :expire_entries, div(ttl, 2))`), not on cache reads. A
+  sweeper that is already running re-reads app env each tick; if TTL is
+  `:infinity` at start, nothing is scheduled until the process restarts.
 
-  The structural program table `:emlx_native_dispatch_cache` is shared across
-  call sites and is not bounded by these knobs.
+  A program stays in memory while a cached closure or a caller still holds it.
+  An evicted program compiles again on its next miss.
   """
 
   use GenServer
@@ -35,9 +38,11 @@ defmodule EMLX.CompileCache do
     # The dispatch tables belong to this process, so they live as long as the application.
     EMLX.__create_dispatch_tables__()
 
+    table = :ets.new(:emlx_compile_closures, [:set, :private])
+
     state = %{
-      table: :ets.new(:emlx_compile_closures, [:set, :private]),
-      counter: 0,
+      table: table,
+      counters: %{table => 0},
       ttl: Keyword.get(opts, :ttl),
       max_items: Keyword.get(opts, :max_items)
     }
@@ -56,6 +61,13 @@ defmodule EMLX.CompileCache do
     GenServer.call(server, {:put, key, fun})
   end
 
+  # Inserts into a public table that EMLX reads directly, such as the dispatch
+  # cache. Keeps an existing value and returns the value in the table.
+  @doc false
+  def put_new(table, key, value, server \\ __MODULE__) do
+    GenServer.call(server, {:put_new, table, key, value})
+  end
+
   @impl true
   def handle_call({:fetch, key}, _from, %{table: table} = state) do
     reply =
@@ -68,10 +80,14 @@ defmodule EMLX.CompileCache do
   end
 
   def handle_call({:put, key, fun}, _from, state) do
-    index = state.counter + 1
-    :ets.insert(state.table, {key, fun, System.monotonic_time(:millisecond), index})
-    evict_overflow(state.table, current_max_items(state), index)
-    {:reply, fun, %{state | counter: index}}
+    {:reply, fun, insert(state, state.table, key, fun)}
+  end
+
+  def handle_call({:put_new, table, key, value}, _from, state) do
+    case :ets.lookup(table, key) do
+      [{_key, existing, _inserted_ms, _index}] -> {:reply, existing, state}
+      [] -> {:reply, value, insert(state, table, key, value)}
+    end
   end
 
   @impl true
@@ -81,9 +97,16 @@ defmodule EMLX.CompileCache do
         {:noreply, state}
 
       ttl ->
-        expire_entries(state.table, ttl)
+        for {table, _index} <- state.counters, do: expire_entries(table, ttl)
         {:noreply, schedule_expire(state)}
     end
+  end
+
+  defp insert(state, table, key, value) do
+    index = Map.get(state.counters, table, 0) + 1
+    :ets.insert(table, {key, value, System.monotonic_time(:millisecond), index})
+    evict_overflow(table, current_max_items(state), index)
+    put_in(state.counters[table], index)
   end
 
   defp expire_entries(table, ttl) do

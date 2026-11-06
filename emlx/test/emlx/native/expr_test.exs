@@ -4222,29 +4222,17 @@ defmodule EMLX.Native.ExprTest do
     end
   end
 
-  defp dispatch_cache_entries_mentioning(shape) do
-    :emlx_native_dispatch_cache
-    |> :ets.tab2list()
-    |> Enum.filter(fn {key, _resource, _runtime_calls} -> term_mentions?(key, shape) end)
-    |> Enum.map(&elem(&1, 0))
-    |> Enum.uniq()
+  # The dispatch keys are digests, so the tests count the entries that a call
+  # adds. This module is not async, so no other test compiles at the same time.
+  defp new_dispatch_cache_entries(fun) do
+    before = dispatch_cache_keys()
+    result = fun.()
+    {result, MapSet.difference(dispatch_cache_keys(), before) |> MapSet.size()}
   end
 
-  defp term_mentions?(term, needle) when term == needle, do: true
-
-  defp term_mentions?(term, needle) when is_tuple(term) do
-    term |> Tuple.to_list() |> term_mentions?(needle)
+  defp dispatch_cache_keys do
+    :emlx_native_dispatch_cache |> :ets.tab2list() |> MapSet.new(&elem(&1, 0))
   end
-
-  defp term_mentions?(term, needle) when is_list(term) do
-    Enum.any?(term, &term_mentions?(&1, needle))
-  end
-
-  defp term_mentions?(term, needle) when is_map(term) do
-    term |> Map.to_list() |> term_mentions?(needle)
-  end
-
-  defp term_mentions?(_term, _needle), do: false
 
   describe "runtime_call split-point dispatch cache (compile once, reuse)" do
     test "calling the same runtime_call-split defn twice compiles its flat stages once" do
@@ -4255,14 +4243,19 @@ defmodule EMLX.Native.ExprTest do
       qw2 = EMLX.quantize(w2, [])
       x = Nx.iota(shape, type: :f32) |> Nx.divide(3) |> Nx.backend_transfer(EMLX.Backend)
 
-      native1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw1)
-      entries_after_first = dispatch_cache_entries_mentioning(shape)
-      assert entries_after_first != []
+      {native1, first} =
+        new_dispatch_cache_entries(fn ->
+          Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw1)
+        end)
 
-      native2 = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw2)
-      entries_after_second = dispatch_cache_entries_mentioning(shape)
+      assert first > 0
 
-      assert entries_after_second == entries_after_first
+      {native2, second} =
+        new_dispatch_cache_entries(fn ->
+          Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw2)
+        end)
+
+      assert second == 0
 
       eager1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw1)
       eager2 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw2)
@@ -4283,10 +4276,13 @@ defmodule EMLX.Native.ExprTest do
       # each traces to a fresh `Expr` (different ids), but the same shape of
       # computation.
       native1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw1)
-      native2 = Nx.Defn.jit(&dequant_surrounded_other_site/2, compiler: EMLX).(x, qw2)
 
-      entries = dispatch_cache_entries_mentioning(shape)
-      assert length(entries) == 1
+      {native2, added} =
+        new_dispatch_cache_entries(fn ->
+          Nx.Defn.jit(&dequant_surrounded_other_site/2, compiler: EMLX).(x, qw2)
+        end)
+
+      assert added == 0
 
       eager1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw1)
       eager2 = Nx.Defn.jit(&dequant_surrounded_other_site/2, compiler: Nx.Defn.Evaluator).(x, qw2)
@@ -4316,11 +4312,14 @@ defmodule EMLX.Native.ExprTest do
       # independent, since tracing is symbolic) was never what discriminated
       # these before this change either, so this also guards against a
       # regression that would split them.
-      {u1, s1, vt1} = Nx.Defn.jit_apply(fun, [a1], compiler: EMLX)
-      {u2, s2, vt2} = Nx.Defn.jit_apply(fun, [a2], compiler: EMLX)
+      {{u1, s1, vt1}, first} =
+        new_dispatch_cache_entries(fn -> Nx.Defn.jit_apply(fun, [a1], compiler: EMLX) end)
 
-      entries = dispatch_cache_entries_mentioning(shape)
-      assert length(entries) == 1
+      {{u2, s2, vt2}, second} =
+        new_dispatch_cache_entries(fn -> Nx.Defn.jit_apply(fun, [a2], compiler: EMLX) end)
+
+      assert first == 1
+      assert second == 0
 
       assert_close(Nx.dot(Nx.multiply(u1, Nx.reshape(s1, {1, 17})), vt1), a1)
       assert_close(Nx.dot(Nx.multiply(u2, Nx.reshape(s2, {1, 17})), vt2), a2)
@@ -4341,12 +4340,11 @@ defmodule EMLX.Native.ExprTest do
       fun_100 = fn t -> Nx.LinAlg.svd(t, full_matrices?: false, max_iter: 100) end
 
       {u1, s1, vt1} = Nx.Defn.jit_apply(fun_50, [a], compiler: EMLX)
-      entries_after_50 = dispatch_cache_entries_mentioning(shape)
 
-      {u2, s2, vt2} = Nx.Defn.jit_apply(fun_100, [a], compiler: EMLX)
-      entries_after_both = dispatch_cache_entries_mentioning(shape)
+      {{u2, s2, vt2}, added} =
+        new_dispatch_cache_entries(fn -> Nx.Defn.jit_apply(fun_100, [a], compiler: EMLX) end)
 
-      assert length(entries_after_both) > length(entries_after_50)
+      assert added > 0
 
       # Loose tolerance: the Jacobi rotation algorithm's reconstruction
       # accuracy at these iteration counts isn't what this test is about --
