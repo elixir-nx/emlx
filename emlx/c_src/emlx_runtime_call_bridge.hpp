@@ -39,6 +39,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -141,6 +142,28 @@ inline void invoke_runtime_call(int64_t callback_index,
   }
   new (pending) PendingRuntimeCall();
 
+  // The worker must own a reference while waiting: the recipient may die or
+  // discard the message at any point. Also invalidate destinations on every
+  // exit path, so a delayed/duplicate reply can never write freed output memory.
+  auto release_pending = [](PendingRuntimeCall *p) {
+    {
+      std::lock_guard<std::mutex> lock(p->mu);
+      if (!p->done) {
+        p->done = true;
+        p->ok = false;
+        p->error = "runtime_call abandoned";
+      }
+      p->outputs.clear();
+    }
+    p->cv.notify_one();
+    enif_release_resource(p);
+  };
+  std::unique_ptr<PendingRuntimeCall, decltype(release_pending)> owner(pending, release_pending);
+  std::unique_ptr<ErlNifEnv, decltype(&enif_free_env)> alive_env(enif_alloc_env(), enif_free_env);
+  if (!alive_env) {
+    throw std::runtime_error("emlx::native: failed to allocate liveness env");
+  }
+
   if (!alias_inputs) {
     // Pre-allocate every output buffer now so the destination pointers are
     // stable before we hand the request to the Elixir side.
@@ -154,7 +177,6 @@ inline void invoke_runtime_call(int64_t callback_index,
 
   ErlNifEnv *msg_env = enif_alloc_env();
   if (msg_env == nullptr) {
-    enif_release_resource(pending);
     throw std::runtime_error("emlx::native: failed to allocate msg env for runtime_call");
   }
 
@@ -174,7 +196,6 @@ inline void invoke_runtime_call(int64_t callback_index,
     size_t nbytes = in.nbytes();
     ErlNifBinary bin;
     if (!enif_alloc_binary(nbytes, &bin)) {
-      enif_release_resource(pending);
       enif_free_env(msg_env);
       throw std::runtime_error(
           "emlx::native: failed to allocate binary for runtime_call arg");
@@ -195,11 +216,7 @@ inline void invoke_runtime_call(int64_t callback_index,
   }
 
   ERL_NIF_TERM pending_term = enif_make_resource(msg_env, pending);
-  // enif_make_resource/enif_make_copy below keep their own references; drop
-  // ours now — the resource stays alive via the message term (and later,
-  // whatever term resolve_runtime_call's caller decodes it into) until its
-  // own destructor runs.
-  enif_release_resource(pending);
+  // Keep the worker-owned reference until this invocation has unwound.
 
   ERL_NIF_TERM args_list = enif_make_list_from_array(
       msg_env, arg_terms.data(), static_cast<unsigned>(arg_terms.size()));
@@ -218,8 +235,14 @@ inline void invoke_runtime_call(int64_t callback_index,
         "emlx::native: failed to send runtime_call request (target process not alive?)");
   }
 
-  auto is_done = [pending] {
+  auto is_done = [pending, &alive_env, &caller_pid] {
     std::lock_guard<std::mutex> lock(pending->mu);
+    if (!pending->done && !enif_is_process_alive(alive_env.get(), &caller_pid)) {
+      pending->done = true;
+      pending->ok = false;
+      pending->error = "runtime_call caller exited";
+      pending->outputs.clear();
+    }
     return pending->done;
   };
 
@@ -233,8 +256,12 @@ inline void invoke_runtime_call(int64_t callback_index,
   if (Worker *worker = g_current_worker) {
     worker->pump_until(is_done);
   } else {
-    std::unique_lock<std::mutex> lock(pending->mu);
-    pending->cv.wait(lock, [pending] { return pending->done; });
+    // A dead caller cannot reply or notify this condition variable. Wake
+    // periodically to check its liveness, just as pump_until does above.
+    while (!is_done()) {
+      std::unique_lock<std::mutex> lock(pending->mu);
+      pending->cv.wait_for(lock, std::chrono::milliseconds(5));
+    }
   }
 
   std::lock_guard<std::mutex> lock(pending->mu);
@@ -244,8 +271,8 @@ inline void invoke_runtime_call(int64_t callback_index,
 
   if (alias_inputs) {
     size_t passthrough_start = inputs.size() - outputs.size();
-    for (size_t i = passthrough_start; i < outputs.size(); i++) {
-      outputs[i].copy_shared_buffer(inputs[i]);
+    for (size_t i = 0; i < outputs.size(); i++) {
+      outputs[i].copy_shared_buffer(inputs[passthrough_start + i]);
     }
   }
 }
@@ -279,6 +306,10 @@ inline ERL_NIF_TERM resolve_runtime_call(ErlNifEnv *env, int argc,
 
   {
     std::lock_guard<std::mutex> lock(pending->mu);
+
+    if (pending->done) {
+      return nx::nif::error(env, "runtime_call already resolved or abandoned");
+    }
 
     if (is_ok) {
       unsigned n;
