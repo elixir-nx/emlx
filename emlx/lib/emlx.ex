@@ -174,20 +174,11 @@ defmodule EMLX do
 
   ## Named hooks
 
-  The compiler's `:hooks` map overrides named `hook` callbacks on Nx 0.13 and
-  named `io_call` callbacks on Nx 1.x. Missing, nil, or false overrides use the
-  inline default; a name without a default is a no-op. Matching overrides must
-  be functions of arity one. Hooks in native while bodies run per iteration.
+  Use the compiler's `:hooks` option to override named `io_call` callbacks.
+  Otherwise, the inline callback runs, if provided.
 
-  Compilations with nonempty `:hooks` and executables containing runtime
-  callbacks bypass global caches, including the structural program cache.
-  This keeps request-specific callback closures and receiver aliases out of
-  process-lifetime storage. A caller-held `Nx.Defn.compile/3` executable still
-  supports repeated invocation with its own callbacks. Side effects inside
-  conditional branches remain unsupported.
-
-  If a callback caller dies, the native bridge abandons its pending callback
-  wait and rejects late replies. This does not preempt a running MLX kernel.
+  Executables with callbacks bypass global caches; keep the function returned
+  by `Nx.Defn.compile/3` to reuse them.
 
   ## Compile-time debug flags
 
@@ -2303,8 +2294,9 @@ defmodule EMLX do
        ) do
     cache_key = {base_key, quant_signature}
     table = dispatch_cache_table()
+    cached = if base_key, do: :ets.lookup(table, cache_key), else: []
 
-    case if(base_key, do: :ets.lookup(table, cache_key), else: []) do
+    case cached do
       [{_key, compiled, _inserted_ms, _index}] ->
         compiled
 

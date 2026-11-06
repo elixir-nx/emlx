@@ -256,6 +256,8 @@ inline void invoke_runtime_call(int64_t callback_index,
   if (Worker *worker = g_current_worker) {
     worker->pump_until(is_done);
   } else {
+    // A dead caller cannot reply or notify this condition variable. Wake
+    // periodically to check its liveness, just as pump_until does above.
     while (!is_done()) {
       std::unique_lock<std::mutex> lock(pending->mu);
       pending->cv.wait_for(lock, std::chrono::milliseconds(5));
