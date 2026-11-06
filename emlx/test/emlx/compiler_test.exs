@@ -351,6 +351,20 @@ defmodule EMLX.CompilerTest do
         assert :ets.info(table, :owner) == Process.whereis(EMLX.CompileCache)
       end
     end
+
+    test "keep at most max_items compiled programs" do
+      config = Application.get_env(:emlx, EMLX.CompileCache)
+      Application.put_env(:emlx, EMLX.CompileCache, max_items: 2)
+      on_exit(fn -> Application.put_env(:emlx, EMLX.CompileCache, config || []) end)
+
+      for n <- 1..3 do
+        input = Nx.iota({n, 31}, type: :f32, backend: {EMLX.Backend, device: :cpu})
+        Nx.Defn.jit(&Nx.exp/1, compiler: EMLX, device: :cpu).(input)
+      end
+
+      assert :ets.info(:emlx_native_dispatch_cache, :size) == 2
+      assert :ets.info(:emlx_dispatch_key_by_id, :size) == 2
+    end
   end
 
   # MLX compiles with recursion as deep as the graph. A 512 KB thread stack
@@ -416,6 +430,20 @@ defmodule EMLX.CompilerTest do
         assert Nx.to_number(Nx.is_nan(result[0])) == 1
         assert_all_close(result[1], Nx.tensor(-2.0, type: t))
       end
+    end
+  end
+
+  describe "dispatch cache" do
+    test "functions that differ only in a tensor literal get different programs" do
+      a = Nx.tensor([1.0, 2.0, 3.0], backend: Nx.BinaryBackend)
+      b = Nx.tensor([10.0, 20.0, 30.0], backend: Nx.BinaryBackend)
+      zero = Nx.tensor([0.0, 0.0, 0.0], backend: {EMLX.Backend, device: :cpu})
+
+      add_a = Nx.Defn.jit(fn x -> Nx.add(x, a) end, compiler: EMLX, device: :cpu)
+      add_b = Nx.Defn.jit(fn x -> Nx.add(x, b) end, compiler: EMLX, device: :cpu)
+
+      assert_equal(Nx.backend_transfer(add_a.(zero), Nx.BinaryBackend), a)
+      assert_equal(Nx.backend_transfer(add_b.(zero), Nx.BinaryBackend), b)
     end
   end
 end
