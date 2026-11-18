@@ -222,7 +222,7 @@ defmodule EMLX.Backend do
       end
 
     new_scales = Nx.backend_copy(cfg.scales, device_opts)
-    new_biases = Nx.backend_copy(cfg.biases, device_opts)
+    new_biases = cfg.biases && Nx.backend_copy(cfg.biases, device_opts)
 
     %T{
       shape: logical_shape,
@@ -1949,13 +1949,10 @@ defmodule EMLX.Backend do
 
     indices_list =
       Enum.map(0..(num_axes - 1), fn entry ->
-        {_device, ref} =
-          indices
-          |> Nx.slice_along_axis(entry, 1, axis: -1)
-          |> Nx.squeeze(axes: [-1])
-          |> from_nx()
-
-        ref
+        indices
+        |> Nx.slice_along_axis(entry, 1, axis: -1)
+        |> Nx.squeeze(axes: [-1])
+        |> from_nx()
       end)
 
     tensor
@@ -1984,13 +1981,10 @@ defmodule EMLX.Backend do
 
     indices_list =
       Enum.map(0..(num_axes - 1), fn entry ->
-        {_device, ref} =
-          indices
-          |> Nx.slice_along_axis(entry, 1, axis: -1)
-          |> Nx.squeeze(axes: [-1])
-          |> from_nx()
-
-        ref
+        indices
+        |> Nx.slice_along_axis(entry, 1, axis: -1)
+        |> Nx.squeeze(axes: [-1])
+        |> from_nx()
       end)
 
     # MLX scatter takes one update slice per index with the target's rank: size 1 on the

@@ -426,9 +426,9 @@ defmodule EMLX do
   deftensor concatenate(tensors, axis)
   deftensor take_along_axis(tensor, tensorIndices, axis)
   deftensor take(tensor, tensorIndices, axis)
-  deftensor gather(tensor, indices, axes, slice_sizes)
-  deftensor scatter_add(tensor, indices, tensor_updates, axes)
-  deftensor scatter(tensor, indices, tensor_updates, axes)
+  deftensor gather(tensor, tensorIndices, axes, slice_sizes)
+  deftensor scatter_add(tensor, tensorIndices, tensor_updates, axes)
+  deftensor scatter(tensor, tensorIndices, tensor_updates, axes)
   deftensor max(tensor, axes, keep_axes)
   deftensor min(tensor, axes, keep_axes)
   deftensor clip(tensor, tensor_min, tensor_max)
@@ -466,13 +466,15 @@ defmodule EMLX do
         sorted_indices \\ false
       )
       when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) do
-    {ref_b, biases_device} = unwrap_optional_tensor(biases)
-    {ref_lhs, lhs_device} = unwrap_optional_tensor(lhs_indices)
-    {ref_rhs, rhs_device} = unwrap_optional_tensor(rhs_indices)
-
-    device =
-      [dev_x, dev_w, dev_s, biases_device, lhs_device, rhs_device]
-      |> Enum.reduce(&merge_device(&2, &1))
+    {[ref_x, ref_w, ref_s, ref_b, ref_lhs, ref_rhs], device} =
+      prepare_tensors!([
+        {dev_x, ref_x},
+        {dev_w, ref_w},
+        {dev_s, ref_s},
+        biases,
+        lhs_indices,
+        rhs_indices
+      ])
 
     {worker, effective_device} = resolve_worker(device)
 
@@ -526,8 +528,9 @@ defmodule EMLX do
         mode \\ "affine"
       )
       when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) do
-    {ref_b, biases_device} = unwrap_optional_tensor(biases)
-    device = merge_device(merge_device(dev_x, dev_w), merge_device(dev_s, biases_device))
+    {[ref_x, ref_w, ref_s, ref_b], device} =
+      prepare_tensors!([{dev_x, ref_x}, {dev_w, ref_w}, {dev_s, ref_s}, biases])
+
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -572,8 +575,7 @@ defmodule EMLX do
         mode \\ "affine"
       )
       when is_tensor(dev_w, ref_w) and is_tensor(dev_s, ref_s) do
-    {ref_b, biases_device} = unwrap_optional_tensor(biases)
-    device = merge_device(dev_w, merge_device(dev_s, biases_device))
+    {[ref_w, ref_s, ref_b], device} = prepare_tensors!([{dev_w, ref_w}, {dev_s, ref_s}, biases])
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -613,11 +615,6 @@ defmodule EMLX do
      wrap_optional_tensor(biases_ref, effective_device)}
   end
 
-  # `nil` (microscaled modes have no biases) passes through as the atom `nil`
-  # to the NIF layer; a real tensor unwraps to its raw ref for device merging.
-  defp unwrap_optional_tensor(nil), do: {nil, nil}
-  defp unwrap_optional_tensor({device, ref}), do: {ref, device}
-
   defp wrap_optional_tensor(nil, _device), do: nil
   defp wrap_optional_tensor(ref, device), do: {device, ref}
 
@@ -635,7 +632,7 @@ defmodule EMLX do
   @mlx_function {:fast_rms_norm, 5}
   def fast_rms_norm({dev_x, ref_x}, {dev_w, ref_w}, eps)
       when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) do
-    device = merge_device(dev_x, dev_w)
+    {[ref_x, ref_w], device} = prepare_tensors!([{dev_x, ref_x}, {dev_w, ref_w}])
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -705,8 +702,9 @@ defmodule EMLX do
   @mlx_function {:fast_sdpa, 7}
   def fast_sdpa({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale, sinks \\ nil)
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and is_tensor(dev_v, ref_v) do
-    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
-    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, sinks_device)))
+    {[ref_q, ref_k, ref_v, ref_s], device} =
+      prepare_tensors!([{dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, sinks])
+
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -737,13 +735,8 @@ defmodule EMLX do
       )
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
              is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) do
-    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
-
-    device =
-      merge_device(
-        dev_q,
-        merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device)))
-      )
+    {[ref_q, ref_k, ref_v, ref_m, ref_s], device} =
+      prepare_tensors!([{dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, {dev_m, ref_m}, sinks])
 
     {worker, effective_device} = resolve_worker(device)
 
@@ -776,7 +769,9 @@ defmodule EMLX do
   @mlx_function {:fast_layer_norm, 6}
   def fast_layer_norm({dev_x, ref_x}, {dev_w, ref_w}, {dev_b, ref_b}, eps)
       when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) and is_tensor(dev_b, ref_b) do
-    device = merge_device(dev_x, merge_device(dev_w, dev_b))
+    {[ref_x, ref_w, ref_b], device} =
+      prepare_tensors!([{dev_x, ref_x}, {dev_w, ref_w}, {dev_b, ref_b}])
+
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -794,7 +789,7 @@ defmodule EMLX do
   @mlx_function {:fast_layer_norm_no_bias, 5}
   def fast_layer_norm_no_bias({dev_x, ref_x}, {dev_w, ref_w}, eps)
       when is_tensor(dev_x, ref_x) and is_tensor(dev_w, ref_w) do
-    device = merge_device(dev_x, dev_w)
+    {[ref_x, ref_w], device} = prepare_tensors!([{dev_x, ref_x}, {dev_w, ref_w}])
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -819,7 +814,7 @@ defmodule EMLX do
   @mlx_function {:fast_rope_ids, 8}
   def fast_rope_ids({dev_a, ref_a}, dims, traditional, base, scale, {dev_off, ref_off})
       when is_tensor(dev_a, ref_a) and is_tensor(dev_off, ref_off) do
-    device = merge_device(dev_a, dev_off)
+    {[ref_a, ref_off], device} = prepare_tensors!([{dev_a, ref_a}, {dev_off, ref_off}])
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -862,7 +857,7 @@ defmodule EMLX do
         {dev_pos, ref_pos}
       )
       when is_tensor(dev_a, ref_a) and is_tensor(dev_pos, ref_pos) do
-    device = merge_device(dev_a, dev_pos)
+    {[ref_a, ref_pos], device} = prepare_tensors!([{dev_a, ref_a}, {dev_pos, ref_pos}])
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -903,7 +898,9 @@ defmodule EMLX do
         {dev_f, ref_f}
       )
       when is_tensor(dev_a, ref_a) and is_tensor(dev_off, ref_off) and is_tensor(dev_f, ref_f) do
-    device = merge_device(dev_a, merge_device(dev_off, dev_f))
+    {[ref_a, ref_off, ref_f], device} =
+      prepare_tensors!([{dev_a, ref_a}, {dev_off, ref_off}, {dev_f, ref_f}])
+
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -941,8 +938,9 @@ defmodule EMLX do
   @mlx_function {:fast_sdpa_causal, 7}
   def fast_sdpa_causal({dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, scale, sinks \\ nil)
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and is_tensor(dev_v, ref_v) do
-    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
-    device = merge_device(dev_q, merge_device(dev_k, merge_device(dev_v, sinks_device)))
+    {[ref_q, ref_k, ref_v, ref_s], device} =
+      prepare_tensors!([{dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, sinks])
+
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -981,13 +979,8 @@ defmodule EMLX do
       )
       when is_tensor(dev_q, ref_q) and is_tensor(dev_k, ref_k) and
              is_tensor(dev_v, ref_v) and is_tensor(dev_m, ref_m) and is_integer(kv_offset) do
-    {ref_s, sinks_device} = unwrap_optional_tensor(sinks)
-
-    device =
-      merge_device(
-        dev_q,
-        merge_device(dev_k, merge_device(dev_v, merge_device(dev_m, sinks_device)))
-      )
+    {[ref_q, ref_k, ref_v, ref_m, ref_s], device} =
+      prepare_tensors!([{dev_q, ref_q}, {dev_k, ref_k}, {dev_v, ref_v}, {dev_m, ref_m}, sinks])
 
     {worker, effective_device} = resolve_worker(device)
 
@@ -1021,7 +1014,7 @@ defmodule EMLX do
   @mlx_function {:fast_swiglu, 4}
   def fast_swiglu({dev_gate, ref_gate}, {dev_up, ref_up})
       when is_tensor(dev_gate, ref_gate) and is_tensor(dev_up, ref_up) do
-    device = merge_device(dev_gate, dev_up)
+    {[ref_gate, ref_up], device} = prepare_tensors!([{dev_gate, ref_gate}, {dev_up, ref_up}])
     {worker, effective_device} = resolve_worker(device)
 
     job_ref =
@@ -1050,16 +1043,18 @@ defmodule EMLX do
   """
   @mlx_function {:kv_cache_attention, 9}
   def kv_cache_attention(
-        {dev_q, ref_q},
-        {_dev_k, ref_k},
-        {_dev_v, ref_v},
-        {_dev_kc, ref_kc},
-        {_dev_vc, ref_vc},
+        q,
+        new_k,
+        new_v,
+        k_cache,
+        v_cache,
         offset,
         scale
       )
-      when is_tensor(dev_q, ref_q) and is_integer(offset) and is_float(scale) do
-    device = dev_q
+      when is_integer(offset) and is_float(scale) do
+    {[ref_q, ref_k, ref_v, ref_kc, ref_vc], device} =
+      prepare_tensors!([q, new_k, new_v, k_cache, v_cache])
+
     {worker, effective_device} = resolve_worker(device)
 
     {attn_ref, k_upd_ref, v_upd_ref} =
@@ -1095,17 +1090,19 @@ defmodule EMLX do
   """
   @mlx_function {:kv_cache_attention_masked, 10}
   def kv_cache_attention_masked(
-        {dev_q, ref_q},
-        {_dev_k, ref_k},
-        {_dev_v, ref_v},
-        {_dev_kc, ref_kc},
-        {_dev_vc, ref_vc},
+        q,
+        new_k,
+        new_v,
+        k_cache,
+        v_cache,
         offset,
         scale,
-        {_dev_m, ref_m}
+        key_mask
       )
-      when is_tensor(dev_q, ref_q) and is_integer(offset) and is_float(scale) do
-    device = dev_q
+      when is_integer(offset) and is_float(scale) do
+    {[ref_q, ref_k, ref_v, ref_kc, ref_vc, ref_m], device} =
+      prepare_tensors!([q, new_k, new_v, k_cache, v_cache, key_mask])
+
     {worker, effective_device} = resolve_worker(device)
 
     {attn_ref, k_upd_ref, v_upd_ref} =
@@ -1141,16 +1138,18 @@ defmodule EMLX do
   """
   @mlx_function {:kv_cache_sdpa_update, 9}
   def kv_cache_sdpa_update(
-        {dev_q, ref_q},
-        {_dev_k, ref_k},
-        {_dev_v, ref_v},
-        {_dev_kc, ref_kc},
-        {_dev_vc, ref_vc},
+        q,
+        new_k,
+        new_v,
+        k_cache,
+        v_cache,
         offset,
         scale
       )
-      when is_tensor(dev_q, ref_q) and is_integer(offset) and is_float(scale) do
-    device = dev_q
+      when is_integer(offset) and is_float(scale) do
+    {[ref_q, ref_k, ref_v, ref_kc, ref_vc], device} =
+      prepare_tensors!([q, new_k, new_v, k_cache, v_cache])
+
     {worker, effective_device} = resolve_worker(device)
 
     {attn_ref, k_upd_ref, v_upd_ref} =
@@ -1525,11 +1524,15 @@ defmodule EMLX do
   # thread-local, so a GPU op cannot eval a CPU scalar that `Nx.to_tensor/1`
   # allocated on the default CPU backend (`Stream(cpu, N)` lives on the CPU
   # worker). Promoting here keeps the graph single-device / single-worker.
+  # `nil` is an absent optional operand (biases, sinks, indices) and stays `nil`.
   defp prepare_tensors!(tensors) do
     target = merge_devices(tensors)
 
     prepared =
       Enum.map(tensors, fn
+        nil ->
+          nil
+
         {dev, ref} = tensor when is_tensor(dev, ref) ->
           elem(ensure_on_device!(tensor, target), 1)
 
@@ -1545,6 +1548,9 @@ defmodule EMLX do
 
   defp merge_devices(tensors) do
     Enum.reduce(tensors, :cpu, fn
+      nil, device ->
+        device
+
       {dev, ref}, device when is_tensor(dev, ref) ->
         merge_device(device, dev)
 
@@ -1566,32 +1572,51 @@ defmodule EMLX do
   # Passthrough EMLX tensors into a runtime_call still live on the
   # eval_program / default worker's stream. Same device atom (`:cpu`) as the
   # bound `runtime_call_worker`, so `to_device/2` alone is a no-op — eval on
-  # the home worker, then contiguous onto the bound stream.
+  # the home worker, then contiguous onto the bound stream. The scales and
+  # biases of a quantized weight are arrays of the home worker too.
   defp adopt_passthrough_tensor(
-         %Nx.Tensor{data: %EMLX.Backend{ref: {device, ref} = tensor_ref}} = tensor
-       )
-       when is_tensor(device, ref) do
+         %Nx.Tensor{
+           data:
+             %EMLX.Backend{
+               ref: {device, _},
+               quantization_config: %EMLX.Quantization.Config{} = cfg
+             } =
+               data
+         } = tensor
+       ) do
     case Process.get(:emlx_command_queue) do
-      {worker, ^device} = bound ->
-        Process.delete(:emlx_command_queue)
+      {_worker, ^device} = bound ->
+        cfg = %{
+          cfg
+          | scales: adopt_tensor(cfg.scales, bound),
+            biases: cfg.biases && adopt_tensor(cfg.biases, bound)
+        }
 
-        try do
-          eval(tensor_ref)
-        after
-          Process.put(:emlx_command_queue, bound)
-        end
-
-        new_ref =
-          EMLX.NIF.to_device(worker, ref, device)
-          |> unwrap!()
-          |> await_worker()
-          |> wrap_tensor(device)
-
-        %{tensor | data: %{tensor.data | ref: new_ref}}
+        %{tensor | data: %{data | ref: adopt_ref(data.ref, bound), quantization_config: cfg}}
 
       _ ->
         tensor
     end
+  end
+
+  defp adopt_tensor(%Nx.Tensor{data: %EMLX.Backend{ref: ref} = data} = tensor, bound) do
+    %{tensor | data: %{data | ref: adopt_ref(ref, bound)}}
+  end
+
+  defp adopt_ref({device, ref} = tensor_ref, {worker, bound_device} = bound)
+       when is_tensor(device, ref) do
+    Process.delete(:emlx_command_queue)
+
+    try do
+      eval(tensor_ref)
+    after
+      Process.put(:emlx_command_queue, bound)
+    end
+
+    EMLX.NIF.to_device(worker, ref, bound_device)
+    |> unwrap!()
+    |> await_worker()
+    |> wrap_tensor(bound_device)
   end
 
   defp merge_device(:gpu, _), do: :gpu
@@ -2255,18 +2280,16 @@ defmodule EMLX do
   end
 
   # Materialises defn input lazy refs to real bound %Nx.Tensor{} values on
-  # `dev`. Already-EMLX tensors on another device are moved with `to_device/2`
-  # — required since MLX 0.32: `eval_program` runs on `dev`'s worker, and a
-  # lazy CPU graph (e.g. `Nx.broadcast`) still tagged `Stream(cpu, N)` cannot
-  # be eval'd on the GPU worker when `opts[:device]`/`default_device()` is `:gpu`.
+  # `dev`. Tensors on another device are copied to `dev` — required since MLX
+  # 0.32: `eval_program` runs on `dev`'s worker, and a lazy CPU graph (e.g.
+  # `Nx.broadcast`) still tagged `Stream(cpu, N)` cannot be eval'd on the GPU
+  # worker when `opts[:device]`/`default_device()` is `:gpu`. `backend_copy`
+  # also moves the scales and biases of a quantized weight.
   defp materialise_input_tensors(params, dev) do
     Enum.map(params, fn lazy ->
       case lazy.() do
         %Nx.Tensor{data: %EMLX.Backend{ref: {^dev, _}}} = t ->
           t
-
-        %Nx.Tensor{data: %EMLX.Backend{ref: ref}} = t ->
-          %{t | data: %{t.data | ref: to_device(ref, dev)}}
 
         %Nx.Tensor{} = t ->
           Nx.backend_copy(t, {EMLX.Backend, device: dev})
