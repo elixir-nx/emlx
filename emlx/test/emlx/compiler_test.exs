@@ -216,6 +216,39 @@ defmodule EMLX.CompilerTest do
 
       assert_all_close(r1, r2)
     end
+
+    # The constants of a compiled program must not belong to the stream of the
+    # worker that compiled it. Another worker cannot evaluate an op of that stream.
+    test "two CPU queues can run a program with constants and a while" do
+      queues = [CommandQueue.new!(:cpu), CommandQueue.new!(:cpu)]
+
+      defmodule ConstantTwoQueues do
+        import Nx.Defn
+
+        defn add_constant(a), do: Nx.add(a, 1.5)
+
+        defn count_down(x) do
+          {x, _} =
+            while {x, positive = Nx.greater(Nx.sum(x), 0)}, positive do
+              x = Nx.subtract(x, 1)
+              {x, Nx.greater(Nx.sum(x), 0)}
+            end
+
+          x
+        end
+      end
+
+      add_constant = Nx.Defn.jit(&ConstantTwoQueues.add_constant/1, compiler: EMLX, device: :cpu)
+      count_down = Nx.Defn.jit(&ConstantTwoQueues.count_down/1, compiler: EMLX, device: :cpu)
+
+      for q <- queues ++ queues do
+        CommandQueue.with_queue(q, fn ->
+          x = Nx.tensor([3.0, 2.0], backend: {EMLX.Backend, device: :cpu})
+          assert Nx.to_flat_list(add_constant.(x)) == [4.5, 3.5]
+          assert Nx.to_flat_list(count_down.(x)) == [0.0, -1.0]
+        end)
+      end
+    end
   end
 
   # MLX uses one process-wide default device (the GPU with Metal), so an op without
