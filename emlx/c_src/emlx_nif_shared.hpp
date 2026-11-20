@@ -268,35 +268,24 @@ struct TensorArg {
 namespace fine {
 
 template <> struct Decoder<TensorArg> {
-  static TensorArg decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  static DecodeResult<TensorArg> try_decode(ErlNifEnv *env,
+                                            const ERL_NIF_TERM &term) {
     TensorP tp(env, term);
     if (!tp.is_valid()) {
-      throw std::invalid_argument(tp.error_message());
+      return DecodeError{tp.error_message()};
     }
     auto *ptr = tp.data();
     return TensorArg{std::move(tp), ptr};
   }
 };
 
-// `std::optional<TensorArg>` mirrors OPTIONAL_TENSOR_PARAM: the Elixir
-// caller passes the atom `nil` when the tensor is absent.
-template <> struct Decoder<std::optional<TensorArg>> {
-  static std::optional<TensorArg> decode(ErlNifEnv *env,
-                                         const ERL_NIF_TERM &term) {
-    std::string atom_val;
-    if (nx::nif::get_atom(env, term, atom_val) && atom_val == "nil") {
-      return std::nullopt;
-    }
-    return Decoder<TensorArg>::decode(env, term);
-  }
-};
-
 // Device atom (`:cpu` / `:gpu`) -> mlx::core::Device, matching DEVICE_PARAM.
 template <> struct Decoder<mlx::core::Device> {
-  static mlx::core::Device decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  static DecodeResult<mlx::core::Device> try_decode(ErlNifEnv *env,
+                                                    const ERL_NIF_TERM &term) {
     std::string atom_val;
     if (!nx::nif::get_atom(env, term, atom_val)) {
-      throw std::invalid_argument("Unable to get device atom in NIF");
+      return DecodeError{"Unable to get device atom in NIF", term};
     }
     return string2device(atom_val);
   }
@@ -307,10 +296,11 @@ template <> struct Decoder<mlx::core::Device> {
 // directly instead of going through an int<->dtype lookup table shared with
 // Elixir (see EMLX.Native.to_mlx_type/1 on the Elixir side).
 template <> struct Decoder<mlx::core::Dtype> {
-  static mlx::core::Dtype decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  static DecodeResult<mlx::core::Dtype> try_decode(ErlNifEnv *env,
+                                                   const ERL_NIF_TERM &term) {
     std::string atom_val;
     if (!nx::nif::get_atom(env, term, atom_val)) {
-      throw std::invalid_argument("Unable to get dtype atom in NIF");
+      return DecodeError{"Unable to get dtype atom in NIF", term};
     }
     return string2dtype(atom_val);
   }
@@ -322,8 +312,13 @@ template <> struct Decoder<mlx::core::Dtype> {
 // std::vector<mlx::core::array>, ...) semantics used e.g. for compile_program's
 // captures.
 template <> struct Decoder<mlx::core::array> {
-  static mlx::core::array decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
-    return *Decoder<TensorArg>::decode(env, term);
+  static DecodeResult<mlx::core::array> try_decode(ErlNifEnv *env,
+                                                   const ERL_NIF_TERM &term) {
+    auto result = fine::try_decode<TensorArg>(env, term);
+    if (!result) {
+      return std::move(result).error();
+    }
+    return *result.value();
   }
 };
 
@@ -331,10 +326,10 @@ template <> struct Decoder<mlx::core::array> {
 // nx::nif::get(..., int*)/enif_get_int semantics exactly (used for e.g.
 // RoPE `dims`/`offset` params).
 template <> struct Decoder<int> {
-  static int decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  static DecodeResult<int> try_decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
     int value;
     if (!enif_get_int(env, term, &value)) {
-      throw std::invalid_argument("Unable to get int param in NIF");
+      return DecodeError{"Unable to get int param in NIF", term};
     }
     return value;
   }

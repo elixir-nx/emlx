@@ -156,6 +156,25 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc,
 } // namespace native
 } // namespace emlx
 
+namespace emlx::native {
+
+// Decodes the field `key` of the Elixir struct `term` as T.
+template <typename T>
+fine::DecodeResult<T> decode_field(ErlNifEnv *env, const ERL_NIF_TERM &term,
+                                   const char *struct_name,
+                                   const fine::Atom &key) {
+  ERL_NIF_TERM value;
+  if (!enif_get_map_value(env, term, fine::encode(env, key), &value)) {
+    return fine::DecodeError{std::string("decode failed, expected an ") +
+                                 struct_name + " struct with field " +
+                                 key.to_string(),
+                             term};
+  }
+  return fine::try_decode<T>(env, value);
+}
+
+} // namespace emlx::native
+
 namespace fine {
 
 // Decode a constant entry {value, mlx_dtype} where value is either an Erlang
@@ -165,14 +184,14 @@ namespace fine {
 // specialisation maps them to the appropriate C double.
 template <>
 struct Decoder<std::tuple<double, mlx::core::Dtype>> {
-  static std::tuple<double, mlx::core::Dtype>
-  decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  using Constant = std::tuple<double, mlx::core::Dtype>;
+
+  static DecodeResult<Constant> try_decode(ErlNifEnv *env,
+                                           const ERL_NIF_TERM &term) {
     int arity;
     const ERL_NIF_TERM *elems;
     if (!enif_get_tuple(env, term, &arity, &elems) || arity != 2) {
-      throw std::invalid_argument(
-          "decode failed, expected a 2-tuple for constant, got: " +
-          format_term(env, term));
+      return DecodeError{"decode failed, expected a 2-tuple for constant", term};
     }
     double value;
     char atom[64];
@@ -184,37 +203,51 @@ struct Decoder<std::tuple<double, mlx::core::Dtype>> {
       else if (std::strcmp(atom, "nan") == 0)
         value = std::numeric_limits<double>::quiet_NaN();
       else
-        throw std::invalid_argument(
-            "decode failed, unexpected atom for constant value: " +
-            std::string(atom));
+        return DecodeError{"decode failed, unexpected atom for constant value",
+                           elems[0]};
     } else {
-      value = fine::decode<double>(env, elems[0]);
+      auto decoded = fine::try_decode<double>(env, elems[0]);
+      if (!decoded) {
+        return std::move(decoded).error();
+      }
+      value = decoded.value();
     }
-    return {value, fine::decode<mlx::core::Dtype>(env, elems[1])};
+    auto dtype = fine::try_decode<mlx::core::Dtype>(env, elems[1]);
+    if (!dtype) {
+      return std::move(dtype).error();
+    }
+    return Constant{value, dtype.value()};
   }
 };
 
 template <> struct Decoder<emlx::native::Ref> {
-  static emlx::native::Ref decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
-    auto [kind_atom, index] =
-        fine::decode<std::tuple<fine::Atom, int64_t>>(env, term);
+  static DecodeResult<emlx::native::Ref> try_decode(ErlNifEnv *env,
+                                                    const ERL_NIF_TERM &term) {
+    using emlx::native::Ref;
+    using emlx::native::RefKind;
+
+    auto decoded = fine::try_decode<std::tuple<fine::Atom, int64_t>>(env, term);
+    if (!decoded) {
+      return std::move(decoded).error();
+    }
+    auto [kind_atom, index] = std::move(decoded).value();
     if (kind_atom == "input")
-      return {emlx::native::RefKind::Input, index};
+      return Ref{RefKind::Input, index};
     if (kind_atom == "capture")
-      return {emlx::native::RefKind::Capture, index};
+      return Ref{RefKind::Capture, index};
     if (kind_atom == "const")
-      return {emlx::native::RefKind::Const, index};
+      return Ref{RefKind::Const, index};
     if (kind_atom == "result")
-      return {emlx::native::RefKind::Result, index};
+      return Ref{RefKind::Result, index};
     if (kind_atom == "carry")
-      return {emlx::native::RefKind::Carry, index};
-    throw std::invalid_argument("decode failed, unknown ref kind: " +
-                                kind_atom.to_string());
+      return Ref{RefKind::Carry, index};
+    return DecodeError{"decode failed, unknown ref kind", term};
   }
 };
 
 template <> struct Decoder<emlx::native::Attr> {
-  static emlx::native::Attr decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  static DecodeResult<emlx::native::Attr> try_decode(ErlNifEnv *env,
+                                                     const ERL_NIF_TERM &term) {
     // Try int64 first (the overwhelmingly common case: shapes, axes, flags,
     // f64_bits-encoded floats); fall back to atom (dtypes, quant modes).
     ErlNifSInt64 v;
@@ -226,7 +259,12 @@ template <> struct Decoder<emlx::native::Attr> {
       return emlx::native::Attr(
           std::string(reinterpret_cast<const char *>(binary.data), binary.size));
     }
-    return emlx::native::Attr(fine::decode<fine::Atom>(env, term));
+    auto atom = fine::try_decode<fine::Atom>(env, term);
+    if (!atom) {
+      return DecodeError{
+          "decode failed, expected an integer, binary or atom attribute", term};
+    }
+    return emlx::native::Attr(std::move(atom).value());
   }
 };
 
@@ -234,23 +272,25 @@ template <> struct Decoder<emlx::native::Attr> {
 // emlx::native::SubProgram embeds emlx::native::Instruction — mutually
 // recursive, so the two decoders are mutually recursive too.
 template <> struct Decoder<emlx::native::SubProgram> {
-  static emlx::native::SubProgram decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  static DecodeResult<emlx::native::SubProgram>
+  try_decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+    using emlx::native::decode_field;
+    static const char *name = "EMLX.Native.SubProgram";
     static const fine::Atom instructions_atom("instructions");
     static const fine::Atom outputs_atom("outputs");
 
-    ERL_NIF_TERM instructions_term, outputs_term;
-    if (!enif_get_map_value(env, term, fine::encode(env, instructions_atom),
-                            &instructions_term) ||
-        !enif_get_map_value(env, term, fine::encode(env, outputs_atom),
-                            &outputs_term)) {
-      throw std::invalid_argument(
-          "decode failed, expected an EMLX.Native.SubProgram struct, got: " +
-          format_term(env, term));
+    auto instructions = decode_field<std::vector<emlx::native::Instruction>>(
+        env, term, name, instructions_atom);
+    if (!instructions) {
+      return std::move(instructions).error();
     }
-
-    return emlx::native::SubProgram{
-        fine::decode<std::vector<emlx::native::Instruction>>(env, instructions_term),
-        fine::decode<std::vector<emlx::native::Ref>>(env, outputs_term)};
+    auto outputs =
+        decode_field<std::vector<emlx::native::Ref>>(env, term, name, outputs_atom);
+    if (!outputs) {
+      return std::move(outputs).error();
+    }
+    return emlx::native::SubProgram{std::move(instructions).value(),
+                                    std::move(outputs).value()};
   }
 };
 
@@ -258,37 +298,45 @@ template <> struct Decoder<emlx::native::SubProgram> {
 // mechanism) so field lookup failures produce a clear, specific error
 // message without needing constexpr member-pointer/Atom-pointer tables.
 template <> struct Decoder<emlx::native::Instruction> {
-  static emlx::native::Instruction decode(ErlNifEnv *env,
-                                          const ERL_NIF_TERM &term) {
+  static DecodeResult<emlx::native::Instruction>
+  try_decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+    using emlx::native::decode_field;
+    static const char *name = "EMLX.Native.Instruction";
     static const fine::Atom op_atom("op");
     static const fine::Atom operands_atom("operands");
     static const fine::Atom attrs_atom("attrs");
     static const fine::Atom subprograms_atom("subprograms");
 
-    ERL_NIF_TERM op_term, operands_term, attrs_term, subprograms_term;
-    if (!enif_get_map_value(env, term, fine::encode(env, op_atom), &op_term) ||
-        !enif_get_map_value(env, term, fine::encode(env, operands_atom),
-                            &operands_term) ||
-        !enif_get_map_value(env, term, fine::encode(env, attrs_atom),
-                            &attrs_term) ||
-        !enif_get_map_value(env, term, fine::encode(env, subprograms_atom),
-                            &subprograms_term)) {
-      throw std::invalid_argument(
-          "decode failed, expected an EMLX.Native.Instruction struct, "
-          "got: " +
-          format_term(env, term));
+    auto op = decode_field<fine::Atom>(env, term, name, op_atom);
+    if (!op) {
+      return std::move(op).error();
     }
-
+    auto operands =
+        decode_field<std::vector<emlx::native::Ref>>(env, term, name, operands_atom);
+    if (!operands) {
+      return std::move(operands).error();
+    }
+    auto attrs =
+        decode_field<std::vector<emlx::native::Attr>>(env, term, name, attrs_atom);
+    if (!attrs) {
+      return std::move(attrs).error();
+    }
+    auto subprograms = decode_field<std::vector<emlx::native::SubProgram>>(
+        env, term, name, subprograms_atom);
+    if (!subprograms) {
+      return std::move(subprograms).error();
+    }
     return emlx::native::Instruction{
-        fine::decode<fine::Atom>(env, op_term),
-        fine::decode<std::vector<emlx::native::Ref>>(env, operands_term),
-        fine::decode<std::vector<emlx::native::Attr>>(env, attrs_term),
-        fine::decode<std::vector<emlx::native::SubProgram>>(env, subprograms_term)};
+        std::move(op).value(), std::move(operands).value(),
+        std::move(attrs).value(), std::move(subprograms).value()};
   }
 };
 
 template <> struct Decoder<emlx::native::Program> {
-  static emlx::native::Program decode(ErlNifEnv *env, const ERL_NIF_TERM &term) {
+  static DecodeResult<emlx::native::Program> try_decode(ErlNifEnv *env,
+                                                        const ERL_NIF_TERM &term) {
+    using emlx::native::decode_field;
+    static const char *name = "EMLX.Native.Program";
     static const fine::Atom num_inputs_atom("num_inputs");
     static const fine::Atom captures_atom("captures");
     static const fine::Atom constants_atom("constants");
@@ -296,30 +344,44 @@ template <> struct Decoder<emlx::native::Program> {
     static const fine::Atom outputs_atom("outputs");
     static const fine::Atom num_real_outputs_atom("num_real_outputs");
 
-    auto get_field = [&](const fine::Atom &key) -> ERL_NIF_TERM {
-      ERL_NIF_TERM value;
-      if (!enif_get_map_value(env, term, fine::encode(env, key), &value)) {
-        throw std::invalid_argument(
-            "decode failed, expected an EMLX.Native.Program struct with "
-            "field " +
-            key.to_string() + ", got: " + format_term(env, term));
-      }
-      return value;
-    };
+    auto num_inputs = decode_field<int>(env, term, name, num_inputs_atom);
+    if (!num_inputs) {
+      return std::move(num_inputs).error();
+    }
+    auto captures =
+        decode_field<std::vector<mlx::core::array>>(env, term, name, captures_atom);
+    if (!captures) {
+      return std::move(captures).error();
+    }
+    auto constants =
+        decode_field<std::vector<std::tuple<double, mlx::core::Dtype>>>(
+            env, term, name, constants_atom);
+    if (!constants) {
+      return std::move(constants).error();
+    }
+    auto instructions = decode_field<std::vector<emlx::native::Instruction>>(
+        env, term, name, instructions_atom);
+    if (!instructions) {
+      return std::move(instructions).error();
+    }
+    auto outputs =
+        decode_field<std::vector<emlx::native::Ref>>(env, term, name, outputs_atom);
+    if (!outputs) {
+      return std::move(outputs).error();
+    }
+    auto num_real_outputs =
+        decode_field<int>(env, term, name, num_real_outputs_atom);
+    if (!num_real_outputs) {
+      return std::move(num_real_outputs).error();
+    }
 
     emlx::native::Program program;
-    program.num_inputs = fine::decode<int>(env, get_field(num_inputs_atom));
-    program.captures = fine::decode<std::vector<mlx::core::array>>(
-        env, get_field(captures_atom));
-    program.constants =
-        fine::decode<std::vector<std::tuple<double, mlx::core::Dtype>>>(
-            env, get_field(constants_atom));
-    program.instructions = fine::decode<std::vector<emlx::native::Instruction>>(
-        env, get_field(instructions_atom));
-    program.outputs =
-        fine::decode<std::vector<emlx::native::Ref>>(env, get_field(outputs_atom));
-    program.num_real_outputs =
-        fine::decode<int>(env, get_field(num_real_outputs_atom));
+    program.num_inputs = num_inputs.value();
+    program.captures = std::move(captures).value();
+    program.constants = std::move(constants).value();
+    program.instructions = std::move(instructions).value();
+    program.outputs = std::move(outputs).value();
+    program.num_real_outputs = num_real_outputs.value();
     return program;
   }
 };
