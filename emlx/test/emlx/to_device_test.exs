@@ -102,4 +102,46 @@ defmodule EMLX.ToDeviceTest do
       assert binary == expected
     end
   end
+
+  # An op moves all its operands to one device first. A worker cannot evaluate a
+  # lazy op on the stream of another worker, so an operand that stays on the
+  # other device fails with "There is no Stream(...) in current thread".
+  describe "ops with operands on both devices" do
+    @describetag :metal
+
+    test "gather with GPU indices into a CPU tensor" do
+      t = Nx.iota({3, 3}, type: :f32, backend: {EMLX.Backend, device: :cpu})
+      indices = Nx.tensor([[0, 0], [1, 1], [2, 2]], backend: {EMLX.Backend, device: :gpu})
+
+      assert Nx.to_flat_list(Nx.gather(t, indices)) == [0.0, 4.0, 8.0]
+    end
+
+    test "indexed_add and indexed_put with GPU indices into a CPU tensor" do
+      t = Nx.broadcast(Nx.tensor(1.0, backend: {EMLX.Backend, device: :cpu}), {3})
+      indices = Nx.tensor([[0], [2]], backend: {EMLX.Backend, device: :gpu})
+      updates = Nx.tensor([10.0, 20.0], backend: {EMLX.Backend, device: :cpu})
+
+      assert Nx.to_flat_list(Nx.indexed_add(t, indices, updates)) == [11.0, 1.0, 21.0]
+      assert Nx.to_flat_list(Nx.indexed_put(t, indices, updates)) == [10.0, 1.0, 20.0]
+    end
+
+    test "quantized_matmul with a GPU input, CPU weights and no biases" do
+      weight = Nx.iota({64, 64}, type: :f32, backend: {EMLX.Backend, device: :cpu})
+
+      {w, scales, nil} =
+        EMLX.quantize(EMLX.Backend.from_nx(Nx.divide(weight, 100)), 32, 4, "mxfp4")
+
+      x = Nx.iota({2, 64}, type: :f32) |> Nx.divide(64)
+
+      matmul = fn device ->
+        x
+        |> Nx.backend_copy({EMLX.Backend, device: device})
+        |> EMLX.Backend.from_nx()
+        |> EMLX.quantized_matmul(w, scales, nil, true, 32, 4, "mxfp4")
+        |> EMLX.to_blob()
+      end
+
+      assert matmul.(:gpu) == matmul.(:cpu)
+    end
+  end
 end

@@ -60,7 +60,8 @@ defmodule EMLX.GatherQuantizedMatmulTest do
           compiler: EMLX
         )
 
-      assert_equal(
+      # On :gpu the compiled and the eager results can differ by 1 ulp.
+      assert_all_close(
         fun.(x, qw, indices),
         EMLX.Quantization.gather_quantized_matmul(x, qw, indices)
       )

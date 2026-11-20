@@ -4182,7 +4182,7 @@ defmodule EMLX.Native.ExprTest do
       native = Nx.Defn.jit(&dequant_surrounded/2, compiler: EMLX).(x, qw)
       eager = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw)
 
-      assert_all_close(native, eager)
+      assert_all_close(native, eager, rtol: 1.0e-6)
     end
 
     test "two independent runtime_calls in one defn both split correctly" do
@@ -4195,7 +4195,7 @@ defmodule EMLX.Native.ExprTest do
       native = Nx.Defn.jit(&two_runtime_calls/3, compiler: EMLX).(x, qw1, qw2)
       eager = Nx.Defn.jit(&two_runtime_calls/3, compiler: Nx.Defn.Evaluator).(x, qw1, qw2)
 
-      assert_all_close(native, eager)
+      assert_all_close(native, eager, rtol: 1.0e-6)
     end
 
     # No longer a split point: `:runtime_call` is native-while-eligible (see
@@ -4231,7 +4231,7 @@ defmodule EMLX.Native.ExprTest do
       native = Nx.Defn.jit(&quantized_matmul_surrounded/2, compiler: EMLX).(x, qw)
       eager = Nx.Defn.jit(&quantized_matmul_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw)
 
-      assert_all_close(native, eager)
+      assert_all_close(native, eager, rtol: 1.0e-6)
     end
 
     test "a recognized EMLX.Fast.* runtime_call is still lowered in-graph, not split" do
@@ -4287,8 +4287,8 @@ defmodule EMLX.Native.ExprTest do
 
       eager1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw1)
       eager2 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw2)
-      assert_all_close(native1, eager1)
-      assert_all_close(native2, eager2)
+      assert_all_close(native1, eager1, rtol: 1.0e-6)
+      assert_all_close(native2, eager2, rtol: 1.0e-6)
     end
 
     test "structurally-identical callback-bearing call sites do not populate the cache" do
@@ -4314,8 +4314,8 @@ defmodule EMLX.Native.ExprTest do
 
       eager1 = Nx.Defn.jit(&dequant_surrounded/2, compiler: Nx.Defn.Evaluator).(x, qw1)
       eager2 = Nx.Defn.jit(&dequant_surrounded_other_site/2, compiler: Nx.Defn.Evaluator).(x, qw2)
-      assert_all_close(native1, eager1)
-      assert_all_close(native2, eager2)
+      assert_all_close(native1, eager1, rtol: 1.0e-6)
+      assert_all_close(native2, eager2, rtol: 1.0e-6)
     end
   end
 
@@ -4464,11 +4464,13 @@ defmodule EMLX.Native.ExprTest do
 
   defp assert_close(a, b), do: assert_close(a, b, 1.0e-4)
 
+  # `rtol` scales with the magnitude: 1 float32 ulp is 1.5e-5 near 200.
   defp assert_all_close(a, b, opts \\ []) do
     tol = Keyword.get(opts, :tol, 1.0e-5)
+    rtol = Keyword.get(opts, :rtol, 0.0)
 
     Enum.zip(Nx.to_flat_list(a), Nx.to_flat_list(b))
-    |> Enum.each(fn {av, bv} -> assert_in_delta(av, bv, tol) end)
+    |> Enum.each(fn {av, bv} -> assert_in_delta(av, bv, tol + rtol * abs(bv)) end)
   end
 
   describe "non-contiguous runtime_call arguments" do
