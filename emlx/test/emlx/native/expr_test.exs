@@ -24,6 +24,12 @@ defmodule EMLX.Native.ExprTest.NestedWhileAst do
   end
 end
 
+defmodule EMLX.Native.ExprTest.IgnoredArgBlock do
+  @moduledoc false
+  # A block struct that no lowering recognizes, so it lowers through its default expression.
+  defstruct []
+end
+
 defmodule EMLX.Native.ExprTest do
   @moduledoc """
   Tests for the EMLX native defn compiler:
@@ -2818,6 +2824,19 @@ defmodule EMLX.Native.ExprTest do
   end
 
   describe "block-descent completeness (AllClose/Phase/TopK)" do
+    test "a default function that ignores an argument reads each argument at its position" do
+      a = Nx.tensor([1.0, 2.0], type: :f32, backend: EMLX.Backend)
+      b = Nx.tensor([10.0, 20.0], type: :f32, backend: EMLX.Backend)
+
+      fun = fn a, b ->
+        Nx.block(%EMLX.Native.ExprTest.IgnoredArgBlock{}, [a, b], b, fn _struct, _a, b ->
+          Nx.multiply(b, 2)
+        end)
+      end
+
+      assert Nx.to_flat_list(Nx.Defn.jit(fun, compiler: EMLX).(a, b)) == [20.0, 40.0]
+    end
+
     test "all_close: close tensors vs EMLX.Backend" do
       a = Nx.tensor([1.0, 2.0, 3.0], type: :f32, backend: EMLX.Backend)
       b = Nx.tensor([1.0, 2.0, 3.0 + 1.0e-7], type: :f32, backend: EMLX.Backend)
