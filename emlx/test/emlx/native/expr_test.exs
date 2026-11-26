@@ -85,6 +85,18 @@ defmodule EMLX.Native.ExprTest do
     result
   end
 
+  # Two quantized weights carried unchanged through one `while`, and one of
+  # them also dotted after the loop: the loop carries the scales and biases of
+  # both weights, and the outer dot reads the same program inputs.
+  defn quantized_dots_in_and_after_while(x, qw1, qw2) do
+    {_i, acc, _qw1, _qw2} =
+      while {i = 0, acc = x, qw1, qw2}, i < 2 do
+        {i + 1, Nx.tanh(Nx.dot(Nx.tanh(Nx.dot(acc, qw1)), qw2)), qw1, qw2}
+      end
+
+    acc + Nx.sum(Nx.dot(x, qw1))
+  end
+
   defn two_runtime_calls(x, qw1, qw2) do
     Nx.add(EMLX.Quantization.dequantize(qw1), EMLX.Quantization.dequantize(qw2)) |> Nx.add(x)
   end
@@ -4038,6 +4050,32 @@ defmodule EMLX.Native.ExprTest do
       assert_all_close(r2, eager2)
     end
 
+    test "two quantized weights with the same structure share one specialized program" do
+      # The program reads the scales and biases as inputs, so it keeps no
+      # weight memory and a model that loads again compiles nothing new.
+      w1 = Nx.iota({192, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+      w2 = Nx.iota({192, 64}, type: :f32) |> Nx.divide(-30) |> Nx.backend_transfer(EMLX.Backend)
+      qw1 = EMLX.quantize(w1, [])
+      qw2 = EMLX.quantize(w2, [])
+      x = Nx.iota({4, 192}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+      jitted = Nx.Defn.jit(&Nx.dot/2, compiler: EMLX)
+
+      {r1, _first} = new_dispatch_cache_entries(fn -> jitted.(x, qw1) end)
+      {r2, second} = new_dispatch_cache_entries(fn -> jitted.(x, qw2) end)
+
+      assert second == 0
+
+      assert_all_close(
+        r1,
+        EMLX.Backend.dot(Nx.template({4, 64}, r1.type), x, [1], [], qw1, [0], [])
+      )
+
+      assert_all_close(
+        r2,
+        EMLX.Backend.dot(Nx.template({4, 64}, r2.type), x, [1], [], qw2, [0], [])
+      )
+    end
+
     test "a defn with two independently-quantized weights specializes both dots" do
       w1 =
         Nx.iota({128, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
@@ -4135,6 +4173,20 @@ defmodule EMLX.Native.ExprTest do
       eager = Nx.Defn.jit(&quantized_dot_in_while_body/3, compiler: Nx.Defn.Evaluator).(x, qw, n)
 
       assert_all_close(native, eager)
+    end
+
+    test "two quantized weights carried through a while, one also dotted after it, work" do
+      w1 = Nx.iota({64, 64}, type: :f32) |> Nx.divide(100) |> Nx.backend_transfer(EMLX.Backend)
+      w2 = Nx.iota({64, 64}, type: :f32) |> Nx.divide(-70) |> Nx.backend_transfer(EMLX.Backend)
+      qw1 = EMLX.quantize(w1, [])
+      qw2 = EMLX.quantize(w2, [])
+      x = Nx.iota({4, 64}, type: :f32) |> Nx.divide(37) |> Nx.backend_transfer(EMLX.Backend)
+
+      fun = &quantized_dots_in_and_after_while/3
+      native = Nx.Defn.jit(fun, compiler: EMLX).(x, qw1, qw2)
+      eager = Nx.Defn.jit(fun, compiler: Nx.Defn.Evaluator).(x, qw1, qw2)
+
+      assert_all_close(native, eager, rtol: 1.0e-4)
     end
 
     test "a quantized left operand still raises a clear ArgumentError (matches EMLX.Backend.dot/7)" do
