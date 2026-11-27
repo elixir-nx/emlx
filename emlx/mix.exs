@@ -76,7 +76,7 @@ defmodule EMLX.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       {:fine, "~> 0.2.0", runtime: false},
-      {:nx, "~> 1.0"},
+      {:nx, "~> 1.1"},
       {:telemetry, "~> 1.0"},
       {:ex_doc, "~> 0.34", only: :docs}
     ]
