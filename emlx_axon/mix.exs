@@ -42,7 +42,7 @@ defmodule EMLXAxon.MixProject do
     [
       {:elixir_make, "~> 0.6"},
       emlx_dep(),
-      {:nx, "~> 1.0"},
+      {:nx, "~> 1.1"},
       {:axon, "~> 0.9"},
       {:bumblebee, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :docs}

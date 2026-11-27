@@ -117,7 +117,7 @@ FINE_ASYNC_NIF(fast_rope)
 // MLX: mlx::fast::scaled_dot_product_attention(q, k, v, scale, mask_mode, mask_arr, sinks, stream)
 // GQA-native: k/v may have fewer heads than q.
 // sinks (optional, {N_q} or {N_q, ...} learned per-head attention-sink logits)
-// is `nil` from Elixir when absent — see the std::optional<TensorArg> decoder.
+// is `nil` from Elixir when absent; fine decodes `nil` as an empty std::optional.
 mlx::core::array fast_sdpa_impl(ErlNifEnv *env, TensorArg q, TensorArg k,
                                 TensorArg v, double scale,
                                 std::optional<TensorArg> sinks,
