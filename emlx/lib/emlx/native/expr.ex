@@ -2386,7 +2386,7 @@ defmodule EMLX.Native.Expr do
          b_left,
          right,
          c_right,
-         %EMLX.Quantization.Config{} = cfg,
+         %{group_size: _, bits: _, mode: _, transpose: _, biases: _} = cfg,
          state
        ) do
     unless b_left == [] do
