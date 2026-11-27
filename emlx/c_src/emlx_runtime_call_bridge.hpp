@@ -90,9 +90,16 @@ struct PendingRuntimeCall {
 // A worker thread uses only these two streams. Its own stream is the default
 // stream for its device. The ops of the other device use the default stream of
 // that device.
+//
+// The GPU stream is only peeked. An op on the default GPU stream of the thread
+// creates that stream first, so a thread without one has no GPU work to wait for.
+// default_stream() would create the stream on a :cpu worker only to commit an
+// empty command buffer and wait for it.
 inline void synchronize_thread_streams() {
   if (mlx::core::is_available(mlx::core::Device::gpu)) {
-    mlx::core::synchronize(mlx::core::default_stream(mlx::core::Device::gpu));
+    if (auto gpu = mlx::core::peek_default_stream(mlx::core::Device::gpu)) {
+      mlx::core::synchronize(*gpu);
+    }
   }
   mlx::core::synchronize(mlx::core::default_stream(mlx::core::Device::cpu));
 }

@@ -2492,26 +2492,22 @@ defmodule EMLX.Native.Expr do
   defp expand_block_via_default(id, in_args, default_expr, state) do
     inner_ordered = EMLX.Defn.Tree.post_order(default_expr, &scope_dependencies/1)
 
-    # Collect inner :parameter nodes; sort by position (args[0]).
-    inner_params =
-      inner_ordered
-      |> Enum.filter(&(&1.data.op == :parameter))
-      |> Enum.sort_by(fn t -> hd(t.data.args) end)
+    # The inner :parameter nodes that the default expression reaches. A parameter can be
+    # unused, so each one maps to the parent-scope arg at its own position (args[0]), not
+    # to the next arg in order. The tensor args come before the option lists.
+    inner_params = Enum.filter(inner_ordered, &(&1.data.op == :parameter))
 
-    # Map each inner param id → the corresponding parent-scope arg ref.
-    parent_arg_refs = Enum.map(in_args, &Map.fetch!(state.node_to_ref, &1.data.id))
+    parent_arg_refs =
+      in_args
+      |> Enum.take_while(&(not is_list(&1)))
+      |> Enum.map(&Map.fetch!(state.node_to_ref, &1.data.id))
 
-    inner_param_id_set =
-      inner_params
-      |> Enum.zip(parent_arg_refs)
-      |> Enum.reduce(MapSet.new(), fn {param, _}, acc ->
-        MapSet.put(acc, param.data.id)
-      end)
+    inner_param_id_set = MapSet.new(inner_params, & &1.data.id)
 
     inner_param_ref_map =
-      inner_params
-      |> Enum.zip(parent_arg_refs)
-      |> Map.new(fn {param, ref} -> {param.data.id, ref} end)
+      Map.new(inner_params, fn %T{data: %Nx.Defn.Expr{id: id, args: [pos | _]}} ->
+        {id, Enum.at(parent_arg_refs, pos)}
+      end)
 
     # Extend node_to_ref with inner param → parent ref mappings.
     merged_node_to_ref = Map.merge(state.node_to_ref, inner_param_ref_map)

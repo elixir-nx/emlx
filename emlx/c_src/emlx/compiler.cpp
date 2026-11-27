@@ -2421,12 +2421,13 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   bool has_runtime_call = false;
   validate_and_resolve_instructions(program.instructions, has_runtime_call);
 
-  // Build constant arrays on the current (worker) thread using its default
-  // stream.
+  // Constants hold their data and have no primitive. Workers of one device share
+  // this program, and a worker cannot evaluate an op on the stream of another
+  // worker. mlx::core::compile also builds again each traced op on each call.
   std::vector<mlx::core::array> constants;
   constants.reserve(program.constants.size());
   for (const auto &[value, dtype] : program.constants) {
-    constants.push_back(mlx::core::full({}, value, dtype, worker_stream()));
+    constants.push_back(mlx::core::array(value, dtype));
   }
 
   int num_inputs_val = program.num_inputs;

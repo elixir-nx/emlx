@@ -222,7 +222,7 @@ defmodule EMLX.Backend do
       end
 
     new_scales = Nx.backend_copy(cfg.scales, device_opts)
-    new_biases = Nx.backend_copy(cfg.biases, device_opts)
+    new_biases = cfg.biases && Nx.backend_copy(cfg.biases, device_opts)
 
     %T{
       shape: logical_shape,
@@ -1949,13 +1949,10 @@ defmodule EMLX.Backend do
 
     indices_list =
       Enum.map(0..(num_axes - 1), fn entry ->
-        {_device, ref} =
-          indices
-          |> Nx.slice_along_axis(entry, 1, axis: -1)
-          |> Nx.squeeze(axes: [-1])
-          |> from_nx()
-
-        ref
+        indices
+        |> Nx.slice_along_axis(entry, 1, axis: -1)
+        |> Nx.squeeze(axes: [-1])
+        |> from_nx()
       end)
 
     tensor
@@ -1984,13 +1981,10 @@ defmodule EMLX.Backend do
 
     indices_list =
       Enum.map(0..(num_axes - 1), fn entry ->
-        {_device, ref} =
-          indices
-          |> Nx.slice_along_axis(entry, 1, axis: -1)
-          |> Nx.squeeze(axes: [-1])
-          |> from_nx()
-
-        ref
+        indices
+        |> Nx.slice_along_axis(entry, 1, axis: -1)
+        |> Nx.squeeze(axes: [-1])
+        |> from_nx()
       end)
 
     # MLX scatter takes one update slice per index with the target's rank: size 1 on the
@@ -2164,11 +2158,19 @@ defmodule EMLX.Backend do
     |> to_nx(out)
   end
 
+  # mx::allclose takes abs(b) in the type of b, which overflows at the smallest signed integer.
+  # Two integer tensors go to the default function, which widens them first.
   @impl true
-  def block(%Nx.Block.AllClose{atol: atol, rtol: rtol, equal_nan: equal_nan}, out, [a, b], _fun) do
+  def block(
+        %Nx.Block.AllClose{atol: atol, rtol: rtol, equal_nan: equal_nan},
+        out,
+        [%T{type: {kind_a, _}} = a, %T{type: {kind_b, _}} = b],
+        _fun
+      )
+      when kind_a not in [:s, :u] or kind_b not in [:s, :u] do
     a
     |> from_nx()
-    |> EMLX.allclose(from_nx(b), atol || 1.0e-4, rtol || 1.0e-8, equal_nan == true)
+    |> EMLX.allclose(from_nx(b), rtol, atol, equal_nan == true)
     |> to_nx(out)
   end
 
