@@ -2066,6 +2066,7 @@ defmodule EMLX do
       {worker, dev} = resolve_worker(effective_device)
       tensors = materialise_input_tensors(params, dev)
       quant_signature = quant_signature(tensors, quantizable_positions)
+      quant_inputs = quant_inputs(tensors, quant_signature)
 
       # The plain (non-quantized) resource was already looked up/compiled
       # (and cached under `{base_key, %{}}`) by our caller, so the common
@@ -2083,7 +2084,7 @@ defmodule EMLX do
             base_key,
             quant_signature,
             fn -> fun.(vars) end,
-            num_inputs,
+            num_inputs + length(quant_inputs),
             worker,
             dev,
             hooks
@@ -2091,7 +2092,7 @@ defmodule EMLX do
         end
 
       job_ref =
-        EMLX.NIF.eval_program(worker, program_resource, input_refs(tensors))
+        EMLX.NIF.eval_program(worker, program_resource, input_refs(tensors ++ quant_inputs))
         |> unwrap!()
 
       # `eval_program` already trims any keepalive tail on the native side
@@ -2318,15 +2319,48 @@ defmodule EMLX do
   # either — otherwise every distinct quantized tensor identity would mint
   # its own permanently-unreused dispatch-cache entry for an
   # otherwise structurally-identical program.
+  #
+  # The signature holds only the structure of each weight, never its tensors.
+  # The scales and biases are extra program inputs after the call's own
+  # inputs, at `scales_input` and `biases_input` (see `quant_inputs/2`). So
+  # the program captures no weight memory, and every weight with the same
+  # structure, such as the same model loaded again, shares one program.
   defp quant_signature(tensors, allowed_positions) do
-    tensors
-    |> Enum.with_index()
-    |> Enum.reduce(%{}, fn {tensor, pos}, sig ->
-      cond do
-        not MapSet.member?(allowed_positions, pos) -> sig
-        is_nil(tensor.data.quantization_config) -> sig
-        true -> Map.put(sig, pos, tensor.data.quantization_config)
-      end
+    {signature, _next_input} =
+      tensors
+      |> Enum.with_index()
+      |> Enum.reduce({%{}, length(tensors)}, fn {tensor, pos}, {sig, next} ->
+        cfg = tensor.data.quantization_config
+
+        if cfg && MapSet.member?(allowed_positions, pos) do
+          spec = %{
+            group_size: cfg.group_size,
+            bits: cfg.bits,
+            mode: cfg.mode,
+            transpose: cfg.transpose,
+            scales: {cfg.scales.shape, cfg.scales.type},
+            biases: cfg.biases && {cfg.biases.shape, cfg.biases.type},
+            scales_input: next,
+            biases_input: cfg.biases && next + 1
+          }
+
+          {Map.put(sig, pos, spec), if(cfg.biases, do: next + 2, else: next + 1)}
+        else
+          {sig, next}
+        end
+      end)
+
+    signature
+  end
+
+  # The scales and biases of the quantized weights of `signature`, in the order
+  # of their input positions.
+  defp quant_inputs(tensors, signature) do
+    signature
+    |> Enum.sort_by(fn {_pos, spec} -> spec.scales_input end)
+    |> Enum.flat_map(fn {pos, _spec} ->
+      cfg = Enum.at(tensors, pos).data.quantization_config
+      Enum.reject([cfg.scales, cfg.biases], &is_nil/1)
     end)
   end
 

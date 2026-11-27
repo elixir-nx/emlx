@@ -67,6 +67,7 @@ defmodule EMLX.Native.Expr do
       hooks: hooks,
       top_scope_ids: top_scope_ids,
       quant_signature: quant_signature,
+      quant_inputs: %{},
       while_nesting_depth: 0,
       stable_positions: %{},
       refcounts: compute_refcounts(ordered)
@@ -2385,7 +2386,7 @@ defmodule EMLX.Native.Expr do
          b_left,
          right,
          c_right,
-         %EMLX.Quantization.Config{} = cfg,
+         %{group_size: _, bits: _, mode: _, transpose: _, biases: _} = cfg,
          state
        ) do
     unless b_left == [] do
@@ -2417,15 +2418,9 @@ defmodule EMLX.Native.Expr do
     left_ref = Map.fetch!(state.node_to_ref, left.data.id)
     right_ref = Map.fetch!(state.node_to_ref, right.data.id)
 
-    {scales_ref, state} = emit_capture(cfg.scales, state)
-
-    {operands, has_bias, state} =
-      if cfg.biases do
-        {biases_ref, state} = emit_capture(cfg.biases, state)
-        {[left_ref, right_ref, scales_ref, biases_ref], 1, state}
-      else
-        {[left_ref, right_ref, scales_ref], 0, state}
-      end
+    {quant_refs, state} = quant_input_refs(cfg, state)
+    operands = [left_ref, right_ref | quant_refs]
+    has_bias = if cfg.biases, do: 1, else: 0
 
     mode_int = String.to_atom(cfg.mode)
     transpose_int = if transpose, do: 1, else: 0
@@ -2443,9 +2438,31 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
-  defp emit_capture(%Nx.Tensor{} = tensor, state) do
-    ref = make_ref()
-    {ref, %{state | captures: [{ref, tensor} | state.captures]}}
+  # The refs of the scales and (optional) biases of a quantized weight. They
+  # are program inputs at the positions of `spec` (see `quant_signature/2` in
+  # emlx.ex), so a program holds no weight memory and serves every weight of
+  # the same structure. `state.inputs` is the one record of the ref of each
+  # input position. Inside a `:while` scope, `state.quant_inputs` gives the
+  # extra carries that `expand_while_native/6` adds instead.
+  defp quant_input_refs(spec, state) do
+    case state.quant_inputs do
+      %{^spec => refs} ->
+        {refs, state}
+
+      _ when state.while_nesting_depth > 0 ->
+        raise ArgumentError, "a quantized weight inside a :while has no carry for its scales"
+
+      _ ->
+        {refs, inputs} =
+          [spec.scales_input, spec.biases_input]
+          |> Enum.reject(&is_nil/1)
+          |> Enum.map_reduce(state.inputs, fn pos, inputs ->
+            ref = Map.get_lazy(inputs, pos, &make_ref/0)
+            {ref, Map.put(inputs, pos, ref)}
+          end)
+
+        {refs, %{state | inputs: inputs}}
+    end
   end
 
   # ── indexing helpers ──────────────────────────────────────────────────────
@@ -2733,10 +2750,32 @@ defmodule EMLX.Native.Expr do
     stable_positions =
       propagate_stable_carry_positions(arg_list, body_list, initial_list, state.stable_positions)
 
+    # The scales and biases of each quantized weight that a carry holds
+    # unchanged become extra carries, because a sub-program reads no inputs.
+    outer_quant_inputs = state.quant_inputs
+
+    {quant_init, state} =
+      arg_list
+      |> Enum.map(&Map.get(state.quant_signature, Map.get(stable_positions, &1.data.id)))
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.map_reduce(state, fn spec, st ->
+        {refs, st} = quant_input_refs(spec, st)
+        {{spec, refs}, st}
+      end)
+
+    quant_carries =
+      Map.new(quant_init, fn {spec, refs} -> {spec, Enum.map(refs, fn _ -> make_ref() end)} end)
+
+    quant_carry_refs = Enum.flat_map(quant_init, fn {spec, _refs} -> quant_carries[spec] end)
+    init_refs = init_refs ++ Enum.flat_map(quant_init, &elem(&1, 1))
+    carry_refs = carry_refs ++ quant_carry_refs
+
     nested_state = %{
       state
       | while_nesting_depth: depth + 1,
-        stable_positions: stable_positions
+        stable_positions: stable_positions,
+        quant_inputs: quant_carries
     }
 
     {cond_sub, state} =
@@ -2746,13 +2785,16 @@ defmodule EMLX.Native.Expr do
       lower_while_subprogram(body_list, carry_refs, param_ref_by_pos, %{
         state
         | while_nesting_depth: depth + 1,
-          stable_positions: stable_positions
+          stable_positions: stable_positions,
+          quant_inputs: quant_carries
       })
 
-    state = %{state | while_nesting_depth: depth}
+    body_sub = %{body_sub | outputs: body_sub.outputs ++ quant_carry_refs}
+    state = %{state | while_nesting_depth: depth, quant_inputs: outer_quant_inputs}
 
     result_refs = Enum.map(init_refs, fn _ -> make_ref() end)
-    result_id = if match?([_], result_refs), do: hd(result_refs), else: result_refs
+    visible_refs = Enum.take(result_refs, length(initial_list))
+    result_id = if match?([_], visible_refs), do: hd(visible_refs), else: visible_refs
 
     instr = {result_refs, :while, init_refs, [], [cond_sub, body_sub]}
 
@@ -3118,9 +3160,9 @@ defmodule EMLX.Native.Expr do
   # such position and is never recognized as a `:dot` operand here, even
   # when fed straight into one. Extending quantized `:dot` dispatch to
   # cover that case would mean recognizing `__EMLX_QUANT__` nodes here too,
-  # and reworking `expand_quantized_dot/8` to consume scales/biases as
+  # and reworking `expand_quantized_dot/9` to consume scales/biases as
   # graph-flowing operands (via their own `node_to_ref` entries) instead of
-  # `emit_capture/2`-ing real, call-time-known tensors — out of scope today.
+  # program inputs bound at call time — out of scope today.
   @doc false
   def quantizable_param_positions(output) do
     {positions, _stable} = quantizable_positions_in_scope(output, %{})
