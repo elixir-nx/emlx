@@ -1,7 +1,7 @@
 defmodule EMLXAxon.MixProject do
   use Mix.Project
 
-  @version "0.5.0"
+  @version "0.6.0"
   @source_url "https://github.com/elixir-nx/emlx"
 
   def project do
@@ -60,7 +60,7 @@ defmodule EMLXAxon.MixProject do
   end
 
   defp hex_emlx_dep do
-    {:emlx, "~> 0.5.0"}
+    {:emlx, "~> 0.6.0"}
   end
 
   def cli do
